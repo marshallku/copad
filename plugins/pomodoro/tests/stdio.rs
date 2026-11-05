@@ -1,10 +1,5 @@
-//! Integration test: drive the real `copad-plugin-pomodoro` binary over its
-//! stdio JSON protocol (the wire contract copad's supervisor speaks).
-//!
-//! Covers the fast path — handshake, action invocation, `pomodoro.state`
-//! emission, validation, and atomic persistence. The timer-expiry →
-//! transition/toast path is a 60s wall-clock wait, so it stays in the
-//! clock-injected unit tests (`state.rs`) rather than here.
+//! Drives the real `copad-plugin-pomodoro` binary over its stdio JSON protocol. Timer expiry is a
+//! 60s wall-clock wait, so it is covered by the clock-injected unit tests in `state.rs`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -76,7 +71,6 @@ impl Harness {
         }));
     }
 
-    /// Block up to 2s for the first frame satisfying `pred`.
     fn wait_for(&self, pred: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -97,7 +91,6 @@ impl Harness {
         }
     }
 
-    /// The response frame for a given request id.
     fn response(&self, id: &str) -> Value {
         self.wait_for(|v| v.get("id").and_then(Value::as_str) == Some(id) && v.get("ok").is_some())
     }
@@ -142,7 +135,6 @@ fn start_status_pause_resume_reset() {
     assert!(text.starts_with("🍅 25:00"), "text was {text:?}");
     assert!(text.contains("refactor"));
 
-    // start emitted a pomodoro.state event.
     h.wait_for(|v| {
         v.get("method").and_then(Value::as_str) == Some("event.publish")
             && v["params"]["kind"] == "pomodoro.state"
@@ -171,7 +163,6 @@ fn rejects_out_of_range_minutes_without_mutating() {
     let r = h.response("bad");
     assert!(!r["ok"].as_bool().unwrap());
     assert_eq!(r["error"]["code"], "invalid_params");
-    // Still idle.
     h.invoke("st", "pomodoro.status", json!({}));
     assert!(
         h.response("st")["result"]["text"]
@@ -192,7 +183,6 @@ fn set_durations_persists_to_state_file() {
     );
     assert!(h.response("d")["ok"].as_bool().unwrap());
 
-    // Give the atomic rename a moment, then read the file directly.
     let saved = h.wait_for_file();
     assert_eq!(saved["work_min"], 50);
     assert_eq!(saved["break_min"], 10);

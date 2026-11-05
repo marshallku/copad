@@ -1,33 +1,20 @@
 //! First-party Google Calendar service plugin for copad.
 //!
-//! Two run modes (selected by `argv[1]`):
-//! - **`auth`** — interactive OAuth 2.0 device-code flow. Prints a
-//!   user_code and verification URL to stderr, polls Google's token
-//!   endpoint until the user approves, then writes the resulting
-//!   `TokenSet` to the configured store (keyring with plaintext
-//!   fallback). Exits 0 on success.
-//! - **(no args)** — RPC mode. Speaks the copad service-plugin protocol
-//!   over stdio, provides `calendar.list_events` / `calendar.event_details`,
-//!   and runs a background poller that publishes `calendar.event_imminent`
-//!   events at the lead times configured via `COPAD_CALENDAR_LEAD_MINUTES`.
+//! Run mode is selected by `argv[1]`:
+//! - `auth`: interactive OAuth 2.0 device-code flow. Prints a user_code and verification URL to
+//!   stderr, polls Google's token endpoint until approval, then writes the `TokenSet` to the
+//!   store (keyring with plaintext fallback).
+//! - no args: RPC mode over stdio (`docs/service-plugins.md`), providing `calendar.list_events` /
+//!   `calendar.event_details` plus a poller that publishes `calendar.event_imminent` at the lead
+//!   times in `COPAD_CALENDAR_LEAD_MINUTES`.
 //!
-//! If RPC mode starts with no stored token the plugin still completes
-//! `initialize` (so `provides` resolution works) but actions return
-//! `not_authenticated` and the poller stays idle until tokens appear.
-//! This lets the user run `copad-plugin-calendar auth` while copad is
-//! already running — the poller picks up the new token on its next tick.
+//! With no stored token, `initialize` still completes (so `provides` resolution works), actions
+//! return `not_authenticated` and the poller idles until `copad-plugin-calendar auth` supplies
+//! tokens. Per-event customisation lives in the user's `[[triggers]]`; the plugin only emits events.
 //!
-//! See the protocol contract in `docs/service-plugins.md`. Per-event
-//! customisation (different actions for different recurring events,
-//! conditional execution by attendance status) lives in the user's
-//! `[[triggers]]` config — calendar plugin is purely an event emitter.
-//!
-//! Unix-only. `keyring`'s mock fallback on platforms with no native
-//! credential-store feature would let `auth` succeed without
-//! actually persisting tokens — a silent failure mode we refuse to
-//! ship. Linux + macOS is copad's full support matrix; if/when a
-//! Windows port lands, add `windows-native` to the keyring features
-//! and relax this gate.
+//! Unix-only: `keyring`'s mock fallback on platforms without a native credential-store feature
+//! would let `auth` succeed without persisting tokens. A Windows port needs `windows-native` in
+//! the keyring features and this gate relaxed.
 
 #[cfg(not(unix))]
 compile_error!(
@@ -78,8 +65,6 @@ fn run_auth() {
             std::process::exit(1);
         }
     };
-    // `auth` is the one path where the OAuth client credentials MUST be present — RPC mode is
-    // allowed to start unconfigured (quiet), but the device-code flow can't run without them.
     if config.is_minimal() {
         eprintln!(
             "[calendar] auth requires COPAD_CALENDAR_CLIENT_ID and COPAD_CALENDAR_CLIENT_SECRET"
@@ -108,13 +93,10 @@ fn run_rpc() {
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            // Don't fail init — the plugin can still echo errors back
-            // for actions, and the user might fix the env vars while
-            // copad is running. Log loudly so the cause is obvious.
+            // Don't fail init: the user may fix the env vars while copad runs. Log loudly.
             eprintln!("[calendar] config error (actions will fail): {e}");
-            // Use a minimal config so we can at least serve initialize.
-            // Subsequent actions will return not_authenticated; the
-            // carried error is toasted once via plugin.config_error.
+            // Minimal config to serve initialize; actions return not_authenticated and the error is
+            // toasted once via plugin.config_error.
             Config::minimal_with_error(e)
         }
     };
@@ -125,8 +107,7 @@ fn run_rpc() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    // Single writer thread funnels all outgoing JSON so init reply,
-    // action replies, and event.publish notifications never interleave.
+    // Single writer thread so init reply, action replies and event.publish never interleave.
     let (tx, rx) = channel::<String>();
     let writer_tx = tx.clone();
     thread::spawn(move || {
@@ -140,8 +121,7 @@ fn run_rpc() {
 
     let initialized = Arc::new(AtomicBool::new(false));
 
-    // Poller runs in its own thread. It checks the store on every tick,
-    // so it tolerates the auth-after-startup case.
+    // The poller checks the store every tick, so it tolerates auth after startup.
     let poller = Arc::new(Poller::new(
         Arc::new(config.clone()),
         store.clone(),
@@ -225,9 +205,7 @@ fn handle_frame(
                 Err((code, msg)) => send_error(tx, id, &code, &msg),
             }
         }
-        "event.dispatch" => {
-            // calendar plugin doesn't subscribe — quietly ignore.
-        }
+        "event.dispatch" => {}
         "shutdown" => std::process::exit(0),
         other if !other.is_empty() && !id.is_empty() => {
             send_error(
@@ -247,13 +225,9 @@ fn handle_action(
     config: &Config,
     store: &Arc<dyn TokenStore>,
 ) -> Result<Value, (String, String)> {
-    // auth_status surfaces BOTH the env-configured state and the
-    // stored-credentials state so callers can distinguish "no
-    // CLIENT_ID set" from "tokens not yet authenticated". A plugin
-    // started with bad env can still hold a valid token from a
-    // previous good run; without `configured`, that mixed state
-    // looks like normal "authenticated" until the next refresh
-    // breaks.
+    // auth_status reports both the env-configured and stored-credentials state, so "no CLIENT_ID
+    // set" is distinguishable from "not yet authenticated". Without `configured`, a bad env plus an
+    // old valid token looks authenticated until the next refresh breaks.
     if name == "calendar.auth_status" {
         return Ok(json!({
             "configured": !config.is_minimal(),
@@ -262,10 +236,8 @@ fn handle_action(
             "account": config.account_label.clone(),
         }));
     }
-    // For everything that needs to talk to Google we refuse early
-    // when env is missing — without this guard, a stale stored token
-    // would make `list_events` succeed once and then break on
-    // refresh with a confusing "client_secret missing" error.
+    // Refuse early when env is missing: a stale stored token would let `list_events` succeed once
+    // and then fail on refresh with a confusing "client_secret missing" error.
     if config.is_minimal() {
         return Err((
             "not_authenticated".to_string(),
@@ -307,8 +279,7 @@ fn handle_action(
     }
 }
 
-/// Capped at one year — `0` or huge values would cause a tight refresh
-/// loop or wrap negative when cast to `i64` for `chrono::Duration`.
+/// Capped at one year: `0` or huge values would cause a tight refresh loop or wrap negative as `i64`.
 fn parse_lookahead_param(params: &Value, default: u64) -> Result<u64, (String, String)> {
     const MAX_HOURS: u64 = 24 * 365;
     let Some(v) = params.get("lookahead_hours") else {

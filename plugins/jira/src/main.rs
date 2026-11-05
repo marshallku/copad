@@ -160,8 +160,7 @@ fn run_rpc() {
     let initialized = Arc::new(AtomicBool::new(false));
 
     // Polling runs in a background thread, waiting for `initialized`, and resolves credentials
-    // every
-    // tick, so a later `copad-plugin-jira auth` is picked up without a restart.
+    // every tick, so a later `copad-plugin-jira auth` is picked up without a restart.
     {
         let cfg_for_poller = Arc::new(config.clone());
         let store_for_poller = store.clone();
@@ -338,8 +337,7 @@ fn map_jira_error(err: String) -> (String, String) {
         "io_error",
     ];
     // Split on whitespace, `(` and `:` so `"unauthorized HTTP 401:"` and `"rate_limited
-    // (Retry-After:..."`
-    // both yield the bare keyword.
+    // (Retry-After:..."` both yield the bare keyword.
     let bare = err
         .split(|c: char| c.is_whitespace() || c == '(' || c == ':')
         .next()
@@ -924,8 +922,7 @@ mod tests {
     #[test]
     fn current_credentials_rejects_stored_non_atlassian_base_url() {
         // Security boundary: env validation rejects non-Atlassian hosts to prevent token
-        // exfiltration,
-        // and a hand-edited keyring entry must not bypass it.
+        // exfiltration, and a hand-edited keyring entry must not bypass it.
         for bad_host in [
             "https://attacker.example.com",
             "https://atlassian.net.evil.example",

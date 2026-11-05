@@ -19,8 +19,8 @@ const renderBoard = new Function("state", "escapeHtml", src + "; return renderBo
 
 const out = renderBoard();
 const agents = board.agents || [];
-// Groups are always expanded now — there is no toggle — so a single render must already
-// contain every agent. That IS the regression this guards: the partition once hid 26 of 27.
+// Groups are always expanded, so a single render must contain every agent (the partition once
+// hid 26 of 27).
 const rendered = [...out.matchAll(/data-token="([^"]*)"/g)].map(m => m[1]);
 const renderedOpen = new Set(rendered);
 
@@ -59,7 +59,6 @@ const partialStale = renderBoard();
 console.log("  partial + stale shows the stale banner:", partialStale.includes("응답하지 않음"));
 state.boardStale = false;
 
-// Both null.
 state.board = { sessions: null, agents: null, errors: [] };
 const both = renderBoard();
 console.log("both null -> could not read:", both.includes("읽지 못했습니다"));

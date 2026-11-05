@@ -1,25 +1,18 @@
 //! First-party Todo service plugin for copad.
 //!
-//! Markdown-checkbox files at `~/docs/todos/<workspace>/<id>.md`
-//! with YAML-ish frontmatter as the source of truth — vim and git
-//! are first-class clients alongside this binary's actions.
+//! Markdown-checkbox files at `~/docs/todos/<workspace>/<id>.md` with YAML-ish frontmatter are the
+//! source of truth; vim and git are first-class clients alongside this binary's actions.
 //!
-//! Architecture mirrors the calendar plugin: a stdio RPC loop on
-//! the main thread plus a background poller thread that emits
-//! file-watcher events. We intentionally do NOT delegate writes
-//! through `kb.ensure` (an inter-plugin RPC) — the atomic-create
-//! primitives are 30 lines of libc and rolling them in-crate is
-//! cheaper than the build-graph entanglement.
+//! Architecture mirrors the calendar plugin: a stdio RPC loop on the main thread plus a background
+//! watcher thread. Writes are NOT delegated through `kb.ensure` (an inter-plugin RPC): the
+//! atomic-create primitives are 30 lines of libc, cheaper than the build-graph entanglement.
 //!
-//! Activation `onStartup` (rather than `onAction:todo.*`) so the
-//! file-watcher is alive whenever copad is running. Otherwise an
-//! external `vim` edit only surfaces as `todo.changed` after the
-//! first user-initiated action, which would silently break
-//! triggers like `todo.completed → slack.post_message`.
+//! Activation `onStartup` (not `onAction:todo.*`) so the watcher is alive whenever copad runs;
+//! otherwise an external `vim` edit surfaces as `todo.changed` only after the first user action,
+//! silently breaking triggers like `todo.completed -> slack.post_message`.
 //!
-//! Unix-only (Linux + macOS) — `store.rs` needs `O_NOFOLLOW` plus a
-//! kernel atomic-create-or-fail primitive, both of which we get via
-//! `copad_core::fs_atomic`.
+//! Unix-only (Linux + macOS): `store.rs` needs `O_NOFOLLOW` plus a kernel atomic-create-or-fail
+//! primitive, both via `copad_core::fs_atomic`.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
@@ -60,11 +53,9 @@ fn main() {
         config.default_workspace
     );
 
-    // Even with a fatal_error we still try to open the store —
-    // the error already came from env validation, not the
-    // filesystem, so the store itself is fine. If `Store::new`
-    // ALSO fails (e.g. unwriteable docs dir), that becomes a
-    // second-level fatal_error and actions error out uniformly.
+    // Even with a fatal_error (from env validation, not the filesystem) still try to open the
+    // store; if `Store::new` ALSO fails (e.g. unwriteable docs dir), that becomes a second-level
+    // fatal_error and actions error out uniformly.
     let store_result = Store::new(config.root.clone());
     let (store, store_error): (Option<Arc<Store>>, Option<String>) = match store_result {
         Ok(s) => (Some(Arc::new(s)), None),
@@ -76,23 +67,14 @@ fn main() {
     };
 
     let stdin = std::io::stdin();
-    // Direct-write Stdout wrapped in a Mutex. Replaces the previous
-    // mpsc + writer-thread design — that pattern leaked frames on
-    // shutdown because the writer thread had no bounded drain
-    // window inside the supervisor's 200ms SIGKILL grace. Each
-    // producer (handle_frame, Watcher) now acquires the Mutex,
-    // writes, flushes, and releases. There's no queue, so a hard
-    // process::exit doesn't have any "in-flight" frames to lose —
-    // every emit is fully committed to the stdout buffer +
-    // flushed to the parent pipe before its caller returns.
+    // Direct-write stdout behind a Mutex, no queue or writer thread: a queue had no bounded drain
+    // window inside the supervisor's 200ms SIGKILL grace and leaked frames on shutdown. Each
+    // producer (handle_frame, Watcher) locks, writes, flushes and releases, so every emit is
+    // committed to the parent pipe before its caller returns.
     let writer: Writer = Arc::new(Mutex::new(Box::new(std::io::stdout())));
 
     let initialized = Arc::new(AtomicBool::new(false));
-    // `shutdown` lets the watcher exit promptly on stdin EOF /
-    // `shutdown` method, instead of one full poll cycle later.
-    // Cooperative shutdown semantics; on hard SIGKILL we still
-    // exit immediately, but no frames are lost because nothing is
-    // queued.
+    // Lets the watcher exit promptly on stdin EOF / `shutdown` instead of one poll cycle later.
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let watcher_handle = if let Some(s) = &store {
@@ -138,18 +120,10 @@ fn main() {
         }
     }
 
-    // Cooperative shutdown: signal + JOIN. The direct-write model
-    // means each `emit()` call commits its frame end-to-end before
-    // returning, but a watcher mid-emit (between writeln and flush
-    // — yes, our lock spans both, but at the syscall-issued layer
-    // there's still a brief window) when main returns would be
-    // killed by the OS process tear-down. Joining the watcher
-    // ensures its current iteration (sleep poll + optional scan +
-    // any emits) fully completes before we return. The watcher
-    // notices the flag within ~100ms during its chunked sleep, so
-    // worst-case shutdown is ~100ms + one scan duration — well
-    // inside the supervisor's 200ms SIGKILL grace for typical
-    // workspaces.
+    // Signal + JOIN: a watcher mid-emit when main returns would be killed by process tear-down.
+    // Joining lets its current iteration finish. The watcher notices the flag within ~100ms
+    // (chunked sleep), so worst-case shutdown is ~100ms + one scan, inside the supervisor's 200ms
+    // SIGKILL grace for typical workspaces.
     shutdown.store(true, Ordering::SeqCst);
     if let Some(h) = watcher_handle {
         let _ = h.join();
@@ -241,11 +215,8 @@ fn handle_frame(
             // No subscriptions — quietly ignore.
         }
         "shutdown" => {
-            // Don't process::exit here — that hard-kills the
-            // writer thread mid-flush and loses queued frames. Set
-            // the rendezvous flag and let the read loop break, so
-            // main's drain path joins the writer cleanly. Process
-            // exits naturally when main returns.
+            // No process::exit here: set the flag and let the read loop break so main joins the
+            // watcher cleanly and the process exits when main returns.
             shutdown.store(true, Ordering::SeqCst);
         }
         other if !other.is_empty() && !id.is_empty() => {
@@ -377,8 +348,7 @@ fn action_list(params: &Value, store: &Arc<Store>) -> Result<Value, (String, Str
     if let Some(tag) = &tag_filter {
         todos.retain(|t| t.tags.iter().any(|x| x == tag));
     }
-    // Stable order — by status (open first), then due, then id.
-    // Easier-to-read panel without UI sorting.
+    // Stable order: by status (open first), then due, then id.
     todos.sort_by(|a, b| {
         let order = |s: Status| match s {
             Status::InProgress => 0,
@@ -533,10 +503,9 @@ fn action_set_status(
     }))
 }
 
-/// Emits `todo.start_requested` with the full Todo payload. Users
-/// can chain it (e.g. `→ git.worktree_add → claude.start` via
-/// completion-event triggers, or single-step `→ kb.ensure` /
-/// `→ slack.post_message`); the action itself is fire-and-forget.
+/// Emits `todo.start_requested` with the full Todo payload. Users chain it via triggers (e.g.
+/// `-> git.worktree_add -> claude.start`, `-> kb.ensure`, `-> slack.post_message`); the action
+/// itself is fire-and-forget.
 fn action_start(
     params: &Value,
     config: &Config,
@@ -552,18 +521,10 @@ fn action_start(
     let docs_root = prompt::docs_root_for(&config.root);
     let assembled_prompt = prompt::assemble(&todo, docs_root.as_deref());
     let mut payload = todo.to_json();
-    // Add the layered prompt as a NEW field rather than overwriting
-    // the raw `prompt` frontmatter field. Two surfaces, two meanings:
-    // - `payload.prompt`        = the user's literal frontmatter
-    //                              `prompt` (None / explicit string).
-    // - `payload.assembled_prompt` = global preamble + workspace
-    //                              preamble + Todo prompt-or-body +
-    //                              linked_kb fan-in, late-bound at
-    //                              start time. This is what trigger
-    //                              chains feed to claude.start.
-    // Keeping both means trigger interpolation can pick either — and
-    // a future consumer that wants raw input can still read `prompt`
-    // without rebuilding the assembly itself.
+    // `assembled_prompt` is a NEW field; the raw frontmatter `prompt` is left intact.
+    // - `payload.prompt` = the user's literal frontmatter `prompt` (None / explicit string).
+    // - `payload.assembled_prompt` = global preamble + workspace preamble + Todo prompt-or-body +
+    //   linked_kb fan-in, late-bound at start time; what trigger chains feed to claude.start.
     if let Some(obj) = payload.as_object_mut() {
         obj.insert(
             "assembled_prompt".to_string(),
@@ -602,18 +563,12 @@ fn action_delete(
 
 /// Render the autonomous-loop prompt for an existing todo.
 ///
-/// The rendered protocol addresses the todo by id+workspace directly,
-/// so the `loop` tag is NOT required for this specific path to work.
-/// We auto-add it anyway for two reasons: (1) `coctl todo list --tag
-/// loop` becomes a useful filter for finding active/historical agent
-/// loops, and (2) the parallel manual-fill template at
-/// `~/.claude/loop-template.md` uses `(workspace, tag=loop, title)` for
-/// its bootstrap lookup, so a todo created via this action can be
-/// resumed via the manual flow later without re-tagging by hand.
+/// The protocol addresses the todo by id+workspace, so the `loop` tag is not required. It is
+/// auto-added anyway so `coctl todo list --tag loop` finds agent loops, and so the manual-fill
+/// template `~/.claude/loop-template.md` (which looks up `(workspace, tag=loop, title)`) can
+/// resume the todo later.
 ///
-/// Returns `loop_tag_added: true` only when this call performed the tag
-/// mutation (so callers can surface "we changed something" vs "already
-/// tagged, no-op"); the post-call state is "todo has `loop`" either way.
+/// `loop_tag_added: true` only when this call performed the tag mutation.
 fn action_render_loop_prompt(
     params: &Value,
     config: &Config,
@@ -656,8 +611,6 @@ fn action_render_loop_prompt(
         "prompt": prompt,
     }))
 }
-
-// -- param helpers --
 
 fn required_string(params: &Value, key: &str) -> Result<String, (String, String)> {
     let v = params.get(key).ok_or_else(|| {
@@ -903,7 +856,6 @@ mod tests {
         let t = action_create(&json!({"title": "kickoff"}), &config, &store).unwrap();
         let r = action_start(&json!({"id": t.id}), &config, &store, &writer).unwrap();
         assert_eq!(r["todo"]["title"], "kickoff");
-        // emit() writes one line + \n; parse the captured bytes.
         let bytes = captured.lock().unwrap().clone();
         let line = std::str::from_utf8(&bytes).unwrap().trim_end();
         let frame: Value = serde_json::from_str(line).unwrap();
@@ -920,7 +872,7 @@ mod tests {
             &store,
         )
         .unwrap();
-        // Touch only title + tags. body, priority, due, jira, kb, prompt absent ⇒ untouched.
+        // Touch only title + tags; absent fields stay untouched.
         let r = action_update(
             &json!({"id": t.id, "title": "new title", "tags": ["a", "b", "c"]}),
             &config,
@@ -928,7 +880,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r["todo"]["title"], "new title");
-        // body round-trips with a trailing newline normalization from render_new.
+        // body round-trips with render_new's trailing-newline normalization.
         assert_eq!(r["todo"]["body"].as_str().unwrap().trim(), "old body");
         assert_eq!(r["todo"]["tags"], json!(["a", "b", "c"]));
         assert_eq!(r["todo"]["status"], "open");
@@ -1003,8 +955,7 @@ mod tests {
     #[test]
     fn update_append_subtask_handles_existing_body_newline() {
         let (_d, config, store, _tx, _rx) = fixture();
-        // Body without trailing newline (render_new will add one on store,
-        // but parse round-trips body content as authored).
+        // Body without trailing newline.
         let t =
             action_create(&json!({"title": "x", "body": "- [ ] one"}), &config, &store).unwrap();
         let r = action_update(
@@ -1014,7 +965,6 @@ mod tests {
         )
         .unwrap();
         let body = r["todo"]["body"].as_str().unwrap();
-        // Both lines present; no doubled blank line between them.
         assert!(body.contains("- [ ] one"));
         assert!(body.contains("- [ ] two"));
         assert!(!body.contains("\n\n- [ ] two"));
@@ -1086,7 +1036,6 @@ mod tests {
         let prompt = r["prompt"].as_str().unwrap();
         assert!(prompt.contains("LOOP NAME: doc trim"));
         assert!(prompt.contains(&format!("TODO ID: {}", t.id)));
-        // workspace defaults to "default" in the fixture; verify it appears.
         assert!(prompt.contains("WORKSPACE: default"));
     }
 
@@ -1097,7 +1046,6 @@ mod tests {
         assert!(!t.tags.iter().any(|tag| tag == "loop"));
         let r = action_render_loop_prompt(&json!({"id": t.id}), &config, &store).unwrap();
         assert_eq!(r["loop_tag_added"], json!(true));
-        // Re-fetch and confirm the tag actually persisted to the file.
         let listed = action_list(&json!({}), &store).unwrap();
         let todos = listed.get("todos").and_then(Value::as_array).unwrap();
         let me = todos
@@ -1119,7 +1067,6 @@ mod tests {
         .unwrap();
         let r = action_render_loop_prompt(&json!({"id": t.id}), &config, &store).unwrap();
         assert_eq!(r["loop_tag_added"], json!(false));
-        // Tag set unchanged — no duplicate `loop` entry.
         let listed = action_list(&json!({}), &store).unwrap();
         let me = listed["todos"]
             .as_array()

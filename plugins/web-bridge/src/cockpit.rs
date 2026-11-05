@@ -1,28 +1,21 @@
-//! Phase 24.6 — orchestration cockpit data layer.
-//!
-//! Composes the three orchestration surfaces decision #51 keeps separate:
-//! the pilot goal queue (`pilot.status`, the source of truth, fetched via
-//! the daemon RPC in `main.rs`), the live `csd ps --json` driven-session
-//! view, and the `tmx agents --json` observation snapshot. pilot owns the
-//! queue, `csd` drives, `tmx` observes — web-bridge only aggregates, it
-//! does not reimplement any of them (the `agents::read_snapshot` tmx
-//! shell-out is the established precedent).
+//! Orchestration cockpit data layer. Composes three surfaces decision #51 keeps separate: the
+//! pilot goal queue (`pilot.status`, source of truth, fetched via the daemon RPC in `main.rs`),
+//! the live `csd ps --json` driven-session view, and the `tmx agents --json` snapshot. web-bridge
+//! only aggregates them.
 
 use std::process::Command;
 
 use serde_json::{Value, json};
 
-/// `csd ps --json` → its parsed JSON (`{ sessions: [...] }`). Tries the
-/// configured binary then the usual install locations, mirroring
-/// `agents::read_snapshot`'s tmx lookup — the daemon env that `copadd`
-/// spawns plugins under may lack the interactive shell's PATH.
+/// `csd ps --json` parsed (`{ sessions: [...] }`). Tries the configured binary then the usual
+/// install locations, as `agents::read_snapshot` does: the env `copadd` spawns plugins under may
+/// lack the interactive shell's PATH.
 pub fn read_csd_ps() -> Result<Value, String> {
     read_csd_ps_from(&csd_candidates(std::env::var("COPAD_PILOT_CSD_BIN").ok()))
 }
 
-/// Candidate binary paths in priority order: the configured override, then
-/// `csd` on PATH, then the usual install locations. Pure (the env read
-/// lives in [`read_csd_ps`]) so it's testable without mutating process env.
+/// Candidate binary paths in priority order: configured override, `csd` on PATH, usual install
+/// locations. Pure (the env read is in [`read_csd_ps`]) so it is testable without mutating env.
 fn csd_candidates(configured: Option<String>) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     if let Some(bin) = configured.filter(|s| !s.is_empty()) {
@@ -57,11 +50,9 @@ fn read_csd_ps_from(candidates: &[String]) -> Result<Value, String> {
     Err(last_err)
 }
 
-/// Build the cockpit view from the three (independently fallible) sources.
-/// `pilot` is required (the daemon RPC already errored out the request if
-/// it failed); `csd` and `tmx` are best-effort — a failure becomes a null
-/// body plus an entry under `errors`, so the queue still renders when the
-/// observation side-cars are down.
+/// Build the cockpit view from three independently fallible sources. `pilot` is required (the
+/// RPC already failed the request otherwise); `csd` and `tmx` are best-effort: a failure becomes a
+/// null body plus an entry under `errors`, so the queue still renders.
 pub fn aggregate(pilot: Value, csd: Result<Value, String>, tmx: Result<Value, String>) -> Value {
     let mut errors = serde_json::Map::new();
     let csd = unwrap_or_record(csd, "csd", &mut errors);
@@ -107,8 +98,7 @@ mod tests {
 
     #[test]
     fn aggregate_degrades_on_sidecar_failure() {
-        // pilot always present; csd down, tmx ok → csd nulled + recorded,
-        // pilot/tmx intact (the queue still renders).
+        // csd down: nulled and recorded; pilot and tmx intact.
         let out = aggregate(
             json!({ "active": "g-7" }),
             Err("csd: No such file or directory".into()),
@@ -126,15 +116,13 @@ mod tests {
         let c = csd_candidates(Some("/custom/csd".into()));
         assert_eq!(c[0], "/custom/csd");
         assert!(c.contains(&"csd".to_string()));
-        // Empty override is ignored (falls back to PATH `csd`).
         assert_eq!(csd_candidates(Some(String::new()))[0], "csd");
         assert_eq!(csd_candidates(None)[0], "csd");
     }
 
     #[test]
     fn read_csd_ps_from_parses_stub_output() {
-        // Drive the parse path with a stub binary — no process-env mutation
-        // (csd_candidates already isolates the env read).
+        // Drive the parse path with a stub binary, without mutating process env.
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("csd");
         std::fs::write(

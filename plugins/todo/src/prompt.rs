@@ -1,38 +1,18 @@
-//! Layered prompt assembly for `todo.start_requested` events.
+//! Layered prompt assembly for `todo.start_requested` events: one self-contained prompt string,
+//! so the trigger TOML stays `prompt = "{event.assembled_prompt}"`. (`event.prompt` on
+//! `todo.start_requested` is the raw frontmatter field, NOT the layered output; see
+//! `action_start` in main.rs.)
 //!
-//! When a Todo is "started", consumers (claude.start, future LLM
-//! steps) want a single self-contained prompt string rather than
-//! reassembling Todo fields themselves. We build that here so the
-//! assembly logic lives near the Todo data model and the trigger
-//! TOML stays a one-liner: `prompt = "{event.assembled_prompt}"`
-//! (note: `event.prompt` on `todo.start_requested` is the raw
-//! frontmatter field, NOT the layered output — see
-//! `action_start` in main.rs for the contract split).
+//! Layers (top-down, all optional):
+//! 1. global preamble: `<docs_root>/claude/global.md`
+//! 2. workspace preamble: `<docs_root>/claude/workspaces/<ws>.md`
+//! 3. todo instruction: the `prompt` field if set, else `# {title}\n\n{body}`
+//! 4. linked_jira key reference
+//! 5. linked_kb: full markdown of each path under docs_root, prefixed `## Reference: <path>`
 //!
-//! Layering (top-down, all optional):
-//! 1. **Global preamble** — `<docs_root>/claude/global.md`. Common
-//!    instructions for every agent session ("rust edition 2024",
-//!    "use snake_case", whatever the user puts there).
-//! 2. **Workspace preamble** — `<docs_root>/claude/workspaces/<ws>.md`.
-//!    Per-workspace context.
-//! 3. **Todo instruction** — Todo's `prompt` field if set; otherwise
-//!    `# {title}\n\n{body}` fallback. The body is a human-readable
-//!    description; `prompt` is the explicit agent imperative when
-//!    they need to differ.
-//! 4. **linked_jira** — included as a key reference; full ticket
-//!    summary fan-in waits on Phase 16 + 14.2.
-//! 5. **linked_kb** — full markdown content of each path under the
-//!    docs_root, prefixed with `## Reference: <path>`.
-//!
-//! `<docs_root>` is `<COPAD_TODO_ROOT>/..` — sibling-of-todos. For the
-//! default `~/docs/todos` setup that's `~/docs`, which the KB plugin
-//! also calls home. Layer files are read at *assembly time*, not at
-//! Todo-create time, so the user can keep evolving global.md /
-//! workspaces and the next `todo.start` picks up the latest content.
-//!
-//! Errors are non-fatal: missing layers are skipped, unreadable
-//! `linked_kb` paths log a warning and are omitted. If every layer
-//! is missing the prompt is just `# {title}\n\n{body}` — never empty
+//! `<docs_root>` is `<COPAD_TODO_ROOT>/..`. Layer files are read at assembly time, so edits to
+//! global.md / workspaces apply to the next `todo.start`. Errors are non-fatal: missing layers
+//! are skipped and unreadable `linked_kb` paths warn and are omitted. The prompt is never empty
 //! since title is always present.
 
 use std::path::{Path, PathBuf};
@@ -71,15 +51,10 @@ pub fn assemble(todo: &Todo, docs_root: Option<&Path>) -> String {
         for path in &todo.linked_kb {
             match resolve_within(root, path) {
                 Some(abs) => {
-                    // Symlink-ancestor check matches the KB plugin's
-                    // posture (`copad-plugin-kb::kb::check_no_symlink_ancestors`):
-                    // the lexical containment in `resolve_within` only
-                    // catches `..` / absolute paths in the FRONTMATTER
-                    // — it can't see filesystem-level escapes where
-                    // `<root>/alias -> /etc` makes `alias/passwd`
-                    // resolve outside the boundary. Walk every existing
-                    // prefix of `abs` (down from `root`) and reject if
-                    // any component is a symlink.
+                    // Symlink-ancestor check, as in the KB plugin
+                    // (`copad-plugin-kb::kb::check_no_symlink_ancestors`): `resolve_within` only
+                    // catches `..` / absolute paths in the frontmatter, not `<root>/alias -> /etc`.
+                    // Walk every existing prefix of `abs` down from `root` and reject any symlink.
                     if !path_has_no_symlink_ancestors(root, &abs) {
                         eprintln!(
                             "[todo] linked_kb path {path:?} rejected: symlink ancestor \
@@ -134,20 +109,16 @@ fn path_has_no_symlink_ancestors(root: &Path, target: &Path) -> bool {
     true
 }
 
-/// Lexical containment check (no `..` / absolute components) BEFORE
-/// reading, so a future-created file at a forbidden lexical location
-/// can't sneak in. KB-style docs-root posture.
+/// Lexical containment check (no `..` / absolute components) BEFORE reading, so a file created
+/// later at a forbidden lexical location can't sneak in.
 fn resolve_within(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() {
         return None;
     }
     let candidate = Path::new(rel);
-    // Reject absolute paths outright.
     if candidate.is_absolute() {
         return None;
     }
-    // Walk components; ParentDir / RootDir / Prefix cannot appear in
-    // a contained relative path.
     use std::path::Component;
     for c in candidate.components() {
         match c {
@@ -230,9 +201,8 @@ mod tests {
         t.prompt = Some("Implement assemble() per spec.".into());
         let out = assemble(&t, None);
         assert!(out.starts_with("Implement assemble() per spec."));
-        // Title/body are NOT included when prompt is explicit — the
-        // user's prompt field is the imperative, body stays
-        // human-only.
+        // Title/body are NOT included when prompt is explicit: `prompt` is the imperative, body
+        // stays human-only.
         assert!(!out.contains("wire claude.start"));
     }
 
@@ -258,7 +228,6 @@ mod tests {
         t.linked_kb = vec!["notes/spec.md".into()];
         let out = assemble(&t, Some(docs));
 
-        // Order: global → workspace → instruction → linked_kb.
         let pos_global = out.find("GLOBAL_RULES").expect("global missing");
         let pos_ws = out.find("WORKSPACE_RULES").expect("workspace missing");
         let pos_task = out.find("# Ship Phase 18.2").expect("task missing");
@@ -274,7 +243,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut t = fixture_todo();
         t.linked_kb = vec!["missing/file.md".into()];
-        // Should not panic; just emits a warning to stderr and skips.
         let out = assemble(&t, Some(dir.path()));
         assert!(out.contains("# Ship Phase 18.2"));
         assert!(!out.contains("missing/file.md"));
@@ -283,8 +251,6 @@ mod tests {
     #[test]
     fn assemble_rejects_absolute_linked_kb_paths() {
         let dir = tempdir().unwrap();
-        // Plant a real file outside the docs root that an attacker
-        // would want to exfiltrate.
         let outside = dir.path().parent().unwrap().join("outside.md");
         let _ = fs::write(&outside, "SECRET\n");
         let mut t = fixture_todo();
@@ -300,7 +266,6 @@ mod tests {
         let outside = dir.path().parent().unwrap().join("outside-rel.md");
         let _ = fs::write(&outside, "ESCAPED\n");
         let mut t = fixture_todo();
-        // Try to climb out using `..`.
         t.linked_kb = vec!["../outside-rel.md".into()];
         let out = assemble(&t, Some(dir.path()));
         assert!(!out.contains("ESCAPED"), "..-escape must not be read");

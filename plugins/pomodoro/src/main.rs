@@ -1,19 +1,13 @@
-//! Pomodoro service plugin for copad.
+//! Pomodoro service plugin for copad: a standalone focus timer shown in the status bar.
 //!
-//! A standalone focus timer that renders in the status bar. It is
-//! DELIBERATELY DECOUPLED from the todo plugin: it never imports or
-//! subscribes to todo. The "start a pomodoro when I start a todo" flow is
-//! wired entirely through copad's `[[triggers]]` engine — `todo.start`
-//! emits `todo.start_requested`, and a user trigger maps that to
-//! `pomodoro.start` with `label = "{event.title}"` (see
-//! `triggers.example.toml`). Any event can drive the timer that way; the
-//! plugin only ever sees "start with this label."
+//! Deliberately decoupled from the todo plugin (never imports or subscribes to it). "Start a
+//! pomodoro when I start a todo" is wired through copad's `[[triggers]]` engine: `todo.start`
+//! emits `todo.start_requested`, and a user trigger maps it to `pomodoro.start` with
+//! `label = "{event.title}"` (see `triggers.example.toml`).
 //!
-//! State model lives in `state.rs` (pure, clock-injected). This file owns
-//! the wire protocol, the single mutex + condvar, and the one scheduler
-//! thread that reads the real clock, fires phase-completion toasts (via a
-//! best-effort `action.invoke` → `notify.show`), and emits `pomodoro.state`
-//! events on every transition.
+//! State model lives in `state.rs` (pure, clock-injected). This file owns the wire protocol, the
+//! single mutex + condvar, and the one scheduler thread that fires phase-completion toasts
+//! (best-effort `action.invoke` -> `notify.show`) and emits `pomodoro.state` on every transition.
 
 mod persist;
 mod state;
@@ -51,8 +45,7 @@ fn main() {
     let stdout = std::io::stdout();
     let (tx, rx) = channel::<String>();
 
-    // Single writer so the scheduler thread and the request handler can't
-    // interleave bytes mid-line on stdout.
+    // Single writer so the scheduler and request handler can't interleave bytes mid-line.
     thread::spawn(move || {
         let mut out = stdout.lock();
         for line in rx.iter() {
@@ -165,10 +158,9 @@ fn handle_frame(
     }
 }
 
-/// Apply a `pomodoro.*` action. Mutating actions emit a `pomodoro.state`
-/// event and wake the scheduler; all actions reply with the current state
-/// snapshot. Returns `Err((code, message))` on bad params — with no partial
-/// mutation.
+/// Apply a `pomodoro.*` action. Mutating actions emit a `pomodoro.state` event and wake the
+/// scheduler; all reply with the current state snapshot. `Err((code, message))` on bad params,
+/// with no partial mutation.
 fn dispatch_action(
     name: &str,
     params: &Value,
@@ -179,11 +171,9 @@ fn dispatch_action(
 ) -> Result<Value, (String, String)> {
     let (lock, cvar) = &**shared;
 
-    // `status` is read-only; everything else mutates then notifies. In every
-    // case sample `now` AFTER acquiring the lock: if we read the clock first
-    // and then block while the scheduler transitions Work→Break under the
-    // lock, we'd apply a pre-transition timestamp to the post-transition
-    // phase (e.g. `pause` freezing the new break with more than its length).
+    // Sample `now` AFTER acquiring the lock: reading the clock first and then blocking while the
+    // scheduler transitions Work->Break would apply a pre-transition timestamp to the new phase
+    // (e.g. `pause` freezing the break with more than its length).
     if name == "pomodoro.status" {
         let guard = lock.lock().unwrap();
         let now = now_ms();
@@ -224,11 +214,8 @@ fn dispatch_action(
                 merge_min(params, "rounds_before_long", cur.rounds_before_long)?,
             )
             .map_err(|e| ("invalid_params".to_string(), e))?;
-            // Persist FIRST, apply only on success: returning ok while the
-            // write failed would leave runtime disagreeing with what a
-            // restart loads (AC#4). Done under the lock so a concurrent set
-            // can't interleave read-cur / save / apply; the write is a tiny
-            // atomic temp+rename on a rare (config-change) path.
+            // Persist first, apply only on success: otherwise runtime would disagree with what a
+            // restart loads. Under the lock so a concurrent set can't interleave read/save/apply.
             persist::save_durations(&next).map_err(|e| {
                 (
                     "io_error".to_string(),
@@ -258,10 +245,9 @@ fn dispatch_action(
     Ok(payload)
 }
 
-/// The scheduler thread. Owns wall-clock reads; fires toasts and state
-/// events on phase completion. One sleeper, so there is no orphaned-timer
-/// cancellation problem — it re-derives everything from locked state on
-/// every wake.
+/// The scheduler thread. Owns wall-clock reads; fires toasts and state events on phase
+/// completion. One sleeper, so no orphaned-timer cancellation: it re-derives everything from
+/// locked state on every wake.
 fn run_scheduler(
     shared: Shared,
     tx: Sender<String>,
@@ -273,13 +259,9 @@ fn run_scheduler(
         let mut guard = lock.lock().unwrap();
         let now = now_ms();
         if let Some(trans) = guard.tick_if_due(now) {
-            // Publish the STATE event under the lock so it's ordered with the
-            // RPC path's emits (a concurrent start/reset can't slip a newer
-            // payload ahead of this one). The toast, by contrast, is
-            // best-effort and order-independent, so it goes AFTER the unlock
-            // — keeping the "never invoke notify while holding the lock" rule
-            // the docs promise. (Both are non-blocking mpsc pushes regardless;
-            // the actual notify.show runs in the daemon and we never await it.)
+            // Publish the state event under the lock so it is ordered with the RPC path's emits;
+            // the toast is best-effort and order-independent, so it goes after the unlock (never
+            // invoke notify while holding the lock).
             let payload = guard.event_payload(now);
             emit_state(&tx, &initialized, &payload);
             drop(guard);
@@ -340,8 +322,6 @@ fn parse_minutes(v: &Value) -> Result<u32, (String, String)> {
         })
 }
 
-/// Read an optional integer override for a duration field, falling back to
-/// the current value when absent/null.
 fn merge_min(params: &Value, field: &str, current: u32) -> Result<u32, (String, String)> {
     match params.get(field) {
         None | Some(Value::Null) => Ok(current),

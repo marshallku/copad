@@ -4,44 +4,18 @@
 <meta charset="utf-8" />
 <title>Discord</title>
 <style>
-/* ========================================================================
-   discord/panel.html — "Signal Log" aesthetic (mirrors slack/panel.html)
-   Same row-based, mono-only design language; rail color encodes event
-   kind. Discord differs from Slack in event surface (4 kinds: message /
-   mention / dm / reaction) and in identifier shape (snowflakes, not
-   ts/channel-prefix codes). The reference precedent is the sister
-   slack panel — keep the visual vocabulary aligned so users moving
-   between them retain muscle memory.
-   ----------------------------------------------------------------------
-   §1  TOKENS         design tokens, status colors, motion timings
-   §2  RESET          box-sizing, color-scheme, body baseline
-   §3  LAYOUT         shell: header / filter / feed / composer
-   §4  HEADER         workspace + status pill + refresh
-   §5  FILTER         chip row, active state
-   §6  FEED           list, empty state, scroll
-   §7  CARD           shared row chrome — rail / collapsed / expanded
-   §7.1 CARD-MENTION   mention rail
-   §7.2 CARD-DM        DM rail
-   §7.3 CARD-MESSAGE   message rail (least prominent — firehose)
-   §7.4 CARD-RXN       reaction rail + reacted-on body slot
-   §8  COMPOSER       sticky standalone + inline reply (same DOM)
-   §9  TOAST          error overlay
-   §10 SETUP          fatal/setup view
-   §11 MOTION         keyframes, prefers-reduced-motion override
-   §12 UTIL           .visually-hidden, .truncate, .copy-id
-   ======================================================================== */
+/* "Signal Log" look, mono-only and row-based, mirroring slack/panel.html (keep the two visual
+   vocabularies aligned). The rail color encodes event kind. */
 
-/* §1 TOKENS ------------------------------------------------------------- */
 :root {
-  /* Status palette — Catppuccin Mocha defaults; host doesn't expose these
-     as CSS vars, so the panel hardcodes them. Edit here to retheme. */
+  /* Status palette (Catppuccin Mocha); the host doesn't expose these as CSS vars, so they are
+     hardcoded here. */
   --discord-ok:    #a6e3a1;   /* green */
   --discord-warn:  #f9e2af;   /* yellow */
   --discord-info:  #89b4fa;   /* blue — DM rail */
   --discord-rxn:   #94e2d5;   /* teal — reaction rail */
   --discord-msg:   #6c7086;   /* muted — plain-message rail (firehose) */
 
-  /* Type rails — modifier-driven */
   --rail-default: var(--copad-overlay0);
   --rail-mention: var(--copad-accent);
   --rail-dm:      var(--discord-info);
@@ -62,7 +36,6 @@
   --rail-w:          4px;
 }
 
-/* §2 RESET -------------------------------------------------------------- */
 *, *::before, *::after { box-sizing: border-box; }
 :root { color-scheme: dark; }
 
@@ -78,7 +51,6 @@ body {
   background: transparent;
 }
 
-/* §3 LAYOUT ------------------------------------------------------------- */
 .discord-shell {
   display: flex;
   flex-direction: column;
@@ -86,7 +58,6 @@ body {
   min-height: 0;
 }
 
-/* §4 HEADER ------------------------------------------------------------- */
 .discord-header {
   display: flex;
   align-items: center;
@@ -141,7 +112,6 @@ body {
 .discord-header__refresh:active { transform: scale(0.97); }
 .discord-header__refresh:disabled { opacity: 0.4; cursor: progress; }
 
-/* §5 FILTER ------------------------------------------------------------- */
 .discord-filter {
   display: flex;
   gap: var(--s-1);
@@ -182,7 +152,6 @@ body {
   color: color-mix(in oklab, var(--copad-accent) 70%, var(--copad-subtext1));
 }
 
-/* §6 FEED --------------------------------------------------------------- */
 .discord-feed {
   flex: 1;
   min-height: 0;
@@ -218,7 +187,6 @@ body {
   color: var(--copad-overlay0);
 }
 
-/* §7 CARD --------------------------------------------------------------- */
 .discord-card {
   --rail-color: var(--rail-default);
   display: grid;
@@ -372,20 +340,15 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* §7.1 CARD-MENTION ------------------------------------------------------ */
 .discord-card--mention { --rail-color: var(--rail-mention); }
 
-/* §7.2 CARD-DM ----------------------------------------------------------- */
 .discord-card--dm { --rail-color: var(--rail-dm); }
 
-/* §7.3 CARD-MESSAGE ----------------------------------------------------- */
 .discord-card--message { --rail-color: var(--rail-msg); }
 .discord-card--message .discord-card__channel {
-  /* Plain-message channel id is less load-bearing than mention/DM */
   color: var(--copad-subtext1);
 }
 
-/* §7.4 CARD-RXN ---------------------------------------------------------- */
 .discord-card--rxn { --rail-color: var(--rail-rxn); }
 .discord-card--rxn .discord-card__badge {
   font-size: 13px;
@@ -408,7 +371,6 @@ body {
   font-style: italic;
 }
 
-/* §8 COMPOSER ----------------------------------------------------------- */
 .discord-composer {
   display: flex;
   flex-direction: column;
@@ -528,7 +490,6 @@ body {
 }
 .discord-card__expand .discord-composer__channel { width: 160px; }
 
-/* §9 TOAST -------------------------------------------------------------- */
 .discord-toast {
   position: fixed;
   top: 12px;
@@ -561,7 +522,6 @@ body {
 }
 .discord-toast__msg { word-break: break-word; }
 
-/* §10 SETUP ------------------------------------------------------------- */
 .discord-setup {
   flex: 1;
   min-height: 0;
@@ -651,7 +611,6 @@ body {
   color: var(--copad-subtext0);
 }
 
-/* §11 MOTION ------------------------------------------------------------ */
 @keyframes signalPulse {
   0%   { box-shadow: 0 0 0 0    color-mix(in oklab, var(--discord-ok) 60%, transparent); }
   70%  { box-shadow: 0 0 0 6px  color-mix(in oklab, var(--discord-ok)  0%, transparent); }
@@ -670,7 +629,6 @@ body {
   .discord-card:hover { transform: none; }
 }
 
-/* §12 UTIL -------------------------------------------------------------- */
 .visually-hidden {
   position: absolute !important;
   width: 1px; height: 1px;
@@ -682,7 +640,6 @@ body {
 <body>
 <div class="discord-shell">
 
-  <!-- §4 HEADER -->
   <header class="discord-header" id="header" aria-label="Discord auth status">
     <div class="discord-header__dot" id="status-dot"></div>
     <div class="discord-header__workspace" id="workspace-label">…</div>
@@ -691,7 +648,6 @@ body {
     <button class="discord-header__refresh" id="refresh-btn" type="button">refresh</button>
   </header>
 
-  <!-- §5 FILTER -->
   <nav class="discord-filter" id="filter" role="tablist" hidden>
     <button class="discord-filter__chip" data-filter="all" type="button" role="tab">
       ALL<span class="discord-filter__count" data-count="all"> 0</span>
@@ -710,10 +666,10 @@ body {
     </button>
   </nav>
 
-  <!-- §6 FEED or §10 SETUP — toggled by JS -->
+  <!-- Feed or setup view, toggled by JS -->
   <main id="main" class="discord-feed" aria-live="polite"></main>
 
-  <!-- §8 COMPOSER (standalone) — only mounted in feed view -->
+  <!-- Standalone composer; only shown in the feed view -->
   <footer class="discord-composer" id="composer" hidden>
     <div class="discord-composer__row">
       <input class="discord-composer__channel" id="composer-channel"
@@ -730,18 +686,14 @@ body {
 
 </div>
 
-<!-- §9 TOAST region -->
 <div class="discord-toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
 'use strict';
 
-/* ========================================================================
-   discord/panel.html — JS
-   - Bridge: window.copad.call / .on
-   - Snowflake → ms via DISCORD_EPOCH; no ts field on payloads.
-   - localStorage keys: discord-filter, discord-expanded, discord-composer-draft
-   ======================================================================== */
+/* JS. Bridge: window.copad.call / .on. Snowflakes are converted to ms via DISCORD_EPOCH since
+   payloads carry no ts. localStorage keys: discord-filter, discord-expanded,
+   discord-composer-draft. */
 
 const LS = {
   filter:   'discord-filter',
@@ -886,7 +838,6 @@ function renderBody() {
   }
 }
 
-/* §10 SETUP render — transport-error variant -------------------------- */
 function renderTransportError() {
   const e = state.authError;
   dom.main.className = 'discord-setup';
@@ -905,7 +856,6 @@ function renderTransportError() {
   `;
 }
 
-/* §10 SETUP render ----------------------------------------------------- */
 function renderSetup() {
   const a = state.auth || {};
   const fatal = a.fatal_error;
@@ -933,7 +883,6 @@ function renderSetup() {
   `;
 }
 
-/* §6 FEED render ------------------------------------------------------- */
 function renderFeed() {
   dom.main.className = 'discord-feed';
   const filtered = state.events.filter(matchesFilter);
@@ -1064,7 +1013,6 @@ function renderCard(ev) {
     </article>`;
 }
 
-/* Event ingest --------------------------------------------------------- */
 function makeEventId(kind, payload) {
   // Reactions share message_id with another event class — disambiguate
   // by suffixing user_id + emoji so reaction-add bursts on the same
@@ -1121,7 +1069,6 @@ async function fetchReactionBody(channelId, messageId) {
   scheduleRender();
 }
 
-/* Toast ---------------------------------------------------------------- */
 function toast(code, msg, ttl = 4000) {
   const el = document.createElement('div');
   el.className = 'discord-toast__item';
@@ -1166,7 +1113,6 @@ async function sendMessage(channelId, content, sourceEv) {
   }
 }
 
-/* Wire UP -------------------------------------------------------------- */
 function bindFilter() {
   dom.filter.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-filter]');

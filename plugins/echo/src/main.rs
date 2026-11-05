@@ -1,10 +1,6 @@
-//! Mock service plugin for copad.
-//!
-//! Useful as both a wire-protocol smoke test and a debug heartbeat.
-//! Exposes a single action (`echo.ping`) that round-trips its params and
-//! publishes a `system.heartbeat` event on a configurable interval
-//! (`COPAD_ECHO_HEARTBEAT_SECS`, defaulting to 30s — short during E2E,
-//! long enough not to spam logs in normal use).
+//! Mock service plugin for copad: a wire-protocol smoke test and debug heartbeat. One action
+//! (`echo.ping`) round-trips its params, and a `system.heartbeat` event is published every
+//! `COPAD_ECHO_HEARTBEAT_SECS` (default 30s).
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
@@ -21,9 +17,8 @@ fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    // All writes funnel through one channel so the heartbeat thread
-    // and the request handler can't interleave bytes mid-line on
-    // stdout.
+    // One channel for all writes so the heartbeat thread and request handler cannot interleave
+    // bytes mid-line.
     let (tx, rx) = channel::<String>();
     let writer_tx = tx.clone();
 
@@ -36,9 +31,7 @@ fn main() {
         }
     });
 
-    // Heartbeat publisher. Sleeps then sends — and gates on the
-    // `initialized` notification flag so heartbeat events never leak
-    // out before copad has finished the handshake.
+    // Heartbeat publisher, gated on the `initialized` flag so nothing leaks before the handshake.
     let initialized = Arc::new(AtomicBool::new(false));
     let interval_secs: u64 = std::env::var("COPAD_ECHO_HEARTBEAT_SECS")
         .ok()
@@ -97,9 +90,8 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
 
     match method {
         "initialize" => {
-            // Verify the protocol version matches before claiming
-            // capabilities. A mismatch surfaces clearly via the reply
-            // rather than silent miswires later.
+            // Verify the protocol version before claiming capabilities, so a mismatch shows in the
+            // reply.
             let proto = params.get("protocol_version").and_then(Value::as_u64);
             if proto != Some(PROTOCOL_VERSION as u64) {
                 send_error(
@@ -128,11 +120,8 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
             let action_params = params.get("params").cloned().unwrap_or(Value::Null);
             match name {
                 "echo.ping" => {
-                    // Optional `sleep_ms` lets E2E callers exercise the
-                    // Phase 9.4 GTK-non-blocking guarantee — the plugin
-                    // parks for the requested duration before replying,
-                    // letting the test verify that concurrent dispatches
-                    // on the host side stay live during the wait.
+                    // Optional `sleep_ms` lets E2E callers verify the host stays non-blocking
+                    // while the plugin parks.
                     if let Some(ms) = action_params.get("sleep_ms").and_then(Value::as_u64) {
                         thread::sleep(Duration::from_millis(ms));
                     }
@@ -152,16 +141,11 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
                 }
             }
         }
-        "event.dispatch" => {
-            // The echo plugin doesn't subscribe to anything, but the
-            // protocol allows copad to forward events for future
-            // configurations; ignore quietly.
-        }
+        "event.dispatch" => {}
         "shutdown" => {
             std::process::exit(0);
         }
-        // Unknown request: only reply if it had an id (otherwise
-        // it was a notification — quietly ignored).
+        // Unknown request: reply only if it had an id; otherwise it was a notification.
         other if !other.is_empty() && !id.is_empty() => {
             send_error(
                 tx,

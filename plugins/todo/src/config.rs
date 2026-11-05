@@ -1,21 +1,16 @@
 //! Env-based configuration for the todo plugin.
 //!
-//! - `COPAD_TODO_ROOT` — directory holding per-workspace todo subdirs.
-//!   Default: `~/docs/todos`. Force-canonicalized on construction so
-//!   later filesystem ops can `resolve_within_root` against it.
-//! - `COPAD_TODO_DEFAULT_WORKSPACE` — workspace label used when
-//!   `todo.create` / `todo.list` callers omit `workspace`. Default
-//!   `"default"`. Validated against the same charset as KB folder
+//! - `COPAD_TODO_ROOT` — directory holding per-workspace todo subdirs. Default `~/docs/todos`.
+//!   Canonicalized on construction so later filesystem ops can `resolve_within_root` against it.
+//! - `COPAD_TODO_DEFAULT_WORKSPACE` — workspace label used when `todo.create` / `todo.list`
+//!   callers omit `workspace`. Default `"default"`. Validated against the same charset as KB folder
 //!   names so a stray `..` can't escape the root.
-//! - `COPAD_TODO_POLL_SECS` — file-watcher poll interval in seconds.
-//!   Default 2. Bounded `[1, 60]` — 0 would burn a CPU core, > 60
-//!   makes vim-edit feedback feel laggy.
+//! - `COPAD_TODO_POLL_SECS` — file-watcher poll interval in seconds. Default 2, bounded `[1, 60]`
+//!   (0 would burn a CPU core, above 60 makes vim-edit feedback laggy).
 //!
-//! Like the calendar plugin, `from_env` never errors: invalid values
-//! land in `fatal_error` and the plugin still completes `initialize`
-//! (so the supervisor's `provides` resolution succeeds) — every action
-//! then short-circuits to a clear diagnostic instead of silently
-//! dispatching against a half-broken config.
+//! Like the calendar plugin, `from_env` never errors: invalid values land in `fatal_error` so
+//! `initialize` still completes (the supervisor's `provides` resolution succeeds) and every action
+//! short-circuits with a clear diagnostic.
 
 use std::path::PathBuf;
 use std::time::Duration;

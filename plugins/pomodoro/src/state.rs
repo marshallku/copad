@@ -145,9 +145,8 @@ pub struct PomodoroState {
     completed_work_rounds: u32,
     durations: Durations,
     /// Full length of the current phase in millis (0 when Idle). Stored because `start(minutes)`
-    /// can
-    /// override the work length and `set_durations` only affects future phases, so the configured
-    /// duration is no denominator for a progress ring. Preserved across pause/resume.
+    /// can override the work length and `set_durations` only affects future phases, so the
+    /// configured duration is no denominator for a progress ring. Preserved across pause/resume.
     current_phase_total_ms: u64,
 }
 

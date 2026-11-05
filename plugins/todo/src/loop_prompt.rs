@@ -1,28 +1,16 @@
-//! Renders the autonomous-loop prompt for an existing todo.
-//!
-//! Embedded so the panel + CLI return identical strings without an
-//! external file dependency. Update both this template and
-//! `~/.claude/loop-template.md` together when the protocol changes —
-//! the latter is the manual-fill version (LOOP NAME / WORKSPACE / GOAL
-//! / FIRST ITERATION as user-fill slots), this one targets an existing
-//! todo and pre-fills those slots from the todo's metadata.
+//! Renders the autonomous-loop prompt for an existing todo. Embedded so the panel and CLI return
+//! identical strings. Update this template and `~/.claude/loop-template.md` (the manual-fill
+//! version) together when the protocol changes.
 
 const TEMPLATE: &str = include_str!("loop_prompt_template.txt");
 
-/// Substitute `{TITLE}` / `{WORKSPACE}` / `{ID}` markers in the
-/// embedded template. Single-pass — chained `replace()` would let a
-/// title containing literal `{ID}` get rewritten by the next pass, so
-/// the rendered prompt's LOOP NAME could silently differ from the
-/// actual todo title. This walks the template once and only substitutes
-/// markers that came from the template itself.
+/// Substitute `{TITLE}` / `{WORKSPACE}` / `{ID}` in the embedded template in a single pass: chained
+/// `replace()` would rewrite a title containing literal `{ID}` on the next pass, so LOOP NAME
+/// could differ from the real title.
 ///
-/// No escaping: the substituted text lands inside the prompt body that
-/// Claude reads as data, not inside a shell or markdown context this
-/// code interprets. Title is only validated as non-empty
-/// (`Store::create` / `Store::update`); it can contain shell metacharacters
-/// or markdown that the *user's* shell or rendering layer would have to
-/// handle. Workspace is validated against `[A-Za-z0-9_\-.@]+`; id is
-/// `T-<datetime>-<seq>` by `generate_id`, constrained by `validate_id`.
+/// No escaping: the text lands in a prompt body Claude reads as data. Title is only validated as
+/// non-empty, so it may hold shell metacharacters or markdown for the user's shell or renderer to
+/// handle. Workspace is validated against `[A-Za-z0-9_\-.@]+`, id by `validate_id`.
 pub fn render(title: &str, workspace: &str, id: &str) -> String {
     let mut out = String::with_capacity(TEMPLATE.len() + title.len() + workspace.len() + id.len());
     let mut rest = TEMPLATE;
@@ -39,9 +27,8 @@ pub fn render(title: &str, workspace: &str, id: &str) -> String {
             out.push_str(id);
             rest = stripped;
         } else {
-            // Unknown sequence starting with `{` — emit the brace verbatim
-            // and continue scanning past it. `{` is a single byte so
-            // splitting at byte index 1 is char-boundary-safe.
+            // Unknown sequence starting with `{`: emit the brace and keep scanning (a single byte,
+            // so the split is char-safe).
             out.push('{');
             rest = &rest[1..];
         }
@@ -60,7 +47,6 @@ mod tests {
         assert!(p.contains("LOOP NAME: doc trim"));
         assert!(p.contains("WORKSPACE: copad"));
         assert!(p.contains("TODO ID: T-2026-001"));
-        // No raw markers left.
         assert!(!p.contains("{TITLE}"));
         assert!(!p.contains("{WORKSPACE}"));
         assert!(!p.contains("{ID}"));
@@ -76,21 +62,17 @@ mod tests {
 
     #[test]
     fn render_does_not_re_substitute_marker_text_inside_title() {
-        // Title containing literal `{ID}` text should survive verbatim —
-        // chained `replace()` would corrupt it on the second pass.
+        // A title containing literal `{ID}` must survive verbatim.
         let p = render("trim docs {ID}", "copad", "T-2026-001");
         assert!(p.contains("LOOP NAME: trim docs {ID}"));
         assert!(!p.contains("LOOP NAME: trim docs T-2026-001"));
-        // Real template markers still substituted.
         assert!(p.contains("TODO ID: T-2026-001"));
         assert!(p.contains("WORKSPACE: copad"));
     }
 
     #[test]
     fn render_passes_through_unknown_brace_sequences_in_inputs() {
-        // Inputs containing `{FOO}` style braces that are NOT one of
-        // the three real markers must round-trip verbatim — we don't
-        // re-scan substituted text for further substitutions.
+        // `{FOO}` braces that are not real markers must round-trip verbatim.
         let p = render("with {FOO} brace", "ws", "id");
         assert!(p.contains("LOOP NAME: with {FOO} brace"));
     }

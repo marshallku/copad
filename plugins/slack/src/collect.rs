@@ -1,21 +1,12 @@
-//! Knowledge-base capture for `collect`-profile channels.
+//! Knowledge-base capture for `collect`-profile channels: a human message in a channel registered
+//! with `ChannelProfile::Collect` appends one JSONL line to `<collect_dir>/<channel_id>.jsonl`,
+//! under XDG_DATA_HOME since the stream is data.
 //!
-//! When a human message arrives in a channel registered with
-//! `ChannelProfile::Collect`, one JSONL line is appended to
-//! `<collect_dir>/<channel_id>.jsonl`. Files live under XDG_DATA_HOME
-//! (not config) because the captured stream is data.
-//!
-//! Append uses `O_APPEND | O_CREAT` so concurrent writers within the
-//! same plugin process see line-atomic appends for payloads under
-//! `PIPE_BUF` (4 KB on macOS/Linux). Slack messages can exceed that
-//! when blocks/files are attached, so the writer flushes after each
-//! line and treats failures as best-effort (log to stderr, drop the
-//! line). Multi-process collectors are not in scope — only one
-//! plugin instance per workspace.
-//!
-//! Each line carries the same identity Slack guarantees `(channel,
-//! ts)`-unique, plus the team/event ids so downstream `jq` consumers
-//! can dedupe by `event_id` if redelivery happens after a crash.
+//! Append uses `O_APPEND | O_CREAT`, line-atomic for payloads under `PIPE_BUF` (4 KB). Slack
+//! messages with blocks/files can exceed that, so the writer flushes each line and is best-effort
+//! (log to stderr, drop the line). Multi-process collectors are out of scope: one plugin instance
+//! per workspace. Each line carries `(channel, ts)` plus the team/event ids so `jq` consumers can
+//! dedupe by `event_id` after a redelivery.
 
 use std::fs;
 use std::io::Write;
@@ -47,10 +38,8 @@ impl CollectStore {
         Self { base_dir }
     }
 
-    /// Append one line to `<base_dir>/<channel_id>.jsonl`. Channel id is
-    /// re-validated here even though ChannelStore checks on persist —
-    /// `channel_id` here ultimately comes from a Slack event payload,
-    /// which is external input.
+    /// Append one line to `<base_dir>/<channel_id>.jsonl`. The channel id is re-validated here even
+    /// though ChannelStore checks on persist, since it comes from an external Slack event payload.
     pub fn append(&self, line: &CollectLine) -> Result<(), String> {
         if !is_valid_channel_id(&line.channel) {
             return Err(format!(
@@ -149,7 +138,6 @@ mod tests {
         let store = CollectStore::new(dir.path().to_path_buf());
         let bad = sample("../etc/passwd", "1700000000.000100", "U999", "boom");
         assert!(store.append(&bad).is_err());
-        // Nothing should have been written
         assert!(!dir.path().join("../etc/passwd.jsonl").exists());
     }
 
@@ -171,8 +159,7 @@ mod tests {
 
     #[test]
     fn appends_preserve_existing_lines() {
-        // A second CollectStore for the same path must not truncate
-        // the file; this is the core "append not overwrite" contract.
+        // A second CollectStore for the same path must not truncate the file.
         let dir = tempdir().unwrap();
         let store_a = CollectStore::new(dir.path().to_path_buf());
         store_a

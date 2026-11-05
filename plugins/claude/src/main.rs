@@ -1,28 +1,17 @@
 //! Claude Code state surfacing plugin.
 //!
-//! Four read-only actions over the on-disk artifacts that the harness
-//! hooks (`auto-handoff.sh`, `track-edit.sh`) maintain under `~/.claude/`:
+//! Four read-only actions over the artifacts the harness hooks (`auto-handoff.sh`,
+//! `track-edit.sh`) maintain under `~/.claude/`:
+//! - `claude.last_handoff`: the latest handoff doc (`~/.claude/handoffs/latest.md`) and its mtime.
+//! - `claude.list_sessions`: transcripts under `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`
+//!   as `{session_id, project_path, started_at_ms, last_modified_ms}`; optional `project_path` filter.
+//! - `claude.session_state`: for a session id (or the most recently modified), the file path,
+//!   first/last timestamps and message count (jsonl line count).
+//! - `claude.list_dirty`: the unique edited files per session from `~/.claude/state/dirty-*.log`.
 //!
-//! - `claude.last_handoff` — returns the most recent handoff doc
-//!   (`~/.claude/handoffs/latest.md`) along with its mtime.
-//! - `claude.list_sessions` — enumerates transcript files under
-//!   `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Each entry
-//!   is `{session_id, project_path, started_at_ms, last_modified_ms}`.
-//!   Optional `project_path` param filters to one project's sessions.
-//! - `claude.session_state` — for one session id (or the most recently
-//!   modified across all projects, if absent), returns the file path,
-//!   first/last timestamps, and message count (line count of the jsonl).
-//! - `claude.list_dirty` — reads every `~/.claude/state/dirty-*.log`
-//!   (one per active session) and returns the unique edited-file list
-//!   per session, deduped.
-//!
-//! Pure-Rust, no external deps beyond serde_json. Resolves `~/.claude`
-//! via `$HOME` at startup; tests can override via `$COPAD_CLAUDE_DIR`.
-//!
-//! All actions are read-only. The plugin never mutates anything under
-//! `~/.claude/`. Failures (missing file, permission denied) surface as
-//! structured `claude_state_unavailable` errors so callers can handle
-//! "harness not installed" gracefully rather than treating it as a crash.
+//! `~/.claude` is resolved from `$HOME`; tests override it via `$COPAD_CLAUDE_DIR`. Nothing under
+//! `~/.claude/` is ever mutated. Failures (missing file, permission denied) surface as structured
+//! `claude_state_unavailable` errors so callers can treat "harness not installed" as normal.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -41,10 +30,7 @@ fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    // Single-writer channel — same pattern as `copad-plugin-echo`. The
-    // plugin itself is single-threaded for request handling (no
-    // heartbeat), but the writeln-through-channel design keeps the
-    // door open for future event publish.
+    // Single-writer channel, as in `copad-plugin-echo`.
     let (tx, rx) = channel::<String>();
     let writer_tx = tx.clone();
 
@@ -59,8 +45,7 @@ fn main() {
 
     let claude_dir = resolve_claude_dir();
 
-    // Reader loop is single-threaded — no need to share state through
-    // Mutex. Each frame's handler reads `claude_dir` by reference.
+    // The reader loop is single-threaded; handlers read `claude_dir` by reference.
     let reader = BufReader::new(stdin.lock());
     for line in reader.lines() {
         let line = match line {
@@ -81,9 +66,8 @@ fn main() {
     }
 }
 
-/// Resolve `~/.claude` at startup. Tests pin `COPAD_CLAUDE_DIR` to an
-/// isolated temp tree so they don't read the developer's actual
-/// session history. Production callers should never set it.
+/// Resolve `~/.claude` at startup. Tests pin `COPAD_CLAUDE_DIR` to a temp tree so they do not read
+/// the developer's real session history.
 fn resolve_claude_dir() -> PathBuf {
     if let Ok(p) = std::env::var("COPAD_CLAUDE_DIR")
         && !p.is_empty()
@@ -195,12 +179,10 @@ fn err(code: &str, message: impl Into<String>) -> ActionError {
     }
 }
 
-/// Strict optional-string param extractor. Requires `params` to be
-/// either `null` (no params) or a JSON object — a top-level non-object
-/// (e.g. `42` or `[]`) yields `invalid_params` rather than silently
-/// reading "no such key" and returning broader results than intended.
-/// Within an object: absent or `null` value → `Ok(None)`; string →
-/// `Ok(Some(...))`; non-string → `invalid_params`.
+/// Strict optional-string param extractor. `params` must be `null` or an object: a top-level
+/// non-object (`42`, `[]`) is `invalid_params` rather than reading "no such key" and returning
+/// broader results. Within an object: absent or `null` is `Ok(None)`, a string is `Ok(Some)`,
+/// anything else is `invalid_params`.
 fn optional_string_param(params: &Value, key: &str) -> Result<Option<String>, ActionError> {
     let obj = match params {
         Value::Null => return Ok(None),
@@ -222,7 +204,6 @@ fn optional_string_param(params: &Value, key: &str) -> Result<Option<String>, Ac
     }
 }
 
-/// `~/.claude/handoffs/latest.md` if present.
 fn last_handoff(claude_dir: &Path) -> Result<Value, ActionError> {
     let path = claude_dir.join("handoffs").join("latest.md");
     let content = fs::read_to_string(&path).map_err(|e| {
@@ -239,11 +220,9 @@ fn last_handoff(claude_dir: &Path) -> Result<Value, ActionError> {
     }))
 }
 
-/// Enumerate `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
-/// `project_filter` matches against the encoded-cwd dirname, NOT the
-/// decoded path — callers should pass the dir name as it appears on
-/// disk (e.g. `-Users-marshallku-dev-copad`). Sorted newest-first by
-/// `last_modified_ms`.
+/// Enumerate `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. `project_filter` matches the
+/// encoded-cwd dirname as on disk (e.g. `-Users-marshallku-dev-copad`), not the decoded path.
+/// Sorted newest-first by `last_modified_ms`.
 fn list_sessions(claude_dir: &Path, project_filter: Option<&str>) -> Result<Value, ActionError> {
     let projects = claude_dir.join("projects");
     let project_dirs = match fs::read_dir(&projects) {
@@ -290,7 +269,6 @@ fn list_sessions(claude_dir: &Path, project_filter: Option<&str>) -> Result<Valu
             }));
         }
     }
-    // Newest first — most use cases want "what was I doing recently".
     sessions.sort_by(|a, b| {
         b.get("last_modified_ms")
             .and_then(Value::as_u64)
@@ -307,10 +285,8 @@ fn list_sessions(claude_dir: &Path, project_filter: Option<&str>) -> Result<Valu
     }))
 }
 
-/// For one session id (or the most recently modified one across all
-/// projects), return file path + first/last timestamps + message
-/// count (jsonl line count). The transcripts are append-only one-
-/// JSON-object-per-line so line count == message count.
+/// For one session id (or the most recently modified), return file path, first/last timestamps and
+/// message count. Transcripts are one JSON object per line, so line count == message count.
 fn session_state(claude_dir: &Path, session_id: Option<&str>) -> Result<Value, ActionError> {
     let projects = claude_dir.join("projects");
     let project_dirs = fs::read_dir(&projects).map_err(|e| {
@@ -381,10 +357,8 @@ fn session_state(claude_dir: &Path, session_id: Option<&str>) -> Result<Value, A
     }))
 }
 
-/// Enumerate `~/.claude/state/dirty-<session-id>.log`. Each file is a
-/// newline-separated list of edited file paths (`track-edit.sh`
-/// appends one line per Edit/Write). Returns a dedup'd entry per
-/// session.
+/// Enumerate `~/.claude/state/dirty-<session-id>.log` (one edited path per line, appended by
+/// `track-edit.sh`), returning a deduped entry per session.
 fn list_dirty(claude_dir: &Path) -> Result<Value, ActionError> {
     let state = claude_dir.join("state");
     let entries = match fs::read_dir(&state) {
@@ -517,14 +491,12 @@ mod tests {
         fs::create_dir_all(&p1).unwrap();
         fs::create_dir_all(&p2).unwrap();
         fs::write(p1.join("aaa.jsonl"), "{}").unwrap();
-        // Sleep so the second file's mtime is strictly later (mtime
-        // is ms-resolution on macOS / Linux, but a 5ms gap is safe).
+        // Sleep so the second file's mtime is strictly later.
         std::thread::sleep(std::time::Duration::from_millis(10));
         fs::write(p2.join("bbb.jsonl"), "{}").unwrap();
         let out = list_sessions(&dir, None).unwrap();
         assert_eq!(out["count"], 2);
         let sessions = out["sessions"].as_array().unwrap();
-        // Newest first.
         assert_eq!(sessions[0]["session_id"], "bbb");
         assert_eq!(sessions[1]["session_id"], "aaa");
         let _ = fs::remove_dir_all(&dir);
@@ -587,21 +559,17 @@ mod tests {
 
     #[test]
     fn optional_string_param_strict_rejects_non_string() {
-        // C2 fix: a number/bool/etc passed for a string param must
-        // not be silently coerced to None — return invalid_params.
+        // A number/bool passed for a string param must be invalid_params, not coerced to None.
         let p = json!({ "project_path": 42 });
         let e = optional_string_param(&p, "project_path").unwrap_err();
         assert_eq!(e.code, "invalid_params");
-        // Absent / null = None (still treated as unset).
         assert!(optional_string_param(&json!({}), "x").unwrap().is_none());
         assert!(
             optional_string_param(&json!({"x": null}), "x")
                 .unwrap()
                 .is_none()
         );
-        // Whole-params null is treated as "no params" — None for any key.
         assert!(optional_string_param(&Value::Null, "x").unwrap().is_none());
-        // String passes through.
         assert_eq!(
             optional_string_param(&json!({"x": "y"}), "x").unwrap(),
             Some("y".into())
@@ -610,9 +578,7 @@ mod tests {
 
     #[test]
     fn optional_string_param_rejects_non_object_top_level() {
-        // C1 round-2 fix: a top-level non-object/null params (e.g.
-        // `42` or `[]`) used to be silently treated as "no key here"
-        // and broaden the query. Now it surfaces as invalid_params.
+        // A top-level non-object params (`42`, `[]`) must be invalid_params, not "no key here".
         let e = optional_string_param(&json!(42), "x").unwrap_err();
         assert_eq!(e.code, "invalid_params");
         let e = optional_string_param(&json!([]), "x").unwrap_err();
@@ -623,14 +589,11 @@ mod tests {
 
     #[test]
     fn session_state_propagates_transcript_read_error() {
-        // C1 fix: an unreadable transcript path surfaces as
-        // claude_state_unavailable, not message_count = 0.
-        // We simulate "unreadable" by making the file a directory
-        // (read_to_string / open will EISDIR).
+        // An unreadable transcript (simulated by making it a directory, so open fails with EISDIR)
+        // surfaces as claude_state_unavailable, not message_count = 0.
         let dir = tmpdir();
         let proj = dir.join("projects").join("-proj");
         fs::create_dir_all(&proj).unwrap();
-        // Sub-dir at the jsonl name — opening it as a file fails.
         let weird = proj.join("brokensess.jsonl");
         fs::create_dir(&weird).unwrap();
         let e = session_state(&dir, Some("brokensess")).unwrap_err();
@@ -649,7 +612,6 @@ mod tests {
         )
         .unwrap();
         fs::write(state.join("dirty-sess-B.log"), "/x.rs\n").unwrap();
-        // Non-matching file: ignored.
         fs::write(state.join("not-a-dirty-log.txt"), "ignored").unwrap();
         let out = list_dirty(&dir).unwrap();
         assert_eq!(out["count"], 2);

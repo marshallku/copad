@@ -165,8 +165,8 @@ fn classify_event(
     match event_type {
         "reaction_added" => {
             // Only message reactions reach copad: there is no "fetch the body" counterpart for
-            // files in the
-            // trigger DSL. File-reaction capture would need its own `slack.file_reaction` event.
+            // files in the trigger DSL. File-reaction capture would need its own
+            // `slack.file_reaction` event.
             let item = event.get("item")?;
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
             if item_type != "message" {
@@ -194,8 +194,8 @@ fn classify_event(
                 reaction,
                 item_user,
                 // Filled in by the socket_mode layer after classify via a best-effort
-                // `chat.getPermalink`,
-                // keeping events.rs free of HTTP and a network failure log-only.
+                // `chat.getPermalink`, keeping events.rs free of HTTP and a network failure
+                // log-only.
                 permalink: None,
                 team_id,
                 event_id,
@@ -203,8 +203,7 @@ fn classify_event(
         }
         "app_mention" => {
             // Defensive: skip bot-originated mentions and edits, symmetric with the DM path, so a
-            // Slack
-            // delivery change cannot turn the plugin into a self-loop generator.
+            // Slack delivery change cannot turn the plugin into a self-loop generator.
             if event.get("subtype").is_some() {
                 return None;
             }
@@ -570,8 +569,7 @@ mod tests {
     #[test]
     fn reaction_with_unknown_bot_user_id_still_emits() {
         // `auth.test` not yet run or env-only credentials: bot_user_id unknown, so the self-filter
-        // is
-        // skipped and the reaction is still emitted.
+        // is skipped and the reaction is still emitted.
         let p = payload_with(reaction_payload(json!({"user": "U_REACTOR"})));
         let out = from_events_api_payload(&p, None);
         assert_eq!(out.len(), 2);

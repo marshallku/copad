@@ -1,20 +1,14 @@
 //! Two-token Slack credential store.
 //!
-//! Slack Socket Mode requires both a Bot User OAuth Token (`xoxb-...`,
-//! HTTP API auth) and an App-Level Token (`xapp-...`, WebSocket auth).
-//! Both are persisted; the env-var values used at startup take
-//! precedence over what's in the store, but `auth.test`-validated
-//! tokens are written here so a future restart can run without
-//! re-supplying the env each time.
+//! Socket Mode needs a Bot User OAuth Token (`xoxb-...`, HTTP API) and an App-Level Token
+//! (`xapp-...`, WebSocket). Both are persisted; env values take precedence at startup, but
+//! `auth.test`-validated tokens are written here so a restart needs no env.
 //!
-//! Keyring is preferred (Linux Secret Service / macOS Keychain).
-//! On failure, falls back to plaintext at
-//! `$XDG_CONFIG_HOME/copad/slack-tokens-<workspace>.json` (mode 0600,
-//! atomic-replace via per-call temp + rename) with a stderr warning
-//! on every open. `COPAD_SLACK_REQUIRE_SECURE_STORE=1` forbids the
-//! plaintext fallback entirely — token operations error instead of
-//! writing plaintext, while RPC init still succeeds (analogous to
-//! calendar plugin's degraded mode).
+//! Keyring is preferred (Secret Service / macOS Keychain). On failure it falls back to plaintext
+//! at `$XDG_CONFIG_HOME/copad/slack-tokens-<workspace>.json` (mode 0600, atomic replace via
+//! per-call temp + rename) with a stderr warning on every open.
+//! `COPAD_SLACK_REQUIRE_SECURE_STORE=1` forbids the fallback: token operations error while RPC
+//! init still succeeds.
 
 use std::fs;
 use std::io::Write;
@@ -33,8 +27,8 @@ pub struct TokenSet {
     pub app_token: String,
     pub team_id: Option<String>,
     pub user_id: Option<String>,
-    /// `#[serde(default)]` load-bearing: keyring entries written before
-    /// this field existed must still deserialize.
+    /// `#[serde(default)]` is load-bearing: keyring entries written before this field must still
+    /// deserialize.
     #[serde(default)]
     pub user_token: String,
 }
@@ -50,10 +44,8 @@ pub trait TokenStore: Send + Sync {
 
 pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
     if !config.use_keychain {
-        // Default on macOS — see `Config::use_keychain` doc. Skipping
-        // the probe entirely (vs relying on the 2s timeout in
-        // `KeyringStore::open`) keeps startup snappy on the typical
-        // path and avoids the leaked probe thread.
+        // Default on macOS (see `Config::use_keychain`). Skipping the probe avoids relying on the
+        // 2s timeout in `KeyringStore::open` and the leaked probe thread.
         if config.require_secure_store {
             eprintln!(
                 "[slack] secure keyring disabled (COPAD_SLACK_USE_KEYCHAIN=0) but \
@@ -84,12 +76,9 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
     }
 }
 
-// -- Keyring backend --
-
 pub struct KeyringStore {
     entry: keyring::Entry,
-    // Only read by the macOS `save_macos_open_acl` path; on other platforms
-    // `save` writes through `entry` directly, leaving this field unread.
+    // Only read by the macOS `save_macos_open_acl` path.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     workspace: String,
 }
@@ -98,16 +87,12 @@ impl KeyringStore {
     pub fn open(workspace: &str) -> Result<Self, String> {
         let entry = keyring::Entry::new(KEYRING_SERVICE, workspace)
             .map_err(|e| format!("keyring entry: {e}"))?;
-        // Probe the secret-service backend so a real failure (D-Bus
-        // unavailable, locked keyring) surfaces here rather than at
-        // first save. Probe runs in a thread with a 2s deadline —
-        // macOS Keychain blocks indefinitely waiting for a UI prompt
-        // when the binary's signature doesn't match the entry's ACL,
-        // which happens every time we rebuild the binary. A background
-        // plugin process has no UI to surface that prompt, so a
-        // probe-time hang would prevent the plugin from ever
-        // initialising. On timeout, surface as a probe failure so
-        // `open_store` falls back to plaintext.
+        // Probe the backend so a real failure (D-Bus unavailable, locked keyring) surfaces here,
+        // not at first save. It runs in a thread with a 2s deadline: macOS Keychain blocks
+        // indefinitely on a UI
+        // prompt when the binary's signature no longer matches the entry's ACL (every rebuild), and
+        // a background plugin has no UI, so a hang would stop it initialising. A timeout is a probe
+        // failure, so `open_store` falls back to plaintext.
         let probe_entry = keyring::Entry::new(KEYRING_SERVICE, workspace)
             .map_err(|e| format!("keyring entry (probe): {e}"))?;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -125,11 +110,8 @@ impl KeyringStore {
                 workspace: workspace.to_string(),
             }),
             Ok(Err(e)) => Err(e),
-            // The probe thread is leaked (it stays blocked on the
-            // Keychain prompt). Plugin lifetime is short, and the leak
-            // is bounded to one thread per plugin process, so this is
-            // acceptable for the rebuild-during-dev case this guard
-            // exists for.
+            // The probe thread is leaked (blocked on the Keychain prompt), bounded to one per
+            // plugin process.
             Err(_) => Err(
                 "keyring probe timed out — likely waiting for a Keychain ACL prompt that \
                  cannot be surfaced from a background plugin process (run the binary from a \
@@ -192,29 +174,17 @@ impl TokenStore for KeyringStore {
     }
 }
 
-/// macOS-specific write that sets the Keychain ACL to "Allow all
-/// applications" (`-A` flag). The default ACL is bound to the writing
-/// binary's code-signing identity (cdhash), so a rebuild produces a
-/// new cdhash and the next read prompts the user. A background plugin
-/// process can't surface that prompt — it hangs until the supervisor
-/// kills it. Setting an open ACL avoids the prompt entirely.
+/// macOS write that sets the Keychain ACL to "Allow all applications" (`-A`). The default ACL is
+/// bound to the writing binary's cdhash, so a rebuild makes the next read prompt, and a
+/// background plugin cannot surface that prompt and hangs until killed.
 ///
-/// Security trade-off: within the same user account, any process can
-/// now read the entry without warning. Cross-user / cross-machine
-/// boundaries are unchanged (the Keychain is still unlocked only when
-/// the user logs in). For a single-user dev laptop running their own
-/// Slack bot tokens, this is acceptable; for shared systems it's
-/// roughly equivalent to the plaintext fallback we already use under
-/// `COPAD_SLACK_REQUIRE_SECURE_STORE=0`.
-///
-/// `ps`-visibility: the password appears in the `security` argv for the
-/// brief duration of the command. Acceptable for the `auth` subcommand
-/// (runs once per token rotation), not great for high-frequency saves —
-/// we don't have any.
+/// Trade-off: any process of the same user can read the entry without warning (comparable to the
+/// plaintext fallback). The password is visible in the `security` argv briefly, acceptable for
+/// `auth` (once per token rotation).
 #[cfg(target_os = "macos")]
 fn save_macos_open_acl(workspace: &str, json: &str) -> Result<(), String> {
-    // Delete first — `add-generic-password` won't overwrite an existing
-    // entry's ACL, only its data. We need a fresh entry to pick up `-A`.
+    // Delete first: `add-generic-password` updates data but not an existing entry's ACL, and we
+    // need `-A`.
     let _ = std::process::Command::new("/usr/bin/security")
         .args([
             "delete-generic-password",
@@ -244,8 +214,6 @@ fn save_macos_open_acl(workspace: &str, json: &str) -> Result<(), String> {
     Ok(())
 }
 
-// -- Plaintext fallback --
-
 pub struct PlaintextStore {
     path: PathBuf,
 }
@@ -258,9 +226,8 @@ impl PlaintextStore {
 
 impl TokenStore for PlaintextStore {
     fn load(&self) -> Option<TokenSet> {
-        // Distinguish "no token file yet" (NotFound — quiet) from
-        // "we cannot read the file" (EACCES, EIO, etc. — log so
-        // operators can debug). Round-6 cross-review I2.
+        // "No token file yet" (NotFound) is quiet; unreadable (EACCES, EIO) is logged for
+        // operators.
         let bytes = match fs::read(&self.path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -306,8 +273,7 @@ impl TokenStore for PlaintextStore {
     }
 }
 
-/// Per-process counter so concurrent `save()` calls don't collide on
-/// a pid-derived temp path. Same pattern as calendar plugin.
+/// Per-process counter so concurrent `save()` calls do not collide on a pid-derived temp path.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
@@ -327,8 +293,6 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     fs::rename(&tmp, path)
 }
-
-// -- Sentinel store for require_secure_store mode when keyring is broken --
 
 struct BrokenStore {
     reason: String,

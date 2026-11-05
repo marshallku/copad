@@ -1,24 +1,12 @@
-//! Raw daemon-socket client. Mirrors `copad-cli/src/client.rs` but
-//! over `tokio::net::UnixStream` so it composes with the axum runtime.
+//! Raw daemon-socket client, mirroring `copad-cli/src/client.rs` over `tokio::net::UnixStream`.
 //!
-//! Two access patterns are exposed:
+//! Two access patterns: a one-shot RPC (open, send a `Request`, read the matching `Response`,
+//! close; the daemon dispatch is thread-safe and connect is cheap, so there is no pool), and a
+//! long-lived `event.subscribe` whose event lines are forwarded to an `mpsc::Sender<Value>`
+//! until the channel closes or the socket dies (`/ws/events` fans one subscription out).
 //!
-//! 1. **One-shot RPC** — open connection, send a `Request`, read the
-//!    matching `Response`, close. The daemon dispatch path is
-//!    thread-safe and connect is cheap, so each axum handler that
-//!    needs to call a daemon method just opens a fresh socket. No
-//!    connection pool yet; if the dashboard starts hammering the
-//!    daemon we can revisit.
-//!
-//! 2. **Long-lived subscription** — open connection, send
-//!    `event.subscribe { patterns }`, then forward every event line
-//!    to an `mpsc::Sender<Value>` until the channel closes or the
-//!    socket dies. Used by `/ws/events` to fan one daemon
-//!    subscription out to multiple WebSocket clients.
-//!
-//! Requests use the canonical `copad_core::protocol::{Request,
-//! Response}` shape so a daemon protocol change shows up as a
-//! compile error in this plugin too — no parallel structs.
+//! Requests use `copad_core::protocol::{Request, Response}` so a daemon protocol change is a
+//! compile error here too.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,13 +41,8 @@ impl DaemonClient {
         }
     }
 
-    /// Round-trip a single Request/Response. The daemon may interleave
-    /// `<method>.completed` events on the same socket connection
-    /// (because action dispatch publishes on the bus and forwarders
-    /// pick them up), but those don't get this connection — generic
-    /// clients aren't subscribed unless they explicitly call
-    /// `event.subscribe`. So we just read until the response with our
-    /// id arrives, ignoring anything else.
+    /// Round-trip a single Request/Response, reading until the response with our id arrives and
+    /// ignoring anything else the daemon interleaves on the connection.
     pub async fn rpc(&self, method: &str, params: Value) -> Result<Value, DaemonError> {
         let req = Request {
             id: uuid::Uuid::new_v4().to_string(),
@@ -103,33 +86,22 @@ impl DaemonClient {
         Err(DaemonError::Closed)
     }
 
-    /// Open a long-lived `event.subscribe` connection. Reads lines
-    /// forever and forwards everything that parses as JSON (Event
-    /// frames OR the initial subscribe ack) to `sink`. Returns when
-    /// the receiver is closed or the socket dies.
+    /// Open a long-lived `event.subscribe` connection, forwarding every line that parses as JSON
+    /// (events or the subscribe ack) to `sink` until the receiver closes or the socket dies.
     ///
-    /// Implemented over `std::os::unix::net::UnixStream` inside
-    /// `tokio::task::spawn_blocking`, mirroring `copad-cli/src/client.rs`
-    /// (which is the validated working path against this same daemon
-    /// socket protocol). An earlier tokio `UnixStream + into_split`
-    /// version connected and wrote successfully but never observed
-    /// any line on read; rather than debug that further inside Slice
-    /// 3.0, this matches the known-good model. Blocking I/O lives on
-    /// the blocking pool, not on the runtime workers, so axum's HTTP
-    /// handlers stay snappy.
+    /// Uses `std::os::unix::net::UnixStream` in `spawn_blocking`, mirroring `copad-cli`. A tokio
+    /// `UnixStream + into_split` version connected and wrote but never saw a line on read.
+    /// Blocking I/O stays on the blocking pool so axum handlers stay responsive.
     pub async fn subscribe(
         &self,
         patterns: Vec<String>,
         sink: mpsc::Sender<Value>,
     ) -> Result<(), DaemonError> {
         let socket_path = self.socket_path.clone();
-        // Shared stop flag — the outer async future drops `_guard` on
-        // task abort (WS client closed), which flips the flag; the
-        // blocking reader's polling loop checks it between socket
-        // read-timeouts and exits cleanly. Without this the
-        // `spawn_blocking` thread can sit forever inside read_line
-        // when the daemon is idle, leaking the socket connection +
-        // blocking-pool slot even after `subscribe_task.abort()`.
+        // Shared stop flag: dropping `_guard` on task abort (WS client closed) flips it, and the
+        // reader checks it between read timeouts. Without it the `spawn_blocking` thread sits in
+        // read_line on an idle daemon, leaking the connection and a pool slot after
+        // `subscribe_task.abort()`.
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_blocking = stop.clone();
@@ -146,10 +118,7 @@ impl DaemonClient {
                 target_client_id: None,
             };
             let stream = StdUnix::connect(socket_path.as_path())?;
-            // Short read timeout so the loop polls the stop flag
-            // ~twice a second. 500ms is the sweet spot — frequent
-            // enough to make WS close + reconnect feel snappy, rare
-            // enough that idle CPU is negligible.
+            // Short read timeout so the loop polls the stop flag about twice a second.
             stream.set_read_timeout(Some(Duration::from_millis(500)))?;
             let mut writer = stream.try_clone()?;
             let line = serde_json::to_string(&req)?;
@@ -197,9 +166,8 @@ impl DaemonClient {
     }
 }
 
-/// RAII handle that flips an `AtomicBool` on drop. Used to signal
-/// the `spawn_blocking` reader inside `DaemonClient::subscribe` to
-/// terminate when the outer async future is aborted or completes.
+/// RAII handle that flips an `AtomicBool` on drop, telling the `spawn_blocking` reader in
+/// `DaemonClient::subscribe` to stop when the outer future is aborted or completes.
 struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for StopOnDrop {

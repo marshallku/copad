@@ -1,11 +1,8 @@
-//! Thin wrapper over the `csd` CLI (claude/codex session driver). Every
-//! call is an argv-vector `Command` — never a shell string — so a goal's
-//! cwd / instruction can't inject extra flags. `csd` prints JSON on
-//! stdout on success and `{"error": "..."}` on stderr with a non-zero
-//! exit on failure; those CLI failures are out-of-band from the `state`
-//! status enum (codex C7), so every call also enforces a wall-clock
-//! timeout and surfaces missing-binary / tmux / hung-command failures as
-//! `CsdError`.
+//! Thin wrapper over the `csd` CLI (claude/codex session driver). Every call is an argv-vector
+//! `Command`, never a shell string, so a goal's cwd / instruction cannot inject flags. `csd`
+//! prints JSON on stdout on success and `{"error": "..."}` on stderr with a non-zero exit on
+//! failure; those failures are out-of-band from the `state` enum, so every call also enforces a
+//! wall-clock timeout and surfaces missing-binary / tmux / hung-command failures as `CsdError`.
 
 use std::fmt;
 use std::io::Read;
@@ -15,26 +12,20 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Classification of a `csd` failure so the cockpit can show an actionable cause instead of an
-/// opaque string — the three failures a user actually hits are distinct (the tool isn't installed,
-/// its tmux dependency isn't, or the agent never became driveable) and each has a different fix.
+/// Classification of a `csd` failure so the cockpit can show an actionable cause. The three common
+/// failures (csd not installed, tmux not installed, agent never driveable) each have a different fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsdErrorKind {
-    /// The `csd` binary itself could not be launched (not installed / not on PATH).
     CsdMissing,
-    /// `csd` ran but reported tmux is unavailable — no session can be driven without it.
     TmuxMissing,
-    /// `csd` could not get the agent (claude) to accept input: the TUI never became driveable
-    /// (claude missing / not logged in, or gate-marker drift after a claude upgrade).
+    /// `csd` could not get the agent to accept input: claude missing / not logged in, or
+    /// gate-marker drift after a claude upgrade.
     AgentUnresponsive,
-    /// `csd` exceeded pilot's wall-clock timeout.
     Timeout,
-    /// Any other csd failure (session gone, bad args, unparseable output).
     Other,
 }
 
 impl CsdErrorKind {
-    /// Stable machine code surfaced on `pilot.goal_failed` and in `goal.error`.
     pub fn code(self) -> &'static str {
         match self {
             Self::CsdMissing => "csd_missing",
@@ -45,7 +36,6 @@ impl CsdErrorKind {
         }
     }
 
-    /// One-line fix hint, or `None` when the cause is too generic to advise on.
     pub fn remediation(self) -> Option<&'static str> {
         match self {
             Self::CsdMissing => Some(
@@ -60,8 +50,8 @@ impl CsdErrorKind {
     }
 }
 
-/// Classify a csd stderr/error message into a [`CsdErrorKind`]. Matches against csd's stable
-/// `Display` strings (`src/error.rs`): tmux-missing and TUI-not-accepted are the load-bearing ones.
+/// Classify a csd stderr/error message by csd's stable `Display` strings (`src/error.rs`);
+/// tmux-missing and TUI-not-accepted are the load-bearing ones.
 fn classify_csd_error(message: &str) -> CsdErrorKind {
     let m = message.to_ascii_lowercase();
     if m.contains("tmux is not installed") || m.contains("tmux command failed") {
@@ -113,9 +103,8 @@ impl fmt::Display for CsdError {
 pub struct SpawnInfo {
     pub session_id: Option<String>,
     pub jsonl_path: Option<String>,
-    /// csd's marker version guard (csd ≥ 0.2.0): present when the installed
-    /// claude is not marker-verified, i.e. gate detection may silently miss
-    /// prompts. Absent on older csd — treated as "no warning".
+    /// csd's marker version guard (csd >= 0.2.0): present when the installed claude is not
+    /// marker-verified, so gate detection may silently miss prompts. Absent on older csd.
     pub marker_warning: Option<String>,
 }
 
@@ -130,7 +119,6 @@ impl SpawnInfo {
     }
 }
 
-/// One verdict from `csd state` (and the `state` field of `csd ps`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsdState {
     Spawning,
@@ -185,10 +173,8 @@ impl CsdState {
 pub struct Csd {
     bin: String,
     timeout: Duration,
-    /// Shorter cap for `csd state` reads (always fast: jsonl + capture-pane)
-    /// vs the long `timeout` for `spawn`/`send` (which type into the TUI with
-    /// retries). Keeps a hung `state` from stalling the dispatcher poll — or
-    /// the single reader thread during a `pilot.status` cockpit read.
+    /// Shorter cap for `csd state` reads (always fast) than the long `timeout` for `spawn`/`send`,
+    /// so a hung `state` cannot stall the dispatcher poll or the `pilot.status` reader thread.
     status_timeout: Duration,
 }
 
@@ -236,10 +222,8 @@ impl Csd {
                 )
             })?;
 
-        // Drain both pipes on their own threads so a large `csd` stderr
-        // (a panic / backtrace) can't fill the pipe buffer and wedge the
-        // child before it exits — which would turn the real error into a
-        // bare timeout.
+        // Drain both pipes on their own threads: a large stderr (panic / backtrace) could fill the
+        // pipe and wedge the child, turning the real error into a bare timeout.
         let mut out_pipe = child.stdout.take();
         let mut err_pipe = child.stderr.take();
         let out_h = thread::spawn(move || {
@@ -296,8 +280,8 @@ impl Csd {
     }
 
     pub fn spawn(&self, cwd: &str, name: &str, posture: &str) -> Result<SpawnInfo, CsdError> {
-        // `--cwd=<path>` / `--name=<name>` (attached form) so a value that
-        // starts with `-` can't be reparsed as a flag.
+        // Attached `--cwd=<path>` / `--name=<name>` form so a value starting with `-` is not
+        // reparsed as a flag.
         let mut args = vec![
             "spawn".into(),
             format!("--cwd={cwd}"),
@@ -310,16 +294,13 @@ impl Csd {
     }
 
     pub fn send(&self, name: &str, prompt: &str) -> Result<(), CsdError> {
-        // `--` ends option parsing so a prompt starting with `-` is taken
-        // as text, not a flag (csd's `send` positional is `trailing_var_arg`
-        // but still parses a leading `-foo` as CLI syntax without this).
+        // `--` ends option parsing so a prompt starting with `-` is text, not a flag.
         self.run(&["send".into(), name.into(), "--".into(), prompt.into()])?;
         Ok(())
     }
 
-    /// Raw `csd state` JSON — what the cockpit wants (question / plan /
-    /// tools detail beyond the persisted [`CsdState`] enum). Uses the short
-    /// `status_timeout` so a cockpit read can't stall the reader thread.
+    /// Raw `csd state` JSON, for the cockpit's question / plan / tools detail beyond [`CsdState`].
+    /// Uses the short `status_timeout` so a cockpit read cannot stall the reader thread.
     pub fn state_json(&self, name: &str) -> Result<Value, CsdError> {
         self.run_with_timeout(&["state".into(), name.into()], self.status_timeout)
     }
@@ -344,9 +325,8 @@ impl Csd {
     }
 }
 
-/// Map a pilot posture keyword to `csd spawn` flags. Default (`trust`)
-/// auto-clears only the one-time folder-trust gate so unattended spawns
-/// are driveable; permission gates still surface as `AwaitingGate`.
+/// Map a pilot posture keyword to `csd spawn` flags. Default (`trust`) auto-clears only the
+/// one-time folder-trust gate; permission gates still surface as `AwaitingGate`.
 fn posture_flags(posture: &str) -> Vec<&'static str> {
     match posture {
         "yolo" => vec!["--yolo"],
@@ -402,7 +382,6 @@ mod tests {
             CsdState::from_json(&json!({"status": "dead"})),
             CsdState::Dead
         );
-        // Unrecognized / missing status → Unknown (driver waits, never false-completes).
         assert_eq!(
             CsdState::from_json(&json!({"status": "wat"})),
             CsdState::Unknown
@@ -440,7 +419,6 @@ mod tests {
             with.marker_warning.as_deref(),
             Some("claude 9.9.9 is not marker-verified")
         );
-        // Pre-0.2.0 csd output has no marker_warning field.
         let without = SpawnInfo::from_json(&json!({"session_id": "0a1b"}));
         assert_eq!(without.marker_warning, None);
         assert_eq!(without.jsonl_path, None);
@@ -487,7 +465,6 @@ mod tests {
 
     #[test]
     fn classifies_csd_error_messages() {
-        // csd's stable Display strings (see csd src/error.rs).
         assert_eq!(
             classify_csd_error("tmux is not installed or not on PATH"),
             CsdErrorKind::TmuxMissing
@@ -500,7 +477,6 @@ mod tests {
             classify_csd_error("input was not accepted by the TUI after 30 attempts"),
             CsdErrorKind::AgentUnresponsive
         );
-        // An unrecognized csd error stays Other (no misleading remediation).
         let other = classify_csd_error("session \"x\" does not exist");
         assert_eq!(other, CsdErrorKind::Other);
         assert_eq!(other.remediation(), None);

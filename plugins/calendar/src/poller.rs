@@ -1,33 +1,18 @@
 //! Background poller that publishes `calendar.event_imminent` events.
 //!
-//! Loop:
-//! 1. Wait until the supervisor has sent `initialized` (so events
-//!    don't leak before copad has finished the handshake).
-//! 2. Run an immediate first `tick()` (no leading sleep), then sleep
-//!    `poll_interval` between subsequent ticks.
-//! 3. If credentials are not present, skip silently (the user might
-//!    run `copad-plugin-calendar auth` while copad is already running).
-//! 4. Fetch events for the next `lookahead_hours`.
-//! 5. For each (event, lead_minutes) pair, fire if
-//!    `firing_time <= now < event.start` (where `firing_time =
-//!    event.start - lead_minutes`) AND we have not already fired this
-//!    `(event_id, lead)` pair. The dedupe set ensures exactly-once
-//!    publishing across ticks, while the bare "is now in the firing
-//!    band?" check is what gives us startup-catchup: if copad restarts
-//!    20 seconds after the canonical firing time but before
-//!    `event.start`, the first tick still publishes. The earlier
-//!    `[now + lead, now + lead + poll_interval)` framing missed
-//!    exactly that case — the event would already be before the lower
-//!    bound and never fire.
-//! 6. GC the fired-set: drop entries whose event has passed.
+//! Loop: wait for the supervisor's `initialized` (so no event leaks before the handshake), run a
+//! first `tick()` immediately, then sleep `poll_interval` between ticks. A tick skips silently
+//! without credentials (the user may run `copad-plugin-calendar auth` while copad is up), fetches
+//! events for the next `lookahead_hours`, and for each (event, lead_minutes) fires if
+//! `firing_time <= now < event.start` (`firing_time = event.start - lead_minutes`), now is within
+//! `max(2 * poll_interval, 2 min)` of `firing_time`, and the pair has not fired yet.
 //!
-//! The dedupe key is `(event_id, lead_minutes)` so a 60-minute lead
-//! and a 10-minute lead on the same event each get exactly one
-//! firing (each is independently useful — 60m might trigger
-//! "block focus time", 10m might trigger "open meeting note").
+//! The dedupe key `(event_id, lead_minutes)` gives each lead (60m "block focus time", 10m "open
+//! meeting note") exactly one firing. The band check gives startup catchup: a restart 20 seconds
+//! after the firing time but before `event.start` still publishes.
+//! A `[now + lead, now + lead + poll_interval)` window would have missed that case.
 //!
-//! All errors are logged to stderr and swallowed; one bad poll
-//! tick must not kill the daemon.
+//! Errors are logged to stderr and swallowed; one bad tick must not kill the daemon.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,8 +29,7 @@ use crate::event::{CalendarEvent, to_json};
 use crate::gcal::Client;
 use crate::store::TokenStore;
 
-/// Firing records linger this long past start so a sleep/wake within
-/// the lead window doesn't re-fire.
+/// Firing records linger this long past start so a sleep/wake within the lead window does not re-fire.
 const RETAIN_AFTER_START: chrono::Duration = chrono::Duration::minutes(5);
 
 pub struct Poller {
@@ -79,21 +63,13 @@ impl Poller {
     }
 
     pub fn run(&self) {
-        // Wait for the `initialized` notification before starting any
-        // poll cycle. Without this, an event published during init
-        // would race against the supervisor's handshake.
+        // Without waiting for `initialized`, an event published during init would race the
+        // handshake.
         while !self.initialized.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(100));
         }
-        // First tick runs IMMEDIATELY (not after a poll_interval
-        // sleep). Without this, any event whose firing window
-        // (start - lead - poll_interval, start - lead] overlaps with
-        // the time between copad startup and the first scheduled tick
-        // is permanently missed. Example: copad starts at 09:50:30,
-        // lead=10m, event at 10:00, poll=60s → naive sleep-first
-        // would not check until 09:51:30, well past the firing
-        // window 09:49:00-09:50:00. With immediate-first, 09:50:30
-        // catches it on the same tick path.
+        // The first tick runs immediately, not after a sleep: otherwise an event whose firing
+        // window falls between startup and the first tick is missed.
         if let Err(e) = self.tick() {
             eprintln!("[calendar] initial poll tick failed: {e}");
         }
@@ -114,12 +90,9 @@ impl Poller {
             Err(_) => return Ok(()), // not authenticated yet — silent skip
         };
         let now = Utc::now();
-        // Look back by the longest lead so a restart inside that
-        // window still picks up events whose firing time has passed
-        // but whose start has not. Without this, an event scheduled
-        // at `now + 5m` with a 10m lead would never enter the
-        // returned set (timeMin defaults to now), and the catchup
-        // logic in should_fire couldn't see it.
+        // Look back by the longest lead so a restart inside that window still sees events whose
+        // firing time passed but whose start has not (timeMin defaults to now), which should_fire's
+        // catchup needs.
         let max_lead = self.config.lead_minutes.iter().copied().max().unwrap_or(0);
         let lookback = chrono::Duration::minutes(max_lead as i64);
         let max = now + chrono::Duration::hours(self.config.lookahead_hours as i64);
@@ -137,10 +110,9 @@ impl Poller {
         Ok(())
     }
 
-    /// Fires when `now` is in `[firing_time, firing_time + max(2×poll, 2min)]`.
-    /// The bounded "just-arrived" band stops a 60-min-lead reminder from
-    /// firing 51 minutes late as a "catchup". Dedupe set enforces
-    /// exactly-once across consecutive in-band ticks.
+    /// Fires when `now` is in `[firing_time, firing_time + max(2*poll, 2min)]`. The bounded band
+    /// stops a 60-min-lead reminder firing 51 minutes late as a "catchup"; the dedupe set enforces
+    /// exactly-once across in-band ticks.
     fn should_fire(&self, event: &CalendarEvent, lead_minutes: u32, now: DateTime<Utc>) -> bool {
         let lead = chrono::Duration::minutes(lead_minutes as i64);
         let firing_time = event.start_time - lead;
@@ -187,29 +159,19 @@ impl Poller {
     }
 
     fn gc_fired_set(&self, now: DateTime<Utc>) {
-        // Without this, the fired set grows unbounded over a long
-        // session. We can't trivially look up event start times for
-        // already-removed-from-calendar events, so we use a coarser
-        // strategy: drop any entry whose event_id we no longer see in
-        // the current event list. Implementation: caller passes the
-        // current set; the simpler proxy used here is "if the lead
-        // window has likely passed, drop". Because we don't store
-        // per-fire timestamps, we instead rely on bounded growth via
-        // a cap.
+        // Bounds the fired set over a long session. Entries are not timestamped, so growth is
+        // capped instead of dropping by event start.
         const CAP: usize = 4096;
         let mut fired = self.fired.lock().unwrap();
         if fired.len() > CAP {
-            // Best-effort flush: clear the whole set. Worst case we
-            // re-fire a few imminent events that were on the boundary.
-            // Acceptable trade for not tracking per-entry timestamps.
+            // Best-effort: clear the whole set. Worst case a few boundary events re-fire.
             eprintln!(
                 "[calendar] fired-set exceeded cap ({}); flushing — may re-fire boundary events",
                 CAP
             );
             fired.clear();
         }
-        // `now` and `RETAIN_AFTER_START` are kept in the API for a
-        // future timestamped strategy.
+        // `now` and `RETAIN_AFTER_START` are unused until entries are timestamped.
         let _ = (now, RETAIN_AFTER_START);
     }
 }
@@ -272,8 +234,7 @@ mod tests {
     fn fires_at_exact_firing_time() {
         let p = mk_poller(vec![10], 60);
         let now = Utc::now();
-        // Event starts in 10 min — firing_time == now, so the lower
-        // bound is inclusive: this should fire.
+        // Firing_time == now; the lower bound is inclusive, so this fires.
         let evt = fake_event("e1", now + chrono::Duration::minutes(10));
         assert!(p.should_fire(&evt, 10, now));
     }
@@ -282,19 +243,15 @@ mod tests {
     fn fires_when_event_within_lead_window() {
         let p = mk_poller(vec![10], 60);
         let now = Utc::now();
-        // Event in 9 min, lead 10 min — firing time was 1 min ago,
-        // event hasn't started, so this is the steady-state "have
-        // we crossed the lead boundary?" YES path.
+        // Firing time was 1 min ago and the event has not started: the steady-state path.
         let evt = fake_event("e1", now + chrono::Duration::minutes(9));
         assert!(p.should_fire(&evt, 10, now));
     }
 
     #[test]
     fn fires_after_restart_inside_firing_window() {
-        // Reproduces codex round-5 C1: copad restarts at 09:50:30, an
-        // event is at 10:00:00 with lead=10. Canonical firing time
-        // was 09:50:00, so we are 30 seconds past it but still well
-        // before event start. Must fire.
+        // Restart at 09:50:30 with an event at 10:00:00, lead=10: 30 seconds past the firing time,
+        // well before start. Must fire.
         let p = mk_poller(vec![10], 60);
         let now = Utc.with_ymd_and_hms(2026, 4, 26, 9, 50, 30).unwrap();
         let evt = fake_event("e1", Utc.with_ymd_and_hms(2026, 4, 26, 10, 0, 0).unwrap());
@@ -303,7 +260,6 @@ mod tests {
 
     #[test]
     fn does_not_fire_before_firing_time() {
-        // Event in 30 min, lead 10 min — firing time is 20 min away.
         let p = mk_poller(vec![10], 60);
         let now = Utc::now();
         let evt = fake_event("e1", now + chrono::Duration::minutes(30));
@@ -312,9 +268,7 @@ mod tests {
 
     #[test]
     fn does_not_fire_when_firing_time_long_past() {
-        // 60-min lead on an event only 9 min away. Firing time was
-        // 51 min ago — far past the 2*poll catchup window. A reminder
-        // 51 min late lost its meaning.
+        // Firing time was 51 min ago, far past the 2*poll catchup window; too late to be useful.
         let p = mk_poller(vec![60], 60);
         let now = Utc::now();
         let evt = fake_event("e1", now + chrono::Duration::minutes(9));
@@ -323,8 +277,7 @@ mod tests {
 
     #[test]
     fn does_not_fire_after_event_started() {
-        // Event was 5 min ago — meeting is in progress; reminder is
-        // useless noise.
+        // The meeting is already in progress.
         let p = mk_poller(vec![10], 60);
         let now = Utc::now();
         let evt = fake_event("e1", now - chrono::Duration::minutes(5));
@@ -338,8 +291,7 @@ mod tests {
         let evt = fake_event("e1", now + chrono::Duration::minutes(9));
         assert!(p.should_fire(&evt, 10, now));
         assert!(!p.should_fire(&evt, 10, now)); // second call deduped
-        // Subsequent tick a few seconds later still in the firing
-        // window: still deduped.
+        // A later tick still in the window stays deduped.
         let later = now + chrono::Duration::seconds(30);
         assert!(!p.should_fire(&evt, 10, later));
     }
@@ -348,13 +300,10 @@ mod tests {
     fn fires_independently_for_each_lead() {
         let p = mk_poller(vec![10, 60], 60);
         let now = Utc::now();
-        // e1: 9 min away, lead=10 fires (firing_time was 1 min ago,
-        // event is upcoming), but lead=60 is too early (firing_time
-        // is 51 min from now — well in the future).
+        // e1 (9 min away): lead=10 fires, lead=60 is too late.
         let evt_10 = fake_event("e1", now + chrono::Duration::minutes(9));
         assert!(p.should_fire(&evt_10, 10, now));
         assert!(!p.should_fire(&evt_10, 60, now));
-        // e2: 59 min away, only lead=60 fires.
         let evt_60 = fake_event("e2", now + chrono::Duration::minutes(59));
         assert!(p.should_fire(&evt_60, 60, now));
         assert!(!p.should_fire(&evt_60, 10, now));
@@ -385,15 +334,13 @@ mod tests {
     fn fired_set_caps_to_prevent_unbounded_growth() {
         let p = mk_poller(vec![10], 60);
         let now = Utc::now();
-        // Fill past CAP. Each event is 9 min from now so all fire
-        // (firing_time was 1 min ago, event upcoming).
+        // Fill past CAP; each event fires (firing_time 1 min ago, event upcoming).
         for i in 0..5000 {
             let evt = fake_event(&format!("evt-{i}"), now + chrono::Duration::minutes(9));
             p.should_fire(&evt, 10, now);
         }
         p.gc_fired_set(now);
         let fired = p.fired.lock().unwrap();
-        // After GC the set is empty (we cleared it because cap exceeded).
         assert_eq!(fired.len(), 0);
         let _ = Attendee {
             email: None,

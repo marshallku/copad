@@ -4,49 +4,18 @@
 <meta charset="utf-8" />
 <title>Slack</title>
 <style>
-/* ========================================================================
-   slack/panel.html — single panel with two internal views
-   Top-level tab strip switches between FEED (Signal Log: mention/DM/reaction
-   event feed) and CHANNELS (per-channel profile registry). Monospace
-   throughout, Catppuccin Mocha tokens, type-rail color is the primary
-   visual differentiator.
-   ----------------------------------------------------------------------
-   §1   TOKENS         design tokens, status colors, motion timings
-   §2   RESET          box-sizing, color-scheme, body baseline
-   §3   LAYOUT         shell: header / tabs / body / composer
-   §4   HEADER         workspace + status pill + refresh
-   §5   TABS           internal view switcher (feed | channels)
-   §6   FILTER         feed sub-filter (chip row, active state)
-   §7   FEED           event-card list, empty state
-   §8   CARD           shared card chrome — rail / collapsed / expanded
-   §8.1 CARD-MENTION   mention rail
-   §8.2 CARD-DM        DM rail
-   §8.3 CARD-RXN       reaction rail + reacted-on body slot
-   §9   CHANNELS       channel-registry view (add bar + row list + edit form)
-   §9.1 CHAN-ROW       channel row chrome — rail per profile
-   §9.2 CHAN-FORM      inline edit form (name / profile / bot-rpc)
-   §9.3 CHAN-BOTRPC    bot-rpc sub-form (template / wait / regex / timeout)
-   §10  COMPOSER       sticky standalone + inline reply (feed only)
-   §11  TOAST          error / success overlay
-   §12  SETUP          fatal/setup view (replaces feed+channels when un-auth)
-   §13  MOTION         keyframes, prefers-reduced-motion override
-   §14  UTIL           visually-hidden, truncate, copy-btn
-   ======================================================================== */
 
-/* §1 TOKENS ------------------------------------------------------------- */
 :root {
   --slack-ok:    #a6e3a1;
   --slack-warn:  #f9e2af;
   --slack-info:  #89b4fa;
   --slack-rxn:   #94e2d5;
 
-  /* Type rails — modifier-driven; defaults to overlay grey */
   --rail-default: var(--copad-overlay0);
   --rail-mention: var(--copad-accent);
   --rail-dm:      var(--slack-info);
   --rail-rxn:     var(--slack-rxn);
 
-  /* Channel-profile rails */
   --rail-read:    var(--copad-overlay0);
   --rail-collect: var(--slack-ok);
   --rail-bot:     var(--slack-info);
@@ -66,7 +35,6 @@
   --rail-w:          4px;
 }
 
-/* §2 RESET -------------------------------------------------------------- */
 *, *::before, *::after { box-sizing: border-box; }
 :root { color-scheme: dark; }
 
@@ -82,7 +50,6 @@ body {
   background: transparent;
 }
 
-/* §3 LAYOUT ------------------------------------------------------------- */
 .slack-shell {
   display: flex;
   flex-direction: column;
@@ -90,7 +57,6 @@ body {
   min-height: 0;
 }
 
-/* §4 HEADER ------------------------------------------------------------- */
 .slack-header {
   display: flex;
   align-items: center;
@@ -145,7 +111,6 @@ body {
 .slack-header__refresh:active { transform: scale(0.97); }
 .slack-header__refresh:disabled { opacity: 0.4; cursor: progress; }
 
-/* §5 TABS --------------------------------------------------------------- */
 .slack-tabs {
   display: flex;
   align-items: stretch;
@@ -183,7 +148,6 @@ body {
   color: color-mix(in oklab, var(--copad-accent) 70%, var(--copad-subtext1));
 }
 
-/* §6 FILTER ------------------------------------------------------------- */
 .slack-filter {
   display: flex;
   gap: var(--s-1);
@@ -219,7 +183,6 @@ body {
   color: color-mix(in oklab, var(--copad-accent) 70%, var(--copad-subtext1));
 }
 
-/* §7 FEED --------------------------------------------------------------- */
 .slack-feed {
   flex: 1;
   min-height: 0;
@@ -255,7 +218,6 @@ body {
   color: var(--copad-overlay0);
 }
 
-/* §8 CARD --------------------------------------------------------------- */
 .slack-card {
   --rail-color: var(--rail-default);
   display: grid;
@@ -402,13 +364,10 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* §8.1 CARD-MENTION ----------------------------------------------------- */
 .slack-card--mention { --rail-color: var(--rail-mention); }
 
-/* §8.2 CARD-DM ---------------------------------------------------------- */
 .slack-card--dm { --rail-color: var(--rail-dm); }
 
-/* §8.3 CARD-RXN --------------------------------------------------------- */
 .slack-card--rxn { --rail-color: var(--rail-rxn); }
 .slack-card--rxn .slack-card__badge {
   font-size: 13px;
@@ -435,7 +394,6 @@ body {
   font-style: italic;
 }
 
-/* §9 CHANNELS ----------------------------------------------------------- */
 .chan-add {
   display: flex;
   align-items: center;
@@ -610,7 +568,6 @@ body {
   color: var(--copad-overlay0);
 }
 
-/* §9.1 CHAN-ROW --------------------------------------------------------- */
 .chan-row {
   --rail-color: var(--rail-read);
   display: grid;
@@ -732,7 +689,6 @@ body {
 }
 .chan-row--expanded .chan-row__expand { display: flex; }
 
-/* §9.2 CHAN-FORM -------------------------------------------------------- */
 .chan-form {
   display: flex;
   flex-direction: column;
@@ -818,7 +774,6 @@ body {
   color: var(--copad-bg);
 }
 
-/* §9.3 CHAN-BOTRPC ------------------------------------------------------ */
 .chan-botrpc {
   display: none;
   flex-direction: column;
@@ -837,7 +792,6 @@ body {
   font-weight: 600;
 }
 
-/* §10 COMPOSER ---------------------------------------------------------- */
 .slack-composer {
   display: flex;
   flex-direction: column;
@@ -954,7 +908,6 @@ body {
 }
 .slack-card__expand .slack-composer__channel { width: 100px; }
 
-/* §11 TOAST ------------------------------------------------------------- */
 .slack-toast {
   position: fixed;
   top: 12px;
@@ -988,7 +941,6 @@ body {
 }
 .slack-toast__msg { word-break: break-word; }
 
-/* §12 SETUP ------------------------------------------------------------- */
 .slack-setup {
   flex: 1;
   min-height: 0;
@@ -1078,7 +1030,6 @@ body {
   color: var(--copad-subtext0);
 }
 
-/* §13 MOTION ------------------------------------------------------------ */
 @keyframes signalPulse {
   0%   { box-shadow: 0 0 0 0    color-mix(in oklab, var(--slack-ok) 60%, transparent); }
   70%  { box-shadow: 0 0 0 6px  color-mix(in oklab, var(--slack-ok)  0%, transparent); }
@@ -1097,7 +1048,6 @@ body {
   .slack-card:hover { transform: none; }
 }
 
-/* §14 UTIL -------------------------------------------------------------- */
 .visually-hidden {
   position: absolute !important;
   width: 1px; height: 1px;
@@ -1135,7 +1085,6 @@ body {
     </button>
   </nav>
 
-  <!-- Feed sub-filter (visible only when tab=feed) -->
   <nav class="slack-filter" id="filter" role="tablist" hidden>
     <button class="slack-filter__chip" data-filter="all" type="button" role="tab">
       ALL<span class="slack-filter__count" data-count="all"> 0</span>
@@ -1151,7 +1100,6 @@ body {
     </button>
   </nav>
 
-  <!-- Channel add row (visible only when tab=channels) -->
   <form class="chan-add" id="chan-add" hidden>
     <input class="chan-add__input" id="chan-add-id" type="text"
            placeholder="C01ABC… (channel id)" spellcheck="false"
@@ -1193,18 +1141,8 @@ body {
 <script>
 'use strict';
 
-/* ========================================================================
-   slack/panel.html — JS
-   Two internal views: FEED (event log) and CHANNELS (registry). The tab
-   strip toggles visibility — both are mounted, only one is rendered into.
-   ----------------------------------------------------------------------
-   localStorage keys:
-     * slack-tab               "feed"|"channels"  (active view)
-     * slack-filter            feed sub-filter
-     * slack-expanded          feed cards expanded
-     * slack-channels-expanded channel rows expanded
-     * slack-composer-draft    composer text
-   ======================================================================== */
+/* localStorage keys: slack-tab ("feed"|"channels"), slack-filter, slack-expanded,
+   slack-channels-expanded, slack-composer-draft. */
 
 const LS = {
   tab:       'slack-tab',
@@ -1242,7 +1180,6 @@ function safeJSON(s) { try { return JSON.parse(s); } catch { return null; } }
 function persistExpanded()  { localStorage.setItem(LS.expanded, JSON.stringify([...state.expanded])); }
 function persistChanExp()   { localStorage.setItem(LS.chanExp,  JSON.stringify([...state.chanExpanded])); }
 
-/* DOM refs ------------------------------------------------------------- */
 const $ = (id) => document.getElementById(id);
 const dom = {
   shell:     document.querySelector('.slack-shell'),
@@ -1297,7 +1234,6 @@ function relTimeMs(unixMs) {
   return `${Math.floor(sec / 86400)}d ago`;
 }
 
-/* Auth + channels refresh --------------------------------------------- */
 async function refreshAll() {
   dom.refresh.disabled = true;
   try {
@@ -1400,7 +1336,6 @@ function renderTabsCounts() {
   });
 }
 
-/* §12 SETUP render ----------------------------------------------------- */
 function renderTransportError() {
   const e = state.authError;
   dom.main.className = 'slack-setup';
@@ -1447,7 +1382,6 @@ function renderSetup() {
   `;
 }
 
-/* §7 FEED render ------------------------------------------------------- */
 function renderFeed() {
   dom.main.className = 'slack-feed';
   const filtered = state.events.filter(matchesFilter);
@@ -1548,7 +1482,6 @@ function renderCard(ev) {
     </article>`;
 }
 
-/* §9 CHANNELS render --------------------------------------------------- */
 function renderChannelsList() {
   dom.main.className = 'chan-list';
   if (state.channels.length === 0) {
@@ -1704,7 +1637,6 @@ function readChanDraft(form) {
   };
 }
 
-/* Event ingest --------------------------------------------------------- */
 function makeEventId(kind, payload) {
   if (payload.event_id) return `${kind}:${payload.event_id}`;
   return `${kind}:${payload.channel || '?'}:${payload.ts || Date.now()}`;
@@ -1738,7 +1670,6 @@ function scheduleRender() {
   });
 }
 
-/* Reaction body fetch -------------------------------------------------- */
 async function fetchReactionBody(channel, ts) {
   const key = `${channel}:${ts}`;
   if (state.bodies.has(key)) return;
@@ -1754,7 +1685,6 @@ async function fetchReactionBody(channel, ts) {
   scheduleRender();
 }
 
-/* Toast ---------------------------------------------------------------- */
 function toast(code, msg, opts = {}) {
   const el = document.createElement('div');
   el.className = `slack-toast__item${opts.ok ? ' slack-toast__item--ok' : ''}`;
@@ -1766,7 +1696,6 @@ function toast(code, msg, opts = {}) {
   setTimeout(() => el.remove(), opts.ttl || 4000);
 }
 
-/* Send (feed view) ----------------------------------------------------- */
 async function sendMessage(channel, text, threadTs, sourceEv) {
   if (!channel || !text.trim()) return;
   try {
@@ -1786,7 +1715,6 @@ async function sendMessage(channel, text, threadTs, sourceEv) {
   }
 }
 
-/* Wire up -------------------------------------------------------------- */
 function bindTabs() {
   dom.tabs.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-tab]');
@@ -1998,7 +1926,6 @@ function bindChannels() {
   });
 }
 
-/* §10 DISCOVER — workspace channel browser ----------------------------- */
 function renderDiscover() {
   if (!state.discoverOpen) {
     dom.chanDiscover.hidden = true;
@@ -2142,7 +2069,6 @@ function refreshRelTimes() {
   }
 }
 
-/* Init ----------------------------------------------------------------- */
 async function init() {
   bindHeader();
   bindTabs();

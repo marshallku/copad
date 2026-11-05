@@ -1,15 +1,11 @@
 //! Token persistence with two backends:
 //!
-//! - `KeyringStore` — OS-native secret store (Linux Secret Service /
-//!   macOS Keychain). Preferred. Failures during open are not fatal —
-//!   we fall through to plaintext unless `require_secure_store=true`.
-//! - `PlaintextStore` — JSON at `$XDG_CONFIG_HOME/copad/jira-token-<workspace>.json`,
-//!   mode 0600. Used only when keyring is unavailable AND
-//!   `require_secure_store=false`. Emits a stderr warning on every
-//!   open so the user notices.
-//!
-//! Both stores serialize the same `TokenSet` JSON. Identical structure
-//! to calendar/slack/discord — only the `TokenSet` fields differ.
+//! - `KeyringStore` — OS-native secret store (Linux Secret Service / macOS Keychain). Preferred.
+//!   Failures during open are not fatal: falls through to plaintext unless
+//!   `require_secure_store=true`.
+//! - `PlaintextStore` — JSON at `$XDG_CONFIG_HOME/copad/jira-token-<workspace>.json`, mode 0600.
+//!   Used only when keyring is unavailable AND `require_secure_store=false`. Warns on stderr on
+//!   every open.
 
 use std::fs;
 use std::io::Write;
@@ -35,7 +31,7 @@ pub struct TokenSet {
 pub trait TokenStore: Send + Sync {
     fn load(&self) -> Option<TokenSet>;
     fn save(&self, t: &TokenSet) -> Result<(), String>;
-    /// Test-only today; on the trait so a future `jira.logout` is uniform.
+    /// Test-only.
     #[allow(dead_code)]
     fn clear(&self) -> Result<(), String>;
     fn kind(&self) -> &'static str;
@@ -61,8 +57,6 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
     }
 }
 
-// -- Keyring backend --
-
 pub struct KeyringStore {
     entry: keyring::Entry,
 }
@@ -71,9 +65,8 @@ impl KeyringStore {
     pub fn open(workspace: &str) -> Result<Self, String> {
         let entry = keyring::Entry::new(KEYRING_SERVICE, workspace)
             .map_err(|e| format!("keyring entry: {e}"))?;
-        // Test that the underlying secret service is actually reachable
-        // by attempting a get; ignore "no entry" but bubble up real
-        // errors (e.g. D-Bus unavailable).
+        // Probe that the secret service is reachable; ignore "no entry", bubble up real errors
+        // (e.g. D-Bus unavailable).
         match entry.get_password() {
             Ok(_) => Ok(Self { entry }),
             Err(keyring::Error::NoEntry) => Ok(Self { entry }),
@@ -127,8 +120,6 @@ impl TokenStore for KeyringStore {
     }
 }
 
-// -- Plaintext fallback --
-
 pub struct PlaintextStore {
     path: PathBuf,
 }
@@ -145,12 +136,8 @@ impl TokenStore for PlaintextStore {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
-                // Distinguish unreadable-store failures (EACCES from
-                // a chmod race / EIO from disk trouble) from "no
-                // tokens yet" — both end up as not_authenticated,
-                // but the operator needs to know whether the cause
-                // is a credential gap or a broken store. Same posture
-                // as slack/discord's plaintext load.
+                // EACCES (chmod race) or EIO means a broken store, not missing tokens; both end
+                // up as not_authenticated, so say which one it is.
                 eprintln!(
                     "[jira] plaintext token store at {} could not be read \
                      (treating as not_authenticated, but the underlying issue \
@@ -214,8 +201,6 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     fs::rename(&tmp, path)
 }
-
-// -- Sentinel store for require_secure_store mode when keyring is broken --
 
 struct BrokenStore {
     reason: String,

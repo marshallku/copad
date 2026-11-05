@@ -1,19 +1,11 @@
-//! tmux shell-out surface for plugins/web-bridge (Slice 3.1).
+//! tmux shell-out surface for plugins/web-bridge: `list_panes` for overview cards, `capture_pane`
+//! for previews, and `send_text` for one-shot commands. Live attach spawns `tmux attach-session`
+//! in a portable_pty pair from the WS handler in `main.rs`.
 //!
-//! tmux is the primary data model for the dashboard: `list_panes` for
-//! the overview cards, `capture_pane` for per-pane previews, and
-//! `send_text` (via `load-buffer` + `paste-buffer`) for one-shot
-//! commands from overview mode. Live attach (xterm.js bidirectional)
-//! spawns `tmux attach-session` inside a portable_pty PTY pair from
-//! the WS handler in `main.rs`.
-//!
-//! `send_text` uses the same load-buffer/paste-buffer pattern as
-//! `copad-linux::socket::handle_claude_start` (socket.rs:1710). Going
-//! through a buffer makes multiline + ANSI / quoting safe;
-//! `send-keys -l` requires per-character escaping that's easy to get
-//! wrong. `paste-buffer -p` enables bracketed paste so the receiving
-//! shell can distinguish typed input from pasted blocks; `-d` deletes
-//! the buffer after paste so they don't pile up across calls.
+//! `send_text` uses load-buffer/paste-buffer like `copad-linux::socket::handle_claude_start`
+//! (socket.rs:1710): multiline, ANSI and quoting are safe, where `send-keys -l` needs fragile
+//! per-character escaping. `paste-buffer -p` enables bracketed paste so the shell can tell pasted
+//! blocks from typing; `-d` deletes the buffer so they do not pile up.
 
 use serde::Serialize;
 use std::io::Write;
@@ -28,16 +20,13 @@ pub struct TmuxPane {
     pub pane_id: String,
     pub pane_active: bool,
     pub cwd: String,
-    /// PID of the pane's foreground process group leader (the shell, or
-    /// whatever the user spawned in the pane). `None` only if tmux
-    /// emitted an empty string, which shouldn't happen in practice.
-    /// Used as the root for `find_descendant("claude" | "codex")`.
+    /// PID of the pane's foreground process group leader; `None` only if tmux emitted an empty
+    /// string.
+    /// Root for `find_descendant("claude" | "codex")`.
     pub pane_pid: Option<u32>,
 }
 
-/// `tmux list-panes -a -F …` — all panes across all sessions in one
-/// shell-out. Returns `Ok(vec![])` when no tmux server is running so
-/// callers don't have to special-case the empty-overview path.
+/// `tmux list-panes -a -F ...`: all panes in one shell-out. `Ok(vec![])` when no tmux server runs.
 pub fn list_panes() -> Result<Vec<TmuxPane>, String> {
     let out = Command::new("tmux")
         .args([
@@ -72,9 +61,7 @@ pub fn parse_list_panes(stdout: &str) -> Vec<TmuxPane> {
             let pane_id = cols.next()?.to_string();
             let pane_active = cols.next()? == "1";
             let cwd = cols.next()?.to_string();
-            // pane_pid is best-effort — an empty or non-numeric value
-            // means we skip agent enrichment for this pane but keep the
-            // row so it still appears in the overview.
+            // Best-effort: a bad pid only skips agent enrichment; the row still appears.
             let pane_pid = cols.next().and_then(|s| s.parse::<u32>().ok());
             Some(TmuxPane {
                 session,
@@ -90,9 +77,8 @@ pub fn parse_list_panes(stdout: &str) -> Vec<TmuxPane> {
         .collect()
 }
 
-/// `tmux capture-pane -p -e -t <pane_id> -S -<last_n>` — last N lines
-/// of pane history with ANSI escapes preserved. `-e` keeps colors so
-/// the overview card can render them; the SPA strips on demand.
+/// `tmux capture-pane -p -e -t <pane_id> -S -<last_n>`: last N lines with ANSI escapes preserved
+/// (`-e`) so the card can render colors.
 pub fn capture_pane(pane_id: &str, last_n: u32) -> Result<String, String> {
     let out = Command::new("tmux")
         .args([
@@ -113,22 +99,13 @@ pub fn capture_pane(pane_id: &str, last_n: u32) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Safe arbitrary-text send via `load-buffer` (stdin) + `paste-buffer`, with a
-/// trailing newline delivered as a real Enter key so the command actually runs.
-///
-/// Mirrors `copad-linux::socket::handle_claude_start` (socket.rs:1710) —
-/// multiline / quoted / special-char input round-trips intact. But a trailing
-/// `\n` is the "submit": under bracketed paste (modern zsh/bash), a *pasted*
-/// `\n` is inserted literally and does NOT execute — the command just sits on
-/// the prompt. So split the final newline off, paste the body (bracketed for
-/// special-char safety), then send a real `Enter` KEY via `send-keys`, which
-/// submits regardless of bracketed-paste mode. Interior newlines (a genuine
-/// multi-line command) stay in the pasted body.
+/// Safe arbitrary-text send via `load-buffer` (stdin) + `paste-buffer`, with a trailing newline
+/// delivered as a real Enter key. Under bracketed paste (modern zsh/bash) a pasted `\n` is
+/// inserted literally and does not execute, so the final newline is split off, the body pasted,
+/// and `send-keys Enter` submits regardless of paste mode. Interior newlines stay in the body.
 pub fn send_text(target: &str, text: &str) -> Result<(), String> {
-    // Strip a single trailing line terminator as the submit. Try `\r\n` first
-    // (web clients / Windows line endings send CRLF) so a stray `\r` isn't
-    // pasted before Enter; then bare `\n`. Interior / lone `\r` bytes stay in
-    // the body.
+    // Strip one trailing line terminator as the submit, `\r\n` first so web clients' CRLF does not
+    // paste a stray `\r`, then bare `\n`. Interior / lone `\r` bytes stay in the body.
     let (body, submit) = if let Some(rest) = text.strip_suffix("\r\n") {
         (rest, true)
     } else if let Some(rest) = text.strip_suffix('\n') {
@@ -177,9 +154,8 @@ pub fn send_text(target: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve the session name a given `pane_id` (`%N`) belongs to, by
-/// scanning a `list_panes` result. Used by the attach WS handler to
-/// invoke `tmux attach-session -t <session>` + `select-pane -t %N`.
+/// Find the pane for a `pane_id` (`%N`) in a `list_panes` result, so the attach WS handler can
+/// run `tmux attach-session -t <session>` + `select-pane -t %N`.
 pub fn find_pane<'a>(panes: &'a [TmuxPane], pane_id: &str) -> Option<&'a TmuxPane> {
     panes.iter().find(|p| p.pane_id == pane_id)
 }
@@ -215,8 +191,7 @@ mod tests {
 
     #[test]
     fn parse_list_panes_skips_malformed_lines() {
-        // Missing required columns up to and including cwd — drop the
-        // row. A missing trailing pid is tolerated (becomes None).
+        // Missing columns up to cwd drop the row; a missing trailing pid is tolerated (None).
         let sample = "ok\t@0\t0\tn\t%0\t1\t/a\t111\n\
                      bad\t@1\t1\tn\t%1\t1\n\
                      ok2\t@2\t2\tn\t%2\t0\t/b\t222\n";
@@ -230,8 +205,7 @@ mod tests {
 
     #[test]
     fn parse_list_panes_missing_pane_pid_column_tolerated() {
-        // Old-format rows without the trailing pid column still parse;
-        // pane_pid is None and downstream agent enrichment skips them.
+        // Old-format rows without the pid column still parse with pane_pid None.
         let sample = "s\t@0\t0\tn\t%0\t1\t/a\n";
         let panes = parse_list_panes(sample);
         assert_eq!(panes.len(), 1);
@@ -240,7 +214,6 @@ mod tests {
 
     #[test]
     fn parse_list_panes_session_name_with_spaces() {
-        // session_name can contain spaces; tab-separation must survive.
         let sample = "my session\t@0\t0\tw\t%0\t1\t/home\t99\n";
         let panes = parse_list_panes(sample);
         assert_eq!(panes.len(), 1);

@@ -1,28 +1,14 @@
 //! First-party bookmark service plugin for copad.
 //!
-//! Captures URLs into `~/docs/bookmarks/YYYY-MM/<urlhash8>-<slug>.md`,
-//! one file per bookmark, frontmatter-headed Markdown. Filesystem is
-//! the source of truth — there is NO on-disk index. `bookmark.list`
-//! re-derives by walking the tree, mirroring the kb/todo plugin
-//! pattern. Vim/git-edit safe.
+//! Captures URLs into `~/docs/bookmarks/YYYY-MM/<urlhash8>-<slug>.md`, one frontmatter-headed
+//! Markdown file per bookmark. The filesystem is the source of truth with no on-disk index:
+//! `bookmark.list` walks the tree (as the kb/todo plugins do), so vim/git edits are safe.
 //!
-//! BM-1 surface (this crate, today):
-//! - `bookmark.add`     — canonicalize URL, dedup by urlhash8, write
-//!   queued stub (no fetch yet — BM-2 adds the worker).
-//! - `bookmark.list`    — walk tree, optional filters.
-//! - `bookmark.show`    — read by id-prefix or url.
-//! - `bookmark.delete`  — unlink by id-prefix or url.
+//! Actions: `bookmark.add` (canonicalize URL, dedup by urlhash8, write a queued stub, no fetch),
+//! `bookmark.list` (optional filters), `bookmark.show` and `bookmark.delete` (by id-prefix or url).
 //!
-//! Out of scope for BM-1 (see roadmap):
-//! - BM-2: async fetch + readability extraction + status transitions.
-//! - BM-3: keyword-based linker writing `linked_kb` frontmatter.
-//! - BM-4: HTML panel.
-//! - BM-5: harness `/bookmark` slash skill + offline inbox drain.
-//!
-//! Unix-only (Linux + macOS); path-safety primitives mirror
-//! `copad-plugin-kb` (canonicalize root + re-validate every resolved
-//! path). The atomic-create-or-fail rename routes through
-//! `copad_core::fs_atomic` so the per-OS syscall lives in one place.
+//! Unix-only. Path-safety mirrors `copad-plugin-kb` (canonicalize root, re-validate every
+//! resolved path); the atomic create-or-fail rename goes through `copad_core::fs_atomic`.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
@@ -65,8 +51,7 @@ fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    // Single writer thread so action replies and (future) notifications
-    // never interleave bytes — same shape as kb/todo.
+    // Single writer thread so replies and notifications never interleave bytes, as in kb/todo.
     let (tx, rx) = channel::<String>();
     let writer_tx = tx.clone();
     thread::spawn(move || {
@@ -141,9 +126,7 @@ fn handle_frame(bookmark: &Bookmark, frame: &Value, tx: &Sender<String>) {
                 Err((code, msg)) => send_error(tx, id, code, &msg),
             }
         }
-        "event.dispatch" => {
-            // bookmark plugin doesn't subscribe to anything in BM-1.
-        }
+        "event.dispatch" => {}
         "shutdown" => std::process::exit(0),
         other if !other.is_empty() && !id.is_empty() => {
             send_error(

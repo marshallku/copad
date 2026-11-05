@@ -7,16 +7,13 @@
 //!   inbox/                         # BM-5: offline drain destination
 //! ```
 //!
-//! The filesystem is the source of truth. There is no on-disk index;
-//! `list` walks the tree on every call. (Personal scale, todos plugin
-//! does the same.) If perf becomes a problem we'll add an in-memory
-//! cache invalidated by a watcher — same infra as copad-plugin-todo.
+//! The filesystem is the source of truth. There is no on-disk index; `list` walks the tree on
+//! every call (personal scale, as the todos plugin does).
 //!
 //! Path-safety contract (mirrors copad-plugin-kb / copad-plugin-todo):
 //! - Root is canonicalized at construction.
-//! - Every resolved path is re-canonicalized and checked to start
-//!   with `root_canonical` before being surfaced — defeats a symlink
-//!   inside the root that points outside.
+//! - Every resolved path is re-canonicalized and checked to start with `root_canonical` before
+//!   being surfaced, which defeats a symlink inside the root that points outside.
 //! - Hidden directories (`.foo`) are skipped during walk.
 
 use std::fs;
@@ -56,8 +53,6 @@ impl StoreError {
     }
 }
 
-/// A bookmark as it lives on disk: parsed frontmatter + body + the
-/// 8-char id derived from the filename prefix.
 #[derive(Debug, Clone)]
 pub struct Match {
     pub id: String,
@@ -98,9 +93,6 @@ impl Store {
         }
     }
 
-    /// Walks `YYYY-MM/*.md`. Files without valid frontmatter or without
-    /// a `url` field are silently skipped so a stray hand-written note
-    /// can't crash list. Hidden dirs skipped.
     pub fn list_all(&self) -> Vec<Match> {
         let mut out = Vec::new();
         let mut paths = Vec::new();
@@ -110,13 +102,9 @@ impl Store {
                 out.push(m);
             }
         }
-        // Newest first. `captured_at` is RFC3339 and may carry mixed
-        // timezone offsets across machines / hand-edits, so a raw
-        // string compare is not chronology-preserving (`...Z` vs
-        // `...+09:00` for the same instant). Parse to `DateTime` so
-        // the sort key is the actual instant. Unparseable values
-        // (hand-edited mistakes) sink to the bottom — better than
-        // letting them pollute the top of the list.
+        // Newest first. `captured_at` is RFC3339 and may carry mixed offsets, so a raw string
+        // compare is not chronology-preserving (`...Z` vs `...+09:00`); sort on the parsed
+        // instant. Unparseable values (hand-edits) sink to the bottom.
         out.sort_by(|a, b| {
             let pa = DateTime::<FixedOffset>::parse_from_rfc3339(&a.captured_at).ok();
             let pb = DateTime::<FixedOffset>::parse_from_rfc3339(&b.captured_at).ok();
@@ -139,7 +127,6 @@ impl Store {
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            // Skip hidden entries (.git, .copad-cache, .DS_Store).
             if name_str.starts_with('.') {
                 continue;
             }
@@ -147,8 +134,8 @@ impl Store {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            // Don't descend into symlinks even if their target is inside
-            // root — we'd lose the path-safety invariant.
+            // Don't descend into symlinks even if their target is inside root: it would lose the
+            // path-safety invariant.
             if file_type.is_dir() {
                 self.collect_md_files(&path, out);
             } else if file_type.is_file()
@@ -188,8 +175,6 @@ impl Store {
         })
     }
 
-    /// Read the full file (frontmatter + body) for a path that we've
-    /// already validated as ours. Returns the parsed frontmatter and body.
     pub fn read_full(&self, path: &Path) -> Result<(Frontmatter, String), StoreError> {
         if !self.within_root(path) {
             return Err(StoreError::NotFound(format!(
@@ -203,8 +188,6 @@ impl Store {
         Ok((fm, body.to_string()))
     }
 
-    /// Resolve a user-supplied id (may be a prefix of urlhash8) to a
-    /// concrete match. Errors with the candidate list when ambiguous.
     pub fn find_by_id(&self, id_prefix: &str) -> Result<Match, StoreError> {
         let id_prefix = id_prefix.trim();
         if id_prefix.is_empty() {
@@ -230,16 +213,13 @@ impl Store {
         }
     }
 
-    /// Used after canonicalization to detect re-add. Returns the most
-    /// recent match (`list_all` is newest-first) when duplicate hashes
-    /// somehow exist.
+    /// Used after canonicalization to detect re-add. Returns the most recent match if duplicate
+    /// hashes somehow exist.
     pub fn find_by_urlhash(&self, urlhash8: &str) -> Option<Match> {
         let target = urlhash8.to_ascii_lowercase();
         self.list_all().into_iter().find(|m| m.id == target)
     }
 
-    /// Atomic create. If a file with the same `urlhash8` already exists
-    /// anywhere under root, returns `CreateOutcome::Existed` instead.
     pub fn create(&self, req: CreateRequest<'_>) -> Result<CreateOutcome, StoreError> {
         if let Some(existing) = self.find_by_urlhash(req.urlhash8) {
             return Ok(CreateOutcome::Existed(existing));
@@ -267,24 +247,18 @@ impl Store {
 
         match atomic_write_new(&final_path, rendered.as_bytes()) {
             Ok(()) => {
-                // Re-read so the surfaced Match reflects what landed on
-                // disk — and the path-safety re-check fires.
+                // Re-read so the surfaced Match reflects what landed on disk (and the path-safety
+                // re-check fires).
                 let m = self
                     .read_match(&final_path)
                     .ok_or_else(|| StoreError::Io("post-write re-read failed".into()))?;
                 Ok(CreateOutcome::Created(m))
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // Lost the race: another writer (concurrent process or
-                // thread that also passed `find_by_urlhash` before us)
-                // created the same file between our dedup check and the
-                // `renameat2(RENAME_NOREPLACE)`. Re-run the dedup lookup
-                // — if the winner was a bookmark.add for the same URL,
-                // we now find it and report Existed for idempotent
-                // behavior. If the path was occupied by something
-                // foreign (a manually created file with our slug
-                // pattern but a different URL inside), we surface that
-                // explicitly rather than silently overwriting.
+                // Lost the race: another writer created the same file between our dedup check and
+                // the `renameat2(RENAME_NOREPLACE)`. Re-run the dedup lookup: a concurrent
+                // bookmark.add for the same URL is found and reported as Existed (idempotent). A
+                // foreign file (our slug pattern, different URL) is surfaced, not overwritten.
                 match self.find_by_urlhash(req.urlhash8) {
                     Some(existing) => Ok(CreateOutcome::Existed(existing)),
                     None => Err(StoreError::Io(format!(
@@ -320,8 +294,8 @@ pub enum CreateOutcome {
     Existed(Match),
 }
 
-/// Inputs to [`Store::create`] bundled as a struct so the call site
-/// stays readable and clippy's `too_many_arguments` is happy.
+/// Inputs to [`Store::create`], bundled to keep the call site readable and satisfy clippy's
+/// `too_many_arguments`.
 pub struct CreateRequest<'a> {
     pub urlhash8: &'a str,
     pub slug: &'a str,
@@ -359,8 +333,6 @@ pub fn slug(input: &str) -> String {
     }
 }
 
-/// Extract id (8-char urlhash) from a filename of the form
-/// `<urlhash8>-<slug>.md`.
 fn id_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem().and_then(|s| s.to_str())?;
     let prefix = stem.split('-').next()?;
@@ -371,11 +343,9 @@ fn id_from_filename(path: &Path) -> Option<String> {
     }
 }
 
-/// Same-directory temp + `copad_core::fs_atomic::rename_no_replace`
-/// (matching todo/kb). POSIX `rename(2)` alone replaces atomically —
-/// the kernel's "fail if destination exists" flag is what keeps the
-/// no-replace contract honest against the race between the caller's
-/// dedup check and this write.
+/// Same-directory temp + `copad_core::fs_atomic::rename_no_replace` (as todo/kb). POSIX
+/// `rename(2)` alone replaces; the kernel's fail-if-exists flag keeps the no-replace contract
+/// against the race between the caller's dedup check and this write.
 fn atomic_write_new(final_path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = final_path
         .parent()
@@ -444,7 +414,6 @@ mod tests {
     fn slug_truncates_chars_not_bytes() {
         let long_emoji = "café".repeat(50);
         let s = slug(&long_emoji);
-        // <= 60 chars (each "café" is 4 chars).
         assert!(s.chars().count() <= 60);
     }
 
@@ -595,37 +564,23 @@ mod tests {
 
     #[test]
     fn atomic_write_new_refuses_existing_target() {
-        // Regression test for the no-replace contract: even if a file
-        // somehow appears at the target path between dedup check and
-        // write, `renameat2(RENAME_NOREPLACE)` must refuse to overwrite
-        // it. Plain `fs::rename` would silently replace.
+        // No-replace contract: a file appearing at the target between dedup check and write must
+        // not be overwritten (plain `fs::rename` would replace it).
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("dest.md");
         fs::write(&target, b"existing user content").unwrap();
         let err = atomic_write_new(&target, b"new content").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-        // Existing content unchanged.
         assert_eq!(fs::read(&target).unwrap(), b"existing user content");
     }
 
     #[test]
     fn create_recovers_with_foreign_file_error_on_target_collision() {
-        // Reach the post-write recovery branch (`atomic_write_new`
-        // returned `AlreadyExists`) by pre-creating an unparseable
-        // file at the exact target path. Because the file lacks valid
-        // bookmark frontmatter, `find_by_urlhash` returns None → the
-        // pre-write dedup short-circuit doesn't catch it → create()
-        // proceeds to atomic_write_new → `renameat2(NOREPLACE)` errors
-        // EEXIST → the recovery branch re-runs find_by_urlhash → still
-        // None (file isn't a valid bookmark) → we surface the
-        // "foreign file" error rather than silently overwriting.
-        //
-        // The sibling Existed-on-race branch (concurrent valid
-        // writer) is only reachable under genuine concurrency between
-        // dedup and rename; reasoned about in the recovery comment in
-        // create(), not unit-tested because deterministic single-
-        // threaded simulation isn't possible — find_by_urlhash always
-        // catches a pre-existing valid bookmark before the write.
+        // Reaches the post-write recovery branch (`atomic_write_new` returned `AlreadyExists`) by
+        // pre-creating an unparseable file at the exact target path. `find_by_urlhash` finds no
+        // valid bookmark both before and after the write, so create() must surface the "foreign
+        // file" error instead of overwriting. The Existed-on-race branch needs real concurrency
+        // and is not unit-testable.
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path().to_path_buf()).unwrap();
         let now = Local::now();
@@ -648,7 +603,6 @@ mod tests {
         let (code, msg) = err.code_message();
         assert_eq!(code, "io_error");
         assert!(msg.contains("foreign file"), "got: {msg}");
-        // Pre-existing content must be untouched.
         assert_eq!(fs::read(&path).unwrap(), b"not a bookmark, no frontmatter");
     }
 }

@@ -1,5 +1,5 @@
-// Exercise the REAL enterMux/teardownMux/muxPreflight from the file against a fake api(),
-// reproducing the Back-then-Forward-while-pending sequence codex found.
+// Exercise the real enterMux/teardownMux/muxPreflight against a fake api(), including
+// Back-then-Forward while a preflight is pending.
 import fs from "fs";
 const src0 = fs.readFileSync(new URL("../static/app.js", import.meta.url), "utf8");
 const grab = (re) => { const m = src0.match(re); if (!m) throw new Error("not found: " + re); return m[0]; };
@@ -22,8 +22,8 @@ const history = { state: null, pushState(s) { this.state = s; }, back() {} };
 let polls = { start: 0, stop: 0 };
 const startBoardPolling = () => { polls.start++; };
 const stopBoardPolling = () => { polls.stop++; };
-// The input layer's own teardown. Counted rather than stubbed away: every dispose MUST invalidate
-// it, or a queued chord from the previous attach drains into the replacement socket.
+// The input layer's teardown is counted, not stubbed: every dispose must invalidate it, or a queued
+// chord from the previous attach drains into the replacement socket.
 let resets = 0;
 const resetIme = () => { resets++; };
 const fn = new Function("state", "api", "render", "history", "startBoardPolling", "stopBoardPolling",

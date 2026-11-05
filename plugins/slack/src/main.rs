@@ -208,9 +208,8 @@ fn run_rpc() {
             }
             socket_mode::run_loop(&cfg, store_for_loop, &stop, |event| {
                 // Route to collect/bot_rpc before the firehose publish so a slow listener cannot
-                // delay disk
-                // writes or response matching. Errors log but never suppress the event.publish
-                // frame.
+                // delay disk writes or response matching. Errors log but never suppress the
+                // event.publish frame.
                 route_for_collect_and_bot_rpc(
                     &event,
                     &channels_for_loop,
@@ -953,8 +952,7 @@ fn handle_get_message(
         // Slack errors are either a bare code (`channel_not_found`, `missing_scope`) or prefix +
         // suffix
         // (`rate_limited (Retry-After: 30)`). A prefix that is lowercase + underscore only becomes
-        // the
-        // top-level error code; transport-shaped messages stay `io_error` with the full body.
+        // the top-level error code; transport-shaped messages stay `io_error` with the full body.
         Err(err) => {
             let bare = err
                 .split(|c: char| c.is_whitespace() || c == '(')

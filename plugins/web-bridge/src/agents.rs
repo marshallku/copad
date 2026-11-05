@@ -1,23 +1,12 @@
-//! Shell-out to `tmx agents --json` for the agent + attention +
-//! codex-job snapshot. tmx ≥ 1.1 is the source of truth; we just parse
-//! its JSON and surface what the dashboard needs.
+//! Shell-out to `tmx agents --json` for the agent + attention + codex-job snapshot (tmx >= 1.1).
 //!
-//! Why a shell-out instead of inline:
-//!   * Single source of truth — tmx's Claude/Codex classification,
-//!     process-tree walk, zombie filtering, repo-marker scanning,
-//!     attention queue parsing AND codex-companion job reading all live
-//!     in one project and evolve together. Re-implementing them here
-//!     would drift (the codex reader WAS duplicated here until tmx 1.1
-//!     exposed structured `codex_jobs`).
-//!   * No `~/.claude/sessions/*.json` schema coupling — when Claude
-//!     renames a field, tmx absorbs the breakage and we get an
-//!     unchanged JSON shape.
+//! Shelled out rather than inlined so tmx stays the single source of truth for Claude/Codex
+//! classification, process-tree walk, attention parsing and codex job reading, which evolve
+//! together, and so this plugin is not coupled to the `~/.claude/sessions/*.json` schema.
 //!
-//! On `tmx` not installed / not on PATH: `read_snapshot` returns
-//! `Err`; callers degrade gracefully (panes still render from
-//! `tmux list-panes`, agent enrichment + attention strip simply
-//! show empty). A pre-1.1 tmx parses fine — `codex_jobs` defaults
-//! to empty.
+//! With `tmx` missing, `read_snapshot` returns `Err` and callers degrade: panes still render from
+//! `tmux list-panes`, and enrichment simply shows empty. A pre-1.1 tmx parses fine, with
+//! `codex_jobs` defaulting to empty.
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
@@ -32,8 +21,7 @@ pub struct TmxSnapshot {
     pub global_blocked: u32,
     #[serde(default)]
     pub captured_at_ms: i64,
-    /// Structured codex-companion background jobs, emitted by tmx ≥ 1.1
-    /// (alive-filtered there: PID liveness + updatedAt freshness).
+    /// Structured codex-companion background jobs from tmx >= 1.1 (alive-filtered there).
     #[serde(default)]
     pub codex_jobs: Vec<CodexJob>,
 }
@@ -41,15 +29,13 @@ pub struct TmxSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
-    /// `None` for non-pane rows — tmx emits codex background jobs into
-    /// `agents[]` with `"pane": null`. A required field here used to
-    /// fail the WHOLE snapshot parse whenever a codex job was live.
+    /// `None` for non-pane rows: tmx emits codex background jobs into `agents[]` with `"pane":
+    /// null`, and a required field here failed the whole snapshot parse while one was live.
     pub pane: Option<AgentPane>,
-    /// `claude` / `codex` / `shell` / `other`. tmx classifies — we
-    /// just relay so the SPA can color cards or filter.
+    /// `claude` / `codex` / `shell` / `other`, as classified by tmx.
     pub kind: String,
-    /// `ready` / `busy` / `waiting` / `idle` / `unknown`. tmx's
-    /// vocabulary; SPA maps to pill colors.
+    /// `ready` / `busy` / `waiting` / `idle` / `unknown`: tmx's vocabulary; the SPA maps it to
+    /// pill colors.
     pub status: String,
     #[serde(default)]
     pub cwd: String,
@@ -57,7 +43,6 @@ pub struct Agent {
     pub repo_name: String,
     #[serde(default)]
     pub flags: AgentFlags,
-    /// Free-text extra (e.g. "pid 12345"); for display only.
     #[serde(default)]
     pub extra: String,
 }
@@ -67,10 +52,8 @@ pub struct AgentPane {
     pub session: String,
     pub window: u32,
     pub pane: u32,
-    /// Pane PID = what `tmux list-panes -F '#{pane_pid}'` would
-    /// return. We join on this when matching tmx agents back to our
-    /// own `tmux list-panes` results, since tmx doesn't emit `%N`
-    /// pane ids.
+    /// Pane PID, as `tmux list-panes -F '#{pane_pid}'` returns. Joined on this when matching tmx
+    /// agents to our own pane list, since tmx does not emit `%N` pane ids.
     #[serde(default)]
     pub pane_pid: Option<u32>,
 }
@@ -104,9 +87,7 @@ pub struct Attention {
     pub tmux_session: String,
 }
 
-/// codex-companion background job, as emitted by tmx ≥ 1.1's
-/// `codex_jobs` (already alive-filtered + newest-first there).
-/// Surfaced in the overview as its own card section.
+/// codex-companion background job from tmx >= 1.1's `codex_jobs` (alive-filtered, newest-first).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexJob {
     pub id: String,
@@ -126,16 +107,9 @@ pub struct CodexJob {
     pub pid: Option<u32>,
 }
 
-/// Shell out to `tmx agents --json` and parse the snapshot. Returns
-/// `Err` if tmx is missing, the call fails, or the JSON doesn't
-/// parse — caller treats this as "agent enrichment unavailable" and
-/// degrades to plain pane rendering.
-///
-/// systemd user units start with a stripped PATH that often omits
-/// `~/.local/bin` and `~/.cargo/bin` — the two places `tmx` is
-/// typically installed. We try the PATH lookup first, then fall back
-/// to those candidate paths so the plugin works without the user
-/// having to edit their user unit's environment.
+/// Shell out to `tmx agents --json` and parse the snapshot. `Err` (tmx missing, call failed,
+/// unparsable JSON) means "enrichment unavailable". systemd user units start with a stripped PATH
+/// that often omits `~/.local/bin` and `~/.cargo/bin`, so PATH is tried first, then those paths.
 pub fn read_snapshot() -> Result<TmxSnapshot, String> {
     let mut candidates: Vec<String> = vec!["tmx".to_string()];
     if let Some(home) = dirs::home_dir() {
@@ -164,9 +138,6 @@ fn parse_snapshot(bytes: &[u8]) -> Result<TmxSnapshot, String> {
 }
 
 impl TmxSnapshot {
-    /// O(N) lookup of an agent by the pane PID it was observed
-    /// running in. Returns the first match — there shouldn't ever be
-    /// duplicates since `pane_pid` is unique per pane.
     pub fn agent_for_pane_pid(&self, pid: u32) -> Option<&Agent> {
         self.agents
             .iter()
@@ -178,11 +149,8 @@ impl TmxSnapshot {
 mod tests {
     use super::*;
 
-    /// Captured from live `tmx agents --json` (tmx 1.1, 2026-06-12).
-    /// Uses the real vocabulary and top-level fields, including a codex
-    /// background row in `agents[]` with `"pane": null` (which used to
-    /// fail the whole parse when `Agent.pane` was required) and the
-    /// structured `codex_jobs` array.
+    /// Captured from live `tmx agents --json` (tmx 1.1, 2026-06-12), including a codex background
+    /// row with `"pane": null` and the structured `codex_jobs` array.
     const SAMPLE: &str = r#"{
         "agents": [
             {
@@ -254,12 +222,11 @@ mod tests {
         assert_eq!(pane.pane, 0);
         assert_eq!(pane.pane_pid, Some(99));
 
-        // Codex background row: pane is null, must not fail the parse.
+        // Codex background row: pane is null and must not fail the parse.
         let codex = &s.agents[2];
         assert_eq!(codex.kind, "codex");
         assert!(codex.pane.is_none());
 
-        // Structured codex_jobs from tmx ≥ 1.1.
         assert_eq!(s.codex_jobs.len(), 1);
         let job = &s.codex_jobs[0];
         assert_eq!(job.id, "task-e2e-1");
@@ -291,7 +258,6 @@ mod tests {
 
     #[test]
     fn parse_handles_missing_optional_top_keys() {
-        // Pre-1.1 tmx output has no codex_jobs key — must still parse.
         let minimal = r#"{"agents":[],"attention":[]}"#;
         let s = parse_snapshot(minimal.as_bytes()).expect("parses");
         assert!(s.agents.is_empty());
@@ -307,7 +273,6 @@ mod tests {
 
     #[test]
     fn parse_attention_required_ts_only() {
-        // ts is the only required attention field — rest default to "".
         let raw = r#"{"agents":[],"attention":[{"ts":42}]}"#;
         let s = parse_snapshot(raw.as_bytes()).unwrap();
         assert_eq!(s.attention.len(), 1);

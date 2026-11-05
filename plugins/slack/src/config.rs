@@ -1,15 +1,9 @@
 //! Env-based configuration for the Slack plugin.
 //!
-//! Two tokens are required:
-//! - `COPAD_SLACK_BOT_TOKEN` — `xoxb-...` Bot User OAuth Token. Used for
-//!   HTTP API calls (`auth.test` to validate, future `chat.postMessage`).
-//! - `COPAD_SLACK_APP_TOKEN` — `xapp-...` App-Level Token with
-//!   `connections:write` scope. Used by Socket Mode to open a
-//!   WebSocket without needing a public HTTPS endpoint.
-//!
-//! `COPAD_SLACK_WORKSPACE` is an optional namespacing label so a future
-//! multi-workspace copad can run multiple slack plugin instances. v1 reads
-//! one workspace at a time.
+//! Tokens: `COPAD_SLACK_BOT_TOKEN` (`xoxb-...`, HTTP API calls such as `auth.test`) and
+//! `COPAD_SLACK_APP_TOKEN` (`xapp-...` with `connections:write`, for Socket Mode without a
+//! public HTTPS endpoint). `COPAD_SLACK_WORKSPACE` is an optional namespacing label for
+//! multiple plugin instances; v1 reads one workspace at a time.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,44 +12,32 @@ use std::time::Duration;
 pub struct Config {
     pub bot_token: String,
     pub app_token: String,
-    /// Optional User OAuth Token (`xoxp-...`). Empty = bot-only mode.
     pub user_token: String,
     pub workspace_label: String,
     pub require_secure_store: bool,
-    /// On macOS, defaults to `false` because Keychain ACLs are bound to
-    /// the writing binary's code-signing identity (cdhash). Every dev
-    /// rebuild changes cdhash and a background plugin process can't
-    /// surface the resulting "Allow this app?" prompt — the probe just
-    /// hangs. Plaintext is the reliable default. Power users on stable
-    /// builds can set `COPAD_SLACK_USE_KEYCHAIN=1` to opt back in (and
-    /// pair it with `security add-generic-password -A` if they want a
-    /// permissive ACL). Defaults to `true` on Linux where the secret
-    /// service / GNOME-Keyring model handles this gracefully.
+    /// Defaults to `false` on macOS: Keychain ACLs are bound to the writing binary's cdhash, every
+    /// rebuild changes it, and a background plugin cannot surface the "Allow this app?" prompt, so
+    /// the probe hangs. Opt back in with `COPAD_SLACK_USE_KEYCHAIN=1` (optionally with
+    /// `security add-generic-password -A`). Defaults to `true` on Linux.
     pub use_keychain: bool,
     pub plaintext_path: PathBuf,
     pub channel_path: PathBuf,
-    /// Per-workspace root for collect-profile JSONL. Each registered
-    /// `collect` channel gets `<root>/<channel_id>.jsonl`. Lives under
-    /// XDG_DATA_HOME (not config) because messages are data, not config.
+    /// Per-workspace root for collect-profile JSONL (`<root>/<channel_id>.jsonl`), under
+    /// XDG_DATA_HOME since messages are data, not config.
     pub collect_dir: PathBuf,
-    /// Initial reconnect delay; exponential backoff up to `reconnect_max`.
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
-    /// Set on malformed env (bad token prefix, invalid workspace label,
-    /// malformed boolean). Distinct from "tokens missing" (OK — store
-    /// fallback). When set: Socket Mode refuses to connect and
-    /// `slack.auth_status` surfaces the message. Bad workspace would
-    /// steer plaintext writes outside the config dir; bad token prefix
-    /// is a user typo we must not mask with stored defaults.
+    /// Set on malformed env (bad token prefix, invalid workspace label, malformed boolean),
+    /// distinct from missing tokens (OK, store fallback). Socket Mode then refuses to connect and
+    /// `slack.auth_status` surfaces it. A bad workspace would steer plaintext writes outside the
+    /// config dir, and a bad prefix is a typo that stored defaults must not mask.
     pub fatal_error: Option<String>,
 }
 
 impl Config {
-    /// Token env vars are OPTIONAL — Socket Mode falls back to the
-    /// keyring-stored TokenSet, so one-time `auth` is enough. Env wins
-    /// when set (cross-workspace testing). Invalid prefix on a *present*
-    /// env token is still a hard error: a user typo must not be masked
-    /// by stored defaults.
+    /// Token env vars are optional: Socket Mode falls back to the keyring TokenSet, so one-time
+    /// `auth` suffices. Env wins when set. An invalid prefix on a present env token is still a hard
+    /// error.
     pub fn from_env() -> Result<Self, String> {
         let bot_token = std::env::var("COPAD_SLACK_BOT_TOKEN").unwrap_or_default();
         if !bot_token.is_empty() && !bot_token.starts_with("xoxb-") {
@@ -82,7 +64,6 @@ impl Config {
             std::env::var("COPAD_SLACK_WORKSPACE").unwrap_or_else(|_| "default".to_string());
         validate_workspace_label(&workspace_label)?;
         let require_secure_store = parse_bool("COPAD_SLACK_REQUIRE_SECURE_STORE", false)?;
-        // Platform-specific default — see field doc.
         #[cfg(target_os = "macos")]
         let use_keychain_default = false;
         #[cfg(not(target_os = "macos"))]
@@ -108,10 +89,9 @@ impl Config {
         })
     }
 
-    /// Builds a Config in fatal-error state so the supervisor
-    /// handshake still completes; token-using actions and Socket Mode
-    /// are no-ops. Carrying the message prevents silent fall-through
-    /// to `default`-workspace stored credentials.
+    /// A Config in fatal-error state so the handshake still completes; token-using actions and
+    /// Socket Mode are no-ops. Carrying the message prevents falling through to `default`-workspace
+    /// stored credentials.
     pub fn minimal_with_error(error: String) -> Self {
         Self {
             bot_token: String::new(),
@@ -129,15 +109,13 @@ impl Config {
         }
     }
 
-    /// Diagnostic surface only — Socket Mode also tries the store.
     pub fn env_tokens_empty(&self) -> bool {
         self.bot_token.is_empty() || self.app_token.is_empty()
     }
 }
 
-/// `[A-Za-z0-9_\-.@]+` minus reserved `.`/`..` — trust-boundary so
-/// the label can't escape the plaintext-store dir or collide with
-/// reserved keyring entries.
+/// `[A-Za-z0-9_\-.@]+` minus reserved `.`/`..`: a trust boundary so the label cannot escape the
+/// plaintext-store dir or collide with reserved keyring entries.
 pub fn validate_workspace_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("COPAD_SLACK_WORKSPACE: cannot be empty".to_string());
@@ -182,8 +160,7 @@ fn default_channel_path(workspace: &str) -> PathBuf {
         .join(format!("slack-channels-{workspace}.json"))
 }
 
-/// `~/.local/share/copad/slack-knowledge/<workspace>/`. Lives under
-/// XDG_DATA_HOME (not config) because captured messages are data.
+/// `~/.local/share/copad/slack-knowledge/<workspace>/`, under XDG_DATA_HOME since captured messages are data.
 fn default_collect_dir(workspace: &str) -> PathBuf {
     let base = data_home().unwrap_or_else(|| PathBuf::from("."));
     base.join("copad").join("slack-knowledge").join(workspace)

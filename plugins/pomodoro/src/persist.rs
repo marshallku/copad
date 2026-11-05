@@ -1,17 +1,12 @@
 //! Durable durations for the Pomodoro plugin.
 //!
-//! Only the *configuration* (work/break/long-break minutes + round count)
-//! is persisted — NOT the in-flight session. A daemon restart therefore
-//! comes back Idle, which avoids the whole class of stale-toast / wall-clock
-//! catch-up problems that restoring a live `ends_at` would introduce
-//! (decision: keep restart semantics trivially safe; live-session resume is
-//! a deliberate non-goal). copad has no config.toml writer, so this file is
-//! where a right-click "set minutes" change lands — the plugin owns it, the
-//! way the todo plugin owns its markdown files.
+//! Only the configuration (work/break/long-break minutes + round count) is persisted, not the
+//! in-flight session, so a daemon restart comes back Idle with no stale-toast or wall-clock
+//! catch-up problems. copad has no config.toml writer, so a right-click "set minutes" change lands
+//! here.
 //!
-//! Writes are atomic (temp in the same dir → fsync → rename over the
-//! target) and mode 0600. A missing or corrupt file silently falls back to
-//! defaults so a bad edit can never wedge startup.
+//! Writes are atomic (temp in the same dir, fsync, rename over the target) and mode 0600. A
+//! missing or corrupt file silently falls back to defaults so a bad edit can never wedge startup.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -44,14 +39,12 @@ struct Persisted {
     rounds_before_long: u32,
 }
 
-/// Load persisted durations, or [`Durations::default`] on any problem
-/// (absent file, unreadable, bad JSON, unknown version, out-of-range
-/// values). Never fails — startup must always proceed.
+/// Load persisted durations, or [`Durations::default`] on any problem. Never fails: startup must
+/// always proceed.
 pub fn load_durations() -> Durations {
     load_durations_from(&state_file_path())
 }
 
-/// Atomically persist durations (see [`save_durations_to`]).
 pub fn save_durations(d: &Durations) -> io::Result<()> {
     save_durations_to(&state_file_path(), d)
 }
@@ -95,8 +88,6 @@ fn load_durations_from(path: &Path) -> Durations {
     }
 }
 
-/// Atomically persist durations to `path`: write a sibling temp file, fsync
-/// it, then rename over the target (POSIX rename is atomic and replaces).
 fn save_durations_to(path: &Path, d: &Durations) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -138,9 +129,6 @@ fn save_durations_to(path: &Path, d: &Durations) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    // Each test owns a unique tempdir + path, passed directly to the
-    // path-injected core — no shared env var, so tests run in parallel
-    // without clobbering each other.
     fn temp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("copad-pomo-{}-{}", std::process::id(), name));
         let _ = fs::create_dir_all(&dir);

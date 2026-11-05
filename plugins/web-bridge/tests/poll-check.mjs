@@ -55,7 +55,7 @@ const check = (label, cond) => { results.push(cond); console.log(`  ${cond ? "ok
   check("a response that lands after leaving is dropped",
         !JSON.stringify(state.board).includes("ghost"));
 
-  // The fork codex found: restarting during an in-flight request used to leave TWO chains.
+  // Restarting during an in-flight request must not leave two polling chains.
   f.startBoardPolling(); await tick();
   const p2 = q.length ? 1 : 0;
   check("a restart during an in-flight request does not fork the loop", maxLive === 1);

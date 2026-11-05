@@ -8,7 +8,6 @@ const check = (l, c) => { results.push(!!c); console.log(`  ${c ? "ok  " : "FAIL
 
 const grab = (re) => { const m = src.match(re); if (!m) throw new Error("not found: " + re); return m[0]; };
 
-// --- the regression itself ---
 check("no touchstart handler cancels the synthesized click any more",
       !/addEventListener\("touchstart", *\(?e\)? *=> *e\.preventDefault/.test(src));
 check("every key bar button is activated through the shared touch+click path",
@@ -16,7 +15,6 @@ check("every key bar button is activated through the shared touch+click path",
 check("...including sticky Ctrl, which had its own handler",
       /onActivate\(document\.getElementById\("ctrl"\)/.test(src));
 
-// --- the tap machine, executed ---
 {
   const fns = [grab(/    const TAP_SLOP_PX = \d+;/),
                grab(/    const TAP_CLICK_SUPPRESS_MS = \d+;/),
@@ -40,7 +38,7 @@ check("...including sticky Ctrl, which had its own handler",
 
   g = tapGesture(TAP_SLOP_PX);
   g.start(t(100, 200), 1);
-  g.move(t(101, 201), 2);          // a second finger lands, possibly on another element
+  g.move(t(101, 201), 2);
   check("a second finger anywhere cancels the gesture", g.end(t(101, 201), 0) === false);
 
   g = tapGesture(TAP_SLOP_PX);
@@ -56,7 +54,6 @@ check("...including sticky Ctrl, which had its own handler",
   check("an ordinary mouse click still fires", shouldFireClick(10000, 0));
 }
 
-// --- the drag machine, executed ---
 {
   const fns = [grab(/    const TOUCH_AXIS_SLOP_PX = \d+;/),
                grab(/    function wheelSteps\([\s\S]*?\n    \}/),
@@ -71,8 +68,6 @@ check("...including sticky Ctrl, which had its own handler",
   check("a drag of three rows is three lines", wheelSteps(52, ROW).steps === 3);
   check("dragging the other way is negative", wheelSteps(-52, ROW).steps === -3);
 
-  // The defect: the movement that latched the axis used to be thrown away, so a gesture
-  // delivered as ONE big touchmove scrolled nothing.
   let g = scrollGesture(TOUCH_AXIS_SLOP_PX);
   g.start(t(200, 400), 1);
   check("one big move scrolls by everything it moved", g.move(t(200, 451), 1, ROW).steps === 3);
@@ -85,13 +80,13 @@ check("...including sticky Ctrl, which had its own handler",
 
   g = scrollGesture(TOUCH_AXIS_SLOP_PX);
   g.start(t(200, 400), 1);
-  g.move(t(260, 402), 1, ROW);                     // latched horizontal
+  g.move(t(260, 402), 1, ROW);
   check("a pan that later curves downward never starts scrolling",
         g.move(t(262, 500), 1, ROW) === null);
 
   g = scrollGesture(TOUCH_AXIS_SLOP_PX);
   g.start(t(200, 400), 1);
-  g.move(t(200, 460), 2, ROW);                     // a second finger joins
+  g.move(t(200, 460), 2, ROW);
   check("a second finger stops the drag emitting wheels",
         g.move(t(200, 520), 1, ROW) === null);
 
@@ -100,7 +95,6 @@ check("...including sticky Ctrl, which had its own handler",
   check("another finger's move is not this gesture's", g.move(t(200, 460, 8), 1, ROW) === null);
 }
 
-// --- the wheel we dispatch is the one xterm can act on ---
 check("the wheel is dispatched in LINE mode, so xterm's own row-height accumulator is not guessed at",
       /deltaMode: 1,/.test(src));
 check("...at the touch point, so comux knows which half was scrolled",

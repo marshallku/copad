@@ -1,14 +1,8 @@
-//! A live L0 subscription to the local comux server (decisions #166) — the board's primary
-//! data source.
-//!
-//! Before this, every `/api/board` poll forked `comux list-sessions` and `comux list-agents`
-//! (see [`crate::comux`]). The subscription keeps comux's own topic values in memory instead,
-//! so a poll is a read of the latest snapshot: no child, no socket round trip, and the values
-//! are the ones comux PUBLISHED rather than two samples taken at different instants.
-//!
-//! The CLI path stays as the fallback: while the link is down (no server yet, an older comux
-//! that does not speak L0, a restart in progress) the board reads exactly as it did before.
-//! The link reconnects on its own with a capped backoff.
+//! A live L0 subscription to the local comux server (decisions #166), the board's primary data
+//! source: a poll reads the latest published snapshot instead of forking `comux list-sessions` and
+//! `comux list-agents` ([`crate::comux`]). That CLI path stays as the fallback while the link is
+//! down (no server yet, an older comux without L0, a restart); the link reconnects on its own with
+//! a capped backoff.
 
 use copad_mux_proto::link::{Endpoint, Link, LinkEvent};
 use copad_mux_proto::{Applied, Model, PubMsg};
@@ -16,7 +10,6 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// What the board can read without touching comux.
 #[derive(Default)]
 pub struct Live {
     pub model: Model,
@@ -26,8 +19,7 @@ pub struct Live {
 
 pub type Shared = Arc<Mutex<Live>>;
 
-/// Start the background subscriber. Never returns an error: a missing server is the normal
-/// state of a freshly booted machine, and the board falls back to the CLI meanwhile.
+/// Never returns an error: a missing server is normal at boot, and the board falls back to the CLI.
 pub fn start() -> Shared {
     let shared: Shared = Arc::default();
     let s = shared.clone();
@@ -62,7 +54,7 @@ fn run(shared: Shared) {
         match opened {
             Ok(link) => {
                 backoff = Duration::from_secs(1);
-                let _ = rx.recv(); // until the stream closes
+                let _ = rx.recv();
                 drop(link);
             }
             Err(_) => backoff = (backoff * 2).min(Duration::from_secs(30)),
@@ -71,8 +63,8 @@ fn run(shared: Shared) {
     }
 }
 
-/// The board's `sessions` + `agents` arrays in the shape `/api/board` has always returned,
-/// built from the live model — `None` when the link is not synced (use the CLI instead).
+/// The board's `sessions` + `agents` arrays in the shape `/api/board` returns, built from the live
+/// model; `None` when the link is not synced (use the CLI instead).
 pub fn board(shared: &Shared) -> Option<(Value, Value)> {
     let live = shared.lock().ok()?;
     if !live.synced {

@@ -1,16 +1,8 @@
-//! Phase 22.3 — `copad-plugin-docs` binary scaffold.
-//!
-//! v1 ships as panel-only — the docs panel HTML is the entire
-//! user-facing surface, and every data call routes through the kb
-//! plugin's existing actions (`kb.search` / `kb.read` / `kb.list`).
-//! There is no service for this binary to register, so it exits
-//! immediately if launched as a service.
-//!
-//! The crate exists so future per-plugin services (e.g., a long-running
-//! frontmatter index cache once dn graph deltas surface as events) have
-//! a place to land without restructuring. Today, the panel-only path in
-//! `scripts/install-plugins.sh` recognizes the missing `[[services]]`
-//! block in `plugin.toml` and skips binary symlinking entirely.
+//! `copad-plugin-docs` binary scaffold. v1 is panel-only: the docs panel HTML is the whole
+//! surface and data calls go through the kb plugin's actions (`kb.search` / `kb.read` /
+//! `kb.list`), so there is no service to register and the binary exits if launched as one.
+//! `scripts/install-plugins.sh` sees the missing `[[services]]` block in `plugin.toml` and skips
+//! symlinking the binary.
 
 fn main() {
     eprintln!(

@@ -1,5 +1,4 @@
-// A board row must open the agent it names — the defect being fixed is that all 27 rows called
-// `enterMux()` with no target and therefore landed on whatever comux last focused.
+// A board row must open the agent it names, not whatever comux last focused.
 import fs from "fs";
 const src = fs.readFileSync(new URL("../static/app.js", import.meta.url), "utf8");
 const results = [];

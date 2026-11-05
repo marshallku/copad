@@ -195,8 +195,7 @@
         ? `<div class="row-detail">${escapeHtml(a.detail)}</div>` : "";
       const tool = hideTool ? "" : `<span class="row-tool">${escapeHtml(a.tool || "")}</span>`;
       // `blocked` and `working` are encoded by band, `ready` by a plain dot. Anything else prints
-      // its
-      // raw label: comux's `idle` also means "no recognized UI", and must not read as ready.
+      // its raw label: comux's `idle` also means "no recognized UI", and must not read as ready.
       const encoded = BOARD_ATTENTION.has(a.status) || BOARD_ACTIVE.has(a.status)
         || a.status === "ready";
       const status = encoded ? "" : `<span class="row-status">${escapeHtml(a.status || "?")}</span>`;
@@ -307,8 +306,7 @@
       try {
         // `api()` has no timeout. A request that never settles (lost signal) would leave
         // `boardInFlight` set forever and skip every later refresh. It is aborted rather than
-        // raced,
-        // since an abandoned request would overlap the next poll.
+        // raced, since an abandoned request would overlap the next poll.
         const ctl = new AbortController();
         deadline = setTimeout(() => ctl.abort(), 15000);
         const b = await api("/api/board", { signal: ctl.signal });
@@ -1102,18 +1100,17 @@
         }
         case "insertFromPaste": {
           // A textarea hands pasted text over on `e.data` with `dataTransfer` null; a
-          // contenteditable does
-          // the opposite. If neither carries it, do not cancel: the text lands in the strip and
+          // contenteditable does the opposite. If neither carries it, do not cancel: the text lands
+          // in the strip and
           // goes out
           // at the next boundary, losing the bracketing but not the paste.
           const text = e.data || e.dataTransfer?.getData("text") || "";
           if (!text) return;
           e.preventDefault();
           // term.paste, not write: it adds the bracketed-paste delimiters when the app asked for
-          // them, so
-          // a multi-line paste is editable instead of running line by line. It reports nothing
-          // back, so
-          // the socket is checked before handing over, and `text` rides along for retention.
+          // them, so a multi-line paste is editable instead of running line by line. It reports
+          // nothing back, so the socket is checked before handing over, and `text` rides along for
+          // retention.
           withOrder(() => {
             if (socketOpen()) {
               try { state.term?.paste(text); } catch { imeWriteFailed = true; }
@@ -1217,8 +1214,7 @@
     // A drag -> lines machine. Same ownership rules as `tapGesture`, plus an axis that latches once
     // past the slop so a curved drag does not switch between scrolling and panning. `move` returns
     // the whole-line steps, or `null` when the move is not ours (wrong or second finger, under
-    // slop,
-    // horizontal).
+    // slop, horizontal).
     function scrollGesture(slop) {
       let id = null, sx = 0, sy = 0, lastY = 0, rest = 0, axis = "";
       return {
@@ -1432,8 +1428,7 @@
       }
       muxGrid(fit, term);
       // repairFontMetrics refits to the raw viewport and would send a size below the floor;
-      // re-apply
-      // the floor and send the corrected size.
+      // re-apply the floor and send the corrected size.
       whenFontReady(term.options.fontSize, () => { repairFontMetrics({ sendResize: false }); sendMuxResize(); });
       // The symbol font changes no metrics (xterm measures the first family) but its glyphs only
       // appear once loaded, so nudge a repaint.
@@ -1512,11 +1507,10 @@
       state.fit = fit;
 
       // xterm measures the glyph cell once at open(), so a webfont landing later leaves every
-      // column
-      // misplaced. Not awaited before open(): `font-display: swap` already paints the fallback, a
-      // wait
-      // would blank the terminal for a ~2 MB download, and an await would open a window between the
-      // idempotence guard and `state.term` being set in which a re-render spawns a second xterm +
+      // column misplaced. Not awaited before open(): `font-display: swap` already paints the
+      // fallback, a wait would blank the terminal for a ~2 MB download, and an await would open a
+      // window between the idempotence guard and `state.term` being set in which a re-render spawns
+      // a second xterm +
       // WS.
       whenFontReady(term.options.fontSize, repairFontMetrics);
 
@@ -1601,8 +1595,7 @@
       let bytes = escape.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
                         .replace(/\\t/g, "\t");
       // A tap mid-syllable must not overtake it: in mux the payload goes through the ordering
-      // owner,
-      // so `Ctrl-b n` cannot switch panes ahead of the text the IME holds.
+      // owner, so `Ctrl-b n` cannot switch panes ahead of the text the IME holds.
       // Sticky Ctrl: if armed and the next tap is one printable byte, fold it with the 0x1f mask.
       if (state.ctrlSticky && bytes.length === 1 && bytes >= " " && bytes <= "~") {
         bytes = String.fromCharCode(bytes.charCodeAt(0) & 0x1f);
@@ -1776,16 +1769,15 @@
     }
 
     // Re-measure after a webfont that landed after term.open(). Reassigning fontFamily is what
-    // makes
-    // xterm drop its cached glyph metrics; then refit and tell the PTY, since rows/cols changed.
+    // makes xterm drop its cached glyph metrics; then refit and tell the PTY, since rows/cols
+    // changed.
     function repairFontMetrics(opts = {}) {
       const { sendResize = true } = opts;
       const term = state.term;
       if (!term) return;
       try {
         // Must assign a different value: xterm's option setter short-circuits on an unchanged
-        // value, so
-        // round-trip through a distinct-but-equivalent stack.
+        // value, so round-trip through a distinct-but-equivalent stack.
         const ff = term.options.fontFamily;
         term.options.fontFamily = "monospace";
         term.options.fontFamily = ff;

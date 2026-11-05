@@ -1,11 +1,9 @@
 //! Env-based configuration for the Discord plugin.
 //!
-//! - `COPAD_DISCORD_BOT_TOKEN` — bot token from
-//!   <https://discord.com/developers/applications> → Bot tab → "Reset
-//!   Token". Required for `auth` subcommand; optional for the long-
-//!   running RPC mode (we read from the keyring there). Discord bot
-//!   tokens don't have a documented prefix; we accept anything
-//!   non-empty and let the `users/@me` validation catch typos.
+//! - `COPAD_DISCORD_BOT_TOKEN` — bot token from <https://discord.com/developers/applications> →
+//!   Bot tab → "Reset Token". Required for the `auth` subcommand; optional for long-running RPC
+//!   mode (read from the keyring). Any non-empty value is accepted; `users/@me` validation catches
+//!   typos.
 //! - `COPAD_DISCORD_WORKSPACE` — keyring-entry namespace. Default
 //!   `"default"`. Same role as `COPAD_SLACK_WORKSPACE`: lets one
 //!   account host multiple bots whose keyring entries don't collide.
@@ -13,19 +11,12 @@
 //!   fall back to plaintext when the OS keyring is unavailable. Same
 //!   posture as the Slack plugin's flag.
 //!
-//! `from_env` never errors: invalid values land in `fatal_error` and
-//! the plugin still completes the `initialize` handshake so the
-//! supervisor's `provides` resolution succeeds. Behavior in degraded
-//! mode is per-action:
-//! - `discord.auth_status` always answers (even with fatal_error
-//!   set) so the UI/CLI can show a coherent diagnostic.
-//! - `discord.send_message` returns `not_authenticated` when
-//!   `fatal_error` is set OR when no credentials are resolvable.
-//!   Both states mean "the gateway cannot send right now"; merging
-//!   them under one error code keeps the trigger DSL simple at the
-//!   cost of slightly fuzzier root-cause attribution (callers can
-//!   still diff against `discord.auth_status` for the structured
-//!   reason).
+//! `from_env` never errors: invalid values land in `fatal_error` so `initialize` still completes
+//! (the supervisor's `provides` resolution succeeds). In degraded mode:
+//! - `discord.auth_status` always answers, so the UI/CLI can show a diagnostic.
+//! - `discord.send_message` returns `not_authenticated` when `fatal_error` is set OR no credentials
+//!   are resolvable. One code keeps the trigger DSL simple; callers can diff against
+//!   `discord.auth_status` for the structured reason.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,8 +29,7 @@ pub struct Config {
     pub bot_token_env: Option<String>,
     pub plaintext_path: PathBuf,
     pub require_secure_store: bool,
-    /// Doubles up to `reconnect_max` on repeated failures; resets on
-    /// clean disconnect (server-rotated reconnect, RESUMED).
+    /// Doubles up to `reconnect_max` on repeated failures; resets on a clean disconnect.
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
     pub fatal_error: Option<String>,

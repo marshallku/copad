@@ -1,8 +1,4 @@
 //! Env-based configuration for the LLM plugin (Anthropic provider).
-//!
-//! v1 supports a single provider (Anthropic). Future expansion for
-//! OpenAI / local models would add a `provider` discriminator that
-//! selects which client + token store to use.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,7 +18,6 @@ pub struct Config {
     /// Empty when env not set; plugin then falls back to the keyring-stored
     /// value at action time (slack/calendar pattern).
     pub api_key: String,
-    /// Default model used when `llm.complete` doesn't pass one.
     pub default_model: String,
     /// Default max_tokens for completions that don't specify.
     /// Anthropic requires this on every request.
@@ -52,7 +47,6 @@ impl Config {
     pub fn from_env() -> Self {
         let mut errors: Vec<String> = Vec::new();
 
-        // Account label first — it determines paths.
         let raw_account =
             std::env::var("COPAD_LLM_ACCOUNT").unwrap_or_else(|_| "default".to_string());
         let (account_label, account_resolved) = match validate_account_label(&raw_account) {
@@ -65,18 +59,15 @@ impl Config {
         let plaintext_path = default_plaintext_path(&account_label);
         let usage_log_path = default_usage_log_path(&account_label);
 
-        // Token: empty if missing; non-empty must match prefix.
         let mut api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
         if !api_key.is_empty() && !api_key.starts_with("sk-ant-") {
             errors.push("ANTHROPIC_API_KEY, when set, must start with sk-ant-".to_string());
             api_key.clear();
         }
 
-        // Reject `COPAD_LLM_DEFAULT_MODEL=""` — using the empty
-        // string as a model id would only surface as a remote API
-        // error per call. Accumulate the error locally and fall
-        // back to the build-time default so `auth` / completions
-        // can still run when the user removes the bad env var.
+        // An empty `COPAD_LLM_DEFAULT_MODEL` would only surface as a remote API error per call.
+        // Record the error and fall back to the build-time default so `auth` / completions still
+        // run once the bad env var is removed.
         let default_model = match std::env::var("COPAD_LLM_DEFAULT_MODEL") {
             Ok(s) if s.is_empty() => {
                 errors.push(

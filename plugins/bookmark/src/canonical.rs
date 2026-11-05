@@ -1,30 +1,18 @@
-//! URL canonicalization (D2 in the bookmark plan).
+//! URL canonicalization.
 //!
-//! Rules:
-//! - Allow only `http` / `https`. Reject `file://`, `data:`,
-//!   `javascript:`, etc — bookmark.add must never be a vector for the
-//!   plugin to read arbitrary local files or be tricked into running
-//!   client-side code via a panel echo.
-//! - Strip URL fragment (`#section`).
-//! - Lowercase host (per RFC 3986 host is case-insensitive).
-//! - Strip well-known tracking query params (utm_*, gclid, fbclid,
-//!   mc_cid, mc_eid, ref). Other params kept verbatim, preserving
-//!   their order — the same logical page should canonicalize to the
-//!   same URL whether or not Marketing decided to slap utm_source on
-//!   today's link, but `?id=42` must NOT be merged with `?id=43`.
-//! - Trailing slash kept as-is. `https://x.com/` and `https://x.com`
-//!   are different paths under RFC 3986 and we preserve that — same
-//!   URL canonicalize twice → same output.
+//! Only `http` / `https` are allowed; `file://`, `data:`, `javascript:` etc. are rejected so
+//! bookmark.add cannot read local files or run client-side code via a panel echo. The fragment is
+//! stripped, the host lowercased, and well-known tracking params (utm_*, gclid, fbclid, mc_cid,
+//! mc_eid, ref) removed. Other params are kept verbatim in order, so `?id=42` and `?id=43` stay
+//! distinct. A trailing slash on a path is kept as-is (`/a/` and `/a` differ under RFC 3986),
+//! while `Url` gives a bare origin one (`https://x.com` becomes `https://x.com/`).
 //!
-//! The id surfaced to callers is the first 8 hex chars of
-//! `sha1(canonical_url)`. 8 chars = 4 bytes = ~1 in 4B collision
-//! probability for a personal KB this is fine, and it's prefix-
-//! resolvable like every other coctl id.
+//! The id is the first 8 hex chars of `sha1(canonical_url)` (4 bytes, fine for a personal KB, and
+//! prefix-resolvable like other coctl ids).
 
 use sha1::{Digest, Sha1};
 use url::Url;
 
-/// Exact matches. `utm_*` is a prefix-glob in `is_tracking_param`.
 const TRACKING_PARAMS: &[&str] = &["gclid", "fbclid", "mc_cid", "mc_eid", "ref"];
 
 fn is_tracking_param(key: &str) -> bool {
@@ -73,14 +61,11 @@ pub fn canonicalize(input: &str) -> Result<Canonical, CanonicalError> {
     if let Some(host) = u.host_str() {
         let lowered = host.to_lowercase();
         if lowered != host {
-            // set_host() can fail e.g. if the lowered form re-parses
-            // differently. Fall back to leaving it alone; canonical
-            // form just won't be quite as canonical.
+            // set_host() can fail if the lowered form re-parses differently; leave it alone.
             let _ = u.set_host(Some(&lowered));
         }
     }
 
-    // Strip tracking params; preserve order of survivors.
     let kept: Vec<(String, String)> = u
         .query_pairs()
         .filter(|(k, _)| !is_tracking_param(k))
@@ -91,7 +76,6 @@ pub fn canonicalize(input: &str) -> Result<Canonical, CanonicalError> {
         if kept.is_empty() {
             u.set_query(None);
         } else {
-            // Re-serialize. `clear()` then `extend_pairs()` does the right thing.
             u.query_pairs_mut().clear().extend_pairs(&kept);
         }
     }
@@ -108,7 +92,6 @@ fn sha1_hex8(s: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(s.as_bytes());
     let digest = hasher.finalize();
-    // First 4 bytes → 8 hex chars.
     let mut out = String::with_capacity(8);
     for b in &digest[..4] {
         out.push_str(&format!("{b:02x}"));
@@ -159,9 +142,7 @@ mod tests {
 
     #[test]
     fn strips_arbitrary_utm_prefix_params() {
-        // `utm_id`, `utm_name`, `utm_term2` etc. — anything Marketing
-        // invents under the `utm_` namespace must be stripped, not
-        // just the canonical five from RFC-on-marketing-conventions.
+        // Anything under the `utm_` namespace must be stripped, not just the canonical five.
         let c =
             canonicalize("https://example.com/page?utm_id=42&utm_name=spring&utm_custom=x&id=10")
                 .unwrap();
@@ -179,9 +160,7 @@ mod tests {
     fn trailing_slash_is_significant() {
         let a = canonicalize("https://example.com/").unwrap();
         let b = canonicalize("https://example.com").unwrap();
-        // Both exist as Url instances but to_string() of `https://example.com`
-        // canonicalizes to `https://example.com/`. Document the actual
-        // behavior so future me knows.
+        // `https://example.com` canonicalizes to `https://example.com/`.
         assert_eq!(a.url, b.url);
     }
 

@@ -1,15 +1,9 @@
 //! Ticket model + ADF utilities.
 //!
-//! `Ticket` is the in-memory shape derived from a Jira `/search` or
-//! `/issue/<key>` response. It's deliberately a flat struct (not a
-//! re-export of the raw JSON) so `to_payload_json` can produce a
-//! stable wire shape that triggers can interpolate `{event.X}` against
-//! without worrying about which field nests where in Jira's response.
-//!
-//! ADF (Atlassian Document Format) walking lives here too because
-//! it's the same logic used in two places: `adf_to_plain_text` for
-//! the `comment.body` field of `jira.comment_added` events, and
-//! `adf_contains_mention_of` for detecting `jira.mention` events.
+//! `Ticket` is a flat struct derived from a Jira `/search` or `/issue/<key>` response, so
+//! `to_payload_json` yields a stable wire shape for `{event.X}` interpolation. ADF (Atlassian
+//! Document Format) walking lives here for `adf_to_plain_text` (`comment.body` of
+//! `jira.comment_added`) and `adf_contains_mention_of` (`jira.mention`).
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
@@ -23,31 +17,28 @@ pub struct Ticket {
     pub assignee_display: Option<String>,
     pub reporter_account_id: Option<String>,
     pub project_key: String,
-    /// Direct browser-friendly URL: `<base>/browse/<key>`.
     pub url: String,
     pub updated: DateTime<Utc>,
-    /// Verbatim issue JSON. Carried into event payloads so triggers reach
-    /// rare fields without us modeling every Jira column.
+    /// Verbatim issue JSON, so triggers reach rare fields without modeling every Jira column.
     pub raw_json: Value,
 }
 
-/// Per-ticket snapshot kept by the poller; tick-to-tick diff produces the
-/// four event kinds. Comment dedup uses a timestamp watermark (not a count)
-/// because Jira's comment indices shift on delete — `startAt=N` after a
-/// deletion would skip past a new comment that filled the freed slot.
+/// Per-ticket snapshot kept by the poller; the tick-to-tick diff produces the four event kinds.
+/// Comment dedup uses a timestamp watermark, not a count: Jira's comment indices shift on delete,
+/// so `startAt=N` would skip a new comment that filled the freed slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketSnapshot {
     pub updated_iso: String,
     pub status_name: String,
     pub assignee_account_id: Option<String>,
-    /// `None` on first sight — first sight does NOT emit historical comment
-    /// events; it just records a baseline so the next tick can diff.
+    /// `None` on first sight, which records a baseline instead of emitting historical comment
+    /// events.
     pub last_comment_created_iso: Option<String>,
 }
 
 impl Ticket {
-    /// Non-comment fields only; the poller's `process_new_comments`
-    /// fills in `last_comment_created_iso` after walking inline comments.
+    /// Non-comment fields only; the poller's `process_new_comments` fills in
+    /// `last_comment_created_iso`.
     pub fn snapshot_without_comments(&self) -> TicketSnapshot {
         TicketSnapshot {
             updated_iso: self.updated.to_rfc3339(),
@@ -58,7 +49,6 @@ impl Ticket {
     }
 }
 
-/// Inline comments from a `*all` issue payload, oldest-first.
 pub fn extract_inline_comments(raw: &Value) -> Vec<Comment> {
     let comments_arr = raw
         .get("fields")
@@ -70,9 +60,8 @@ pub fn extract_inline_comments(raw: &Value) -> Vec<Comment> {
         .unwrap_or_default()
 }
 
-/// Map a single-issue payload to `Ticket`. `base_url` is needed because
-/// Jira's response has no `/browse/<key>` link. Returns `None` on missing
-/// essentials — malformed issues drop quietly rather than poison the tick.
+/// Map a single-issue payload to `Ticket`. `base_url` is needed because Jira's response has no
+/// `/browse/<key>` link. `None` on missing essentials, so a malformed issue cannot poison the tick.
 pub fn from_jira_json(raw: &Value, base_url: &str) -> Option<Ticket> {
     let key = raw.get("key").and_then(Value::as_str)?.to_string();
     let fields = raw.get("fields")?;
@@ -112,9 +101,7 @@ pub fn from_jira_json(raw: &Value, base_url: &str) -> Option<Ticket> {
         .and_then(|p| p.get("key"))
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
-            // Jira always returns project on issues, but if the
-            // caller filtered `fields=` to exclude it, fall back to
-            // the issue key prefix. Better than empty.
+            // Falls back to the key prefix when the caller filtered `fields=` to exclude project.
             key.split_once('-').map(|(p, _)| p).unwrap_or("")
         })
         .to_string();
@@ -138,9 +125,8 @@ pub fn from_jira_json(raw: &Value, base_url: &str) -> Option<Ticket> {
     })
 }
 
-/// Jira Cloud emits ISO 8601 with `+0000`/`+0900` (no colon), which is
-/// not strict RFC 3339. The `%Y-%m-%dT%H:%M:%S%.f%z` format accepts both
-/// forms; we still fall back to RFC 3339 as a safety net.
+/// Jira Cloud emits ISO 8601 with `+0000`/`+0900` (no colon), which is not strict RFC 3339. The
+/// `%Y-%m-%dT%H:%M:%S%.f%z` format accepts both; RFC 3339 is the fallback.
 pub fn parse_jira_timestamp(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
         return Some(dt.with_timezone(&Utc));
@@ -180,20 +166,13 @@ pub fn to_payload_json(t: &Ticket) -> Map<String, Value> {
     m.insert("project_key".to_string(), json!(t.project_key));
     m.insert("url".to_string(), json!(t.url));
     m.insert("updated".to_string(), json!(t.updated.to_rfc3339()));
-    // Verbatim Jira issue payload — matches the slack/discord
-    // `event_json` convention so triggers reach uncommonly-needed
-    // fields without us having to model every Jira field.
+    // Verbatim Jira payload, matching the slack/discord `event_json` convention.
     m.insert("event_json".to_string(), t.raw_json.clone());
     m
 }
 
-// ============================================================
-//                ADF (Atlassian Document Format)
-// ============================================================
-
-/// ADF → plain text for trigger interpolation: paragraph → `\n\n`,
-/// hardBreak → `\n`, mention → `attrs.text` (`@DisplayName`); inline
-/// marks like bold/italic are stripped (not faithful rendering).
+/// ADF -> plain text for trigger interpolation: paragraph -> `\n\n`, hardBreak -> `\n`, mention ->
+/// `attrs.text` (`@DisplayName`); inline marks like bold/italic are stripped.
 pub fn adf_to_plain_text(adf: &Value) -> String {
     let mut out = String::new();
     walk_adf(adf, &mut out);
@@ -235,8 +214,7 @@ fn walk_adf(node: &Value, out: &mut String) {
     }
 }
 
-/// Detects a `mention` node whose `attrs.id` matches `account_id`
-/// (drives `jira.mention` synthesis from `jira.comment_added`).
+/// Detects a `mention` node whose `attrs.id` matches `account_id` (drives `jira.mention` synthesis).
 pub fn adf_contains_mention_of(adf: &Value, account_id: &str) -> bool {
     if !adf.is_object() {
         return false;
@@ -299,7 +277,6 @@ pub struct Comment {
     pub author_display: Option<String>,
 }
 
-/// Serialize a `Comment` for the per-event `comment` sub-object.
 pub fn comment_to_json(c: &Comment) -> Value {
     json!({
         "id": c.id,
@@ -417,7 +394,6 @@ mod tests {
         assert_eq!(m["assignee_account_id"], "5b-me");
         assert_eq!(m["project_key"], "PROJ");
         assert_eq!(m["url"], "https://x.atlassian.net/browse/PROJ-42");
-        // event_json carries the verbatim Jira payload
         assert_eq!(m["event_json"]["key"], "PROJ-42");
     }
 
@@ -427,8 +403,7 @@ mod tests {
         let s = t.snapshot_without_comments();
         assert_eq!(s.status_name, "In Progress");
         assert_eq!(s.assignee_account_id.as_deref(), Some("5b-me"));
-        // last_comment_created_iso starts None — poller fills it in
-        // after walking inline comments.
+        // Starts None; the poller fills it in after walking inline comments.
         assert!(s.last_comment_created_iso.is_none());
         assert!(s.updated_iso.starts_with("2026-05-05T10:00:00"));
     }
@@ -501,7 +476,6 @@ mod tests {
 
     #[test]
     fn adf_contains_mention_handles_nested_lists() {
-        // Mentions can be nested inside list items.
         let adf = json!({
             "type": "doc",
             "content": [{
@@ -552,13 +526,10 @@ mod tests {
 
     #[test]
     fn parse_jira_timestamp_handles_both_offset_forms() {
-        // Jira's actual emission format (no colon in offset).
         let dt = parse_jira_timestamp("2026-05-05T10:00:00.000+0000").unwrap();
         assert_eq!(dt.to_rfc3339(), "2026-05-05T10:00:00+00:00");
-        // RFC 3339 strict (with colon) — fallback path.
         let dt = parse_jira_timestamp("2026-05-05T10:00:00+09:00").unwrap();
         assert_eq!(dt.to_rfc3339(), "2026-05-05T01:00:00+00:00");
-        // Invalid junk.
         assert!(parse_jira_timestamp("not-a-date").is_none());
     }
 

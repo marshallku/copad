@@ -1,13 +1,10 @@
-//! Polling file watcher for `.git/` state. Emits `git.worktree_created`,
-//! `git.worktree_removed`, `git.branch_created`, `git.branch_deleted`,
-//! and `git.checkout` per workspace.
+//! Polling file watcher for `.git/` state. Emits `git.worktree_created`, `git.worktree_removed`,
+//! `git.branch_created`, `git.branch_deleted`, and `git.checkout` per workspace.
 //!
-//! Polling (not `notify`) keeps this dependency-free and works
-//! identically on Linux and macOS. For status-bar / live-indicator
-//! use cases the ~poll-interval lag is fine. `git.worktree_add` and
-//! friends still publish their own `.completed` event directly from
-//! the action handler (Phase 14.1's registry fan-out), so chained
-//! triggers don't pay the polling cost.
+//! Polling (not `notify`) keeps this dependency-free and identical on Linux and macOS; the
+//! poll-interval lag is fine for status-bar use. `git.worktree_add` and friends still publish
+//! their own `.completed` event directly from the action handler, so chained triggers don't pay
+//! the polling cost.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -40,14 +37,11 @@ pub enum WatchEvent {
     WorktreeRemoved { name: String },
 }
 
-/// Per-worktree gitdir (where HEAD lives) and shared common-gitdir
-/// (where refs/heads/ and worktrees/ live). For a primary checkout the
-/// two are the same `<path>/.git`. For a secondary worktree configured
-/// directly as a workspace, `.git` is a file pointing at
-/// `<primary>/.git/worktrees/<name>` — and refs are still shared with
-/// the primary. We delegate to `git rev-parse` so all repo shapes
-/// (primary, secondary worktree, submodule with gitlink, custom
-/// `core.worktree`) resolve to the right pair without our own parser.
+/// Per-worktree gitdir (where HEAD lives) and shared common-gitdir (where refs/heads/ and
+/// worktrees/ live). They are the same `<path>/.git` for a primary checkout; for a secondary
+/// worktree `.git` is a file pointing at `<primary>/.git/worktrees/<name>` and refs are shared
+/// with the primary. Delegating to `git rev-parse` resolves every repo shape (secondary worktree,
+/// submodule gitlink, custom `core.worktree`) without our own parser.
 #[derive(Debug, Clone)]
 struct GitDirs {
     gitdir: std::path::PathBuf,
@@ -82,9 +76,8 @@ fn run_rev_parse(workspace_path: &Path, flag: &str) -> Option<std::path::PathBuf
         return None;
     }
     let p = std::path::PathBuf::from(trimmed);
-    // git returns relative paths when -C points at the worktree root;
-    // resolve them against the workspace so subsequent file reads
-    // don't depend on cwd at snapshot time.
+    // git returns relative paths when -C points at the worktree root; resolve them against the
+    // workspace so later reads don't depend on cwd.
     if p.is_absolute() {
         Some(p)
     } else {
@@ -130,12 +123,9 @@ fn snapshot_with_dirs(dirs: &GitDirs) -> WatcherSnapshot {
     }
 }
 
-/// Recursive walk of `refs/heads/` — branch names with slashes
-/// (`feat/foo`) live as nested files, so a flat readdir would miss
-/// them. Packed refs (`.git/packed-refs`) are intentionally NOT
-/// scanned: branches that exist only in packed-refs are
-/// pre-established as of `git gc` time and don't represent
-/// user-initiated changes within the watching window.
+/// Recursive walk of `refs/heads/`: branch names with slashes (`feat/foo`) are nested files.
+/// `packed-refs` is intentionally NOT scanned: packed-only branches predate the watching window
+/// and are not user-initiated changes.
 fn collect_refs(base: &Path, dir: &Path, out: &mut HashSet<String>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -216,10 +206,6 @@ fn poll_interval() -> Duration {
     Duration::from_millis(raw.max(MIN_POLL_MS))
 }
 
-/// Spawn one polling thread per workspace. Threads are detached
-/// (`thread::spawn`) and exit on process termination. The watchers
-/// emit events via `event_tx`; the writer thread reading that
-/// channel is part of the plugin's main wire (`main.rs`).
 pub fn spawn(
     config: Arc<Config>,
     event_tx: Sender<String>,
@@ -245,9 +231,8 @@ fn run_one(
     initialized: Arc<AtomicBool>,
     interval: Duration,
 ) {
-    // Hold events back until the host completes the `initialize` →
-    // `initialized` handshake. Publishing earlier risks the supervisor
-    // dropping events as out-of-protocol.
+    // Hold events back until the host completes the `initialize` -> `initialized` handshake;
+    // earlier publishes risk being dropped as out-of-protocol.
     while !initialized.load(Ordering::SeqCst) {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -339,10 +324,9 @@ mod tests {
 
     #[test]
     fn diff_no_checkout_when_head_cleared() {
-        // .git/HEAD missing (or unreadable) leaves curr.head=None.
-        // We don't emit a checkout for "branch went away" — that's
-        // the branch_deleted signal's job. Avoids a noisy null head
-        // during transient races.
+        // Missing/unreadable .git/HEAD leaves curr.head=None. No checkout is emitted for that:
+        // "branch went away" is branch_deleted's job, and it avoids a noisy null head during
+        // transient races.
         let a = snap(Some("ref: refs/heads/main"), &["main"], &[]);
         let b = snap(None, &["main"], &[]);
         assert!(diff(&a, &b).is_empty());
@@ -357,7 +341,6 @@ mod tests {
             &["wt-a", "wt-b"],
         );
         let events = diff(&a, &b);
-        // Ordering: HEAD first, then sorted-name creates/deletes.
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], WatchEvent::Checkout { .. }));
         assert!(events.contains(&WatchEvent::BranchCreated {
@@ -384,11 +367,8 @@ mod tests {
 
     #[test]
     fn snapshot_secondary_worktree_resolves_via_git_rev_parse() {
-        // Codex C1 round 1: `.git` in a secondary worktree is a FILE
-        // (gitlink), not a directory. The naive `<path>/.git/HEAD`
-        // read fails silently. We must resolve via `git rev-parse
-        // --git-dir` (per-worktree HEAD) + `--git-common-dir`
-        // (shared refs/heads + worktrees).
+        // `.git` in a secondary worktree is a FILE (gitlink), so reading `<path>/.git/HEAD` fails
+        // silently; snapshot must resolve via `git rev-parse --git-dir` / `--git-common-dir`.
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("primary");
         std::fs::create_dir_all(&primary).unwrap();
@@ -416,10 +396,9 @@ mod tests {
             .unwrap();
         assert!(status.success(), "git worktree add failed");
 
-        // Configure the SECONDARY as the workspace. `.git` here is a
-        // file with `gitdir: ...` — not a directory. snapshot() must
-        // still find HEAD (per-worktree, on feat/x) and the shared
-        // refs/heads (main + feat/x) and worktrees registry.
+        // Configure the SECONDARY as the workspace: `.git` there is a `gitdir: ...` file, yet
+        // snapshot() must find the per-worktree HEAD, the shared refs/heads and the worktrees
+        // registry.
         assert!(
             secondary.join(".git").is_file(),
             ".git should be a gitlink file in a secondary worktree"
@@ -446,10 +425,7 @@ mod tests {
 
     #[test]
     fn snapshot_real_repo_picks_up_head_branches_and_worktrees() {
-        // E2E sanity over a real `git init`: confirms our parser
-        // shape matches what git actually writes. Tests use the
-        // same tempdir-and-shell-out pattern as the rest of this
-        // crate.
+        // E2E sanity over a real `git init`: confirms our parser matches what git writes.
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();

@@ -7,11 +7,8 @@
 //! - **(no args)** — RPC mode. Speaks the supervisor protocol over
 //!   stdio. Provides `llm.complete`, `llm.usage`, `llm.auth_status`.
 //!
-//! Activation is `onAction:llm.*` (lazy) — there's no inbound stream
-//! to keep alive (no Socket Mode equivalent), so the plugin only
-//! spawns when a trigger or `coctl call` invokes one of the
-//! actions. Cold-start cost is dominated by the first HTTP call
-//! anyway.
+//! Activation is `onAction:llm.*` (lazy): there is no inbound stream to keep alive, so the plugin
+//! only spawns when a trigger or `coctl call` invokes an action.
 
 #[cfg(not(unix))]
 compile_error!(
@@ -189,9 +186,7 @@ fn handle_frame(
                 Err((code, msg)) => send_error(tx, id, &code, &msg),
             }
         }
-        "event.dispatch" => {
-            // llm plugin doesn't subscribe — quietly ignore.
-        }
+        "event.dispatch" => {}
         "shutdown" => std::process::exit(0),
         other if !other.is_empty() && !id.is_empty() => {
             send_error(
@@ -213,14 +208,9 @@ fn handle_action(
 ) -> Result<Value, (String, String)> {
     match name {
         "llm.auth_status" => Ok(handle_auth_status(config, store)),
-        // `llm.usage` reads the local JSONL log — no Anthropic
-        // call, no credentials required. Stays available even
-        // after a key typo so users can still inspect prior
-        // usage. BUT we refuse when account_resolved is false:
-        // a bad COPAD_LLM_ACCOUNT silently falls back to the
-        // "default" account's path, and reading some other
-        // account's log under the assumption it's the one the
-        // user asked for is a wrong-data bug.
+        // Reads the local JSONL log: no Anthropic call, no credentials, so it works after a key
+        // typo. Refused when account_resolved is false: a bad COPAD_LLM_ACCOUNT falls back to the
+        // "default" account's path, and reading another account's log would return wrong data.
         "llm.usage" => {
             if !config.account_resolved {
                 return Err((
@@ -234,9 +224,8 @@ fn handle_action(
             handle_usage(params, config)
         }
         "llm.complete" => {
-            // Network-touching: refuse upfront on fatal_error so the
-            // status surface and runtime stay consistent and we don't
-            // race a default-store credential fall-through.
+            // Refuse upfront on fatal_error so the status surface and runtime stay consistent and
+            // we don't race a default-store credential fall-through.
             if let Some(err) = &config.fatal_error {
                 return Err((
                     "not_authenticated".to_string(),
@@ -268,13 +257,9 @@ fn handle_auth_status(config: &Config, store: &Arc<dyn TokenStore>) -> Value {
             "validated_at": Value::Null,
         });
     }
-    // Derive `credentials_source` from the EXACT same resolver
-    // `llm.complete` uses so the status surface can never report
-    // "authenticated=true" while the runtime would refuse the call.
-    // Specifically, a stored TokenSet with an empty `api_key` (e.g.
-    // partially-cleared file, corrupted JSON) would otherwise show
-    // `credentials_source="store"` while `resolve_api_key` returns
-    // None.
+    // Derive `credentials_source` from the same resolver `llm.complete` uses, so status can't
+    // report authenticated=true while the call would be refused (e.g. a stored TokenSet with an
+    // empty `api_key` makes `resolve_api_key` return None).
     let credentials_source: &str = if !config.api_key.is_empty() {
         "env"
     } else if resolve_api_key(config, &**store).is_some() {
@@ -325,12 +310,8 @@ fn handle_complete(
         "invalid_params".to_string(),
         "missing 'prompt' (string)".to_string(),
     ))?;
-    // Strict type validation — same fail-closed contract as
-    // temperature/source/since/by_model. Without this, wrong-typed
-    // `system` or `model` ({"model":123}) would silently drop and
-    // the plugin would still issue a paid API call with the
-    // default model / no system prompt — burning tokens on an
-    // accidentally-misconfigured trigger.
+    // Strict type validation (fail closed): a wrong-typed `system` or `model` ({"model":123})
+    // would otherwise be dropped and still issue a paid API call with the defaults.
     let system = match params.get("system") {
         Some(v) if v.is_null() => None,
         Some(v) => Some(v.as_str().ok_or((
@@ -347,10 +328,8 @@ fn handle_complete(
         ))?,
         None => config.default_model.as_str(),
     };
-    // Reject oversized max_tokens explicitly rather than silently
-    // wrapping `as u32` — a request for `4_294_967_297` would
-    // otherwise truncate to 1 and quietly produce a single-token
-    // reply, which is worse than failing closed.
+    // Reject oversized max_tokens instead of wrapping `as u32`: 4_294_967_297 would truncate to 1
+    // and quietly produce a single-token reply.
     let max_tokens: u32 = match params.get("max_tokens") {
         Some(v) => {
             let n = v.as_u64().ok_or((
@@ -372,11 +351,8 @@ fn handle_complete(
             "max_tokens must be > 0".to_string(),
         ));
     }
-    // Strict type validation — present-but-wrong-type is rejected
-    // rather than silently treated as absent. Without this,
-    // `{"temperature": "hot"}` would silently drop the param and
-    // run with Anthropic's default, contradicting the
-    // "invalid_params before the network call" contract.
+    // Present-but-wrong-type is rejected: `{"temperature": "hot"}` must not silently fall back to
+    // Anthropic's default, since the contract is invalid_params before the network call.
     let temperature = match params.get("temperature") {
         Some(v) if v.is_null() => None,
         Some(v) => {
@@ -418,9 +394,7 @@ fn handle_complete(
         temperature,
     };
     let resp = anthropic::complete(&api_key, &req, config.http_timeout).map_err(|e| {
-        // 401-prefixed errors come back as `auth_error: ...`.
-        // Other errors stay under io_error so the protocol
-        // shape matches calendar/slack.
+        // 401-prefixed errors come back as `auth_error: ...`; the rest stay io_error.
         if e.starts_with("auth_error:") {
             ("not_authenticated".to_string(), e)
         } else {
@@ -454,9 +428,8 @@ fn handle_complete(
 }
 
 fn handle_usage(params: &Value, config: &Config) -> Result<Value, (String, String)> {
-    // Strict types: present-but-wrong-type rejected. Treating
-    // `{"since": 0}` as "no filter" would silently broaden the
-    // query to all-time and quietly return misleading aggregates.
+    // Strict types: treating `{"since": 0}` as "no filter" would silently broaden the query to
+    // all-time and return misleading aggregates.
     let since = parse_optional_rfc3339(params, "since")?;
     let until = parse_optional_rfc3339(params, "until")?;
     let model_filter = match params.get("by_model") {
@@ -542,8 +515,7 @@ mod tests {
     }
 
     fn cfg_base() -> Config {
-        // Build a Config fixture independent of process env so
-        // tests don't race each other through env mutation.
+        // Fixture independent of process env, so tests don't race through env mutation.
         Config {
             api_key: String::new(),
             default_model: "claude-sonnet-4-6".into(),
@@ -604,9 +576,6 @@ mod tests {
         assert_eq!(v["authenticated"], false);
         assert_eq!(v["credentials_source"], "none");
         assert_eq!(v["fatal_error"], "bad env");
-        // Documented shape: default_model and validated_at present
-        // even on the fatal-error branch so callers can rely on a
-        // stable contract.
         assert!(v.get("default_model").is_some());
         assert_eq!(v["validated_at"], Value::Null);
     }

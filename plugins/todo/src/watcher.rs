@@ -1,35 +1,16 @@
-//! Polling file-watcher that emits `todo.created` / `todo.changed`
-//! / `todo.completed` / `todo.deleted` events.
+//! Polling file-watcher that emits `todo.created` / `todo.changed` / `todo.completed` /
+//! `todo.deleted`.
 //!
-//! Why polling, not `notify`/inotify, for v1: the calendar plugin
-//! already established the polling pattern in this crate family,
-//! so reusing it keeps the dep graph small and the failure modes
-//! familiar. The visible cost is a 1-2s detection latency on
-//! external (vim) edits — fine for a workflow tool. If a future
-//! iteration shows the latency hurts the loop ("clicked Done in
-//! vim, panel still says Open"), swap in `notify` without
-//! changing the event surface.
+//! Polling, not inotify: it reuses the calendar plugin's pattern, and external (vim) edits are
+//! noticed with 1-2s latency.
 //!
-//! Algorithm:
-//! 1. Wait for `initialized`.
-//! 2. Snapshot the store: `{(workspace, id) → (mtime, status)}`.
-//!    The first tick is treated as the baseline — we don't emit
-//!    `todo.created` for everything that already exists at startup
-//!    (that would spam triggers on every copad restart).
-//! 3. Each subsequent tick re-scans and diffs:
-//!    - new key → `todo.created`
-//!    - same key, mtime changed → `todo.changed` (+ `todo.completed`
-//!      if status transitioned `* → done`)
-//!    - missing key → `todo.deleted`
-//! 4. All payloads are the full `Todo` json (`Todo::to_json`) so
-//!    consumers don't need to re-read the file.
+//! The first scan is the baseline: nothing is emitted for todos that already exist at startup, or
+//! every copad restart would spam triggers. Later ticks diff by `(workspace, id)`: new key ->
+//! `todo.created`; mtime changed -> `todo.changed` (+ `todo.completed` if status went `* -> done`);
+//! missing key -> `todo.deleted`. Payloads are the full `Todo::to_json`.
 //!
-//! Note on completion semantics: a brand-new todo created with
-//! `status: done` (rare but possible — a user logging an
-//! already-completed task) emits `todo.created` only, NOT
-//! `todo.completed`. The `completed` event is for transitions
-//! observed after birth, which is what triggers conditioned on
-//! "task just got finished" actually want.
+//! A todo created already `done` emits only `todo.created`: `completed` is for transitions
+//! observed after birth, which is what "task just got finished" triggers want.
 
 use std::collections::HashMap;
 use std::fs;
@@ -60,9 +41,8 @@ pub struct Watcher {
     store: Arc<Store>,
     writer: Writer,
     initialized: Arc<AtomicBool>,
-    /// Set from main on stdin EOF / `shutdown`. Polled between scans
-    /// and during sleep so the loop exits promptly, drops its `writer`
-    /// clone, and lets the writer thread drain cleanly.
+    /// Set from main on stdin EOF / `shutdown`. Polled between scans and during sleep so the loop
+    /// exits promptly.
     shutdown: Arc<AtomicBool>,
 }
 
@@ -91,8 +71,7 @@ impl Watcher {
             thread::sleep(Duration::from_millis(100));
         }
         if self.config.fatal_error.is_some() {
-            // Config is broken; don't pretend to watch. Actions
-            // surface the error directly.
+            // Broken config: don't pretend to watch; actions surface the error.
             eprintln!("[todo] watcher idle: config has fatal_error");
             return;
         }
@@ -104,11 +83,8 @@ impl Watcher {
             }
         };
         while !self.shutdown.load(Ordering::SeqCst) {
-            // Sleep in 100ms chunks so a shutdown signal mid-poll
-            // is noticed within ~100ms instead of waiting for the
-            // full poll_interval (default 2s). Without this,
-            // graceful shutdown would block the writer drain for
-            // up to one full poll cycle.
+            // Sleep in 100ms chunks so a shutdown is noticed within ~100ms instead of up to one
+            // poll_interval.
             let mut elapsed = Duration::ZERO;
             while elapsed < self.config.poll_interval {
                 if self.shutdown.load(Ordering::SeqCst) {
@@ -130,7 +106,6 @@ impl Watcher {
         }
     }
 
-    /// Emit events for every difference between `prev` and `next`.
     fn diff_and_emit(
         &self,
         prev: &HashMap<(String, String), Snapshot>,
@@ -152,9 +127,7 @@ impl Watcher {
         }
         for key in prev.keys() {
             if !next.contains_key(key) {
-                // Deleted. The file is gone, so we can't read it
-                // for a fresh payload — emit a minimal payload
-                // with just the keys consumers need.
+                // The file is gone, so emit a minimal payload with just the keys consumers need.
                 self.publish_payload(
                     "todo.deleted",
                     json!({
@@ -245,11 +218,9 @@ fn scan_root(root: &std::path::Path) -> Result<HashMap<(String, String), Snapsho
             if validate_id(id).is_err() {
                 continue;
             }
-            // Open with O_NOFOLLOW so a swap to a symlink between
-            // file_type() above and the read here can't redirect
-            // us out (TOCTOU). Status comes from frontmatter
-            // parse; mtime from fstat on the same fd to ensure
-            // the snapshot is internally consistent.
+            // O_NOFOLLOW so a swap to a symlink between file_type() above and this read can't
+            // redirect us out (TOCTOU). mtime comes from fstat on the same fd so the snapshot is
+            // internally consistent.
             let mut file = match fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
@@ -287,7 +258,6 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    /// Read-back sink for watcher tests (mirrors main.rs's TestSink).
     struct TestSink(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for TestSink {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

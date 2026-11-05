@@ -1,12 +1,7 @@
-//! Single-token Anthropic credential store.
-//!
-//! Mirrors the calendar/slack token-store pattern: keyring preferred
-//! (Linux Secret Service / macOS Keychain), plaintext 0600 fallback
-//! at `$XDG_CONFIG_HOME/copad/llm-token-<account>.json`. The
-//! `TokenSet` carries the API key plus optional identity (whether
-//! the key has been validated against the API and what account it
-//! belongs to — Anthropic's `messages` doesn't reveal the account
-//! id, so identity is just "validated_at" timestamp for now).
+//! Single-token Anthropic credential store, mirroring the calendar/slack pattern: keyring
+//! preferred, plaintext 0600 fallback at `$XDG_CONFIG_HOME/copad/llm-token-<account>.json`. The
+//! `TokenSet` carries the API key plus a `validated_at` timestamp (Anthropic's `messages` does
+//! not reveal an account id).
 
 use std::fs;
 use std::io::Write;
@@ -53,8 +48,6 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
         }
     }
 }
-
-// -- Keyring backend --
 
 pub struct KeyringStore {
     entry: keyring::Entry,
@@ -109,8 +102,6 @@ impl TokenStore for KeyringStore {
         "keyring"
     }
 }
-
-// -- Plaintext fallback --
 
 pub struct PlaintextStore {
     path: PathBuf,

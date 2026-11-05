@@ -17,11 +17,9 @@
 //! body markdown with `- [ ]` subtasks
 //! ```
 //!
-//! File-as-source-of-truth. The plugin parses on read and never
-//! caches mutated state — `vim` editing the file mid-session is the
-//! supported workflow. Actions write the full file then atomic-rename
-//! so a crash never leaves a torn file visible to a concurrent
-//! reader (same invariant as `kb.ensure`).
+//! File-as-source-of-truth: parsed on read, no cached mutated state, so editing the file in vim
+//! mid-session is supported. Actions write the full file then atomic-rename so a concurrent
+//! reader never sees a torn file (same invariant as `kb.ensure`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -99,9 +97,8 @@ pub struct Todo {
     pub linked_slack: Vec<Value>,
     pub linked_kb: Vec<String>,
     pub tags: Vec<String>,
-    /// Agent-facing instruction that takes precedence over `body` when
-    /// assembling the per-Todo prompt layer. `body` stays the
-    /// human-readable description; `prompt` is the imperative.
+    /// Agent-facing instruction that takes precedence over `body` when assembling the per-Todo
+    /// prompt layer; `body` stays the human-readable description.
     pub prompt: Option<String>,
 }
 
@@ -291,11 +288,8 @@ pub fn render_new(todo: &Todo) -> String {
         out.push_str(&format!("tags: [{}]\n", todo.tags.join(", ")));
     }
     if let Some(p) = &todo.prompt {
-        // Multi-line prompts use a YAML literal block scalar so the
-        // raw text round-trips without per-line escaping. A single-line
-        // prompt could go inline but the block form is uniform and
-        // also survives quotes / backslashes the user might put in
-        // an agent instruction.
+        // Multi-line prompts use a YAML literal block scalar so raw text round-trips without
+        // per-line escaping; the block form also survives quotes / backslashes.
         out.push_str("prompt: |\n");
         for line in p.lines() {
             out.push_str("  ");
@@ -306,13 +300,9 @@ pub fn render_new(todo: &Todo) -> String {
     out.push_str("---\n\n");
     out.push_str(&format!("# {}\n", todo.title));
     if !todo.body.is_empty() {
-        // `body` is invariant: title-line stripped during parse so
-        // it never contains the H1. render_new prepends the H1
-        // exactly once and the body picks up after a blank line.
-        // This way parse → render → parse round-trips byte-stable
-        // for the body field, which the wire payload depends on
-        // (`todo.list` / `todo.start_requested` consumers can rely
-        // on `body` being just the markdown the user wrote).
+        // `body` never contains the H1 (stripped during parse); render_new prepends it exactly
+        // once. That keeps parse -> render -> parse byte-stable for `body`, which the wire payload
+        // (`todo.list` / `todo.start_requested`) relies on.
         out.push('\n');
         out.push_str(&todo.body);
         if !todo.body.ends_with('\n') {
@@ -335,7 +325,6 @@ pub fn update_status_in_text(content: &str, new_status: Status) -> Option<String
         return None;
     };
     let body = &content[prefix_len..];
-    // Locate the closing fence.
     let mut offset = 0usize;
     let mut close_at: Option<usize> = None;
     for line in body.split_inclusive('\n') {
@@ -357,7 +346,6 @@ pub fn update_status_in_text(content: &str, new_status: Status) -> Option<String
             && let Some((k, _)) = trimmed.split_once(':')
             && k.trim() == "status"
         {
-            // Preserve the original line ending.
             let ending = &line[trimmed.len()..];
             new_block.push_str(&format!("status: {}{}", new_status.as_str(), ending));
             found = true;
@@ -381,8 +369,6 @@ pub fn update_status_in_text(content: &str, new_status: Status) -> Option<String
 /// stripped if present); when the body is empty, falls back to the id
 /// and returns body unchanged.
 fn derive_title_and_body(body_str: &str, id: &str) -> (String, String) {
-    // Walk the original `&str` so we can compute byte ranges and
-    // splice the title line out cleanly.
     let mut cursor = 0usize;
     while cursor < body_str.len() {
         let rest = &body_str[cursor..];
@@ -393,7 +379,6 @@ fn derive_title_and_body(body_str: &str, id: &str) -> (String, String) {
         let line = &body_str[cursor..line_end];
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            // Skip this blank line entirely.
             cursor = line_end + 1;
             continue;
         }
@@ -402,8 +387,7 @@ fn derive_title_and_body(body_str: &str, id: &str) -> (String, String) {
         } else {
             trimmed.to_string()
         };
-        // Remove this title line. Drop one trailing newline if
-        // present and one further blank line so re-rendering
+        // Drop the title line plus one trailing newline and one further blank line, so re-rendering
         // doesn't accumulate blank rows on each round-trip.
         let mut removal_end = line_end;
         if removal_end < body_str.len() && body_str.as_bytes()[removal_end] == b'\n' {
@@ -447,14 +431,11 @@ fn split_frontmatter(content: &str) -> (Option<Map<String, Value>>, &str) {
     };
     let block = &body[..block_end];
     let after_close = &body[block_end..];
-    // Skip the closing `---\n` (or `---\r\n`).
     let after = after_close
         .strip_prefix("---\n")
         .or_else(|| after_close.strip_prefix("---\r\n"))
         .or_else(|| after_close.strip_prefix("---"))
         .unwrap_or(after_close);
-    // Strip a single leading blank line so the rendered body starts
-    // at the user's actual content.
     let after = after.strip_prefix('\n').unwrap_or(after);
     let map = parse_frontmatter_block(block);
     (Some(map), after)
@@ -478,11 +459,9 @@ fn parse_frontmatter_block(block: &str) -> Map<String, Value> {
             continue;
         }
         if val_str == "|" {
-            // YAML literal block scalar: `key: |\n  line1\n  line2`
-            // — preserves newlines verbatim. Used for `prompt:` so
-            // multi-line agent instructions round-trip without
-            // single-line escaping. Each continuation line must be
-            // indented (2-space convention as render_new emits).
+            // YAML literal block scalar (`key: |\n  line1\n  line2`), newlines preserved; used for
+            // `prompt:` so multi-line instructions round-trip. Continuation lines are indented 2
+            // spaces, as render_new emits.
             let mut buf = String::new();
             while let Some(next) = lines.peek() {
                 let nt = next.trim_end_matches(['\n', '\r']);
@@ -498,7 +477,6 @@ fn parse_frontmatter_block(block: &str) -> Map<String, Value> {
             }
             obj.insert(key.to_string(), Value::String(buf));
         } else if val_str.is_empty() {
-            // Block-form list collector: `key:\n  - foo\n  - bar`
             let mut arr = Vec::new();
             while let Some(next) = lines.peek() {
                 let nt = next.trim_end();
@@ -536,9 +514,7 @@ fn parse_yaml_value(v: &str) -> Value {
         return Value::Array(arr);
     }
     if v.starts_with('{') && v.ends_with('}') {
-        // Inline JSON-ish object — let serde_json take a shot, fall
-        // back to verbatim string if it can't parse. Used by
-        // `linked_slack` items.
+        // Inline JSON-ish object (used by `linked_slack` items); falls back to a verbatim string.
         if let Ok(parsed) = serde_json::from_str::<Value>(v) {
             return parsed;
         }
@@ -695,8 +671,7 @@ mod tests {
 
     #[test]
     fn parse_render_round_trips_body_field() {
-        // The wire payload's body must NOT accumulate H1 lines
-        // across write/read cycles. Original C2 cross-review bug.
+        // The body must NOT accumulate H1 lines across write/read cycles.
         let original = Todo {
             id: "T-1".into(),
             status: Status::Open,

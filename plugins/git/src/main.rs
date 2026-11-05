@@ -218,8 +218,8 @@ fn action_worktree_add(params: &Value, config: &Config) -> Result<Value, (String
     let ws = require_workspace(params, config)?;
     let raw_branch = required_string(params, "branch")?;
     // `sanitize_jira` lowercases the branch (keeping slashes for Jira hierarchies) before
-    // validation,
-    // so a trigger can interpolate `linked_jira` from a Todo payload without pre-lowercasing.
+    // validation, so a trigger can interpolate `linked_jira` from a Todo payload without
+    // pre-lowercasing.
     // Default `false` keeps callers that pass a prepared branch name unchanged.
     let sanitize_jira = optional_bool(params, "sanitize_jira")?.unwrap_or(false);
     let branch = if sanitize_jira {
@@ -245,9 +245,8 @@ fn action_worktree_add(params: &Value, config: &Config) -> Result<Value, (String
                 return false;
             }
             // Skip the primary checkout: `git worktree list` includes it, and `worktree_add
-            // {branch: "main"}`
-            // on a repo checked out to `main` would otherwise fail the worktree_root guard instead
-            // of
+            // {branch: "main"}` on a repo checked out to `main` would otherwise fail the
+            // worktree_root guard instead of
             // returning the usual `branch_exists`.
             canonicalize_existing_or_self(&w.path) != ws.path
         })
@@ -341,8 +340,7 @@ fn action_worktree_remove(params: &Value, config: &Config) -> Result<Value, (Str
     let target = PathBuf::from(&path_str);
     // Refuse to delete anything outside the configured workspace `path`s or `worktree_root`s, so a
     // trigger that interpolates the wrong field cannot remove arbitrary directories. Same
-    // allow-list
-    // as `status {path}`. canonicalize_existing_or_self strips `..` from the tail so
+    // allow-list as `status {path}`. canonicalize_existing_or_self strips `..` from the tail so
     // `<allowed>/../etc` cannot lexically pass.
     let canon_target = canonicalize_existing_or_self(&target);
     // Workspaces cannot overlap (config.rs rejects pair-wise overlap), so at most one matches and
@@ -355,8 +353,7 @@ fn action_worktree_remove(params: &Value, config: &Config) -> Result<Value, (Str
         Some(w) => w,
         None => {
             // A fatal config error may mean the intended workspace failed to load; report that
-            // instead of a
-            // generic forbidden.
+            // instead of a generic forbidden.
             let code = if config.fatal_error.is_some() {
                 "config_error"
             } else {
@@ -486,8 +483,7 @@ fn require_workspace<'a>(
     let name = required_string(params, "workspace")?;
     if let Some(w) = config.find(&name) {
         // The workspace itself loaded, so proceed even if other entries have errors; one typo must
-        // not
-        // brick every other workspace.
+        // not brick every other workspace.
         return Ok(w);
     }
     // `not_found` (unknown name, a typo) vs `config_error` (the name may match a block that failed
@@ -766,9 +762,8 @@ default_base = "main"
         let r = action_worktree_add(&json!({"workspace": "myrepo", "branch": "feature/x"}), &cfg)
             .unwrap();
         assert_eq!(r["branch"], "feature/x");
-        // The completion event is published by the platform ActionRegistry, not this handler, so
-        // it is
-        // not exercised here.
+        // The completion event is published by the platform ActionRegistry, not this handler, so it
+        // is not exercised here.
         let added_path = r["path"].as_str().unwrap().to_string();
         let listed = action_list_worktrees(&json!({"workspace": "myrepo"}), &cfg).unwrap();
         let arr = listed["worktrees"].as_array().unwrap();
@@ -811,8 +806,7 @@ default_base = "main"
     #[test]
     fn worktree_add_falls_through_when_branch_is_primary_checkout() {
         // The primary checkout appears in `git worktree list`; the idempotent scan must not
-        // intercept
-        // it, or `worktree_add {branch: "main"}` would surface invalid_state instead of
+        // intercept it, or `worktree_add {branch: "main"}` would surface invalid_state instead of
         // branch_exists.
         let (_d, cfg) = fixture_with_one_workspace();
         let err = action_worktree_add(&json!({"workspace": "myrepo", "branch": "main"}), &cfg)
@@ -870,9 +864,8 @@ default_base = "main"
 
     #[test]
     fn overlapping_workspace_configs_are_rejected() {
-        // Configs whose path/worktree_root sit inside another workspace's are refused at load
-        // time, so
-        // worktree-ownership resolution is unambiguous.
+        // Configs whose path/worktree_root sit inside another workspace's are refused at load time,
+        // so worktree-ownership resolution is unambiguous.
         let dir = tempdir().unwrap();
         let outer = dir.path().join("outer");
         let inner = outer.join("nested");

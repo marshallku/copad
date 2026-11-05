@@ -1,24 +1,14 @@
-//! Pilot — autonomous goal-queue orchestration plugin (Phase 24, decision #51).
+//! Pilot — autonomous goal-queue orchestration plugin (decision #51).
 //!
-//! Owns a persistent goal queue (the single source of truth) and drives
-//! one interactive agent session at a time by shelling out to `csd`
-//! (claude/codex session driver, `~/dev/csd`) — the same consume-don't-
-//! reimplement pattern copad uses for `tmx`. The long drive loop lives in
-//! a background thread ([`dispatcher`]); the `pilot.*` actions are quick
-//! RPCs that enqueue or resolve gates.
+//! Owns a persistent goal queue and drives one interactive agent session at a time by shelling
+//! out to `csd` (claude/codex session driver, `~/dev/csd`), the same consume-don't-reimplement
+//! pattern copad uses for `tmx`. The long drive loop lives in a background thread
+//! ([`dispatcher`]); the `pilot.*` actions (`add`, `list`, `cancel`, `answer`, `approve`) are
+//! quick RPCs that enqueue or resolve gates.
 //!
-//! Actions:
-//! - `pilot.add {cwd, instruction, posture?}` — enqueue a goal.
-//! - `pilot.list` — the full queue (cockpit reads this; events are ephemeral).
-//! - `pilot.cancel {id}` — cancel a goal and kill its session.
-//! - `pilot.answer {id, text}` — answer a clarifying-question gate.
-//! - `pilot.approve {id, option?}` — approve a plan / permission / trust gate.
-//!
-//! Activation `onStartup`: the dispatcher must be alive (and resume
-//! crash-interrupted goals) whenever copad runs. Env knobs:
-//! `COPAD_PILOT_QUEUE_FILE`, `COPAD_PILOT_CSD_BIN`,
-//! `COPAD_PILOT_CSD_TIMEOUT_SECS`, `COPAD_PILOT_POLL_MS`,
-//! `COPAD_PILOT_MAX_REPROMPTS`.
+//! Activation `onStartup`: the dispatcher must be alive (and resume crash-interrupted goals)
+//! whenever copad runs. Env knobs: `COPAD_PILOT_QUEUE_FILE`, `COPAD_PILOT_CSD_BIN`,
+//! `COPAD_PILOT_CSD_TIMEOUT_SECS`, `COPAD_PILOT_POLL_MS`, `COPAD_PILOT_MAX_REPROMPTS`.
 
 mod csd;
 mod dispatcher;
@@ -203,9 +193,9 @@ fn action_add(
             format!("cwd {cwd:?} is not an existing directory"),
         ));
     }
-    // Non-blocking: a goal drives an autonomous coding agent that may edit files. Running it outside
-    // a git work tree means no version control to fall back on, so surface a warning (the cockpit
-    // shows it; the goal still enqueues) rather than silently accepting a risky cwd.
+    // Non-blocking: a goal drives an autonomous agent that may edit files, and outside a git work
+    // tree there is no version control to fall back on. Surface a warning (the cockpit shows it;
+    // the goal still enqueues) rather than silently accepting a risky cwd.
     let vcs_warning = vcs_warning(&dir);
     let goal = store
         .lock()
@@ -217,11 +207,8 @@ fn action_add(
                 format!("goal not enqueued — could not persist the queue: {e}"),
             )
         })?;
-    // Observable enqueue (Phase 24.4): lets the cockpit and chained
-    // triggers react to a goal being added — including goals added BY a
-    // trigger (`event_kind → pilot.add`), which is how event-driven
-    // enqueue works (the TriggerEngine interpolates `{event.*}` into the
-    // params; pilot just exposes the action). See triggers.example.toml.
+    // Observable enqueue, including goals added BY a trigger (`event_kind -> pilot.add`; the
+    // TriggerEngine interpolates `{event.*}` into the params). See triggers.example.toml.
     publish_event(
         tx,
         "pilot.goal_added",
@@ -241,9 +228,9 @@ fn action_add(
     Ok(out)
 }
 
-/// Warn when `cwd` is not inside a git work tree — walks up looking for a `.git` entry (a dir for a
-/// normal repo, a file for a worktree/submodule checkout), so the check needs neither the `git`
-/// binary nor a subprocess. `None` means "inside a repo, no warning".
+/// Warn when `cwd` is not inside a git work tree. Walks up looking for a `.git` entry (a dir for a
+/// normal repo, a file for a worktree/submodule), so it needs neither `git` nor a subprocess.
+/// `None` means "inside a repo, no warning".
 fn vcs_warning(cwd: &std::path::Path) -> Option<String> {
     let in_repo = cwd.ancestors().any(|p| p.join(".git").exists());
     if in_repo {
@@ -267,22 +254,16 @@ fn action_list(store: &Arc<Mutex<Store>>) -> Result<Value, (String, String)> {
     Ok(json!({ "goals": goals }))
 }
 
-/// Cockpit read (Phase 24.3). The full queue + status counts + the active
-/// goal and its current gate, plus a best-effort LIVE `csd state` for the
-/// one active goal (sub-poll freshness + working/tools detail the persisted
-/// status doesn't carry). Events are ephemeral, so a browser opened later
-/// renders the live gate from this read. Cross-session observation
-/// (`csd ps --json` + `tmx agents --json`) is aggregated by `web-bridge`
-/// (Phase 24.6), not reimplemented here.
+/// Cockpit read. The full queue + status counts + the active goal and its current gate, plus a
+/// best-effort LIVE `csd state` for the active goal (sub-poll freshness the persisted status
+/// doesn't carry). Events are ephemeral, so a browser opened later renders the live gate from this
+/// read. Cross-session observation is aggregated by `web-bridge`, not here.
 fn action_status(store: &Arc<Mutex<Store>>, csd: &Csd) -> Result<Value, (String, String)> {
     let goals = store.lock().unwrap().snapshot();
 
-    // The dispatcher drives exactly one goal at a time: the first
-    // non-terminal goal in insertion order.
     let active = goals.iter().find(|g| !g.status.is_terminal()).cloned();
     let active_id = active.as_ref().map(|g| g.id.clone());
 
-    // One live `csd state` query, for the active goal only (bounded cost).
     let live = active
         .as_ref()
         .and_then(|g| g.csd_session.as_deref())
@@ -333,7 +314,6 @@ fn action_cancel(
     tx: &Sender<String>,
 ) -> Result<Value, (String, String)> {
     let id = required_string(params, "id")?;
-    // Distinguish "no such id" from "already terminal" for a useful error.
     let exists = store.lock().unwrap().get(&id).is_some();
     if !exists {
         return Err(("not_found".into(), format!("no goal with id {id:?}")));
@@ -354,10 +334,8 @@ fn action_cancel(
             ));
         }
     };
-    // Surface (don't swallow) the kill outcome: if `csd kill` fails the
-    // interactive agent may linger, so the cockpit/caller can see it and
-    // intervene. We still mark the goal cancelled — the queue shouldn't be
-    // held hostage by a flaky kill — but a failed kill is reported, not lost.
+    // Surface the kill outcome: if `csd kill` fails the agent may linger and the caller should see
+    // it. The goal is still marked cancelled so a flaky kill can't hold the queue hostage.
     let session_kill = match &session {
         Some(name) => match csd.kill(name) {
             Ok(()) => json!("ok"),
@@ -380,10 +358,9 @@ fn action_answer(
     let id = required_string(params, "id")?;
     let text = required_string(params, "text")?;
     let (session, gate) = require_open_gate(store, &id, &["answer"])?;
-    // Re-check live state and confirm it's the SAME question we recorded
-    // (codex C6/C1) — a session that advanced to a different question
-    // since the gate was recorded must reject the stale answer rather
-    // than send it into the wrong turn.
+    // Re-check live state and confirm it is the SAME question we recorded: a session that moved
+    // to a different question must reject the stale answer instead of sending it into the wrong
+    // turn.
     match csd.state(&session).map_err(csd_err)? {
         CsdState::AwaitingAnswer { question }
             if gate.prompt.as_deref().map(str::trim) == Some(question.trim()) => {}
@@ -409,10 +386,8 @@ fn action_approve(
     let id = required_string(params, "id")?;
     let option = optional_u32(params, "option")?.unwrap_or(1);
     let (session, recorded) = require_open_gate(store, &id, &["plan", "trust", "permission"])?;
-    // Reject a stale gate (codex C1/C2): the LIVE gate must match the
-    // recorded kind AND its identifying content (plan file / prompt), so
-    // an approval queued for one gate can't land on a different one the
-    // session has since advanced to.
+    // Reject a stale gate: the LIVE gate must match the recorded kind AND its identifying content
+    // (plan file / prompt), so an approval queued for one gate can't land on a later one.
     match csd.state(&session).map_err(csd_err)? {
         CsdState::PlanReady { plan_file, plan } if recorded.kind == "plan" => {
             // Match BOTH the plan file path AND the plan text (stored in
@@ -449,9 +424,7 @@ fn action_approve(
     Ok(json!({ "id": id, "status": "running", "option": option }))
 }
 
-/// Validate that `id` is paused on a gate of one of `kinds`; return its
-/// `(session, recorded gate)` so the caller can match it against the live
-/// `csd state`.
+/// Validate that `id` is paused on a gate of one of `kinds`; return `(session, recorded gate)`.
 fn require_open_gate(
     store: &Arc<Mutex<Store>>,
     id: &str,
@@ -615,14 +588,12 @@ mod tests {
     #[test]
     fn vcs_warning_flags_non_git_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        // A bare tempdir is not a git work tree → warned.
         let warning = vcs_warning(dir.path()).expect("non-git cwd must warn");
         assert!(
             warning.contains("not inside a git repository"),
             "got {warning}"
         );
 
-        // Plant a `.git` dir → no warning (covers both a repo root and any nested cwd under it).
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         assert_eq!(vcs_warning(dir.path()), None);
         let nested = dir.path().join("src/deep");
@@ -643,7 +614,6 @@ mod tests {
             &null_tx(),
         )
         .unwrap();
-        // Enqueues anyway (non-blocking) but carries the warning for the cockpit.
         assert_eq!(out["status"], "queued");
         assert!(
             out["warning"].as_str().unwrap().contains("git repository"),
@@ -663,7 +633,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, "invalid_params");
 
-        // A real dir succeeds and lands as Queued.
         let ok = action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "do it" }),
             &store,
@@ -701,9 +670,7 @@ mod tests {
 
     #[test]
     fn add_publishes_goal_added_event() {
-        // Phase 24.4: an enqueue (incl. a trigger-driven `event_kind →
-        // pilot.add`) is observable on the bus so the cockpit / chained
-        // triggers can react.
+        // An enqueue (incl. a trigger-driven `event_kind -> pilot.add`) is observable on the bus.
         let (dir, store) = fixture();
         let (tx, rx) = channel::<String>();
         let ok = action_add(
@@ -797,7 +764,6 @@ mod tests {
         )
         .unwrap();
         let id = added["id"].as_str().unwrap();
-        // Queued, not AwaitingGate → invalid_state before any csd call.
         let err = action_answer(&json!({ "id": id, "text": "hi" }), &store, &csd).unwrap_err();
         assert_eq!(err.0, "invalid_state");
     }
@@ -822,10 +788,8 @@ mod tests {
                 plan_file: None,
             });
         });
-        // approve expects plan/trust/permission, gate is "answer".
         let err = require_open_gate(&store, &id, &["plan", "trust", "permission"]).unwrap_err();
         assert_eq!(err.0, "invalid_state");
-        // answer accepts it.
         let (session, gate) = require_open_gate(&store, &id, &["answer"]).unwrap();
         assert_eq!(session, id);
         assert_eq!(gate.kind, "answer");

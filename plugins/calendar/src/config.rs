@@ -1,9 +1,6 @@
-//! Plugin runtime configuration sourced from environment variables.
-//!
-//! The plugin avoids hard-coding any Google OAuth client_id / secret
-//! because copad is OSS and embedding shared credentials would let anyone
-//! impersonate "copad" in OAuth consent screens. Users supply their own
-//! Google Cloud project credentials.
+//! Plugin runtime configuration from environment variables. No Google OAuth client_id / secret is
+//! hard-coded: copad is OSS and shared credentials would let anyone impersonate "copad" on OAuth
+//! consent screens, so users supply their own Google Cloud project credentials.
 
 use std::time::Duration;
 
@@ -17,15 +14,15 @@ pub struct Config {
     pub lookahead_hours: u32,
     pub require_secure_store: bool,
     pub plaintext_path: std::path::PathBuf,
-    /// Set when env validation failed and RPC started in minimal mode — carried so the daemon can
-    /// surface the cause instead of every action silently returning `not_authenticated`.
+    /// Set when env validation failed and RPC started in minimal mode, so the daemon can surface
+    /// the cause instead of every action silently returning `not_authenticated`.
     pub fatal_error: Option<String>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        // Validate the non-credential knobs first — a malformed value here is a genuine config
-        // error regardless of whether credentials are set, and is the only case `run_rpc` toasts.
+        // Validate the non-credential knobs first: a malformed value is a genuine config error
+        // whether or not credentials are set, and is the only case `run_rpc` toasts.
         let account_label =
             std::env::var("COPAD_CALENDAR_ACCOUNT").unwrap_or_else(|_| "default".to_string());
         validate_account_label(&account_label)?;
@@ -40,12 +37,10 @@ impl Config {
 
         let plaintext_path = default_plaintext_path(&account_label);
 
-        // The OAuth client id/secret are required to do anything, but "not set yet" is the normal
-        // pre-auth state (`auth_status` reports configured=false / `is_minimal()`), NOT a
-        // misconfiguration — leave them empty and quiet rather than erroring, so run_rpc doesn't
-        // raise a config-error toast on a fresh, never-authed calendar. `run_auth` checks presence
-        // itself before starting the device-code flow. Mirrors slack/jira, where unset credentials
-        // fall back to the store without a config error.
+        // The OAuth client id/secret being unset is the normal pre-auth state (`auth_status`
+        // reports
+        // configured=false), not a misconfiguration: leave them empty so a fresh calendar raises no
+        // config-error toast. `run_auth` checks presence itself. Mirrors slack/jira.
         let client_id = std::env::var("COPAD_CALENDAR_CLIENT_ID").unwrap_or_default();
         let client_secret = std::env::var("COPAD_CALENDAR_CLIENT_SECRET").unwrap_or_default();
 
@@ -62,14 +57,12 @@ impl Config {
         })
     }
 
-    /// Error-free minimal config (tests only — production always carries the validation error via
-    /// [`Config::minimal_with_error`]).
+    /// Error-free minimal config (tests only; production uses [`Config::minimal_with_error`]).
     #[cfg(test)]
     pub fn minimal() -> Self {
         Self::minimal_with_error_opt(None)
     }
 
-    /// Like [`Config::minimal`] but carries the validation error so the daemon can surface it.
     pub fn minimal_with_error(error: String) -> Self {
         Self::minimal_with_error_opt(Some(error))
     }
@@ -93,9 +86,8 @@ impl Config {
     }
 }
 
-/// `[A-Za-z0-9_\-.@]+` minus reserved `.`/`..`. Trust-boundary: the
-/// label is interpolated into both the keyring entry name and the
-/// plaintext file path (`calendar-token-<account>.json`).
+/// `[A-Za-z0-9_\-.@]+` minus reserved `.`/`..`. Trust boundary: the label is interpolated into the
+/// keyring entry name and the plaintext path (`calendar-token-<account>.json`).
 fn validate_account_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("COPAD_CALENDAR_ACCOUNT: cannot be empty".to_string());
@@ -140,8 +132,7 @@ fn parse_lead_minutes(raw: &str) -> Result<Vec<u32>, String> {
     Ok(out)
 }
 
-/// Strictly-positive — zero would silently degrade poll-interval (tight
-/// loop) or lookahead-window (empty) on a caller typo.
+/// Strictly positive: zero would silently degrade poll-interval (tight loop) or lookahead (empty).
 fn parse_nonzero_int<T>(var: &str, default: T) -> Result<T, String>
 where
     T: std::str::FromStr + PartialEq + Default + Copy,
@@ -175,7 +166,6 @@ fn default_plaintext_path(account: &str) -> std::path::PathBuf {
         .join(format!("calendar-token-{account}.json"))
 }
 
-/// `$XDG_CONFIG_HOME` → `$HOME/.config` → `None`.
 fn dirs_config_dir() -> Option<std::path::PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()

@@ -16,18 +16,12 @@
 //! default_base = "main"
 //! ```
 //!
-//! Validation: name follows the same charset as KB folder names so
-//! it's safe to embed in event payloads / log lines without escaping;
-//! `path` and `worktree_root` are canonicalized at load time so every
-//! later use is a stable absolute path. A missing config file is fine
-//! (returns empty workspace list — the plugin still serves
-//! `git.list_workspaces` returning `[]`).
+//! Validation: name uses the KB folder charset so it is safe in event payloads / log lines;
+//! `path` and `worktree_root` are canonicalized at load time. A missing config file is fine
+//! (empty workspace list; `git.list_workspaces` returns `[]`).
 //!
-//! `default_base` is the branch `worktree_add` uses when the caller
-//! omits `base`. We don't validate that the branch actually exists on
-//! disk at load time — git will error at the worktree_add call if
-//! someone misconfigured it, and that error is more precise than
-//! anything we'd synthesize here.
+//! `default_base` is the branch `worktree_add` uses when the caller omits `base`. It is not
+//! checked against disk at load: git's error at the worktree_add call is more precise.
 
 use std::path::{Path, PathBuf};
 
@@ -122,18 +116,13 @@ impl Config {
                 errors.push(format!("workspace {:?}: {e}", entry.name));
                 continue;
             }
-            // Defer the duplicate-name guard until after the rest
-            // of validation passes — otherwise a malformed first
-            // block "reserves" the name and a later valid block
-            // with the same name gets rejected as duplicate, which
-            // contradicts the documented "bad entry skipped,
-            // keep loading" behavior. We re-check `seen` at the
-            // end before pushing.
+            // Defer the duplicate-name guard until the rest of validation passes: otherwise a
+            // malformed first block "reserves" the name and a later valid block is rejected as a
+            // duplicate, contradicting "bad entry skipped, keep loading". `seen` is re-checked
+            // before pushing.
             let raw_path = PathBuf::from(&entry.path);
-            // Path MUST exist and MUST be a directory — otherwise the
-            // user has a typo or the disk is gone, and silently
-            // accepting a stale path leads to confusing
-            // `git worktree add` errors later.
+            // Path MUST exist and be a directory: a stale path would otherwise surface later as
+            // confusing `git worktree add` errors.
             let canon_path = match std::fs::canonicalize(&raw_path) {
                 Ok(p) => p,
                 Err(e) => {
@@ -153,15 +142,9 @@ impl Config {
                 ));
                 continue;
             }
-            // Sanity-check that the path is actually a git repo.
-            // A bare `.git` existence check passes too liberally —
-            // any arbitrary file named `.git` would slip through —
-            // and misses gitlink files used by submodules /
-            // secondary worktrees. `git rev-parse
-            // --is-inside-work-tree` is the canonical "is this a
-            // git working tree?" probe and covers all valid
-            // shapes (real repos, gitlink-pointed worktrees, etc.).
-            // The fork+exec is a one-time cost at config load.
+            // Probe with `git rev-parse --is-inside-work-tree`: a bare `.git` existence check
+            // passes any file named `.git` and misses gitlink files (submodules, secondary
+            // worktrees). The fork+exec is a one-time cost at config load.
             let probe = std::process::Command::new("git")
                 .arg("-C")
                 .arg(&canon_path)
@@ -182,11 +165,9 @@ impl Config {
                 ));
                 continue;
             }
-            // worktree_root: explicit values must be absolute (the
-            // allow-list checks downstream `Path::starts_with` are
-            // only meaningful against a stable absolute prefix).
-            // Default `<path>-worktrees` is always absolute since
-            // `path` was canonicalized above.
+            // Explicit worktree_root must be absolute: the downstream `Path::starts_with`
+            // allow-list checks need a stable absolute prefix. The default `<path>-worktrees` is
+            // absolute since `path` was canonicalized above.
             let raw_root = match entry.worktree_root.as_deref() {
                 Some(s) if !s.is_empty() => {
                     let p = PathBuf::from(s);
@@ -214,8 +195,6 @@ impl Config {
                     continue;
                 }
             };
-            // Final duplicate check happens here, after every
-            // other validation gate has passed for this entry.
             if !seen.insert(entry.name.clone()) {
                 errors.push(format!(
                     "duplicate workspace name {:?} (names must be unique)",
@@ -223,17 +202,9 @@ impl Config {
                 ));
                 continue;
             }
-            // Reject overlap with already-loaded workspaces. Two
-            // workspaces "overlap" if any of {path_a, root_a}
-            // sits under any of {path_b, root_b} (in either
-            // direction). Without this check, longest-prefix
-            // owner resolution in `worktree_remove` /
-            // `status {path}` is ambiguous on legitimate
-            // configurations (e.g. outer.worktree_root contains
-            // a path matching inner's path), and we'd misroute
-            // git operations to the wrong repo. Rare in practice
-            // — the user defines workspaces.toml — but
-            // forbidding it outright is the cleanest contract.
+            // Reject overlap with already-loaded workspaces (any of {path_a, root_a} under any of
+            // {path_b, root_b}, either direction). Otherwise longest-prefix owner resolution in
+            // `worktree_remove` / `status {path}` is ambiguous and git operations get misrouted.
             let new_paths = [&canon_path, &canon_root];
             let overlap = workspaces.iter().find(|other| {
                 let other_paths = [&other.path, &other.worktree_root];
@@ -278,11 +249,9 @@ impl Config {
     }
 }
 
-/// Canonicalizes the existing prefix and re-appends the missing tail
-/// with `..`/`.` collapsed. Lets a not-yet-created worktree_root hold a
-/// stable absolute path. Without `..`-collapsing, downstream
-/// `Path::starts_with` allow-list checks misbehave on a verbatim
-/// `/foo/bar/../baz` that survives because `bar` doesn't yet exist.
+/// Canonicalizes the existing prefix and re-appends the missing tail with `..`/`.` collapsed, so
+/// a not-yet-created worktree_root still holds a stable absolute path. Without the collapsing,
+/// downstream `Path::starts_with` allow-list checks misbehave on a verbatim `/foo/bar/../baz`.
 fn canonicalize_or_normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     if let Ok(c) = std::fs::canonicalize(p) {
@@ -330,9 +299,8 @@ fn canonicalize_or_normalize(p: &Path) -> PathBuf {
 }
 
 fn default_worktree_root(workspace_path: &Path) -> PathBuf {
-    // `<path>-worktrees`. Hard-fallback to `<path>/.worktrees` if
-    // the parent / file_name decomposition fails (shouldn't happen
-    // for canonicalized paths but guarded for safety).
+    // `<path>-worktrees`, with a hard fallback to `<path>/.worktrees` if the parent / file_name
+    // decomposition fails.
     if let (Some(parent), Some(name)) = (workspace_path.parent(), workspace_path.file_name()) {
         let mut suffixed = name.to_os_string();
         suffixed.push("-worktrees");
@@ -368,9 +336,8 @@ fn config_home() -> Option<PathBuf> {
     None
 }
 
-/// `[A-Za-z0-9_\-.@]+` minus the reserved `.` / `..` (same charset as
-/// KB/todo). Trust-boundary so the name can appear in event payloads,
-/// log lines, or derived paths.
+/// `[A-Za-z0-9_\-.@]+` minus the reserved `.` / `..` (same charset as KB/todo). Trust boundary:
+/// the name appears in event payloads, log lines and derived paths.
 pub fn validate_name(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("workspace name cannot be empty".to_string());
@@ -472,10 +439,8 @@ default_base = "main"
 
     #[test]
     fn fake_dot_git_file_rejected() {
-        // I1 fix: a bogus regular file named `.git` would have
-        // passed the old `exists()` check. The new
-        // rev-parse-based probe properly recognizes this as not
-        // a git working tree.
+        // A bogus regular file named `.git` must not pass: the rev-parse probe recognizes it as
+        // not a git working tree.
         let dir = tempdir().unwrap();
         let fake = dir.path().join("fake");
         std::fs::create_dir_all(&fake).unwrap();
@@ -533,10 +498,8 @@ default_base = "main"
 
     #[test]
     fn missing_default_base_skips_only_that_entry() {
-        // Round-5 C1 fix: a single bad entry must NOT brick other
-        // valid entries. The bad entry surfaces as an error in
-        // `fatal_error` and is omitted from `workspaces`; the
-        // good entry still loads cleanly.
+        // A single bad entry must NOT brick other valid entries: it surfaces in `fatal_error` and
+        // is omitted from `workspaces`, while the good entry still loads.
         let dir = tempdir().unwrap();
         let bad = dir.path().join("bad");
         let good = dir.path().join("good");

@@ -4,10 +4,8 @@
 <meta charset="utf-8" />
 <title>Pilot</title>
 <style>
-  /* Consume the theme CSS copad injects into every panel (--copad-*),
-     so the panel tracks the active color theme instead of a hardcoded
-     palette. `color-scheme: dark` makes native <select>/<input> controls
-     render dark instead of the light system default. */
+  /* Theme CSS injected by copad (--copad-*). `color-scheme: dark` makes native
+     <select>/<input> controls render dark. */
   :root {
     color-scheme: dark;
     --bg: var(--copad-bg, #1e1e2e);
@@ -19,8 +17,7 @@
     --accent: var(--copad-accent, #cba6f7);
     --red: var(--copad-red, #f38ba8);
     --border: var(--copad-surface2, #45475a);
-    /* Semantic status colors (no theme var for these) — saturated so
-       they stay legible on any dark theme. */
+    /* No theme var for these; saturated so they stay legible on any dark theme. */
     --green: #a6e3a1; --yellow: #f9e2af; --blue: #89b4fa;
   }
   * { box-sizing: border-box; }

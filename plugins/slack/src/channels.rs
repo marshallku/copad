@@ -1,18 +1,13 @@
 //! Channel registry: per-channel profile + bot-rpc config.
 //!
-//! Channels live at `$XDG_CONFIG_HOME/copad/slack-channels-<workspace>.json`
-//! (mode 0600, atomic temp+rename — same pattern as PlaintextStore). The
-//! file is small (≤ ~30 entries assumed) so every save rewrites it in
-//! full; no index / pagination.
+//! Channels live at `$XDG_CONFIG_HOME/copad/slack-channels-<workspace>.json` (mode 0600, atomic
+//! temp+rename, same pattern as PlaintextStore). The file is small, so every save rewrites it in
+//! full.
 //!
-//! Profile semantics — the action loop that consumes these is intentionally
-//! not in this slice:
-//! - `read` — passive observation only
-//! - `collect` — earmarked for knowledge-base capture (collect logic TBD)
-//! - `bot-rpc` — generic "post a message, wait for a matching response, fire
-//!   a follow-up action" pattern. `wait_mode`/`wait_regex`/`wait_user_filter`
-//!   / `wait_timeout_ms` define the response-match contract. NOT Jira-specific;
-//!   the user's Jira-bot integration is one instance of the pattern.
+//! Profiles: `read` (passive observation), `collect` (messages appended to the collect store,
+//! `collect.rs`), `bot-rpc` (generic "post a message, wait for a matching response, fire a
+//! follow-up action"; `wait_mode`/`wait_regex`/`wait_user_filter`/`wait_timeout_ms` define the
+//! match contract, not Jira-specific).
 
 use std::fs;
 use std::io::Write;
@@ -62,9 +57,8 @@ pub struct BotRpcConfig {
     pub wait_in_thread: bool,
 }
 
-/// Placeholder for the future `collect` profile config (destination,
-/// format, filters). Empty in this slice — the field exists so future
-/// schema additions don't require a migration.
+/// Placeholder for the future `collect` profile config (destination, format, filters). Empty so
+/// far; the field exists so later additions don't need a migration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollectConfig {}
 
@@ -120,8 +114,6 @@ pub fn channel_supports_name(id: &str) -> bool {
     matches!(id.as_bytes().first(), Some(b'C') | Some(b'G'))
 }
 
-/// Validates an entry before persisting. Returns an `invalid_params`-style
-/// message on rejection (caller maps to RPC error code).
 pub fn validate_entry(entry: &ChannelEntry) -> Result<(), String> {
     if !is_valid_channel_id(&entry.id) {
         return Err(format!(
@@ -150,9 +142,8 @@ fn validate_bot_rpc(cfg: &BotRpcConfig) -> Result<(), String> {
             "'bot_rpc.default_template' exceeds {MAX_TEMPLATE_LEN} chars"
         ));
     }
-    // Codex round-2 PB4: zero is ambiguous (forever vs default) — the
-    // panel form pre-existing builds let users enter 0; this makes the
-    // contract explicit so invoke never has to guess.
+    // Zero is ambiguous (forever vs default); make the contract explicit so invoke never has to
+    // guess.
     if cfg.wait_timeout_ms == 0 {
         return Err("'bot_rpc.wait_timeout_ms' must be > 0 (suggested 30000)".to_string());
     }
@@ -169,18 +160,14 @@ fn validate_bot_rpc(cfg: &BotRpcConfig) -> Result<(), String> {
             .map_err(|e| format!("'bot_rpc.wait_regex' compile error: {e}"))?;
     }
     if !cfg.wait_user_filter.is_empty() && !is_valid_channel_id(&cfg.wait_user_filter) {
-        // Filter is a Slack user id (Uxxx) — same charset as channel id.
-        // Reject malformed input early so the runtime never compares against
-        // garbage strings.
+        // A Slack user id (Uxxx) shares the channel id charset; reject malformed input early.
         return Err(format!(
             "'bot_rpc.wait_user_filter' must be a Slack user id (Uxxx); got {:?}",
             cfg.wait_user_filter
         ));
     }
-    // Codex round-2 PB3: prevent zero-correlation channels. If the
-    // response isn't expected in the request's thread AND the user
-    // gives no filter AND the wait_mode is first-reply (no regex
-    // signal), ANY channel chatter would complete the wait.
+    // Prevent zero-correlation channels: with no thread, no user filter and first-reply mode
+    // (no regex signal), any channel chatter would complete the wait.
     if !cfg.wait_in_thread
         && cfg.wait_user_filter.is_empty()
         && matches!(cfg.wait_mode, WaitMode::FirstReply)
@@ -196,9 +183,8 @@ fn validate_bot_rpc(cfg: &BotRpcConfig) -> Result<(), String> {
 
 pub struct ChannelStore {
     path: PathBuf,
-    // The store is touched from at least two places (RPC dispatch + future
-    // collect/bot-rpc loops). Serializing through one Mutex avoids torn
-    // reads if a save() races a load().
+    // Serializes RPC dispatch and the collect/bot-rpc loops so a save() racing a load() can't
+    // produce torn reads.
     guard: Mutex<()>,
 }
 
@@ -258,10 +244,8 @@ impl ChannelStore {
         } else if entry.added_at == 0 {
             entry.added_at = now;
         }
-        // Strict monotonic `updated_at`: if the wall clock has not
-        // advanced past the previous value (same millisecond, or clock
-        // skew), still bump by 1. AC requires updated_at to refresh on
-        // every upsert; the clock is not a sufficient guarantee.
+        // Strictly monotonic `updated_at`: if the wall clock hasn't advanced (same millisecond,
+        // or skew), still bump by 1 so every upsert refreshes it.
         entry.updated_at = match prev_updated {
             Some((_, prev)) if now <= prev => prev + 1,
             _ => now,
@@ -275,7 +259,6 @@ impl ChannelStore {
         Ok(entry)
     }
 
-    /// Idempotent: returns `false` when nothing was removed.
     pub fn remove(&self, id: &str) -> Result<bool, String> {
         let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = self.load_locked();
@@ -424,8 +407,6 @@ mod tests {
 
     #[test]
     fn validate_preserves_botrpc_on_read_profile() {
-        // Switching profile bot-rpc → read in the UI should keep the
-        // bot-rpc config around (so toggling back doesn't lose input).
         let mut e = sample_bot_rpc("C01");
         e.profile = ChannelProfile::Read;
         validate_entry(&e).expect("read profile + stale bot_rpc config is OK");
@@ -448,8 +429,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_correlation_first_reply() {
-        // first-reply + no thread + no user filter = any channel
-        // chatter would complete the wait. Codex round-2 PB3 fix.
+        // first-reply + no thread + no user filter: any channel chatter would complete the wait.
         let mut e = sample_bot_rpc("C01");
         let cfg = e.bot_rpc.as_mut().unwrap();
         cfg.wait_mode = WaitMode::FirstReply;
@@ -462,8 +442,6 @@ mod tests {
 
     #[test]
     fn validate_accepts_first_reply_when_in_thread() {
-        // wait_in_thread provides the correlation signal — empty
-        // user filter and first-reply is fine.
         let mut e = sample_bot_rpc("C01");
         let cfg = e.bot_rpc.as_mut().unwrap();
         cfg.wait_mode = WaitMode::FirstReply;
@@ -496,8 +474,6 @@ mod tests {
         e2.name = "team-infra-renamed".into();
         let saved2 = store.upsert(e2).unwrap();
         assert_eq!(saved2.added_at, first_added, "added_at preserved");
-        // Monotonic guarantee: even if the clock didn't advance, the
-        // second upsert's updated_at must be strictly greater.
         assert!(
             saved2.updated_at > saved.updated_at,
             "updated_at strictly advances on repeated upsert"
@@ -510,10 +486,8 @@ mod tests {
 
     #[test]
     fn upsert_updated_at_is_strictly_monotonic_back_to_back() {
-        // Exercises the same-millisecond branch of upsert(): N back-to-back
-        // upserts on a fast machine will frequently share a wall-clock
-        // millisecond. Every call must still produce a strictly increasing
-        // updated_at.
+        // Exercises the same-millisecond branch of upsert(): back-to-back upserts often share a
+        // millisecond yet must still produce a strictly increasing updated_at.
         let dir = tempdir().unwrap();
         let store = ChannelStore::new(dir.path().join("c.json"));
         store.upsert(sample_read("C0123ABC")).unwrap();
@@ -570,9 +544,8 @@ mod tests {
 
     #[test]
     fn entry_deserializes_with_minimal_fields() {
-        // Future-proof: a future writer may omit fields we add later. The
-        // current shape must round-trip through a minimal JSON without
-        // breaking (already-saved files in older formats forward-compat).
+        // A minimal JSON (fields added later omitted) must still deserialize, for files saved in
+        // older formats.
         let minimal = r#"{
             "id": "C0123ABC",
             "profile": "read",

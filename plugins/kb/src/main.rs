@@ -1,25 +1,15 @@
-//! First-party KB service plugin for copad.
+//! First-party KB service plugin: `kb.search` / `kb.read` / `kb.append` / `kb.ensure` over a
+//! filesystem root (default `~/docs`, overridable via `COPAD_KB_ROOT`). Protocol contract:
+//! `docs/kb-protocol.md`.
 //!
-//! Implements `kb.search` / `kb.read` / `kb.append` / `kb.ensure` over a
-//! filesystem root (default `~/docs`, overridable via `COPAD_KB_ROOT`).
-//! Search is grep-and-filename only — Phase 13 will swap in an FTS5
-//! index without touching the protocol surface.
-//!
-//! The protocol contract this binary implements is `docs/kb-protocol.md`.
-//! Notable invariants pulled in from there:
-//! - `id` is a logical path-like key (`<folder>/<filename>`), the same
-//!   shape across all backends. Validated against `..` traversal,
-//!   leading slash, embedded nul.
-//! - `kb.ensure` uses temp-file + `renameat2(RENAME_NOREPLACE)` to give
-//!   exactly-one-creator semantics AND no torn reads.
-//! - `kb.append` writes the entire payload in a single `write(2)`
-//!   syscall on an `O_APPEND` fd; short writes are reported as errors
-//!   rather than retried (so concurrent appends never interleave).
+//! - `id` is a logical path-like key, validated against `..`, leading slash and embedded nul.
+//! - `kb.ensure` uses temp-file + `renameat2(RENAME_NOREPLACE)`: one creator, no torn reads.
+//! - `kb.append` writes the whole payload in one `write(2)` on an `O_APPEND` fd; short writes are
+//!   errors, not retried, so concurrent appends never interleave.
 //! - `.raw/` is excluded from `kb.search` results (still writable by id).
 //!
-//! Unix-only: relies on `O_NOFOLLOW` plus a kernel atomic-create-or-fail
-//! primitive (Linux `renameat2(RENAME_NOREPLACE)` / macOS
-//! `renamex_np(RENAME_EXCL)`) routed through `copad_core::fs_atomic`.
+//! Unix-only: relies on `O_NOFOLLOW` plus a kernel atomic-create-or-fail primitive (Linux
+//! `renameat2(RENAME_NOREPLACE)` / macOS `renamex_np(RENAME_EXCL)`) via `copad_core::fs_atomic`.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
@@ -46,8 +36,7 @@ fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    // Single writer thread funnels all outgoing JSON so init-reply,
-    // action-replies, and (future) notifications never interleave bytes.
+    // Single writer thread so replies never interleave bytes.
     let (tx, rx) = channel::<String>();
     let writer_tx = tx.clone();
     thread::spawn(move || {

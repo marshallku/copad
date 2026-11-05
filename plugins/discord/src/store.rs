@@ -1,14 +1,10 @@
-//! Single-token Discord credential store. Slack needs a pair of
-//! tokens (Bot OAuth + App-Level for Socket Mode); Discord's bot
-//! token authenticates BOTH the HTTP API and the Gateway WebSocket,
-//! so the store schema is simpler than Slack's.
+//! Single-token Discord credential store: unlike Slack's pair, one bot token authenticates both
+//! the HTTP API and the Gateway WebSocket.
 //!
-//! Keyring is preferred (Linux Secret Service / macOS Keychain).
-//! On failure, falls back to plaintext at
-//! `$XDG_CONFIG_HOME/copad/discord-token-<workspace>.json` (mode 0600,
-//! atomic-replace via per-call temp + rename) with a stderr warning
-//! on every open. `COPAD_DISCORD_REQUIRE_SECURE_STORE=1` forbids the
-//! plaintext fallback entirely.
+//! Keyring is preferred (Secret Service / macOS Keychain). On failure it falls back to plaintext
+//! at `$XDG_CONFIG_HOME/copad/discord-token-<workspace>.json` (mode 0600, atomic replace via
+//! per-call temp + rename) with a stderr warning on every open.
+//! `COPAD_DISCORD_REQUIRE_SECURE_STORE=1` forbids the fallback.
 
 use std::fs;
 use std::io::Write;
@@ -24,10 +20,9 @@ const KEYRING_SERVICE: &str = "copad-discord";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenSet {
     pub bot_token: String,
-    /// Persisted from `/users/@me` so `auth_status` doesn't re-call.
+    /// Persisted from `/users/@me` so `auth_status` does not re-call.
     pub user_id: Option<String>,
-    /// Bot username + discriminator (or new-style global name).
-    /// Diagnostic only — surfaced by `discord.auth_status`.
+    /// Bot username + discriminator (or global name); diagnostic only, shown by `discord.auth_status`.
     pub username: Option<String>,
 }
 
@@ -59,8 +54,6 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
     }
 }
 
-// -- Keyring backend --
-
 pub struct KeyringStore {
     entry: keyring::Entry,
 }
@@ -83,10 +76,9 @@ impl TokenStore for KeyringStore {
             Ok(s) => match serde_json::from_str(&s) {
                 Ok(set) => Some(set),
                 Err(e) => {
-                    // Malformed credential blob — surface explicitly
-                    // rather than collapsing to "not authenticated".
-                    // Field debugging is otherwise indistinguishable
-                    // from the never-ran-`auth` case.
+                    // A malformed credential blob is surfaced, not collapsed to "not
+                    // authenticated", which field debugging could not tell from never having run
+                    // `auth`.
                     eprintln!(
                         "[discord] keyring credential is corrupted (failed to deserialize): {e}. \
                          Re-run `copad-plugin-discord auth` to overwrite."
@@ -118,8 +110,6 @@ impl TokenStore for KeyringStore {
         "keyring"
     }
 }
-
-// -- Plaintext fallback --
 
 pub struct PlaintextStore {
     path: PathBuf,
@@ -203,8 +193,6 @@ fn atomic_write_0600(path: &Path, tokens: &TokenSet) -> Result<(), String> {
     })?;
     Ok(())
 }
-
-// -- Broken (keyring required, none available) --
 
 pub struct BrokenStore {
     reason: String,

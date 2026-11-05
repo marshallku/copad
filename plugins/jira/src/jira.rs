@@ -1,13 +1,9 @@
-//! Atlassian Cloud REST v3 client. Auth is HTTP Basic with
-//! `email:api_token` base64-encoded — same shape every Atlassian Cloud
-//! SDK uses. Same client serves both `auth` (one-shot `/myself`) and
-//! the polling loop / action surface.
+//! Atlassian Cloud REST v3 client. Auth is HTTP Basic with base64 `email:api_token`. The same
+//! client serves `auth` (one-shot `/myself`), the polling loop and the action surface.
 //!
-//! Bodies destined for `description` / `comment` fields are wrapped in
-//! ADF (Atlassian Document Format) — Jira Cloud rejected the legacy
-//! Wiki Markup format on 2020-06 and now requires structured JSON.
-//! ADF helpers live here so all callers (actions + future trigger
-//! consumers) get a consistent wrap shape.
+//! Bodies for `description` / `comment` fields are wrapped in ADF (Atlassian Document Format):
+//! Jira Cloud no longer accepts Wiki Markup. The ADF helpers live here so all callers get a
+//! consistent wrap shape.
 
 use serde_json::{Value, json};
 
@@ -134,10 +130,6 @@ pub fn join_url(base: &str, path: &str) -> String {
     let path = path.trim_start_matches('/');
     format!("{base}/{path}")
 }
-
-// ============================================================
-//                     High-level API methods
-// ============================================================
 
 /// Result of a paginated `POST /rest/api/3/search/jql`. The legacy
 /// `GET /rest/api/3/search` was deprecated by Atlassian in 2024 (sunset
@@ -349,10 +341,6 @@ pub fn add_comment(creds: Creds, key: &str, body_text: &str) -> Result<String, S
     Ok(id)
 }
 
-// ============================================================
-//                     Validators / encoders
-// ============================================================
-
 /// `[A-Z][A-Z0-9_]*-[0-9]+`. Trust-boundary defense: a malformed key can't
 /// splice path fragments (`"FOO/../bar"`) into the request URL.
 pub fn validate_issue_key(s: &str) -> Result<(), String> {
@@ -413,11 +401,9 @@ pub fn validate_project_key(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Wrap plain text in ADF (Atlassian Document Format). Jira Cloud rejected
-/// Wiki Markup in 2020-06; `description` and `comment.body` require ADF.
-/// Each non-empty line becomes its own `paragraph` so single newlines
-/// produce visible breaks. Empty input → single empty paragraph (Jira
-/// rejects an empty `content` array with 400).
+/// Wrap plain text in ADF. Each non-empty line becomes its own `paragraph` so single newlines
+/// produce visible breaks. Empty input yields a single empty paragraph (Jira rejects an empty
+/// `content` array with 400).
 pub fn text_to_adf(text: &str) -> Value {
     let mut content = Vec::new();
     if text.is_empty() {
@@ -524,7 +510,6 @@ mod tests {
 
     #[test]
     fn base64_encode_matches_known_vectors() {
-        // RFC 4648 §10 test vectors.
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
@@ -536,14 +521,12 @@ mod tests {
 
     #[test]
     fn base64_encode_handles_binary() {
-        // Non-ASCII byte sequence (UTF-8 'é' + 'á').
         assert_eq!(base64_encode(b"\xc3\xa9\xc3\xa1"), "w6nDoQ==");
     }
 
     #[test]
     fn basic_auth_header_format() {
-        // Atlassian's docs use this exact example: `fred@example.com:api_token`
-        // → `Basic ZnJlZEBleGFtcGxlLmNvbTphcGlfdG9rZW4=`
+        // Atlassian's documented example: `fred@example.com:api_token`.
         assert_eq!(
             basic_auth_header("fred@example.com", "api_token"),
             "Basic ZnJlZEBleGFtcGxlLmNvbTphcGlfdG9rZW4="
@@ -602,9 +585,8 @@ mod tests {
 
     #[test]
     fn parse_myself_tolerates_missing_optional_fields() {
-        // displayName and emailAddress are optional in the upstream
-        // schema (rare, but we shouldn't crash on a privacy-redacted
-        // response).
+        // displayName and emailAddress are optional upstream; a privacy-redacted response must
+        // not crash.
         let body = json!({ "accountId": "x" });
         let user = parse_myself(&body).unwrap();
         assert_eq!(user.display_name, "");
@@ -700,7 +682,6 @@ mod tests {
     fn text_to_adf_splits_on_newline() {
         let v = text_to_adf("line one\nline two\n\nline three");
         let content = v["content"].as_array().unwrap();
-        // 4 paragraphs: line one, line two, empty (between \n\n), line three
         assert_eq!(content.len(), 4);
         assert_eq!(content[0]["content"][0]["text"], "line one");
         assert_eq!(content[1]["content"][0]["text"], "line two");
@@ -710,7 +691,6 @@ mod tests {
 
     #[test]
     fn text_to_adf_empty_produces_empty_paragraph() {
-        // Jira's REST validates content has ≥1 node; empty doc 400s.
         let v = text_to_adf("");
         let content = v["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -742,8 +722,6 @@ mod tests {
 
     #[test]
     fn parse_search_response_no_token_no_is_last_treated_as_last() {
-        // Defensive against a response shape that omits both fields
-        // (Atlassian doc hints they may simplify further).
         let body = json!({
             "issues": Vec::<Value>::new(),
         });

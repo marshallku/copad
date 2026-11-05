@@ -1,13 +1,9 @@
-//! Calendar event payload — the wire shape published in
-//! `calendar.event_imminent` events and returned from
-//! `calendar.list_events` / `calendar.event_details`.
+//! Calendar event payload — the wire shape published in `calendar.event_imminent` events and
+//! returned from `calendar.list_events` / `calendar.event_details`.
 //!
-//! The payload deliberately includes more than meeting-prep needs
-//! (attendees, response status, organizer, location, conference URL,
-//! description) because trigger users need it for their `condition`
-//! expressions: "skip if my_status == 'declined'", "only if more than
-//! one attendee", "only physical-location meetings", etc. Triggers can
-//! ignore fields they don't use.
+//! It carries more than meeting-prep needs (attendees, response status, organizer, location,
+//! conference URL, description) because trigger `condition` expressions use them ("skip if
+//! my_status == 'declined'", "only physical-location meetings").
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,7 +18,6 @@ pub struct CalendarEvent {
     pub title: String,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
-    /// Whether this is an all-day event (no clock time).
     pub all_day: bool,
     /// `accepted` / `declined` / `tentative` / `needsAction`. `None`
     /// when the owner is the organizer with no self-response recorded.
@@ -33,8 +28,7 @@ pub struct CalendarEvent {
     pub description: Option<String>,
     /// e.g. Google Meet URL pulled from `conferenceData.entryPoints`.
     pub conference_url: Option<String>,
-    /// Direct link to the event on calendar.google.com — handy for
-    /// `webview.open` triggers.
+    /// Direct link to the event on calendar.google.com.
     pub html_link: String,
 }
 
@@ -128,7 +122,6 @@ pub fn from_gcal_json(raw: &Value) -> Option<CalendarEvent> {
 /// reminders shifted by the offset. See `docs/roadmap.md`.
 fn parse_event_time(node: &Value) -> Option<(DateTime<Utc>, bool)> {
     if let Some(dt) = node.get("dateTime").and_then(Value::as_str) {
-        // RFC3339, includes timezone — parse and convert to UTC.
         return DateTime::parse_from_rfc3339(dt)
             .ok()
             .map(|d| (d.with_timezone(&Utc), false));
@@ -136,9 +129,8 @@ fn parse_event_time(node: &Value) -> Option<(DateTime<Utc>, bool)> {
     if let Some(date) = node.get("date").and_then(Value::as_str) {
         let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
         let naive_midnight = parsed.and_hms_opt(0, 0, 0)?;
-        // `MappedLocalTime::earliest()` resolves DST gaps deterministically
-        // (picks the pre-jump instant) — midnight is rarely affected by DST
-        // but we'd rather pick a value than panic on the rare gap day.
+        // `earliest()` picks one of an ambiguous (fall-back) midnight instead of panicking; a
+        // midnight inside a DST gap yields None and drops the event.
         let local = Local.from_local_datetime(&naive_midnight).earliest()?;
         return Some((local.with_timezone(&Utc), true));
     }
@@ -185,7 +177,6 @@ fn parse_person(node: &Value) -> Option<Person> {
 fn extract_conference_url(raw: &Value) -> Option<String> {
     let conf = raw.get("conferenceData")?;
     let entries = conf.get("entryPoints").and_then(Value::as_array)?;
-    // Prefer "video" entry; fall back to any entry with a uri.
     let video = entries.iter().find(|e| {
         e.get("entryPointType")
             .and_then(Value::as_str)

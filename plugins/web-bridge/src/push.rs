@@ -1,18 +1,10 @@
-//! Web Push (RFC 8030) subscription storage + send pipeline for the
-//! PWA notification path.
+//! Web Push (RFC 8030) subscription storage + send pipeline for the PWA notification path.
 //!
 //! VAPID key pair comes from env (`COPAD_WEB_BRIDGE_VAPID_PRIVATE` /
-//! `COPAD_WEB_BRIDGE_VAPID_PUBLIC`, URL-safe base64 without padding —
-//! the form that `web-push --gen-vapid` and the SPA both consume).
-//! Subscriptions persist to `~/.config/copad/web-bridge-push.jsonl`
-//! (one JSON record per line), reloaded from disk on each mutation
-//! since the list stays small. Push send uses the isahc client baked
-//! into `web-push 0.11`.
-//!
-//! Why JSONL not SQLite: subscriptions are a flat append-mostly set,
-//! the file is human-inspectable when debugging push delivery, and
-//! pruning a 410 Gone endpoint is a whole-file rewrite (still cheap
-//! at our scale — phone + maybe laptop = ≤5 entries).
+//! `COPAD_WEB_BRIDGE_VAPID_PUBLIC`, URL-safe base64 without padding, the form `web-push
+//! --gen-vapid` and the SPA both consume).
+//! Subscriptions persist to `~/.config/copad/web-bridge-push.jsonl` (one JSON record per line).
+//! Sending uses the isahc client baked into `web-push 0.11`.
 
 use std::path::PathBuf;
 
@@ -24,22 +16,18 @@ use web_push::{
 
 #[derive(Debug, Clone)]
 pub struct PushConfig {
-    /// VAPID private key (URL-safe base64, no padding).
     pub vapid_private_b64: String,
-    /// VAPID public key (URL-safe base64, no padding) — exposed to the
-    /// browser via `GET /api/push/vapid-public` so it can call
-    /// `pushManager.subscribe({applicationServerKey: ...})`.
+    /// VAPID public key (URL-safe base64, no padding), served by `GET /api/push/vapid-public` for
+    /// `pushManager.subscribe({applicationServerKey})`.
     pub vapid_public_b64: String,
-    /// `sub` claim for the VAPID JWT — must be a mailto: or https URL.
-    /// Browsers / push services reject signatures without a stable
-    /// identifier; we default to a placeholder mailto when env is unset.
+    /// `sub` claim for the VAPID JWT: a mailto: or https URL. Push services reject signatures
+    /// without one, so a placeholder mailto is the default.
     pub vapid_subject: String,
 }
 
 impl PushConfig {
-    /// Read VAPID config from env. Returns `None` when private/public
-    /// keys aren't both set — caller treats push as disabled and
-    /// returns 501 from the subscribe endpoint.
+    /// `None` when the private/public keys aren't both set; the caller treats push as disabled and
+    /// the subscribe endpoint returns 501.
     pub fn from_env() -> Option<Self> {
         let priv_k = std::env::var("COPAD_WEB_BRIDGE_VAPID_PRIVATE").ok()?;
         let pub_k = std::env::var("COPAD_WEB_BRIDGE_VAPID_PUBLIC").ok()?;
@@ -60,9 +48,7 @@ impl PushConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
-    /// Deterministic id = `sha256(endpoint)` hex. Lets the SPA upsert
-    /// without tracking the server-assigned id — re-POST the same
-    /// browser subscription and we naturally dedupe.
+    /// `sha256(endpoint)` hex, so the SPA can upsert by re-POSTing the same browser subscription.
     pub id: String,
     pub endpoint: String,
     pub p256dh: String,
@@ -80,9 +66,8 @@ impl Subscription {
     }
 }
 
-/// `sha256(endpoint)` as lowercase hex. Endpoint URLs are long + ugly
-/// and contain `/` so they don't make good URL path segments. The
-/// hash is stable across re-subscriptions of the same browser.
+/// `sha256(endpoint)` as lowercase hex: endpoint URLs are long and contain `/`, and the hash is
+/// stable across re-subscriptions of the same browser.
 pub fn subscription_id_for(endpoint: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -123,10 +108,8 @@ fn parse_subscriptions(bytes: &[u8]) -> Vec<Subscription> {
         .collect()
 }
 
-/// Whole-file rewrite under the parent dir's natural lock granularity.
-/// Multiple parallel writers would race, but the only writer here is
-/// the (single) plugin process serialised via `AppState`'s tokio
-/// Mutex, so a simple rewrite is fine. Creates parent dirs on demand.
+/// Whole-file rewrite. The only writer is the single plugin process, serialised via `AppState`'s
+/// tokio Mutex, so parallel-writer races cannot happen. Creates parent dirs on demand.
 pub fn save_subscriptions(subs: &[Subscription]) -> std::io::Result<()> {
     let Some(path) = subscriptions_path() else {
         return Err(std::io::Error::other("no home dir"));
@@ -152,9 +135,8 @@ pub struct PushPayload<'a> {
     pub url: &'a str,
 }
 
-/// Send one notification. Surfaces the raw `WebPushError` so caller
-/// can detect `EndpointNotValid` / `EndpointNotFound` (410 Gone /
-/// 404) and prune the subscription on the next save cycle.
+/// Send one notification. Surfaces the raw `WebPushError` so the caller can prune the
+/// subscription on `EndpointNotValid` / `EndpointNotFound` (410 / 404).
 pub async fn send_to(
     config: &PushConfig,
     sub: &Subscription,
@@ -180,10 +162,8 @@ pub async fn send_to(
     client.send(msg).await
 }
 
-/// `true` for terminal endpoint states we should prune on. 410 Gone
-/// from FCM / Mozilla means the user revoked the subscription; 404
-/// Not Found likewise. Other errors are transient (network, server
-/// overload) — keep the subscription, retry on next tick.
+/// `true` for terminal endpoint states to prune on: 410 Gone / 404 mean the subscription is
+/// revoked. Other errors are transient, so keep the subscription and retry next tick.
 pub fn is_terminal_error(err: &WebPushError) -> bool {
     matches!(
         err,
@@ -247,10 +227,7 @@ mod tests {
 
     #[test]
     fn push_config_from_env_requires_both_keys() {
-        // Without env set, expect None.
-        // (Tests don't share the env reliably across runners — keep
-        // this as a smoke test for the None-path. The Some path is
-        // covered via runtime e2e since it requires real keys.)
+        // Smoke test for the None path only: the Some path needs real keys (runtime e2e).
         unsafe {
             std::env::remove_var("COPAD_WEB_BRIDGE_VAPID_PRIVATE");
             std::env::remove_var("COPAD_WEB_BRIDGE_VAPID_PUBLIC");

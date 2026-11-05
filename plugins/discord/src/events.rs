@@ -1,41 +1,18 @@
 //! Map Discord DISPATCH payloads to copad-shaped `discord.*` events.
 //!
-//! Two DISPATCH event types are handled:
+//! `MESSAGE_CREATE` fans out to `discord.raw` (always; full firehose for archive triggers) plus
+//! one of `discord.dm` (no `guild_id`), `discord.mention` (@-mentions the bot or @everyone) or
+//! `discord.message`. `MESSAGE_REACTION_ADD` emits `discord.reaction` without the message body;
+//! capture triggers chain `discord.get_message`. Reaction removal and burst reactions are not handled.
 //!
-//! 1. `MESSAGE_CREATE` — fans out to up to two copad events:
-//!    - `discord.raw` — always emitted (full firehose for archive triggers)
-//!    - `discord.message` — regular guild channel message (filtered)
-//!    - `discord.dm` — DM-channel message (no `guild_id`)
-//!    - `discord.mention` — message that @-mentions the bot or @everyone
+//! MESSAGE_CREATE filters (non-raw events): skip `author.bot == true` (feedback loops with other
+//! bots) and `author.id == bot_user_id` (self-loop guard; READY's `user.id` is authoritative,
+//! falling back to the stored id). Mention iff `mentions[].id` contains the bot id or
+//! `mention_everyone`; the gateway pre-resolves `mentions`, so `<@id>` is never parsed.
+//! REACTION_ADD skips `user_id == bot_user_id`, e.g. a bot's own "starter" emoji.
 //!
-//! 2. `MESSAGE_REACTION_ADD` — emits a single `discord.reaction`
-//!    event. Useful for the "react with 📝 → capture as Todo" flow.
-//!    Reactions don't carry the message body — capture triggers
-//!    chain `discord.get_message` to fetch content. (Removal +
-//!    burst/super reactions deferred — slice 2.5 captures the common
-//!    case of a single user adding a single emoji.)
-//!
-//! Filter rules for MESSAGE_CREATE (apply to the non-raw events):
-//! - `author.bot == true` — skip (avoids feedback loops with other bots)
-//! - `author.id == bot_user_id` — skip (self-loop guard; READY's
-//!   `user.id` is authoritative, falls back to stored id)
-//! - `guild_id` absent → `discord.dm` instead of `discord.message`
-//! - mention iff `mentions[].id` contains bot id OR `mention_everyone`
-//!
-//! Filter rules for MESSAGE_REACTION_ADD:
-//! - `user_id == bot_user_id` — skip (own reactions, common when bot
-//!   is configured to add a "starter" emoji that humans then mirror).
-//!
-//! Slice 2 (now 2.5 with reactions) restricts the allowlist; UPDATE,
-//! DELETE, REACTION_REMOVE, GUILD_CREATE, PRESENCE_UPDATE etc. arrive
-//! on the gateway but produce no copad events. Discord's DISPATCH
-//! variety (especially PRESENCE_UPDATE bursts) would flood downstream
-//! triggers without value, so we keep the allowlist explicit.
-//!
-//! Mentions in Discord come pre-resolved: the gateway delivers a
-//! `mentions: [User, ...]` array on each message, so we don't need to
-//! parse `<@id>` tokens out of the content body — `mentions[].id`
-//! contains exactly the user IDs the message addresses.
+//! The allowlist is explicit: UPDATE, DELETE, REACTION_REMOVE, GUILD_CREATE and PRESENCE_UPDATE
+//! bursts would flood downstream triggers without value.
 
 use serde_json::{Value, json};
 
@@ -44,11 +21,9 @@ pub enum DiscordEvent {
     Message(MessageFields),
     Dm(MessageFields),
     Mention(MessageFields),
-    /// Reaction added to a message. Doesn't carry the original
-    /// message body — chained `discord.get_message` fetches it.
+    /// Reaction added to a message; chained `discord.get_message` fetches the body.
     Reaction(ReactionFields),
-    /// Full-fidelity firehose for MESSAGE_CREATE (entire `d` object).
-    /// Mirrors `slack.raw`'s posture for archive triggers.
+    /// Firehose for MESSAGE_CREATE (entire `d` object), like `slack.raw`.
     Raw(RawEvent),
 }
 
@@ -58,18 +33,16 @@ pub struct MessageFields {
     pub channel_id: String,
     /// `None` for DM channels (the absence is the DM signal).
     pub guild_id: Option<String>,
-    /// Pre-built deep-link so triggers don't need string-concat in the
-    /// interpolation DSL.
+    /// Pre-built deep link, so triggers need no string concat in the interpolation DSL.
     pub message_url: String,
     pub author_id: String,
-    /// `global_name` (display) preferred, `username` (handle) fallback so
-    /// the field is always populated. Triggers needing a stable identifier
-    /// should use `author_id` instead.
+    /// `global_name` preferred, `username` fallback so it is always populated; use `author_id` for
+    /// a stable identifier.
     pub author_username: String,
     pub content: String,
     pub mention_everyone: bool,
-    /// Pre-computed: bot id in `mentions[]` OR `mention_everyone`. Lets
-    /// triggers `payload_match` without nested-array inspection.
+    /// Bot id in `mentions[]` or `mention_everyone`, so triggers can `payload_match` without array
+    /// inspection.
     pub mentions_bot: bool,
 }
 
@@ -77,18 +50,13 @@ pub struct MessageFields {
 pub struct ReactionFields {
     pub message_id: String,
     pub channel_id: String,
-    /// `None` for DM channels.
     pub guild_id: Option<String>,
-    /// Same format as `MessageFields::message_url`.
     pub message_url: String,
-    /// User who added the reaction.
     pub user_id: String,
-    /// Author of the underlying message when Discord supplies it (absent
-    /// for older clients or deleted authors). Used as a guard so triggers
-    /// don't chain `get_message` against the bot's own messages.
+    /// Author of the underlying message when Discord supplies it (absent for older clients or
+    /// deleted authors); a guard against chaining `get_message` on the bot's own messages.
     pub message_author_id: Option<String>,
-    /// Unicode codepoint for built-in emoji, custom name when `emoji_id`
-    /// is set. Triggers typically `payload_match` on this.
+    /// Unicode codepoint for built-in emoji, the custom name when `emoji_id` is set.
     pub emoji_name: String,
     /// Custom emoji snowflake. `None` means a unicode emoji.
     pub emoji_id: Option<String>,
@@ -101,8 +69,7 @@ pub struct RawEvent {
     pub channel_id: Option<String>,
     pub guild_id: Option<String>,
     pub message_id: Option<String>,
-    /// Verbatim DISPATCH `d` object. Triggers access nested fields via
-    /// the engine's dot-path interpolator (same posture as `slack.raw`).
+    /// Verbatim DISPATCH `d` object, reachable via the engine's dot-path interpolator.
     pub event_json: Value,
 }
 
@@ -152,9 +119,8 @@ impl DiscordEvent {
     }
 }
 
-/// `event_name` = DISPATCH `t`; `data` = DISPATCH `d`. `bot_user_id` is
-/// the READY frame's `user.id` (authoritative) or stored TokenSet fallback,
-/// used to filter the bot's own messages/reactions.
+/// `event_name` = DISPATCH `t`, `data` = DISPATCH `d`. `bot_user_id` is READY's `user.id` or the
+/// stored TokenSet fallback, used to filter the bot's own messages and reactions.
 pub fn from_dispatch(
     event_name: &str,
     data: &Value,
@@ -170,19 +136,15 @@ pub fn from_dispatch(
             out
         }
         "MESSAGE_REACTION_ADD" => {
-            // Reactions don't get a raw entry — `discord.raw` is
-            // scoped to MESSAGE_CREATE for archive purposes. A user
-            // who wants every reaction archived can layer `kb.append`
-            // on `discord.reaction` directly; the filter pass below
-            // is the only "noise gate" they need.
+            // Reactions get no raw entry; `discord.raw` is scoped to MESSAGE_CREATE. Archive every
+            // reaction with `kb.append` on `discord.reaction`.
             classify_reaction(data, bot_user_id).into_iter().collect()
         }
         _ => Vec::new(),
     }
 }
 
-/// `https://discord.com/channels/{guild_id|@me}/{channel_id}/{message_id}` —
-/// `@me` for DM channels (what Discord's web client uses).
+/// `https://discord.com/channels/{guild_id|@me}/{channel_id}/{message_id}`; `@me` for DMs, as the web client does.
 fn build_message_url(guild_id: Option<&str>, channel_id: &str, message_id: &str) -> String {
     let guild_segment = guild_id.unwrap_or("@me");
     format!("https://discord.com/channels/{guild_segment}/{channel_id}/{message_id}")
@@ -208,11 +170,9 @@ fn classify_message(data: &Value, bot_user_id: Option<&str>) -> Option<DiscordEv
     let author = data.get("author")?;
     let author_id = author.get("id").and_then(Value::as_str)?.to_string();
 
-    // Skip bot-authored messages — including our own (would loop) and
-    // any other bots' chatter. The author.bot flag covers both cases
-    // when `bot_user_id` is unknown (e.g. before READY arrives in a
-    // pathological reconnect ordering); the explicit id check covers
-    // the case where Discord ever stops setting the flag for our app.
+    // Skip bot-authored messages, our own included. The `bot` flag covers the case where
+    // `bot_user_id` is unknown (before READY); the explicit id check covers Discord ever dropping
+    // the flag.
     if author.get("bot").and_then(Value::as_bool).unwrap_or(false) {
         return None;
     }
@@ -268,18 +228,10 @@ fn classify_message(data: &Value, bot_user_id: Option<&str>) -> Option<DiscordEv
         mention_everyone,
         mentions_bot,
     };
-    // Mention takes precedence: a single MESSAGE_CREATE can be both
-    // a mention AND a guild/DM message. We emit ONE filtered event so
-    // the trigger DSL stays simple. A user who wants "every message
-    // including mentions" registers two triggers — one on
-    // `discord.message`, one on `discord.mention` — both with the
-    // same action body. They are NOT recoverable via `mentions_bot`
-    // payload-match on `discord.message` because mention messages
-    // never produce a `discord.message` event in the first place.
-    // The `mentions_bot` field still exists on the payload for
-    // diagnostics and for `discord.dm + condition` filtering, where
-    // a DM that is also a mention won't reach the .dm trigger anyway
-    // but the field tells you why.
+    // Mention takes precedence: one MESSAGE_CREATE yields ONE filtered event. Mention messages
+    // never produce `discord.message`, so "every message including mentions" needs two triggers. A
+    // DM that is also a mention fires `discord.mention`; `mentions_bot` tells you why it missed
+    // `.dm`.
     if mentions_bot {
         return Some(DiscordEvent::Mention(fields));
     }
@@ -291,9 +243,7 @@ fn classify_message(data: &Value, bot_user_id: Option<&str>) -> Option<DiscordEv
 
 fn classify_reaction(data: &Value, bot_user_id: Option<&str>) -> Option<DiscordEvent> {
     let user_id = data.get("user_id").and_then(Value::as_str)?.to_string();
-    // Filter out the bot's own reactions. Common when a workflow
-    // posts a starter emoji on every message; without this guard the
-    // starter reaction itself triggers the capture pipeline.
+    // Filter the bot's own reactions: otherwise a starter emoji triggers the capture pipeline.
     if let Some(bot_id) = bot_user_id
         && bot_id == user_id
     {
@@ -396,7 +346,6 @@ mod tests {
             DiscordEvent::Dm(f) => {
                 assert_eq!(f.guild_id, None);
                 assert_eq!(f.channel_id, "CH_1");
-                // DMs use Discord's `@me` URL convention.
                 assert_eq!(f.message_url, "https://discord.com/channels/@me/CH_1/MSG_1");
             }
             other => panic!("expected Dm, got {other:?}"),
@@ -477,9 +426,8 @@ mod tests {
 
     #[test]
     fn mention_without_bot_id_known_falls_back_to_message() {
-        // No bot_user_id known yet (e.g. before READY) — even if the
-        // mentions array contains some user, we can't safely classify
-        // as bot-mention. Falls back to plain message.
+        // No bot_user_id known yet (before READY): cannot classify as a bot mention, so plain
+        // message.
         let out = from_dispatch(
             "MESSAGE_CREATE",
             &message_data(json!({
@@ -495,9 +443,7 @@ mod tests {
 
     #[test]
     fn mention_in_dm_classified_as_mention_not_dm() {
-        // Mention precedence: a DM that @-mentions the bot fires
-        // discord.mention, not discord.dm. Documented in the
-        // classify comment above.
+        // Mention precedence: a DM that @-mentions the bot fires discord.mention, not discord.dm.
         let out = dispatch(
             "MESSAGE_CREATE",
             message_data(json!({
@@ -516,8 +462,7 @@ mod tests {
 
     #[test]
     fn non_message_create_dispatch_returns_empty() {
-        // Slice 2 only handles MESSAGE_CREATE. PRESENCE_UPDATE,
-        // GUILD_CREATE, etc. produce no copad event.
+        // PRESENCE_UPDATE, GUILD_CREATE, etc. produce no copad event.
         let out = dispatch("PRESENCE_UPDATE", json!({"foo": "bar"}));
         assert!(out.is_empty());
     }
@@ -720,8 +665,6 @@ mod tests {
 
     #[test]
     fn message_reaction_remove_returns_empty() {
-        // Not in slice 2.5's allowlist — handled separately if/when
-        // a "uncapture on emoji removal" workflow comes up.
         let out = dispatch("MESSAGE_REACTION_REMOVE", reaction_data(json!({})));
         assert!(out.is_empty());
     }

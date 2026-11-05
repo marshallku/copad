@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Browser-side regression tests for the mobile bridge.
-#
-# They are here rather than in `cargo test` because what they cover lives in `static/app.js`:
-# input ordering, focus ownership, the touch paths, the board's status partition + row targeting,
-# the polling lifecycle and the keybar's byte encoding. Each one pulls the REAL function out of app.js and runs it — none of
-# them re-implement the logic they check, so a behaviour change fails the test rather than
-# quietly diverging from it.
+# Browser-side regression tests for the mobile bridge. They live here rather than in `cargo test`
+# because what they cover is in `static/app.js`: input ordering, focus ownership, touch paths, the
+# board's status partition and row targeting, the polling lifecycle and the keybar's byte
+# encoding. Each pulls the real function out of app.js and runs it, so a behaviour change fails
+# the test instead of diverging from a re-implementation.
 #
 # Two need a live bridge (they are skipped when it is not answering):
 #   board-check    wants a /api/board payload   -> pass it as $1, or set BOARD_JSON

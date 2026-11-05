@@ -1,34 +1,19 @@
 //! First-party Discord service plugin for copad.
 //!
-//! Two run modes (selected by `argv[1]`):
-//! - **`auth`** — validates the env bot token via `GET /users/@me`
-//!   and persists a TokenSet (with bot user_id + global_name) to the
-//!   configured store.
-//! - **(no args)** — RPC mode. Speaks the copad service-plugin
-//!   protocol over stdio, runs the Gateway WebSocket in a background
-//!   thread, and publishes `discord.message` / `discord.dm` /
-//!   `discord.mention` / `discord.raw` events when MESSAGE_CREATE
-//!   dispatches arrive.
+//! Run mode is selected by `argv[1]`:
+//! - `auth`: validates the env bot token via `GET /users/@me` and persists a TokenSet (bot
+//!   user_id + global_name) to the store.
+//! - no args: RPC mode over stdio (protocol: `docs/service-plugins.md`), running the Gateway
+//!   WebSocket in a background thread and publishing `discord.message` / `.dm` / `.mention` /
+//!   `.raw` for MESSAGE_CREATE dispatches.
 //!
-//! If RPC mode starts without stored credentials AND the env token is
-//! missing, the supervisor handshake still completes — the gateway
-//! loop just stays paused. Running `copad-plugin-discord auth` while
-//! copad is running is enough; the loop picks up the new credentials
-//! on its next reconnect attempt.
+//! With no stored credentials and no env token the handshake still completes and the gateway loop
+//! stays paused; running `copad-plugin-discord auth` is picked up on its next reconnect.
 //!
-//! Caveat — env precedence: `COPAD_DISCORD_BOT_TOKEN`, when set, wins
-//! over the stored token (matches Slack's posture, useful for
-//! testing). That means the auth-while-running recovery path only
-//! works if the env var is UNSET in the supervisor's environment.
-//! Once env is set at copad startup, a fresh `auth` run updates the
-//! store but the gateway keeps using the env token until copad
-//! restarts. `discord.auth_status.credentials_source` reports the
-//! live source so the user can see which one is live.
-//!
-//! See `docs/service-plugins.md` for the protocol contract. Discord
-//! plugin is an event emitter + write-action provider — a `kb.append`
-//! / `webhook.fire` action on a `discord.mention` event is purely
-//! user trigger config, the same shape as the Slack integration.
+//! Env precedence: `COPAD_DISCORD_BOT_TOKEN`, when set, wins over the stored token (as in Slack).
+//! So auth-while-running recovery only works if the variable is unset in the supervisor's
+//! environment; otherwise a fresh `auth` updates the store but the gateway keeps the env token
+//! until copad restarts. `discord.auth_status.credentials_source` reports the live source.
 
 mod api;
 mod config;
@@ -136,9 +121,7 @@ fn run_rpc() {
              discord.auth_status reports the fatal_error): {err}"
         );
     }
-    // Box<dyn TokenStore> → Arc<dyn TokenStore> so the gateway thread
-    // can hold an independent reference. The keyring-backed store has
-    // its own internal locking; we don't need a Mutex around it.
+    // Arc so the gateway thread holds its own reference; the keyring store has its own locking.
     let store: Arc<dyn TokenStore> = Arc::from(open_store(&config));
     eprintln!(
         "[discord] workspace={}, store={}",
@@ -151,12 +134,9 @@ fn run_rpc() {
     let initialized = Arc::new(AtomicBool::new(false));
     let stop_signal = Arc::new(AtomicBool::new(false));
 
-    // Gateway loop runs in a background thread, gated on the
-    // supervisor's `initialized` notification so events can't race
-    // the handshake. The loop polls credentials inside `run_loop` —
-    // running `copad-plugin-discord auth` while the plugin is up
-    // populates the store and the loop picks it up on its next
-    // recheck (no plugin process restart required).
+    // The gateway loop runs in a background thread, gated on `initialized` so events cannot race
+    // the handshake. `run_loop` polls credentials, so a later `copad-plugin-discord auth` is picked
+    // up without a restart.
     {
         let init_flag = initialized.clone();
         let stop = stop_signal.clone();
@@ -284,13 +264,9 @@ fn handle_action(
 ) -> Result<Value, (String, String)> {
     match name {
         "discord.auth_status" => {
-            // Same shape as Slack's slack.auth_status — reports BOTH
-            // configured (env validation OK) and authenticated (creds
-            // resolvable for the gateway loop) so a future
-            // `coctl context --full` can render both messengers
-            // uniformly. credentials_source mirrors what the loop
-            // would actually use; reporting "store" while the loop
-            // reads from "env" would be a confusing lie.
+            // Same shape as slack.auth_status: reports both `configured` (env validation OK) and
+            // `authenticated` (creds resolvable for the loop). credentials_source mirrors what the
+            // loop would actually use.
             let configured = config.fatal_error.is_none();
             let resolved = if configured {
                 gateway::current_credentials(config, &**store)
@@ -299,10 +275,8 @@ fn handle_action(
             };
             let stored = if configured { store.load() } else { None };
             let credentials_source = resolved.as_ref().map(|c| c.source).unwrap_or("none");
-            // Identity (user_id, username) is only validated for the
-            // store path — env tokens skip the auth.test step. Match
-            // Slack's posture: surface stored identity only when the
-            // live source is the store, else null.
+            // Identity is only validated for the store path (env tokens skip auth.test), so surface
+            // it only when the live source is the store.
             let report_identity = credentials_source == "store";
             Ok(json!({
                 "configured": configured,
@@ -372,10 +346,8 @@ fn handle_send_message(
             "message_id": message_id,
             "channel_id": posted_channel,
         })),
-        // ApiError carries the structured code already
-        // (`rate_limited` / `discord_<numeric>` / `io_error`); pass
-        // it through so triggers can match `error.code ==
-        // "discord_50001"` rather than parsing the message string.
+        // ApiError already carries the structured code (`rate_limited` / `discord_<numeric>` /
+        // `io_error`); pass it through so triggers can match `error.code == "discord_50001"`.
         Err(api::ApiError { code, message }) => Err((code, message)),
     }
 }
@@ -399,23 +371,19 @@ fn handle_get_message(
     let channel_id = require_snowflake(params, "channel_id")?;
     let message_id = require_snowflake(params, "message_id")?;
     match api::get_message(&creds.bot_token, channel_id, message_id) {
-        // Pass through Discord's full message JSON. Trigger
-        // interpolation sees object-key fields like
-        // `event.await.content` and `event.await.author.id` via the
-        // dot-path interpolator. Array fields (`attachments`,
-        // `mentions`) are present in the value but not indexable from
-        // the DSL today — no `[0]` syntax. Wrapping it under a known
-        // key would force users to know our wrapper shape and break
-        // the symmetry with `discord.message`'s `event_json` raw
-        // field.
+        // Pass through Discord's full message JSON so triggers see fields like
+        // `event.await.content`
+        // via the dot-path interpolator. Array fields (`attachments`, `mentions`) are present but
+        // not indexable (no `[0]` syntax). A wrapper key would break symmetry with
+        // `discord.message`'s
+        // `event_json`.
         Ok(value) => Ok(value),
         Err(api::ApiError { code, message }) => Err((code, message)),
     }
 }
 
-/// Trust-boundary: snowflake check (non-empty decimal-only string)
-/// before splicing into a Discord API path so a malformed param can't
-/// redirect the authenticated request elsewhere.
+/// Trust boundary: snowflake check (non-empty, decimal-only) before splicing into a Discord API
+/// path, so a malformed param cannot redirect the authenticated request.
 fn require_snowflake<'a>(params: &'a Value, key: &str) -> Result<&'a str, (String, String)> {
     let s = params.get(key).and_then(Value::as_str).ok_or_else(|| {
         (

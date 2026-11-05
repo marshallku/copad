@@ -3,17 +3,12 @@
 //! Each `llm.complete` records a single line:
 //!   {"ts":"2026-04-27T12:00:00Z","model":"claude-sonnet-4-6","input_tokens":12,"output_tokens":4,"source":"trigger:meeting-prep"}
 //!
-//! Single-syscall append via libc::write on an O_APPEND fd — same
-//! atomicity contract as the KB plugin's kb.append. Concurrent
-//! invocations across multiple in-flight `llm.complete` calls won't
-//! interleave bytes mid-line; on short write we error rather than
-//! retrying so the JSONL invariant (one record per line) holds.
+//! Single-syscall append via libc::write on an O_APPEND fd, the same atomicity contract as the KB
+//! plugin's kb.append. On short write we error rather than retry so the one-record-per-line
+//! invariant holds.
 //!
-//! `aggregate` reads the file and rolls up by model, optionally
-//! constrained by a time range. We don't index — JSONL scan is
-//! linear in record count, fine for personal-volume usage (a few
-//! hundred to a few thousand calls per month). When that becomes
-//! sluggish, swap in SQLite — same shape, internal change only.
+//! `aggregate` scans the file linearly and rolls up by model, optionally within a time range; no
+//! index, which is fine for personal-volume usage.
 
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -25,13 +20,11 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageRecord {
-    /// RFC3339 timestamp (UTC).
     pub ts: String,
     pub model: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
-    /// Caller label from `params.source`, passed through untouched —
-    /// lets users group spend by trigger / source.
+    /// Caller label from `params.source`, passed through untouched (group spend by trigger).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -49,12 +42,9 @@ pub fn append(path: &Path, record: &UsageRecord) -> Result<(), String> {
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let fd = f.as_raw_fd();
-    // SAFETY: we own `fd` for the duration of this write — `f` is
-    // not dropped until after the `write` call returns and we no
-    // longer use the fd. write(2) on an O_APPEND fd is documented
-    // to be atomic with respect to other O_APPEND writers up to
-    // PIPE_BUF (typically 4096) and is the contract we rely on for
-    // no-interleave between concurrent `llm.complete` calls.
+    // SAFETY: `f` outlives the write, so we own `fd` for its duration. write(2) on an O_APPEND fd
+    // is atomic against other O_APPEND writers up to PIPE_BUF (typically 4096), which is what
+    // keeps concurrent `llm.complete` calls from interleaving.
     let written = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
     if written < 0 {
         return Err(format!(
@@ -64,10 +54,8 @@ pub fn append(path: &Path, record: &UsageRecord) -> Result<(), String> {
         ));
     }
     if written as usize != bytes.len() {
-        // Short-write surfaces as error rather than retrying to
-        // preserve the no-interleave guarantee — a follow-up write
-        // on the same fd could be sandwiched between two other
-        // writers' bytes.
+        // A short write errors instead of retrying: a follow-up write on the same fd could be
+        // sandwiched between two other writers' bytes.
         return Err(format!(
             "short write to {}: wrote {} of {} bytes",
             path.display(),
@@ -75,7 +63,6 @@ pub fn append(path: &Path, record: &UsageRecord) -> Result<(), String> {
             bytes.len()
         ));
     }
-    // Drop the file handle implicitly here.
     drop(f);
     Ok(())
 }
@@ -130,11 +117,8 @@ pub fn aggregate(
         {
             continue;
         }
-        // Always validate the timestamp — a malformed `ts` makes
-        // the record effectively undatable and silently counting
-        // it as usage corrupts aggregate totals (round-3 cross-
-        // review C2). Filter-bound queries already did this; the
-        // unfiltered default now does too.
+        // Always validate the timestamp: a malformed `ts` makes the record undatable, and counting
+        // it silently corrupts the totals.
         let ts = match DateTime::parse_from_rfc3339(&record.ts) {
             Ok(t) => t.with_timezone(&Utc),
             Err(_) => {
@@ -163,7 +147,6 @@ pub fn aggregate(
     Ok((agg, parse_errors))
 }
 
-/// Convert an `Aggregate` to the JSON shape returned by `llm.usage`.
 pub fn aggregate_to_json(agg: &Aggregate, parse_errors: u64) -> Value {
     let by_model: serde_json::Map<String, Value> = agg
         .by_model
@@ -245,7 +228,6 @@ mod tests {
         append(&path, &rec("m1", "2026-01-01T00:00:00Z", 10, 5, None)).unwrap();
         append(&path, &rec("m1", "2026-01-15T00:00:00Z", 20, 10, None)).unwrap();
         append(&path, &rec("m1", "2026-02-01T00:00:00Z", 5, 3, None)).unwrap();
-        // Range that includes only the middle record.
         let since = DateTime::parse_from_rfc3339("2026-01-10T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -261,7 +243,6 @@ mod tests {
     fn aggregate_counts_parse_errors_separately_from_data() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("u.jsonl");
-        // Manually write mixed valid + garbage lines.
         fs::write(
             &path,
             "{\"ts\":\"2026-01-01T00:00:00Z\",\"model\":\"m1\",\"input_tokens\":1,\"output_tokens\":2}\n\
@@ -273,8 +254,6 @@ mod tests {
         let since = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        // With time filter active, the bad-ts line counts as a parse
-        // error too.
         let (agg, errs) = aggregate(&path, Some(since), None, None).unwrap();
         assert_eq!(agg.calls, 2);
         // bad-ts (parse fail under time filter) + not-json
@@ -283,10 +262,8 @@ mod tests {
 
     #[test]
     fn aggregate_skips_malformed_ts_even_without_time_filter() {
-        // Regression: round-3 cross-review C2. Without `since` /
-        // `until`, a record with valid JSON but a bad ts must
-        // still be rejected as a parse error so the aggregate
-        // totals stay trustworthy.
+        // Regression: without `since` / `until`, a record with valid JSON but a bad ts must still
+        // be rejected so aggregate totals stay trustworthy.
         let dir = tempdir().unwrap();
         let path = dir.path().join("u.jsonl");
         fs::write(
@@ -296,7 +273,6 @@ mod tests {
         )
         .unwrap();
         let (agg, errs) = aggregate(&path, None, None, None).unwrap();
-        // Only the well-formed record contributes.
         assert_eq!(agg.calls, 1);
         assert_eq!(agg.input_tokens, 1);
         assert_eq!(agg.output_tokens, 2);
@@ -316,7 +292,6 @@ mod tests {
     fn append_skips_extra_newlines_in_aggregate() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("u.jsonl");
-        // Pre-write empty lines to confirm aggregator skips them.
         fs::write(&path, "\n\n").unwrap();
         append(&path, &rec("m1", "2026-01-01T00:00:00Z", 1, 1, None)).unwrap();
         let (agg, errs) = aggregate(&path, None, None, None).unwrap();

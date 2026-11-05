@@ -1,38 +1,27 @@
-//! Bot-RPC: "post a message, wait for a matching response, fire an
-//! event" runtime.
+//! Bot-RPC runtime: post a message, wait for a matching response, fire an event.
 //!
-//! - `BotRpcRegistry` tracks live `PendingWait`s and ingests message
-//!   events through `ingest_message`. A successful match removes the
-//!   wait and produces a `MatchedResponse` the caller publishes as
-//!   `slack.bot_rpc.completed`.
-//! - `RecentMessageBuffer` (one bounded FIFO per channel) closes the
-//!   race where Slack delivers the bot's response over Socket Mode
-//!   *before* `chat.postMessage` returns with our `request_ts`. When
-//!   `add()` registers a fresh wait, the recent buffer is replayed
-//!   through the same `match_event` path so the wait gets one chance
-//!   to consume a message that arrived during the HTTP round-trip.
-//! - `sweep_expired` removes deadlined waits; a background thread
-//!   (`start_sweeper`) ticks ~4 times a second and emits
-//!   `slack.bot_rpc.timeout` for each one.
+//! - `BotRpcRegistry` tracks live `PendingWait`s; `ingest_message` matches incoming events. A match
+//!   removes the wait and yields a `MatchedResponse` published as `slack.bot_rpc.completed`.
+//! - `RecentMessageBuffer` (bounded FIFO per channel) closes the race where Slack delivers the
+//!   bot's response over Socket Mode *before* `chat.postMessage` returns our `request_ts`: `add()`
+//!   replays the buffer through `match_event` for the new wait.
+//! - `sweep_expired` removes deadlined waits; `start_sweeper` ticks ~4 times a second and emits
+//!   `slack.bot_rpc.timeout` for each.
 //!
-//! Correlation contract (matches the codex round-2 review):
+//! Correlation contract:
 //! - `channel` must equal the wait channel.
-//! - Response `(ts)` must be strictly after the wait's `request_ts`
-//!   (compared as nanosecond tuples — Slack's `<sec>.<frac>` format).
-//! - Author `event.user` must NOT equal the bot's own user id
-//!   (resolved at invoke time; required, never `None`).
-//! - `wait_user_filter`, when set, compared to `event.user` only —
-//!   never to `bot_id`.
-//! - `wait_in_thread == true` (legacy default is `false` to keep
-//!   existing saved configs from silently breaking) requires
-//!   `event.thread_ts == request_ts`.
-//! - `WaitMode::Regex` requires `Regex::captures` to succeed; named
-//!   groups land in the published payload.
+//! - Response `(ts)` must be strictly after the wait's `request_ts` (compared as nanosecond
+//!   tuples; Slack's `<sec>.<frac>` format).
+//! - Author `event.user` must NOT equal the bot's own user id (resolved at invoke time; required,
+//!   never `None`).
+//! - `wait_user_filter`, when set, is compared to `event.user` only, never to `bot_id`.
+//! - `wait_in_thread == true` (default `false` so existing saved configs don't silently break)
+//!   requires `event.thread_ts == request_ts`.
+//! - `WaitMode::Regex` requires `Regex::captures` to succeed; named groups land in the published
+//!   payload.
 //!
-//! Subtype filter for the matcher: accept `subtype` absent or
-//! `"bot_message"` (Jira-style bots reply with `bot_message`).
-//! Everything else (`message_changed`, `message_deleted`, joins) is
-//! ignored.
+//! Subtype filter: accept `subtype` absent or `"bot_message"` (Jira-style bots reply with it).
+//! Everything else (`message_changed`, `message_deleted`, joins) is ignored.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::Sender;
@@ -49,9 +38,8 @@ const RECENT_BUFFER_PER_CHANNEL: usize = 256;
 const RECENT_BUFFER_WINDOW_MS: u64 = 30_000;
 const SWEEPER_TICK: Duration = Duration::from_millis(250);
 
-/// Snapshot of an incoming Slack message, post-filter. `text` may be
-/// empty (a `bot_message` with only blocks/attachments). Held in the
-/// recent buffer and used by `match_event`.
+/// Snapshot of an incoming Slack message, post-filter. `text` may be empty (a `bot_message` with
+/// only blocks/attachments).
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
     pub channel: String,
@@ -72,9 +60,8 @@ pub struct PendingWait {
     pub channel: String,
     pub config: BotRpcConfig,
     pub deadline_ms: u64,
-    /// REQUIRED — never None. invoke must resolve this via auth.test
-    /// before constructing a wait so the matcher can reliably reject
-    /// the bot's own echo.
+    /// REQUIRED, never None: invoke resolves it via auth.test before constructing a wait so the
+    /// matcher can reject the bot's own echo.
     pub bot_user_id: String,
     /// Pre-compiled regex (Regex mode only). Re-compiled on invoke
     /// rather than trusted from persisted state.
@@ -102,8 +89,7 @@ pub struct ExpiredWait {
 
 struct Inner {
     waits: Vec<PendingWait>,
-    /// per-channel ring buffer keyed by channel id. Cap is
-    /// `RECENT_BUFFER_PER_CHANNEL`; older entries are dropped.
+    /// Per-channel ring buffer capped at `RECENT_BUFFER_PER_CHANNEL`; older entries are dropped.
     recent: BTreeMap<String, VecDeque<IncomingMessage>>,
 }
 
@@ -121,10 +107,9 @@ impl BotRpcRegistry {
         }
     }
 
-    /// Register a fresh wait AND replay any messages we've already
-    /// seen on this channel in the last 30s. Returns the resulting
-    /// match if a buffered event satisfied the wait. The caller
-    /// publishes the match exactly the same way as a real-time hit.
+    /// Register a fresh wait AND replay messages already seen on this channel in the last 30s.
+    /// Returns the match if a buffered event satisfied the wait; the caller publishes it like a
+    /// real-time hit.
     pub fn add(&self, wait: PendingWait) -> Option<MatchedResponse> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let recent_for_channel = inner.recent.get(&wait.channel).cloned();
@@ -163,8 +148,6 @@ impl BotRpcRegistry {
         matched
     }
 
-    /// Remove any waits whose deadline has passed. Returns the removed
-    /// waits so the caller can publish `slack.bot_rpc.timeout` for each.
     pub fn sweep_expired(&self, now: u64) -> Vec<ExpiredWait> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut expired = Vec::new();
@@ -214,14 +197,12 @@ fn push_to_recent(map: &mut BTreeMap<String, VecDeque<IncomingMessage>>, msg: &I
     buf.push_back(msg.clone());
 }
 
-/// All correlation gates in one place. Returns `Some(MatchedResponse)`
-/// when the message satisfies the wait; `None` otherwise.
 fn try_match(wait: &PendingWait, msg: &IncomingMessage) -> Option<MatchedResponse> {
     if msg.channel != wait.channel {
         return None;
     }
-    // Strict ordering — reject the bot's own posted request (which
-    // Slack echoes back) and any pre-existing channel chatter.
+    // Strict ordering: rejects the bot's own posted request (Slack echoes it back) and any
+    // earlier channel chatter.
     let req = parse_slack_ts(&wait.request_ts)?;
     let resp = parse_slack_ts(&msg.ts)?;
     if resp <= req {
@@ -270,9 +251,8 @@ fn extract_named_captures(re: &Regex, caps: &regex::Captures<'_>) -> BTreeMap<St
     out
 }
 
-/// Slack ts is `<sec>.<frac>`. Pad the fractional part to 9 digits
-/// (nanoseconds) so `(secs, nanos)` tuple ordering is correct for
-/// variable-width input — `"5.1"` and `"5.05"` no longer collide.
+/// Slack ts is `<sec>.<frac>`. The fraction is padded to 9 digits (nanoseconds) so `(secs, nanos)`
+/// ordering is correct for variable-width input (`"5.1"` vs `"5.05"`).
 pub fn parse_slack_ts(s: &str) -> Option<(u64, u64)> {
     let (sec, frac) = s.split_once('.')?;
     if sec.is_empty() || frac.is_empty() {
@@ -285,26 +265,21 @@ pub fn parse_slack_ts(s: &str) -> Option<(u64, u64)> {
         return None;
     }
     let secs: u64 = sec.parse().ok()?;
-    // Right-pad fractional to 9 chars so it always represents nanos.
-    // Strings longer than 9 are accepted but truncated — Slack docs
-    // only specify microseconds (6) so 9-truncation is safe and
-    // monotonic by construction.
+    // Right-pad the fraction to 9 chars so it always represents nanos. Longer input is truncated;
+    // Slack only specifies microseconds (6), so this is safe and monotonic.
     let padded: String = frac.chars().chain(std::iter::repeat('0')).take(9).collect();
     let nanos: u64 = padded.parse().ok()?;
     Some((secs, nanos))
 }
 
-/// Wait classifier exists so the matcher and unit tests share one
-/// rule. Subtypes outside the allowlist short-circuit before the
-/// recent buffer is touched.
+/// One rule shared by the matcher and unit tests. Subtypes outside the allowlist short-circuit
+/// before the recent buffer is touched.
 pub fn is_matchable_subtype(subtype: Option<&str>) -> bool {
     matches!(subtype, None | Some("bot_message"))
 }
 
-/// Compile a `BotRpcConfig`'s regex at invoke time. `WaitMode::FirstReply`
-/// returns `None`. Empty regex strings under `WaitMode::Regex` would
-/// have been rejected by `validate_entry`, but we still handle them as
-/// `None` for defense in depth.
+/// Compile a `BotRpcConfig`'s regex at invoke time. `WaitMode::FirstReply` returns `None`; an
+/// empty regex under `WaitMode::Regex` (rejected by `validate_entry`) is also `None`.
 pub fn compile_regex(cfg: &BotRpcConfig) -> Result<Option<Regex>, String> {
     match cfg.wait_mode {
         WaitMode::FirstReply => Ok(None),
@@ -319,9 +294,8 @@ pub fn compile_regex(cfg: &BotRpcConfig) -> Result<Option<Regex>, String> {
     }
 }
 
-/// Spawns the background sweeper. Calls `on_expired` for every
-/// timed-out wait on each tick. `stop` flips to true on plugin
-/// shutdown — the thread exits within `SWEEPER_TICK` after that.
+/// Spawns the background sweeper, calling `on_expired` for every timed-out wait on each tick.
+/// `stop` flips to true on plugin shutdown; the thread exits within `SWEEPER_TICK`.
 pub fn start_sweeper<F>(
     registry: Arc<BotRpcRegistry>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -341,8 +315,6 @@ where
     })
 }
 
-/// Helper used by main.rs to format the `slack.bot_rpc.completed`
-/// payload. Public so a unit test can verify the JSON shape.
 pub fn completed_payload(matched: &MatchedResponse) -> Value {
     json!({
         "channel": matched.channel,
@@ -364,9 +336,7 @@ pub fn timeout_payload(expired: &ExpiredWait) -> Value {
     })
 }
 
-/// Convenience for the writer thread — frames the `event.publish`
-/// envelope around an arbitrary payload kind. Used for both completed
-/// and timeout events.
+/// Frames the `event.publish` envelope around a payload; used for completed and timeout events.
 pub fn publish_frame(kind: &str, payload: Value) -> String {
     json!({
         "method": "event.publish",
@@ -378,8 +348,8 @@ pub fn publish_frame(kind: &str, payload: Value) -> String {
     .to_string()
 }
 
-/// Dispatch a completed/timeout event onto the shared writer channel.
-/// Errors silently — the channel is closed only at shutdown.
+/// Dispatch a completed/timeout event onto the shared writer channel. Errors silently: the
+/// channel is closed only at shutdown.
 pub fn dispatch_completed(tx: &Sender<String>, matched: &MatchedResponse) {
     let _ = tx.send(publish_frame(
         "slack.bot_rpc.completed",
@@ -548,7 +518,6 @@ mod tests {
         ));
         let m = reg.ingest_message(msg("C123", "1700000000.000200", "U_JIRA", "nope", None));
         assert!(m.is_none());
-        // Wait must remain — a non-match shouldn't consume.
         assert_eq!(reg.len_for_test(), 1);
     }
 
@@ -560,7 +529,6 @@ mod tests {
             "1700000000.000100",
             cfg(WaitMode::FirstReply, "", "", true),
         ));
-        // No thread_ts → no match.
         assert!(
             reg.ingest_message(msg(
                 "C123",
@@ -571,7 +539,6 @@ mod tests {
             ))
             .is_none()
         );
-        // Wrong thread → no match.
         assert!(
             reg.ingest_message(msg(
                 "C123",
@@ -582,7 +549,6 @@ mod tests {
             ))
             .is_none()
         );
-        // Matching thread → match.
         let m = reg
             .ingest_message(msg(
                 "C123",
@@ -597,9 +563,8 @@ mod tests {
 
     #[test]
     fn replay_recent_catches_message_that_arrived_before_add() {
-        // Codex round-1 PB1: Slack delivers the response over Socket
-        // Mode before chat.postMessage's HTTP call returns. We push
-        // the message first, THEN add the wait — replay must catch it.
+        // Slack can deliver the response over Socket Mode before chat.postMessage returns. Push
+        // the message first, THEN add the wait: replay must catch it.
         let reg = BotRpcRegistry::new();
         let arrived = msg("C123", "1700000000.000200", "U_JIRA", "early bird", None);
         assert!(
@@ -632,10 +597,8 @@ mod tests {
             received_at_ms: now_ms().saturating_sub(60_000),
         };
         reg.ingest_message(stale);
-        // Now ingest something fresh to trigger the window cleanup.
         let _ = reg.ingest_message(msg("C123", "1700000000.000300", "U_OTHER", "fresh", None));
-        // Add a wait whose request_ts is between stale and fresh —
-        // stale should have been evicted, so no replay match.
+        // Wait with request_ts between stale and fresh: stale was evicted, so no replay match.
         let matched = reg.add(wait(
             "C123",
             "1700000000.000250",
@@ -701,7 +664,6 @@ mod tests {
             "1700000000.000110",
             cfg(WaitMode::Regex, r"^B:", "", false),
         ));
-        // Only the B-wait should consume this message.
         let m = reg
             .ingest_message(msg("C123", "1700000000.000200", "U_OTHER", "B: done", None))
             .unwrap();
@@ -756,16 +718,14 @@ mod tests {
             );
             reg.ingest_message(m);
         }
-        // request_ts older than every buffered ts — replay should
-        // pick the OLDEST surviving entry (FIFO order).
+        // request_ts older than every buffered ts: replay picks the OLDEST survivor (FIFO).
         let matched = reg.add(wait(
             "C123",
             "1700000000.000000",
             cfg(WaitMode::FirstReply, "", "", false),
         ));
         let m = matched.unwrap();
-        // FIFO eviction means index `50` is the oldest surviving
-        // entry (50 oldest evicted out of 50 over-cap).
+        // FIFO eviction: index 50 is the oldest survivor (50 entries over cap were evicted).
         assert_eq!(m.response_ts, format!("1700000000.{:06}", 50));
     }
 }

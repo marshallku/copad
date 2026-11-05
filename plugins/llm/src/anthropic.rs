@@ -1,22 +1,11 @@
-//! Anthropic Messages API client.
-//!
-//! Wraps `POST https://api.anthropic.com/v1/messages` with the
-//! conventions every Anthropic SDK uses: `x-api-key` auth header,
-//! `anthropic-version: 2023-06-01` (the stable production version),
-//! JSON request body with `model`, `max_tokens`, `messages`, and
+//! Anthropic Messages API client: `POST https://api.anthropic.com/v1/messages` with `x-api-key`,
+//! `anthropic-version: 2023-06-01`, and a JSON body of `model`, `max_tokens`, `messages` and
 //! optional `system` / `temperature`.
 //!
-//! Error handling intentionally mirrors the slack plugin's
-//! `chat.postMessage` shape so callers can branch uniformly:
-//! - 401 → `auth_error` (key invalid / revoked)
-//! - 429 → `rate_limited (Retry-After: <seconds>)` — header is
-//!   present per Anthropic's published rate-limit response
-//! - 4xx other → `chat error code` from response body if available
-//! - 5xx / network → generic transport error
-//!
-//! v1 is non-streaming (single response). Streaming via SSE is a
-//! Phase 12.2+ candidate when terminal-output progressive rendering
-//! becomes useful.
+//! Errors mirror the slack plugin's `chat.postMessage` shape so callers branch uniformly:
+//! 401 -> `auth_error`; 429 -> `rate_limited (Retry-After: <seconds>)`; other 4xx -> the error
+//! code from the response body if present; 5xx / network -> a generic transport error.
+//! Non-streaming only.
 
 use std::time::Duration;
 
@@ -45,8 +34,8 @@ pub struct Message<'a> {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompleteResponse {
-    /// Pre-flattened concatenation of all `content[type=text]` blocks
-    /// so callers don't need to walk Anthropic's typed-block array.
+    /// Concatenation of all `content[type=text]` blocks, so callers need not walk the typed-block
+    /// array.
     pub text: String,
     pub model: String,
     pub stop_reason: Option<String>,
@@ -96,14 +85,10 @@ pub fn complete(
 }
 
 fn parse_response(body: Value) -> Result<CompleteResponse, String> {
-    // Anthropic's success response shape:
-    //   { id, type:"message", role, model, content:[{type, text}], stop_reason, usage:{input_tokens, output_tokens} }
-    // Error responses (when request reached the API but failed
-    // logically — invalid model, content too long etc.) carry
-    // `{type:"error", error:{type, message}}` and Anthropic
-    // generally uses 4xx HTTP for them, but the `type:"error"`
-    // top-level can also appear in 200 responses for some edge
-    // cases — defensively handle both paths.
+    // Success shape: { id, type:"message", role, model, content:[{type, text}], stop_reason, usage
+    // }.
+    // Logical failures carry `{type:"error", error:{type, message}}`, normally with a 4xx, but the
+    // top-level `type:"error"` can also appear in a 200, so handle both.
     if body.get("type").and_then(Value::as_str) == Some("error") {
         let error_type = body
             .get("error")
@@ -126,10 +111,8 @@ fn parse_response(body: Value) -> Result<CompleteResponse, String> {
         .get("stop_reason")
         .and_then(Value::as_str)
         .map(str::to_string);
-    // Concatenate every `content[i].text` where the block type is
-    // "text". Skips other block types (tool_use etc.) silently;
-    // those aren't reachable from `llm.complete` in v1 since we
-    // only send text-only messages.
+    // Concatenate every text block, skipping others (tool_use): requests are text-only, so none
+    // are expected.
     let text = body
         .get("content")
         .and_then(Value::as_array)
@@ -166,8 +149,7 @@ fn parse_response(body: Value) -> Result<CompleteResponse, String> {
     })
 }
 
-/// 1-token "ping" against `messages` so the `auth` subcommand can
-/// surface invalid keys before persisting.
+/// 1-token "ping" so the `auth` subcommand can surface invalid keys before persisting.
 pub fn validate_key(api_key: &str, model: &str) -> Result<(), String> {
     let req = CompleteRequest {
         model,

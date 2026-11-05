@@ -20,13 +20,11 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
-    /// Accepted, not yet dispatched.
     Queued,
     /// Persisted before `csd spawn` — session may or may not exist yet.
     Spawning,
     /// Persisted before `csd send` — instruction may or may not have landed.
     Sending,
-    /// Instruction confirmed sent; dispatcher is polling for completion.
     Running,
     /// Paused on a `csd` gate (question / plan / trust / permission);
     /// blocks the queue until `pilot.answer` / `pilot.approve` resolves it.
@@ -73,12 +71,12 @@ pub struct Goal {
     /// `csd`-assigned transcript UUID (lets the cockpit locate the JSONL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Absolute path to the session transcript (`csd` reports it on spawn;
-    /// the cockpit reads it to render live progress — Phase 24.3).
+    /// Absolute path to the session transcript (`csd` reports it on spawn; the cockpit reads it
+    /// to render live progress).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jsonl_path: Option<String>,
-    /// Per-goal completion sentinel; only this exact value, on the last
-    /// line of the final assistant turn, counts as done (codex C3).
+    /// Per-goal completion sentinel; only this exact value, on the last line of the final
+    /// assistant turn, counts as done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,11 +246,9 @@ impl Store {
     }
 }
 
-/// Detect the per-goal completion sentinel. Only the LAST non-empty
-/// line of the final assistant turn may be the exact `DONE:<id>:<nonce>`
-/// — a quoted mention mid-message ("I'll print DONE:… when done")
-/// won't match, and the user prompt that carries the instruction is a
-/// user turn, never `idle_done.text` (codex C3).
+/// Detect the per-goal completion sentinel. Only the LAST non-empty line of the final assistant
+/// turn may be the exact `DONE:<id>:<nonce>`: a quoted mention mid-message won't match, and the
+/// user prompt carrying the instruction is a user turn, never `idle_done.text`.
 pub fn detect_completion(text: &str, id: &str, nonce: &str) -> bool {
     let sentinel = format!("DONE:{id}:{nonce}");
     text.lines()
@@ -311,7 +307,6 @@ mod tests {
             assert_eq!(g.status, Status::Queued);
             g.id
         };
-        // Fresh load sees the persisted goal.
         let reloaded = Store::load(path);
         let snap = reloaded.snapshot();
         assert_eq!(snap.len(), 1);
@@ -325,9 +320,7 @@ mod tests {
         let mut s = store(&dir);
         let a = s.add("/a".into(), "first".into(), "trust".into()).unwrap();
         let _b = s.add("/b".into(), "second".into(), "trust".into()).unwrap();
-        // First claim is the oldest.
         assert_eq!(s.claim_next().unwrap().id, a.id);
-        // Mark it done — claim advances to the next.
         s.update_if(&a.id, &[], |g| g.status = Status::Done);
         let next = s.claim_next().unwrap();
         assert_eq!(next.instruction, "second");
@@ -345,7 +338,6 @@ mod tests {
         let session = s.cancel(&g.id).unwrap();
         assert_eq!(session.as_deref(), Some(g.id.as_str()));
         assert_eq!(s.get(&g.id).unwrap().status, Status::Cancelled);
-        // Already terminal — second cancel is rejected.
         assert_eq!(s.cancel(&g.id), Err("terminal"));
     }
 
@@ -355,13 +347,11 @@ mod tests {
         let nonce = "abc";
         assert!(detect_completion("all done\nDONE:g-1:abc", id, nonce));
         assert!(detect_completion("DONE:g-1:abc\n\n", id, nonce));
-        // Mentioned mid-message but not the last line → no match.
         assert!(!detect_completion(
             "I will print DONE:g-1:abc when finished.\nWorking on it now.",
             id,
             nonce
         ));
-        // Wrong nonce → no match.
         assert!(!detect_completion("DONE:g-1:zzz", id, nonce));
     }
 

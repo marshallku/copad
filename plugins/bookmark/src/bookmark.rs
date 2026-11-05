@@ -1,19 +1,8 @@
-//! Action dispatcher for the bookmark plugin.
+//! Action dispatcher for the bookmark plugin (`main.rs` calls into it).
 //!
-//! BM-1 surface (this module is what `main.rs` calls into):
-//! - `bookmark.add`     — canonicalize URL, dedup by urlhash8, write
-//!   queued stub via [`Store::create`]. No fetch yet — BM-2 will spawn
-//!   a worker that transitions `status: queued → extracted | failed`.
-//! - `bookmark.list`    — walk and filter. Filters: `status`, `tag`,
-//!   `since` (RFC3339), `limit`.
-//! - `bookmark.show`    — read by `id` (prefix-resolved) or `url`
-//!   (canonicalized → exact urlhash8 lookup).
-//! - `bookmark.delete`  — same resolution path; unlinks the file.
-//!
-//! Error contract is `(code, message)` as `(String, String)`, which
-//! `main.rs` lifts into the JSON envelope. Codes are stable surface
-//! and intentionally short (`invalid_url`, `not_found`,
-//! `ambiguous_id`, `io_error`, `invalid_params`, `unsupported_scheme`).
+//! Error contract is `(code, message)`, which `main.rs` lifts into the JSON envelope. Codes are
+//! stable surface and intentionally short (`invalid_url`, `not_found`, `ambiguous_id`, `io_error`,
+//! `invalid_params`, `unsupported_scheme`).
 
 use std::path::PathBuf;
 
@@ -153,12 +142,9 @@ impl Bookmark {
             all.retain(|m| m.tags.iter().any(|t| t == tag));
         }
         if let Some(since) = since_filter {
-            // Parse `since` as RFC3339; lexicographic compare on the raw
-            // strings is not chronology-preserving once timezone offsets
-            // differ (`...Z` vs `...+09:00` for the same instant). Be
-            // strict on user input but lenient on stored captured_at —
-            // a hand-edited file with a malformed date is kept rather
-            // than silently dropped from the result set.
+            // Parse `since` as RFC3339: lexicographic compare is wrong once offsets differ
+            // (`...Z` vs `...+09:00`). Strict on user input, lenient on stored captured_at: a
+            // hand-edited file with a malformed date is kept rather than silently dropped.
             let since_dt = DateTime::parse_from_rfc3339(since).map_err(|e| {
                 (
                     "invalid_params",
@@ -184,7 +170,6 @@ impl Bookmark {
         let (fm, body) = self.store.read_full(&m.path).map_err(store_to_action_err)?;
 
         let mut payload = match_to_summary(m);
-        // Spread frontmatter fields onto the response, plus body.
         let pmap = payload.as_object_mut().unwrap();
         for key in [
             "url",
@@ -256,8 +241,6 @@ fn match_to_summary(m: Match) -> Value {
     })
 }
 
-/// When the user didn't supply a title, fall back to the URL host +
-/// last path segment so `bookmark list` is at least skim-readable.
 fn derive_title_from_url(url: &str) -> String {
     let parsed = match url::Url::parse(url) {
         Ok(u) => u,

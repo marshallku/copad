@@ -1,28 +1,16 @@
 //! Filesystem operations on `~/docs/todos/<workspace>/<id>.md`.
 //!
-//! Atomicity contract:
-//! - `create` uses temp + `copad_core::fs_atomic::rename_no_replace`
-//!   (Linux `renameat2(RENAME_NOREPLACE)` / macOS
-//!   `renamex_np(RENAME_EXCL)`) so concurrent creators never see torn
-//!   files; exactly one wins on id collision (loser gets `id_exists`).
-//! - `set_status` is read-modify-rewrite. The rewrite uses temp +
-//!   `rename` (atomic replace, NO_REPLACE-not-applicable since the
-//!   file MUST exist). A concurrent vim save during the same window
-//!   loses — we accept this because the user is the only writer
-//!   most of the time, and detecting a mid-edit collision properly
-//!   needs an mtime check that's racey on its own. Future: file lock.
-//! - `delete` is `unlink`; idempotent (NotFound is OK).
+//! Atomicity: `create` writes a temp file and `copad_core::fs_atomic::rename_no_replace`s it in
+//! (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)`), so exactly one concurrent creator
+//! wins an id collision (the loser gets `id_exists`). `set_status` is read-modify-rewrite via
+//! temp + `rename`; a concurrent vim save in that window loses, since detecting it needs a racey
+//! mtime check. `delete` is an idempotent `unlink`.
 //!
-//! Trust-boundary defense (mirrors `copad-plugin-kb`):
-//! - Workspace label is validated against the same charset before
-//!   it's joined into the path.
-//! - Id is validated to reject path separators, `..`, leading dot,
-//!   nul, leading slash. Always written as `<id>.md`.
-//! - Root is force-canonicalized at construction; every resolved
-//!   path is re-checked against `root_canonical` to defeat any
-//!   symlink placed inside the root.
-//! - O_NOFOLLOW on read so a leaf-swap during a read doesn't
-//!   redirect us out.
+//! Trust boundary (mirrors `copad-plugin-kb`): the workspace label is validated against the same
+//! charset before joining the path; ids reject separators, `..`, leading dot, nul and leading
+//! slash and are always written as `<id>.md`; the root is canonicalized at construction and every
+//! resolved path re-checked against `root_canonical` to defeat symlinks inside the root; reads use
+//! O_NOFOLLOW so a leaf swap cannot redirect them.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -60,8 +48,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// Creates the root if missing (first-run) and stores the canonicalized
-    /// form so later paths can be re-checked against `root_canonical`.
+    /// Creates the root if missing and stores its canonical form for later `root_canonical` checks.
     pub fn new(root: PathBuf) -> Result<Self, Err> {
         if let Err(e) = fs::create_dir_all(&root) {
             return Err(Err::Io(format!("mkdir {}: {e}", root.display())));
@@ -78,19 +65,16 @@ impl Store {
         &self.root
     }
 
-    /// Builds (creates on demand) the per-workspace dir. Refuses if the
-    /// workspace path is a symlink, even when its target stays inside
-    /// the root: `default → work` would let `create("default", ...)` write
-    /// to `work/` while `list`/watcher (real-subdir scans) attribute the
-    /// same file to workspace `work`, breaking workspace-handle stability.
+    /// Builds (creates on demand) the per-workspace dir. Refuses a symlinked workspace path even
+    /// when its target stays inside the root: `default -> work` would let `create("default", ...)`
+    /// write to
+    /// `work/` while `list`/watcher attribute the file to `work`.
     fn workspace_dir(&self, workspace: &str) -> Result<PathBuf, Err> {
         crate::config::validate_workspace(workspace)
             .map_err(|m| Err::InvalidParams(format!("workspace: {m}")))?;
         let dir = self.root.join(workspace);
-        // lstat-style check: refuse pre-existing symlinks at the
-        // workspace dir position. Non-existence is fine (we'll
-        // mkdir below). Anything else (EACCES, ENOTDIR, etc.) is
-        // surfaced rather than silently passing.
+        // lstat-style check; non-existence is fine (mkdir below), anything else (EACCES, ENOTDIR)
+        // is surfaced.
         match fs::symlink_metadata(&dir) {
             Ok(m) if m.file_type().is_symlink() => {
                 return Err(Err::InvalidParams(format!(
@@ -111,10 +95,8 @@ impl Store {
             }
         }
         fs::create_dir_all(&dir).map_err(|e| Err::Io(format!("mkdir {}: {e}", dir.display())))?;
-        // After creating, verify the canonical path stays under the root.
-        // Belt-and-braces against a TOCTOU swap between the
-        // symlink_metadata check and the rename/write — narrow
-        // window, but a free check.
+        // Re-verify the canonical path against a TOCTOU swap between the symlink check and the
+        // write.
         let canon = fs::canonicalize(&dir)
             .map_err(|e| Err::Io(format!("canonicalize {}: {e}", dir.display())))?;
         if !canon.starts_with(&self.root_canonical) {
@@ -132,7 +114,6 @@ impl Store {
         Ok(dir.join(format!("{id}.md")))
     }
 
-    /// `O_NOFOLLOW` so a leaf-swap symlink can't redirect the read.
     pub fn read(&self, workspace: &str, id: &str) -> Result<Todo, Err> {
         let path = self.todo_path(workspace, id)?;
         let mut f = OpenOptions::new()
@@ -149,8 +130,8 @@ impl Store {
         Ok(todo::parse(&s, id, workspace))
     }
 
-    /// Atomic create; returns the persisted `Todo` (echoing the supplied
-    /// or generated id). `id_exists` on collision.
+    /// Atomic create; returns the persisted `Todo` (supplied or generated id). `id_exists` on
+    /// collision.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -198,10 +179,9 @@ impl Store {
         Ok(todo)
     }
 
-    /// In-place rewrite of the `status:` frontmatter line. Returns
-    /// `(previous, new)` so the watcher can detect `→ done` transitions.
-    /// Falls back to a full `render_new` if frontmatter is malformed
-    /// (no closing fence, no status line).
+    /// In-place rewrite of the `status:` frontmatter line, returning `(previous, new)` so the
+    /// watcher can detect `-> done`. Falls back to a full `render_new` if the frontmatter is
+    /// malformed.
     pub fn set_status(
         &self,
         workspace: &str,
@@ -226,8 +206,6 @@ impl Store {
         let new_content = match todo::update_status_in_text(&content, new_status) {
             Some(s) => s,
             None => {
-                // Fallback: malformed file — rebuild from parsed
-                // state with new status.
                 let mut t = todo::parse(&content, id, workspace);
                 t.status = new_status;
                 todo::render_new(&t)
@@ -237,15 +215,12 @@ impl Store {
         Ok((prev, new_status))
     }
 
-    /// Full regenerate via `render_new` (canonicalizes ordering, drops
-    /// comments) — appropriate for UI form-submit, wrong for the
-    /// high-frequency status-toggle path (use `set_status` instead).
-    /// Outer `Option` is "None = don't touch"; for `Option<Option<String>>`
-    /// fields (`due`, `linked_jira`, `prompt`) an inner empty string clears.
-    /// `title: Some("")` is rejected. `body` and `append_subtask` are
-    /// mutually exclusive — the latter performs the read-modify-write
-    /// inside this call so callers don't widen the race window with a
-    /// client-side preflight fetch.
+    /// Full regenerate via `render_new` (canonicalizes ordering, drops comments): right for UI
+    /// form-submit, wrong for the high-frequency status toggle (use `set_status`). Outer `None`
+    /// means "don't touch"; for `Option<Option<String>>` fields (`due`, `linked_jira`, `prompt`) an
+    /// inner empty string clears. `title: Some("")` is rejected. `body` and `append_subtask` are
+    /// mutually exclusive; the latter does its read-modify-write inside this call, so callers need
+    /// no racey client-side preflight fetch.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &self,
@@ -331,7 +306,6 @@ impl Store {
         Ok(t)
     }
 
-    /// Delete a todo file. NotFound is OK (idempotent).
     pub fn delete(&self, workspace: &str, id: &str) -> Result<(), Err> {
         let path = self.todo_path(workspace, id)?;
         match fs::remove_file(&path) {
@@ -341,8 +315,8 @@ impl Store {
         }
     }
 
-    /// `None` walks every workspace dir; `Some(label)` restricts to one.
-    /// Symlinked entries are skipped (same posture as KB search walk).
+    /// `None` walks every workspace dir, `Some(label)` restricts to one. Symlinked entries are
+    /// skipped.
     pub fn list_all(&self, workspace_filter: Option<&str>) -> Result<Vec<Todo>, Err> {
         let mut todos = Vec::new();
         let workspaces = match workspace_filter {
@@ -361,11 +335,8 @@ impl Store {
                 Err(e) => return Err(Err::Io(format!("readdir {}: {e}", dir.display()))),
             };
             for entry in entries.flatten() {
-                // Use `file_type()` (lstat-based) so we identify the
-                // entry itself, not what it might point at — that
-                // makes the symlink skip below actually skip.
-                // `metadata()` follows symlinks; using it here would
-                // silently let a symlink through.
+                // `file_type()` is lstat-based, so the symlink skip below works; `metadata()`
+                // follows symlinks.
                 let ft = match entry.file_type() {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -402,8 +373,7 @@ fn list_subdirs(root: &Path) -> Result<Vec<String>, Err> {
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
-        // `file_type()` is lstat-based (symlink-aware). `metadata()`
-        // would follow symlinks and break the skip below.
+        // `file_type()` is lstat-based; `metadata()` would follow symlinks and defeat the skip.
         let ft = match entry.file_type() {
             Ok(t) => t,
             Err(_) => continue,
@@ -420,8 +390,7 @@ fn list_subdirs(root: &Path) -> Result<Vec<String>, Err> {
     Ok(out)
 }
 
-/// Reject characters that would let an id escape the workspace
-/// directory or collide with hidden files / temp files.
+/// Reject characters that would let an id escape the workspace dir or collide with hidden/temp files.
 pub fn validate_id(id: &str) -> Result<(), Err> {
     if id.is_empty() {
         return Err(Err::InvalidId("id cannot be empty".to_string()));
@@ -447,8 +416,7 @@ pub fn validate_id(id: &str) -> Result<(), Err> {
     Ok(())
 }
 
-/// `T-YYYYMMDDHHMMSS-<seq>` — sortable, no RNG dep, distinct under
-/// same-second concurrent creates.
+/// `T-YYYYMMDDHHMMSS-<seq>`: sortable, no RNG dep, distinct under same-second concurrent creates.
 pub fn generate_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -473,8 +441,6 @@ fn temp_path(target: &Path) -> PathBuf {
     parent.join(format!(".todo-tmp-{pid}-{nanos}-{seq}"))
 }
 
-/// Atomic create: write to temp, rename in with `RENAME_NOREPLACE`.
-/// Returns `Err::IdExists` on collision.
 fn atomic_create(target: &Path, content: &[u8]) -> Result<(), Err> {
     let tmp = temp_path(target);
     {
@@ -505,7 +471,6 @@ fn atomic_create(target: &Path, content: &[u8]) -> Result<(), Err> {
     }
 }
 
-/// Atomic replace: write to temp, rename in (REPLACES existing).
 fn atomic_replace(target: &Path, content: &[u8]) -> Result<(), Err> {
     let tmp = temp_path(target);
     {
@@ -691,7 +656,6 @@ mod tests {
             None,
         )
         .unwrap();
-        // Drop a stray .todo-tmp-* sibling — must be ignored.
         std::fs::write(
             s.root.join("default").join(".todo-tmp-leftover.md"),
             "garbage",
@@ -747,10 +711,8 @@ mod tests {
     #[test]
     fn create_rejects_symlinked_workspace_dir() {
         let (_d, s) = mk_store();
-        // Pre-create a real "real" workspace, then make a symlink
-        // "alias" pointing at it. todo.create("alias", …) must
-        // refuse rather than redirect through and cause workspace
-        // misattribution at list/watch time.
+        // A symlink "alias" to the real workspace: create("alias", ...) must refuse, or list/watch
+        // would misattribute the file.
         s.create(
             "real",
             None,

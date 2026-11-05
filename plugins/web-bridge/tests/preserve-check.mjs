@@ -5,7 +5,6 @@ const src0 = fs.readFileSync(new URL("../static/app.js", import.meta.url), "utf8
 const m = src0.match(/    function renderPreservingTerminal\(html\) \{[\s\S]*?\n    \}/);
 if (!m) { console.log("FAIL: helper not found"); process.exit(1); }
 
-// Minimal DOM: elements with ids, a root whose innerHTML setter rebuilds children.
 class El {
   constructor(id) { this.id = id; this.children = []; this.parent = null; this.marker = null; }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this); this.parent = null; }
@@ -29,8 +28,7 @@ const original = find("term-host");
 original.marker = "LIVE-XTERM";     // stand-in for the real xterm DOM
 state.term = {};                     // a terminal is now live
 
-// NOTE: the mux view is now built once and patched, so this path is only reached on the
-// FIRST build. The helper must still be correct for it.
+// Only the first build of the mux view reaches this path; the helper must still be correct for it.
 console.log("a render while a terminal is live...");
 helper('<div class="banner">push updated</div><div id="term-host"></div><div id="kbd"></div>');
 const after = find("term-host");

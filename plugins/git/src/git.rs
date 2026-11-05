@@ -1,22 +1,12 @@
 //! Argument-vector shell-outs to `git`.
 //!
-//! Every call goes through `Command::arg(...)` — never a shell
-//! string — so caller-supplied data (branch names, base refs)
-//! cannot inject extra arguments or shell metacharacters. We also
-//! pass `--literal-pathspecs` and explicit `-C <repo>` everywhere
-//! to keep the cwd of the calling process from changing what
-//! `git` sees.
+//! Every call goes through `Command::arg(...)`, never a shell string, so caller-supplied data
+//! cannot inject arguments or shell metacharacters. `--literal-pathspecs` and an explicit
+//! `-C <repo>` keep the calling process's cwd from changing what `git` sees.
 //!
-//! Branch name sanitization happens BEFORE git sees the value:
-//! `validate_branch_name` rejects empty / leading-dot / trailing
-//! `.lock` / `..` / control chars, and refuses anything `git
-//! check-ref-format` would also refuse (prefix the actual call to
-//! avoid divergence on edge cases). The roadmap-specified Jira
-//! transform (`PROJ-456 → proj-456`, slashes preserved as path
-//! components) is in `sanitize_branch_for_jira` and is OPTIONAL —
-//! callers that want it pass through that helper before
-//! `worktree_add`, but `worktree_add` itself accepts any
-//! validate-passing branch name verbatim.
+//! Branch names are validated before git sees them (`validate_branch_name`, a coarse subset of
+//! `git check-ref-format`). The Jira transform (`PROJ-456` -> `proj-456`) in
+//! `sanitize_branch_for_jira` is optional; `worktree_add` takes any validated name verbatim.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,8 +41,7 @@ pub fn current_branch(repo: &Path) -> Result<String, GitError> {
         .map_err(|e| GitError::new("io_error", format!("decode HEAD: {e}")))?;
     let trimmed = s.trim().to_string();
     if trimmed.is_empty() {
-        // Detached HEAD — surface explicitly rather than empty
-        // string so callers can distinguish.
+        // Detached HEAD: surface explicitly so callers can distinguish it from an empty string.
         return Err(GitError::new(
             "detached_head",
             "HEAD is detached (no current branch)",
@@ -61,9 +50,8 @@ pub fn current_branch(repo: &Path) -> Result<String, GitError> {
     Ok(trimmed)
 }
 
-/// Parses `git worktree list --porcelain`: blank-line-delimited records
-/// of `worktree <path>` / `HEAD <sha>` / `branch refs/heads/<name>` plus
-/// optional `locked [reason]` / `prunable [reason]` / bare `detached`.
+/// Parses `git worktree list --porcelain`: blank-line-delimited records of `worktree <path>` /
+/// `HEAD <sha>` / `branch refs/heads/<name>` plus optional `locked`, `prunable`, or `detached`.
 pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeInfo>, GitError> {
     let out = run_git(repo, &["worktree", "list", "--porcelain"])?;
     let s = String::from_utf8(out.stdout)
@@ -131,11 +119,9 @@ pub struct WorktreeAddResult {
     pub branch: String,
 }
 
-/// `git -C <repo> worktree add <target> -b <branch> <base>`. Pure
-/// create primitive — fails as `branch_exists` on collision. Re-click
-/// idempotency lives at the action layer where it shares the same
-/// containment / symlink-ancestor / canonicalization gates; doing it
-/// here too would give the action an unvalidated second return path.
+/// `git -C <repo> worktree add <target> -b <branch> <base>`. A pure create primitive that fails
+/// as `branch_exists` on collision. Re-click idempotency lives in the action layer, behind the
+/// same containment / symlink-ancestor gates; doing it here would add an unvalidated return path.
 pub fn worktree_add(
     repo: &Path,
     target: &Path,
@@ -185,7 +171,6 @@ pub fn worktree_add(
     })
 }
 
-/// `git -C <repo> worktree remove [--force] <target>`.
 pub fn worktree_remove(repo: &Path, target: &Path, force: bool) -> Result<(), GitError> {
     let target_str = target
         .to_str()
@@ -225,8 +210,7 @@ pub struct StatusReport {
     pub dirty: bool,
 }
 
-/// Parse `git status --porcelain=v2 --branch`. Cheaper than full
-/// porcelain v1 parsing and gives us ahead/behind counts directly.
+/// Parse `git status --porcelain=v2 --branch`, which gives ahead/behind counts directly.
 pub fn status(target: &Path) -> Result<StatusReport, GitError> {
     let out = run_git(target, &["status", "--porcelain=v2", "--branch"])?;
     let s = String::from_utf8(out.stdout)
@@ -240,15 +224,14 @@ pub fn status(target: &Path) -> Result<StatusReport, GitError> {
         } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
             report.upstream = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            // `# branch.ab +<N> -<M>`
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if parts.len() == 2 {
                 report.ahead = parts[0].trim_start_matches('+').parse().unwrap_or(0);
                 report.behind = parts[1].trim_start_matches('-').parse().unwrap_or(0);
             }
         } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            // Tracked entry. Columns 2-3 are XY status flags.
-            // Index status (col 2) != '.' → staged; worktree (col 3) → unstaged.
+            // Tracked entry; columns 2-3 are XY flags. Index status (col 2) != '.' is staged,
+            // worktree (col 3) unstaged.
             let bytes = line.as_bytes();
             if bytes.len() >= 4 {
                 let xy = &bytes[2..4];
@@ -262,8 +245,7 @@ pub fn status(target: &Path) -> Result<StatusReport, GitError> {
         } else if line.starts_with("? ") {
             report.untracked += 1;
         } else if line.starts_with("u ") {
-            // Unmerged entry counts as both staged and unstaged for
-            // a callers-eye view.
+            // An unmerged entry counts as both staged and unstaged.
             report.staged += 1;
             report.unstaged += 1;
         }
@@ -272,12 +254,10 @@ pub fn status(target: &Path) -> Result<StatusReport, GitError> {
     Ok(report)
 }
 
-/// Coarse subset of `git check-ref-format --branch` enforced before
-/// shelling out — refuses partial-worktree state from git's own
-/// validation landing mid-stream. Rules: non-empty, not just `@`, no
-/// leading `-`, no leading or trailing `/`, no `..`/`@{`/`//`, no
-/// control chars or `~^:?*[\\`/whitespace, no segment starts with `.`
-/// or ends with `.lock` or `.`.
+/// Coarse subset of `git check-ref-format --branch`, so git's own validation does not fail
+/// mid-way and leave partial worktree state. Rules: non-empty, not just `@`, no leading `-`, no
+/// leading or trailing `/`, no `..`/`@{`/`//`, no control chars or `~^:?*[\\`/whitespace, no
+/// segment starting with `.` or ending with `.lock` or `.`.
 pub fn validate_branch_name(s: &str) -> Result<(), GitError> {
     if s.is_empty() {
         return Err(GitError::new(
@@ -343,11 +323,9 @@ pub fn validate_branch_name(s: &str) -> Result<(), GitError> {
             ));
         }
         if segment.ends_with('.') {
-            // git check-ref-format rejects this: `foo.` and
-            // `feature/foo.` both trip "fatal: ... is not a valid
-            // branch name". Without this rule, the bad input
-            // would land late inside `git worktree add` after
-            // we've already created the parent directory.
+            // git rejects `foo.` and `feature/foo.`; without this the bad input would fail late
+            // inside
+            // `git worktree add`, after the parent directory was created.
             return Err(GitError::new(
                 "invalid_branch",
                 format!("branch segment {segment:?} cannot end with '.'"),
@@ -357,11 +335,9 @@ pub fn validate_branch_name(s: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Looser than `validate_branch_name` so legitimate commit-ish forms
-/// (`HEAD~1`, `main^`, `tag^{commit}`) pass; the trust boundary still
-/// rejects: empty, leading `-` (would be parsed as a flag — git worktree
-/// add doesn't accept `--` to terminate options), control / NUL chars,
-/// and any whitespace (commit-ish refs never contain spaces).
+/// Looser than `validate_branch_name` so commit-ish forms (`HEAD~1`, `main^`, `tag^{commit}`)
+/// pass. Still rejects empty, leading `-` (parsed as a flag; `git worktree add` accepts no `--`),
+/// control / NUL chars, and whitespace.
 pub fn validate_base_ref(s: &str) -> Result<(), GitError> {
     if s.is_empty() {
         return Err(GitError::new("invalid_params", "base cannot be empty"));
@@ -389,11 +365,8 @@ pub fn validate_base_ref(s: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Lowercase + run through `validate_branch_name`. Slashes are
-/// preserved (`epic/PROJ-456` → `epic/proj-456`). Used by
-/// `worktree_add` when `sanitize_jira = true`, so a trigger
-/// interpolating `linked_jira` from a Todo payload gets a valid
-/// kebab-style branch name without per-trigger massaging.
+/// Lowercase + `validate_branch_name`, keeping slashes (`epic/PROJ-456` -> `epic/proj-456`).
+/// Used by `worktree_add` when `sanitize_jira = true`.
 pub fn sanitize_jira_branch(s: &str) -> Result<String, GitError> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -407,8 +380,6 @@ pub fn sanitize_jira_branch(s: &str) -> Result<String, GitError> {
     Ok(lower)
 }
 
-/// Run `git -C <repo> <args...>` and return the captured Output on
-/// success, or a GitError on non-zero exit / spawn failure.
 fn run_git(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitError> {
     let out = Command::new("git")
         .arg("-C")
@@ -429,8 +400,7 @@ mod tests {
     use std::process::Command;
     use tempfile::tempdir;
 
-    /// Real `git` (not a fixture) because porcelain parsers depend on
-    /// git's exact output format.
+    /// Real `git`, not a fixture: porcelain parsers depend on git's exact output.
     fn init_repo(dir: &Path) {
         for cmd in [
             vec!["init", "--initial-branch=main", "."],
@@ -493,11 +463,8 @@ mod tests {
 
     #[test]
     fn worktree_add_rejects_existing_branch_at_module_layer() {
-        // git::worktree_add is the pure create primitive — idempotency
-        // for re-click flows lives in action_worktree_add (see its
-        // own test in main.rs). Direct callers that hit a branch
-        // collision here get branch_exists / git_error, same as
-        // before.
+        // git::worktree_add is the pure create primitive; re-click idempotency is in
+        // action_worktree_add.
         let dir = tempdir().unwrap();
         init_repo(dir.path());
         let target = dir.path().join("..").join(format!(
@@ -521,11 +488,9 @@ mod tests {
     fn status_reports_dirty_after_edit() {
         let dir = tempdir().unwrap();
         init_repo(dir.path());
-        // Clean state.
         let r = status(dir.path()).unwrap();
         assert!(!r.dirty);
         assert_eq!(r.branch.as_deref(), Some("main"));
-        // Add an untracked file.
         std::fs::write(dir.path().join("new.txt"), "hello").unwrap();
         let r2 = status(dir.path()).unwrap();
         assert!(r2.dirty);
@@ -564,31 +529,22 @@ mod tests {
             sanitize_jira_branch("Epic/PROJ-456").unwrap(),
             "epic/proj-456"
         );
-        // Pre-lowercased input is a no-op.
         assert_eq!(sanitize_jira_branch("feat/foo").unwrap(), "feat/foo");
-        // Whitespace trimmed.
         assert_eq!(sanitize_jira_branch("  PROJ-1 ").unwrap(), "proj-1");
     }
 
     #[test]
     fn sanitize_jira_rejects_validate_failures_after_lowercase() {
-        // `..` survives lowercasing and validate_branch_name
-        // still catches it.
+        // `..` survives lowercasing and validate_branch_name still catches it.
         assert!(sanitize_jira_branch("a..b").is_err());
-        // Empty trim.
         assert!(sanitize_jira_branch("   ").is_err());
-        // Leading `.` after lowercasing.
         assert!(sanitize_jira_branch(".HIDDEN").is_err());
-        // Leading `-` would be parsed as a flag.
         assert!(sanitize_jira_branch("-flag").is_err());
     }
 
     #[test]
     fn base_ref_accepts_commit_ish_syntax() {
-        // Round-8 fix: HEAD~1, main^, tag^{commit} must pass —
-        // they're the documented-allowed commit-ish forms for
-        // `git worktree add ... <base>`. The narrower check
-        // from round 7 wrongly rejected them.
+        // HEAD~1, main^ and tag^{commit} are documented commit-ish forms and must pass.
         for good in [
             "HEAD",
             "HEAD~1",

@@ -1,16 +1,10 @@
 //! Google Calendar v3 read-only client.
 //!
-//! Calls `events.list` on the primary calendar with `singleEvents=true`
-//! so recurring events are pre-expanded into per-instance entries —
-//! that's what triggers want (each instance has its own start time +
-//! per-instance attendee responses, and the `recurringEventId` field
-//! lets users target a recurrence series in their `[[triggers]]` rules).
-//!
-//! Token refresh: on a 401 we trigger a refresh-token exchange via
-//! the `oauth` module, persist the new `TokenSet` through the
-//! `TokenStore`, and retry the request once. A second 401 is fatal
-//! (we don't loop indefinitely if the refresh_token itself was
-//! revoked — caller must re-run `copad-plugin-calendar auth`).
+//! Calls `events.list` on the primary calendar with `singleEvents=true`, so recurring events are
+//! expanded per instance (each has its own start and attendee responses; `recurringEventId` lets
+//! triggers target a series). On a 401 it refreshes via the `oauth` module, persists the new
+//! `TokenSet`, and retries once; a second 401 is fatal rather than a loop (for instance when the
+//! refresh_token itself was revoked, which needs `copad-plugin-calendar auth` again).
 
 use std::sync::Arc;
 
@@ -42,8 +36,8 @@ impl Client {
         })
     }
 
-    /// Walks `nextPageToken` (capped at `MAX_PAGES`) so a busy window
-    /// doesn't silently lose events past page 1.
+    /// Walks `nextPageToken` (capped at `MAX_PAGES`) so a busy window does not lose events past
+    /// page 1.
     pub fn list_events(
         &mut self,
         time_min: DateTime<Utc>,
@@ -90,8 +84,7 @@ impl Client {
         Ok(all)
     }
 
-    /// Look up a single event by id on the primary calendar.
-    /// Returns `Ok(None)` when the API responds 404.
+    /// Look up a single event by id; `Ok(None)` on 404.
     pub fn get_event(&mut self, event_id: &str) -> Result<Option<CalendarEvent>, String> {
         self.ensure_fresh_token()?;
         let url = format!(
@@ -102,7 +95,6 @@ impl Client {
             Ok(body) => Ok(from_gcal_json(&body)),
             Err(GcalError::Status(404, _)) => Ok(None),
             Err(GcalError::Status(401, _)) => {
-                // Refresh + retry once.
                 self.force_refresh()?;
                 match self.get_raw(&url) {
                     Ok(body) => Ok(from_gcal_json(&body)),
@@ -175,7 +167,6 @@ impl std::fmt::Display for GcalError {
     }
 }
 
-/// Minimal RFC 3986 percent-encode for path/query segments.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -208,7 +199,6 @@ mod tests {
             urlencode("2026-04-26T10:00:00+09:00"),
             "2026-04-26T10%3A00%3A00%2B09%3A00"
         );
-        // Non-ASCII byte sequences encode each byte.
         assert_eq!(urlencode("é"), "%C3%A9");
     }
 }

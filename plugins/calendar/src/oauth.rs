@@ -1,18 +1,5 @@
-//! Google OAuth 2.0 device-code flow + refresh-token exchange.
-//!
-//! Device code flow steps (RFC 8628 + Google specifics):
-//! 1. POST `oauth2.googleapis.com/device/code` with client_id + scope →
-//!    `{ device_code, user_code, verification_url, interval, expires_in }`
-//! 2. Print user_code + verification_url to stderr.
-//! 3. Poll `oauth2.googleapis.com/token` every `interval` seconds with
-//!    `grant_type=urn:ietf:params:oauth:grant-type:device_code` until
-//!    `access_token` is returned (or `expired_token` / `access_denied`).
-//! 4. Compose `TokenSet` with computed `expires_at_unix` for refresh
-//!    scheduling.
-//!
-//! Refresh: POST `oauth2.googleapis.com/token` with
-//! `grant_type=refresh_token`. Google does NOT return a new
-//! refresh_token in this exchange, so we preserve the original.
+//! Google OAuth 2.0 device-code flow (RFC 8628) + refresh-token exchange. Google does not return a
+//! new refresh_token on refresh, so the original is preserved.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,11 +20,9 @@ const REFRESH_LEAD_SECS: u64 = 30;
 struct DeviceCodeResponse {
     device_code: String,
     user_code: String,
-    /// Some Google docs use `verification_url`, others `verification_uri`.
-    /// We accept either.
+    /// Some Google docs say `verification_url`, others `verification_uri`; accept either.
     #[serde(alias = "verification_uri")]
     verification_url: String,
-    /// Default poll interval in seconds.
     interval: u64,
     expires_in: u64,
 }
@@ -71,7 +56,6 @@ pub fn run_device_code_flow(config: &Config) -> Result<TokenSet, String> {
         match poll_token(config, &dc.device_code) {
             Ok(Some(tokens)) => return Ok(tokens),
             Ok(None) => {
-                // Still pending — keep polling.
                 continue;
             }
             Err(PollError::SlowDown) => {
@@ -246,7 +230,7 @@ mod tests {
         let t = TokenSet {
             access_token: "x".into(),
             refresh_token: "r".into(),
-            expires_at_unix: 1, // way in the past
+            expires_at_unix: 1,
             scope: "s".into(),
             token_type: "Bearer".into(),
         };

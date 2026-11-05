@@ -1,21 +1,11 @@
-//! Discord REST API helpers for write actions.
+//! Discord REST helpers for write actions.
 //!
-//! Slice 2 ships only `send_message` (POST `/channels/{id}/messages`).
-//! Future: edit/delete, reactions, file uploads, threads.
+//! No pre-emptive rate limiting: HTTP 429 is surfaced with its `Retry-After` value so triggers or
+//! the UI decide whether to retry.
 //!
-//! Rate limiting: Discord uses per-route bucket headers (`X-RateLimit-*`)
-//! plus a global limit. We don't pre-emptively throttle — we surface
-//! HTTP 429 verbatim with the `Retry-After` value so triggers / the
-//! UI can decide whether to back off and retry. A future scheduler
-//! can layer on top of this without changing the call site.
-//!
-//! Errors return as `(code, message)` so the plugin's RPC layer can
-//! forward `code` directly as the action error code. That preserves
-//! Discord's numeric error codes (`discord_50001` for "Missing
-//! Access" etc.) at the structured layer instead of burying them in
-//! free-text — without that, downstream triggers couldn't branch on
-//! specific Discord failures via the action-completion fanout, which
-//! only preserves `{code, message}`.
+//! Errors are `(code, message)` so the RPC layer forwards `code` as the action error code. That
+//! keeps Discord's numeric codes (`discord_50001`) structured, since the action-completion fanout
+//! preserves only `{code, message}`.
 
 use std::time::Duration;
 
@@ -126,8 +116,7 @@ pub fn post_message(
     Ok((message_id, posted_channel))
 }
 
-/// Single-message fetch (reactions don't carry the body). Returns the
-/// verbatim Discord message object so triggers reach any nested field.
+/// Returns the verbatim Discord message object so triggers reach any nested field.
 pub fn get_message(bot_token: &str, channel_id: &str, message_id: &str) -> Result<Value, ApiError> {
     let resp = ureq::get(&format!(
         "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}"

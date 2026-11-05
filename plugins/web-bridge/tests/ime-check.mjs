@@ -55,12 +55,10 @@ function env({ readyState = 1 } = {}) {
              write, NON_ASCII, IME_COMMIT_MS };`
   )(state, document, { OPEN: 1 }, TextEncoder, class {}, () => {}, () => {}, {});
   api.wireIme();
-  // What `term.onData` does with what `term.paste()` emits: hand it to the real `write`.
   const writeThrough = (t) => api.emit ? api.write(t) : null;
   return { sent, el, state, writeThrough, ...api };
 }
 
-// ---- the key table -------------------------------------------------------------------------
 {
   const { keyBytes } = env();
   const k = (o) => keyBytes({ key: "a", ctrlKey: false, altKey: false, metaKey: false, ...o });
@@ -75,7 +73,6 @@ function env({ readyState = 1 } = {}) {
   check("a modifier keydown is not a key", k({ key: "Shift" }) === null);
 }
 
-// ---- typing is immediate, composing is not -------------------------------------------------
 {
   const e = env();
   let prevented = false;
@@ -92,7 +89,6 @@ function env({ readyState = 1 } = {}) {
   check("a Hangul insertion is left in the strip instead", !prevented && e.sent.join("") === "c");
 }
 
-// ---- a control key never overtakes staged text ----------------------------------------------
 {
   const e = env();
   e.el.value = "한";
@@ -101,7 +97,6 @@ function env({ readyState = 1 } = {}) {
   check("...and clears the strip", e.el.value === "");
 }
 
-// ---- Enter pressed mid-syllable -------------------------------------------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -112,7 +107,6 @@ function env({ readyState = 1 } = {}) {
   check("after the commit it is syllable-then-CR, in that order", e.sent.join("|") === "하|\r");
 }
 
-// ---- a comux chord tapped mid-syllable ------------------------------------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -123,7 +117,6 @@ function env({ readyState = 1 } = {}) {
   check("the syllable lands first, so the chord cannot retarget it", e.sent.join("|") === "하|\x02n");
 }
 
-// ---- a mouse report is ordered the same way --------------------------------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -133,7 +126,6 @@ function env({ readyState = 1 } = {}) {
   check("a tap on another pane cannot precede the syllable", e.sent.join("|") === "하|\x1b[<0;9;3M");
 }
 
-// ---- an IME that never commits ---------------------------------------------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -147,7 +139,6 @@ function env({ readyState = 1 } = {}) {
   check("...and input still works afterwards", e.sent.join("|") === "하|\r");
 }
 
-// ---- a dead socket loses nothing silently ----------------------------------------------------
 {
   const e = env({ readyState: 3 });                  // CLOSED
   e.el.value = "커밋해줘";
@@ -157,7 +148,6 @@ function env({ readyState = 1 } = {}) {
   check("...and raises the disconnected state", e.state.muxDown === true);
 }
 
-// ---- sticky Ctrl reaches the soft keyboard ---------------------------------------------------
 {
   const e = env();
   e.state.ctrlSticky = true;
@@ -166,7 +156,6 @@ function env({ readyState = 1 } = {}) {
   check("...and disarms itself", e.state.ctrlSticky === false);
 }
 
-// ---- teardown invalidates in-flight work ----------------------------------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -185,12 +174,10 @@ function env({ readyState = 1 } = {}) {
   check("reconnecting keeps what was typed while it was down", e.el.value === "한x");
 }
 
-// ---- a paste keeps its bracketing ------------------------------------------------------------
 {
   const e = env();
   const pasted = [];
   e.state.term = { paste: (t) => pasted.push(t) };
-  // A plain textarea hands the text over on `e.data` and leaves dataTransfer null.
   e.onImeBeforeInput({ inputType: "insertFromPaste", data: "echo hello", dataTransfer: null,
                        preventDefault() {} });
   check("a textarea paste is read off e.data, not dataTransfer", pasted.join("") === "echo hello");
@@ -201,7 +188,6 @@ function env({ readyState = 1 } = {}) {
   check("a paste carrying neither is left to land rather than cancelled", !prevented);
 }
 
-// ---- a dead socket keeps what was typed -------------------------------------------------------
 {
   const e = env({ readyState: 3 });
   e.onImeKeyDown({ key: "x", preventDefault() {} });
@@ -211,7 +197,6 @@ function env({ readyState = 1 } = {}) {
   check("...but a control key is not queued up to fire at a later screen", e.el.value === "xy");
 }
 
-// ---- a later composition cannot resurrect an expired chord -------------------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -227,7 +212,6 @@ function env({ readyState = 1 } = {}) {
         e.sent.every((x) => !x.includes("\x02n")));
 }
 
-// ---- the deadline belongs to the first queued action, not to the last -------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -240,7 +224,6 @@ function env({ readyState = 1 } = {}) {
   check("...and both are dropped together", e.state.muxNote.length > 0);
 }
 
-// ---- text queued behind a composition survives a disconnect -----------------------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -252,14 +235,12 @@ function env({ readyState = 1 } = {}) {
   check("a character queued behind a syllable is not lost with the queue", e.el.value === "한x");
 }
 
-// ---- dictation delivers whole words -----------------------------------------------------------
 {
   const e = env({ readyState: 3 });
   e.onImeBeforeInput({ inputType: "insertText", data: "hello", preventDefault() {} });
   check("a multi-character insertion is kept too, not just a single key", e.el.value === "hello");
 }
 
-// ---- nothing typed is lost, wherever the send fails --------------------------------------------
 {
   const e = env();
   e.el.value = "한";
@@ -288,7 +269,6 @@ function env({ readyState = 1 } = {}) {
   check("disconnected typing keeps the order it was typed in", e.el.value === "한xy");
 }
 
-// ---- a failure inside the drain stops it, instead of reordering what follows -------------------
 {
   const e = env();
   e.el.fire("compositionstart");
@@ -306,7 +286,6 @@ function env({ readyState = 1 } = {}) {
   check("...and both are back in the strip, in order", e.el.value === "xy");
 }
 
-// ---- a paste that fails mid-write is kept ------------------------------------------------------
 {
   const e = env();
   // term.paste writes through onData, which reports nothing back — the only signal is the failed
