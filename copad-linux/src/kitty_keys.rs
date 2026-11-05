@@ -21,7 +21,6 @@ use crate::kitty_relay::Relay;
 
 #[derive(Default)]
 struct Keys {
-    /// Hardware keycodes held down — a press of one already here is a repeat.
     held: HashSet<u32>,
     /// Keycodes whose press went out encoded; only these report a release.
     encoded: HashSet<u32>,
@@ -29,7 +28,6 @@ struct Keys {
     held_mods: HashSet<Modifier>,
 }
 
-/// Attach the key handling to `terminal`. `relay` holds the negotiated flags.
 pub fn attach(terminal: &vte4::Terminal, relay: Rc<RefCell<Option<Relay>>>) {
     let keys = Rc::new(RefCell::new(Keys::default()));
     let controller = gtk4::EventControllerKey::new();
@@ -85,7 +83,6 @@ pub fn attach(terminal: &vte4::Terminal, relay: Rc<RefCell<Option<Relay>>>) {
     terminal.add_controller(focus);
 }
 
-/// copad's own terminal chords (font zoom) stay copad's.
 fn is_host_chord(keyval: gdk::Key, state: gdk::ModifierType) -> bool {
     state.contains(gdk::ModifierType::CONTROL_MASK)
         && matches!(
@@ -120,7 +117,6 @@ fn handle(
     match copad_keys::encode(&ev, flags, app_cursor) {
         Encoded::Text => glib::Propagation::Proceed,
         Encoded::Nothing => {
-            // A release nobody asked for, or a lone modifier: VTE has nothing to do either.
             if action == Action::Release {
                 glib::Propagation::Proceed
             } else {
@@ -172,7 +168,6 @@ fn kitty_mods(state: gdk::ModifierType) -> u8 {
     m
 }
 
-/// Build the protocol's view of a GDK key event (the text is returned beside it).
 fn key_event(
     term: &vte4::Terminal,
     event: Option<&gdk::KeyEvent>,
@@ -226,8 +221,8 @@ fn key_event(
         return Some((ev, text));
     }
 
-    // A text key: name it by what it types unshifted in the active layout (level 0 of the
-    // event's layout), with what it types shifted (level 1) alongside.
+    // A text key: named by what it types unshifted (level 0 of the event's layout), with the
+    // shifted text (level 1) alongside.
     let layout = event.map(|e| e.layout());
     let level_char = |level: u32| -> Option<char> {
         let entries = display.map_keycode(keycode)?;

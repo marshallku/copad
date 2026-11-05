@@ -37,8 +37,7 @@ const MAX_OUTSTANDING: u64 = 4;
 /// The marker URI's prefix; its last path component is the publication number.
 pub const MARKER_PREFIX: &str = "file:///copad-image-sync/";
 
-/// Visible image runs at one point of the stream. Rows count from the top of the shadow's
-/// retained history (`history` rows above the screen).
+/// Rows count from the top of the shadow's retained history (`history` rows above the screen).
 pub struct Published {
     pub seq: u64,
     pub history: usize,
@@ -46,10 +45,8 @@ pub struct Published {
     pub images: Vec<Arc<GraphicImage>>,
 }
 
-/// Between the relay's output worker and the GTK side.
 #[derive(Default)]
 pub struct ImageShared {
-    /// `[terminal] images` and the cell size, read by the graphics code.
     pub graphics: Arc<copad_graphics::Shared>,
     published: Mutex<VecDeque<Published>>,
     acked: AtomicU64,
@@ -73,19 +70,14 @@ impl ImageShared {
     }
 }
 
-/// The marker's publication number, from VTE's current-file URI.
 pub fn marker_seq(uri: &str) -> Option<u64> {
     uri.strip_prefix(MARKER_PREFIX)?.parse().ok()
 }
 
-/// What the relay writes to VTE, in order.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Segment {
-    /// Shell output: written to VTE, then fed to the shadow.
     Feed(Vec<u8>),
-    /// A complete APC body: run through the shadow's graphics when it reaches the front.
     Apc(Vec<u8>),
-    /// Written to VTE only (replayed effects, markers).
     Raw(Vec<u8>),
 }
 
@@ -104,10 +96,8 @@ pub struct ApcSplitter {
 enum SplitState {
     #[default]
     Ground,
-    /// Saw ESC outside an APC.
     Escape,
     Apc,
-    /// Saw ESC inside an APC.
     ApcEscape,
 }
 
@@ -179,7 +169,6 @@ impl ApcSplitter {
                 },
                 SplitState::ApcEscape => {
                     if b == b'\\' {
-                        // The empty APC VTE sees ends here; the body runs at this point.
                         pass.extend_from_slice(b"\x1b\\");
                         if !pass.is_empty() {
                             out.push_back(Segment::Feed(std::mem::take(&mut pass)));
@@ -190,7 +179,6 @@ impl ApcSplitter {
                         self.body = Vec::new();
                         self.state = SplitState::Ground;
                     } else {
-                        // Cancelled: that ESC starts the next sequence.
                         pass.push(0x1b);
                         pass.push(b);
                         self.state = if b == b'_' {
@@ -230,7 +218,6 @@ pub struct Shadow {
     published_revision: u64,
     published_any: bool,
     fed: bool,
-    /// The history currently configured (0 or [`SHADOW_HISTORY`]).
     history: usize,
 }
 
@@ -272,7 +259,6 @@ impl Shadow {
         }
     }
 
-    /// Bytes VTE was just given.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
         // The shadow never renders, so it never holds a synchronized update back.
@@ -286,7 +272,6 @@ impl Shadow {
         self.fed = true;
     }
 
-    /// Run one graphics command; returns the bytes that make VTE do what it did to the cursor.
     pub fn run_apc(&mut self, body: &[u8]) -> Vec<u8> {
         // (The APC's empty stand-in already went through `feed`.)
         // History on BEFORE the command: a placement can scroll (its first rows, its closing
@@ -319,7 +304,6 @@ impl Shadow {
         }
     }
 
-    /// Graphics replies for the program, oldest first.
     pub fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut *self.replies.lock().unwrap())
     }

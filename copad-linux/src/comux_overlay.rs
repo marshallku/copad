@@ -15,7 +15,6 @@ use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// The overlay layer's CSS (appended to the chrome's provider).
 pub fn css(s: &Style) -> String {
     let Style {
         family,
@@ -60,11 +59,6 @@ pub fn css(s: &Style) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------------------------
-// Pure logic (mirrors the iOS/macOS overlay; both follow the TUI)
-// ---------------------------------------------------------------------------------------------
-
-/// What a key does in a picker.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Cancel,
@@ -185,7 +179,6 @@ pub(crate) fn filter_rows<'a>(
         .collect()
 }
 
-/// A preview colour: the theme for 0–15, xterm's cube and greys above, or rgb.
 pub(crate) fn run_color(s: &Style, c: l0::RunColor) -> String {
     match c {
         l0::RunColor::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
@@ -209,7 +202,6 @@ pub(crate) fn run_color(s: &Style, c: l0::RunColor) -> String {
     }
 }
 
-/// One preview line as Pango markup.
 pub(crate) fn line_markup(s: &Style, line: &[l0::Run]) -> String {
     let mut out = String::new();
     for r in line {
@@ -244,8 +236,6 @@ pub(crate) fn line_markup(s: &Style, line: &[l0::Run]) -> String {
     out
 }
 
-/// A key press in comux's naming (`Left`, `C-r`, `d`); `None` for what the overlay leaves
-/// alone (Super/Alt shortcuts).
 pub(crate) fn key_name(key: gtk4::gdk::Key, state: gtk4::gdk::ModifierType) -> Option<String> {
     use gtk4::gdk::{Key, ModifierType};
     let named = match key {
@@ -273,28 +263,20 @@ pub(crate) fn key_name(key: gtk4::gdk::Key, state: gtk4::gdk::ModifierType) -> O
         .map(String::from)
 }
 
-// ---------------------------------------------------------------------------------------------
-// Widgets
-// ---------------------------------------------------------------------------------------------
-
-/// The host's side of an overlay.
 #[derive(Clone)]
 pub struct Handlers {
     /// (choice, text): both `None` = cancelled. Closes the overlay.
     pub answer: Rc<dyn Fn(Option<String>, Option<String>)>,
     /// A staying choice: the overlay stays until comux re-sends it.
     pub act: Rc<dyn Fn(String)>,
-    /// Keep the preview of a pane fresh; `None` stops it.
     pub preview: Rc<dyn Fn(Option<PreviewReq>)>,
 }
 
-/// One shown overlay: the layer over the window and, for a picker, its live state.
 pub struct OverlayUi {
     pub id: u64,
     pub layer: gtk4::Box,
     card: gtk4::Box,
     picker: Option<Rc<PickerUi>>,
-    /// Who had focus before; it gets it back on close.
     restore: Option<gtk4::Widget>,
 }
 
@@ -320,9 +302,8 @@ impl OverlayUi {
         card.set_focusable(true);
         card.set_overflow(gtk4::Overflow::Hidden);
         layer.append(&card);
-        // A click outside the card cancels; inside, it is the card's.
-        // Weak: the layer owns this gesture and the card, so a strong capture of either is a
-        // cycle that keeps every closed overlay alive.
+        // A click outside the card cancels. Weak: the layer owns this gesture and the card, so a
+        // strong capture of either is a cycle that keeps every closed overlay alive.
         let click = gtk4::GestureClick::new();
         let (c2, a2) = (card.downgrade(), handlers.answer.clone());
         click.connect_pressed(move |g, _, x, y| {
@@ -359,7 +340,6 @@ impl OverlayUi {
                 build_menu(&card, spec, &handlers, (ww, wh));
                 None
             }
-            // A kind this build doesn't know: answered as cancelled, never guessed at.
             _ => {
                 let a = handlers.answer.clone();
                 gtk4::glib::idle_add_local_once(move || a(None, None));
@@ -375,7 +355,6 @@ impl OverlayUi {
         }
     }
 
-    /// Give the card the keyboard (the filter field, when there is one).
     pub fn focus(&self) {
         match self.picker.as_ref().and_then(|p| p.entry.clone()) {
             Some(e) => {
@@ -447,7 +426,6 @@ fn button(text: &str, class: Option<&str>, on: impl Fn() + 'static) -> gtk4::But
     b
 }
 
-/// `C-r` → `^R`, `Right` → `→`.
 fn key_label(k: &str) -> String {
     match k {
         "Left" => "←".into(),
@@ -628,7 +606,6 @@ fn build_menu(card: &gtk4::Box, spec: &Value, h: &Handlers, (ww, _): (i32, i32))
     });
 }
 
-/// A picker card: header, tab chips, filter line, card rows and the live preview.
 struct PickerUi {
     spec: RefCell<Value>,
     state: RefCell<Value>,
@@ -644,15 +621,12 @@ struct PickerUi {
     chips: gtk4::Box,
     list: gtk4::ListBox,
     scroll: gtk4::ScrolledWindow,
-    /// The rows the list shows, in order (a row's index is its position here).
     shown: RefCell<Vec<Value>>,
     preview: Option<(gtk4::Box, gtk4::Label, gtk4::Label)>,
     card: gtk4::Box,
     window: (i32, i32),
     list_width: i32,
-    /// The cell size of the preview font, for sizing the request.
     cell: (i32, i32),
-    /// What the preview last asked for.
     asked: RefCell<Option<PreviewReq>>,
     /// Itself, for the chips rebuilt on every refill.
     me: RefCell<std::rc::Weak<PickerUi>>,
@@ -828,7 +802,6 @@ impl PickerUi {
             ui.run(o);
             true
         });
-        // Right-click a row: its actions.
         let rc = gtk4::GestureClick::new();
         rc.set_button(3);
         let w = Rc::downgrade(&ui);
@@ -896,13 +869,11 @@ impl PickerUi {
         *self.spec.borrow_mut() = spec.clone();
         *self.state.borrow_mut() = state.clone();
         if loading_done {
-            // The rows landed: take the picker's default row now.
             *self.sel.borrow_mut() = spec["selected"].as_str().map(str::to_string);
         }
         self.refill();
     }
 
-    /// Rebuild the rows (filter, tab, live topics), the header and the preview.
     fn refill(&self) {
         let spec = self.spec.borrow().clone();
         let s = &self.style;
@@ -940,7 +911,6 @@ impl PickerUi {
         self.note.set_visible(!note.is_empty());
         self.note.set_markup(&span(&s.peach, note));
 
-        // Tab chips.
         while let Some(c) = self.chips.first_child() {
             self.chips.remove(&c);
         }
@@ -963,7 +933,6 @@ impl PickerUi {
             }
         }
 
-        // Rows.
         let all = self.rows_of_tab();
         let joins = all.iter().any(|r| {
             r["pane"].as_str().is_some_and(|p| !p.is_empty())
@@ -1013,7 +982,6 @@ impl PickerUi {
         self.refresh_preview();
     }
 
-    /// One row as a card, from the live topics where it joins.
     fn card(&self, r: &Value) -> gtk4::Box {
         let s = &self.style;
         let st = self.state.borrow();
@@ -1103,7 +1071,6 @@ impl PickerUi {
                 .as_str()
                 .map(|d| format!("{place} — {d}"))
                 .unwrap_or(place);
-            // The fill on the row; the whole readout goes above the preview, as in the TUI.
             let ctx = crate::comux_panel::agent_context(a)
                 .map(|(pct, short, _)| {
                     let tone = pct.map_or(s.dim.as_str(), |p| s.usage(p));
@@ -1179,7 +1146,6 @@ impl PickerUi {
             return;
         };
         if !pv.is_visible() {
-            // Nothing to preview any more (the center cleared): stop polling.
             if self.asked.borrow_mut().take().is_some() {
                 (self.handlers.preview)(None);
             }
@@ -1189,7 +1155,6 @@ impl PickerUi {
             .current()
             .and_then(|r| r["pane"].as_str().map(str::to_string))
             .filter(|p| !p.is_empty());
-        // The agent readout under the header takes rows from the pane's text.
         let readout = pane
             .as_deref()
             .and_then(|p| {
@@ -1291,7 +1256,6 @@ impl PickerUi {
         }
     }
 
-    /// Move the highlight without rebuilding (keeps scroll), and bring it into view.
     fn mark(&self, i: usize) {
         let mut k = 0;
         while let Some(r) = self.list.row_at_index(k) {

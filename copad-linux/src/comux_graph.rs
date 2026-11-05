@@ -13,16 +13,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use webkit6::prelude::*;
 
-/// How long a pick in the page's agent picker holds before the panel follows focus again.
 const PICK_HOLDS: Duration = Duration::from_secs(30);
 
 pub struct GraphPanel {
-    /// The panel: a rule on its left, the page.
     pub root: gtk4::Box,
     web: webkit6::WebView,
-    /// The page said `ready`.
     loaded: Cell<bool>,
-    /// What the page posted since the last [`drain`](Self::drain).
     inbox: Rc<RefCell<Vec<Value>>>,
     fed_epoch: RefCell<String>,
     fed_rev: Cell<Option<u64>>,
@@ -92,7 +88,6 @@ impl GraphPanel {
         });
         let w = Rc::downgrade(&this);
         this.web.connect_web_process_terminated(move |web, _| {
-            // Start over: the page is gone, and with it everything that was fed.
             if let Some(p) = w.upgrade() {
                 p.loaded.set(false);
             }
@@ -107,11 +102,9 @@ impl GraphPanel {
         self.loaded.get()
     }
 
-    /// What the page asked for since the last call, validated against `current` — the window's
-    /// connection NOW (`key#epoch`), not the one the page was last fed: a message queued for a
-    /// connection the window has since left (a remote comux's `open`) is dropped, also while the
-    /// page has not been fed the new one yet. `ready` makes the next [`feed`](Self::feed) send
-    /// everything again.
+    /// Validated against `current`, the window's connection NOW (`key#epoch`), not the one the
+    /// page was last fed: a message queued for a connection the window has since left (a remote
+    /// comux's `open`) is dropped. `ready` makes the next [`feed`](Self::feed) resend everything.
     pub fn drain(&self, current: &str) -> Vec<GraphMsg> {
         let raw = std::mem::take(&mut *self.inbox.borrow_mut());
         let epoch = if *self.fed_epoch.borrow() == current {
@@ -129,7 +122,6 @@ impl GraphPanel {
                     out.push(GraphMsg::Ready);
                 }
                 Some(GraphMsg::Agent { token }) => {
-                    // Held for a while; when it ends the panel follows focus again.
                     self.picked_at.set(Some(Instant::now()));
                     *self.followed.borrow_mut() = None;
                     out.push(GraphMsg::Agent { token });
@@ -141,9 +133,7 @@ impl GraphPanel {
         out
     }
 
-    /// Bring the page up to `host` (`key`, `consumer` = this window's page): a new connection
-    /// resets it, a changed graph, agent list or history answer is fed, and agent mode follows
-    /// the focused agent.
+    /// Bring the page up to `host` (`key`, `consumer` = this window's page).
     pub fn feed(&self, host: &MuxHost, key: &str, state: &Value, style: &Style, consumer: &str) {
         if !self.loaded.get() {
             return;
@@ -171,7 +161,6 @@ impl GraphPanel {
             *self.fed_epoch.borrow_mut() = epoch;
             self.fed_rev.set(None);
             self.fed_agents.set(None);
-            // An answer to a request of the previous connection is not this page's.
             self.fed_page.set(page);
             *self.followed.borrow_mut() = None;
             self.picked_at.set(None);
@@ -203,8 +192,6 @@ impl GraphPanel {
         self.follow_focus(state);
     }
 
-    /// Agent mode shows the agent the user is looking at, unless they picked another one in the
-    /// page a moment ago.
     fn follow_focus(&self, state: &Value) {
         let focused = state["agents"]["agents"]
             .as_array()
@@ -250,7 +237,6 @@ impl GraphPanel {
         }
     }
 
-    /// The page's own read-out (`comuxGraph.state()`), for the e2e.
     pub fn page_state(&self, done: impl FnOnce(Option<Value>) + 'static) {
         if !self.loaded.get() {
             return done(None);
@@ -270,13 +256,11 @@ impl GraphPanel {
         );
     }
 
-    /// Render the page as WebKit draws it into `path` (PNG), for the e2e: Broadway's own
-    /// screenshots of a web view are not trustworthy.
+    /// For the e2e: Broadway's own screenshots of a web view are not trustworthy.
     pub fn snapshot(&self, path: &str, done: impl FnOnce(bool) + 'static) {
         let path = path.to_string();
-        // The snapshot leaves out the GPU canvas, so the graph's own pixels are saved beside it
-        // (`<path>.canvas.png`), as WebKit drew them. `done` hears success only when BOTH files
-        // were written: the canvas first, then the snapshot.
+        // The snapshot leaves out the GPU canvas, so the graph's pixels are saved beside it
+        // (`<path>.canvas.png`). `done` hears success only when BOTH files were written.
         let canvas = format!("{path}.canvas.png");
         let web = self.web.clone();
         self.web.evaluate_javascript(
@@ -314,7 +298,6 @@ impl GraphPanel {
     }
 }
 
-/// The work-graph panel's remembered state: open, mode, the width the user dragged it to.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Remembered {
     pub open: bool,
@@ -360,9 +343,9 @@ pub fn save_remembered(r: &Remembered) {
     }
 }
 
-/// The widths of the sidebar and the graph dock within one budget (decisions #204): the
-/// terminal keeps `min_term`; past that the dock gives way first (to 260), then the sidebar (to
-/// 160), and if that is still too much the dock is hidden (0) — not closed.
+/// Fits the sidebar and graph dock widths into one budget (decisions #204): the terminal keeps
+/// `min_term`; past that the dock gives way first (to 260), then the sidebar (to 160), and if
+/// still too much the dock is hidden (0), not closed.
 pub fn fit_widths(width: i32, side: i32, graph: i32, min_term: i32) -> (i32, i32) {
     let budget = width - min_term;
     let (mut side, mut graph) = (side, graph);
@@ -385,11 +368,8 @@ mod tests {
     #[test]
     fn the_terminal_keeps_its_minimum() {
         assert_eq!(fit_widths(2000, 300, 500, 400), (300, 500));
-        // The dock gives way first, to its floor…
         assert_eq!(fit_widths(1100, 300, 500, 400), (300, 400));
-        // …then the sidebar…
         assert_eq!(fit_widths(900, 300, 500, 400), (240, 260));
-        // …then the dock goes.
         assert_eq!(fit_widths(700, 300, 500, 400), (160, 0));
         assert_eq!(fit_widths(1000, 300, 0, 400), (300, 0));
     }

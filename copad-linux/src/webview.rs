@@ -41,21 +41,12 @@ fn build_webview_css(theme: &copad_core::theme::Theme) -> String {
 
 pub struct WebViewPanel {
     pub id: String,
-    /// Identity of the PAGE, distinct from `id`, which identifies the pane.
-    ///
-    /// Minted here even though a pane holds exactly one page today: a tab id is
-    /// the key its history blob is named by (`browser::tabs::history_path`), so
-    /// introducing it later would mean migrating blobs that were written under
-    /// a different identity. One pane = one tab until the tab strip lands.
+    /// Identity of the PAGE, distinct from `id` (the pane). A tab id names the history blob
+    /// (`browser::tabs::history_path`), so it is minted now to avoid migrating blobs later.
     pub tab_id: String,
-    /// Data store this pane's cookies and logins belong to, from
-    /// `[browser] profile`.
-    ///
-    /// Nothing acts on a non-default value yet — the named-store plumbing is a
-    /// later work unit — but the authorization gate reasons about profiles
-    /// rather than panes, so the pane has to carry the same value
-    /// `TabManager::default_browser_profile` reports or the two disagree about
-    /// which panes a protection freezes.
+    /// Data store this pane's cookies and logins belong to, from `[browser] profile`. Nothing
+    /// acts on a non-default value yet, but the authorization gate reasons about profiles, so the
+    /// pane must carry the same value `TabManager::default_browser_profile` reports.
     pub profile: String,
     pub container: gtk4::Box,
     pub webview: webkit6::WebView,
@@ -63,13 +54,11 @@ pub struct WebViewPanel {
 }
 
 impl WebViewPanel {
-    /// Whether this pane currently admits automation.
     pub fn mode(&self) -> copad_core::browser::TabMode {
         self.mode.get()
     }
 
     pub fn new(url: &str, theme: &copad_core::theme::Theme, profile: String) -> Self {
-        // Dedicated web context for process isolation + sandbox paths
         let web_context = webkit6::WebContext::new();
         web_context.add_path_to_sandbox("/tmp", false);
 
@@ -80,7 +69,6 @@ impl WebViewPanel {
             .network_session(&network_session)
             .build();
 
-        // Sane defaults
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
             settings.set_enable_javascript(true);
             settings.set_allow_file_access_from_file_urls(false);
@@ -91,23 +79,15 @@ impl WebViewPanel {
 
         webview.set_hexpand(true);
         webview.set_vexpand(true);
-        // Match plugin webviews — composite transparently so the
-        // window-level BackgroundLayer shows through. Most external
-        // pages paint their own solid bg so this is a no-op visually
-        // for them; the consistency only matters for blank/about: pages.
+        // Match plugin webviews: composite transparently so the window-level BackgroundLayer
+        // shows through.
         webview.set_background_color(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
 
-        // Note on Hyprland workspace-switch panel freeze — see
-        // plugin_panel.rs and docs/troubleshooting.md for the full
-        // history. Confirmed upstream WebKitGTK ↔ Hyprland
-        // limitation, reproduced with the official MiniBrowser and
-        // on integrated graphics. No application-level workaround
-        // works; user mitigation is to click the panel or refocus
-        // copad to revive frame production.
+        // Panel freeze on Hyprland workspace switch is an upstream WebKitGTK limitation with no
+        // app-level workaround; see plugin_panel.rs and docs/troubleshooting.md.
 
         webview.load_uri(url);
 
-        // -- Toolbar --
         let toolbar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         toolbar.add_css_class("copad-url-bar");
 
@@ -144,14 +124,12 @@ impl WebViewPanel {
         toolbar.append(&url_entry);
         toolbar.append(&devtools_btn);
 
-        // -- Container --
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.set_hexpand(true);
         container.set_vexpand(true);
         container.append(&toolbar);
         container.append(&webview);
 
-        // -- CSS --
         let css = gtk4::CssProvider::new();
         css.load_from_string(&build_webview_css(theme));
         gtk4::style_context_add_provider_for_display(
@@ -160,9 +138,6 @@ impl WebViewPanel {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
         );
 
-        // -- Signal wiring --
-
-        // URL entry → navigate on Enter
         {
             let wv = webview.clone();
             url_entry.connect_activate(move |entry| {
@@ -178,7 +153,6 @@ impl WebViewPanel {
             });
         }
 
-        // Back button
         {
             let wv = webview.clone();
             back_btn.connect_clicked(move |_| {
@@ -186,7 +160,6 @@ impl WebViewPanel {
             });
         }
 
-        // Forward button
         {
             let wv = webview.clone();
             forward_btn.connect_clicked(move |_| {
@@ -194,7 +167,6 @@ impl WebViewPanel {
             });
         }
 
-        // Reload/Stop button
         {
             let wv = webview.clone();
             reload_btn.connect_clicked(move |btn| {
@@ -208,7 +180,6 @@ impl WebViewPanel {
             });
         }
 
-        // DevTools button
         {
             let wv = webview.clone();
             devtools_btn.connect_clicked(move |_| {
@@ -218,7 +189,6 @@ impl WebViewPanel {
             });
         }
 
-        // Update URL entry when URI changes
         {
             let entry = url_entry.clone();
             webview.connect_notify_local(Some("uri"), move |wv, _| {
@@ -231,7 +201,6 @@ impl WebViewPanel {
             });
         }
 
-        // Handle load failures — preserve URL in bar
         {
             let entry = url_entry.clone();
             let reload = reload_btn.clone();
@@ -245,7 +214,6 @@ impl WebViewPanel {
             });
         }
 
-        // Recover from web process crashes — reload the page
         {
             webview.connect_web_process_terminated(move |wv, reason| {
                 let reason_str = match reason {
@@ -257,8 +225,7 @@ impl WebViewPanel {
                 };
                 eprintln!("[webview] Web process {reason_str}, reloading...");
 
-                // WebKit requires a fresh load after crash — try_close + reload won't work
-                // We need to reload the URI that was being displayed
+                // WebKit requires a fresh load after a crash; try_close + reload won't work.
                 if let Some(uri) = wv.uri() {
                     let uri = uri.to_string();
                     if !uri.is_empty() && uri != "about:blank" {
@@ -274,7 +241,6 @@ impl WebViewPanel {
             });
         }
 
-        // Update back/forward sensitivity + reload/stop icon on load-changed
         {
             let back = back_btn.clone();
             let fwd = forward_btn.clone();
@@ -407,10 +373,7 @@ impl Panel for WebViewPanel {
     }
 }
 
-/// Pre-built JS snippets for AI agent DOM inspection.
-/// These return JSON strings so results are structured.
 pub mod js {
-    /// Query a single element, return its text, tag, attributes, bounding rect
     pub fn query_selector(selector: &str) -> String {
         format!(
             r#"(() => {{
@@ -433,7 +396,6 @@ pub mod js {
         )
     }
 
-    /// Query all matching elements, return array of summaries
     pub fn query_selector_all(selector: &str, limit: u32) -> String {
         format!(
             r#"(() => {{
@@ -457,7 +419,6 @@ pub mod js {
         )
     }
 
-    /// Get computed styles for an element
     pub fn get_styles(selector: &str, properties: &[&str]) -> String {
         let props_json = serde_json::to_string(properties).unwrap();
         format!(
@@ -475,7 +436,6 @@ pub mod js {
         )
     }
 
-    /// Click an element by selector
     pub fn click(selector: &str) -> String {
         format!(
             r#"(() => {{
@@ -488,7 +448,6 @@ pub mod js {
         )
     }
 
-    /// Type text into an input element
     pub fn fill(selector: &str, value: &str) -> String {
         format!(
             r#"(() => {{
@@ -505,7 +464,6 @@ pub mod js {
         )
     }
 
-    /// Scroll to position or element
     pub fn scroll(selector: Option<&str>, x: i32, y: i32) -> String {
         match selector {
             Some(sel) => format!(
@@ -528,7 +486,6 @@ pub mod js {
         }
     }
 
-    /// Get page metadata (title, url, dimensions, forms, links count)
     pub fn page_info() -> String {
         r#"(() => {
             return JSON.stringify({

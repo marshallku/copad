@@ -26,14 +26,9 @@ mod url_click;
 mod webview;
 mod window;
 
-// service_supervisor + trigger_sink live in `copad-daemon`; this crate
-// imports them via `copad_daemon::{...}` and `crate::socket` re-exports
-// the shared transport types.
-
 fn main() {
-    // Default to `warn` so a no-daemon launch is silent on stderr;
-    // RUST_LOG=info / debug surfaces gui_client register/reconnect
-    // diagnostics and other log:: messages when needed.
+    // `warn` keeps a no-daemon launch silent on stderr; RUST_LOG=info / debug surfaces
+    // gui_client register/reconnect diagnostics.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let args: Vec<String> = std::env::args().collect();

@@ -58,7 +58,6 @@ impl SearchBar {
         container.append(&case_btn);
         container.append(&close_btn);
 
-        // Apply search on text change
         let term = terminal.clone();
         let case = case_btn.clone();
         let label = match_label.clone();
@@ -66,7 +65,6 @@ impl SearchBar {
             apply_search(&term, &e.text(), case.is_active(), &label);
         });
 
-        // Toggle case sensitivity
         let term = terminal.clone();
         let entry_ref = entry.clone();
         let label = match_label.clone();
@@ -74,7 +72,6 @@ impl SearchBar {
             apply_search(&term, &entry_ref.text(), btn.is_active(), &label);
         });
 
-        // Enter = next
         let term = terminal.clone();
         entry.connect_activate(move |_| {
             term.search_find_next();
@@ -97,7 +94,6 @@ impl SearchBar {
         });
         entry.add_controller(key_controller);
 
-        // Button clicks
         let term = terminal.clone();
         next_btn.connect_clicked(move |_| {
             term.search_find_next();
@@ -115,7 +111,6 @@ impl SearchBar {
             close_search(&container_ref, &term, &terminal_for_focus);
         });
 
-        // Load CSS
         let css = gtk4::CssProvider::new();
         css.load_from_string(&build_search_css(theme));
         gtk4::style_context_add_provider_for_display(
@@ -140,12 +135,10 @@ impl SearchBar {
         } else {
             self.container.set_visible(true);
             self.entry.grab_focus();
-            // Select all after focus settles
             let entry = self.entry.clone();
             glib::idle_add_local_once(move || {
                 entry.select_region(0, -1);
             });
-            // Re-apply current search text if any
             if !self.entry.text().is_empty() {
                 apply_search(terminal, &self.entry.text(), false, &self.match_label);
             }

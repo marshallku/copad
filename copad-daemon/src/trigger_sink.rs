@@ -9,16 +9,11 @@ use serde_json::{Value, json};
 
 use crate::socket::SocketCommand;
 
-/// Trigger-only methods. Reserved by `ServiceSupervisor` so a plugin
-/// manifest can't register them — the unix socket is reachable from any
-/// user process, and arbitrary process spawn from socket would be a
-/// trust break.
+/// Trigger-only methods. Reserved by `ServiceSupervisor` so a plugin manifest can't register
+/// them: the unix socket is reachable from any user process, and spawning from it would break
+/// the trust boundary.
 pub const TRIGGER_ONLY_RESERVED_METHODS: &[&str] = &["system.spawn"];
 
-/// Tries `ActionRegistry` first, falls through to `socket::dispatch`
-/// for legacy match-arm actions. All three paths (sync registry,
-/// blocking registry worker, legacy fallthrough) log `[copad] trigger
-/// ...` on failure so misconfigured triggers stay visible.
 pub struct LiveTriggerSink {
     registry: Arc<ActionRegistry>,
     dispatch_tx: mpsc::Sender<SocketCommand>,
@@ -28,9 +23,7 @@ pub struct LiveTriggerSink {
 impl LiveTriggerSink {
     pub fn new(registry: Arc<ActionRegistry>, dispatch_tx: mpsc::Sender<SocketCommand>) -> Self {
         let (reply_tx, reply_rx) = mpsc::channel::<Response>();
-        // Consumer thread: logs any fallthrough reply that came back with
-        // ok=false. Lives until all `reply_tx` clones drop (i.e. the sink is
-        // gone AND every queued SocketCommand has been processed).
+        // Logs fallthrough replies with ok=false. Lives until every `reply_tx` clone drops.
         std::thread::spawn(move || {
             while let Ok(resp) = reply_rx.recv() {
                 if resp.ok {
@@ -55,17 +48,12 @@ impl LiveTriggerSink {
 }
 
 impl LiveTriggerSink {
-    /// Trigger-only fire-and-forget exec. Reachable ONLY from
-    /// `[[triggers]]` config (same trust surface as `[keybindings]
-    /// spawn:`) — `coctl call system.spawn` returns `unknown_method`.
+    /// Reachable ONLY from `[[triggers]]` config; `coctl call system.spawn` returns
+    /// `unknown_method`.
     ///
-    /// Param shape: `{ argv: ["program", "arg1", ...] }`. argv is NOT
-    /// auto-wrapped in a shell, so each `{event.*}`/`{context.*}` lands
-    /// as a literal argv element where metacharacters can't be re-parsed
-    /// — `; rm -rf ~` in a payload field stays inert. Users opting into
-    /// `["sh", "-c", "<string>"]` lose that guarantee and own auditing
-    /// every value spliced into the shell string. Children reaped on a
-    /// worker; non-zero exits log.
+    /// argv is NOT wrapped in a shell, so `{event.*}`/`{context.*}` values land as literal argv
+    /// elements and cannot be re-parsed (`; rm -rf ~` in a payload stays inert). A user who opts
+    /// into `["sh", "-c", ...]` owns auditing every spliced value.
     fn handle_system_spawn(params: Value) -> ActionResult {
         let argv = params
             .get("argv")
@@ -101,10 +89,7 @@ impl LiveTriggerSink {
         let pid = child.id();
         eprintln!("[copad] trigger system.spawn pid={pid} argv={argv_strs:?}");
 
-        // Reap on a worker thread so the child doesn't become a
-        // zombie. Trigger-spawned processes are fire-and-forget; we
-        // discard the exit status on success and log on non-zero so a
-        // misconfigured cure command is visible.
+        // Reap on a worker so the child doesn't become a zombie; log non-zero exits.
         let argv_log = argv_strs;
         std::thread::spawn(move || match child.wait() {
             Ok(status) if !status.success() => {
@@ -124,26 +109,16 @@ impl LiveTriggerSink {
 
 impl TriggerSink for LiveTriggerSink {
     fn dispatch_action(&self, action: &str, params: Value) -> ActionResult {
-        // `system.spawn` is intercepted before the registry check —
-        // not registered, not in socket::dispatch's match arm — so the
-        // unix socket can't reach it. See `handle_system_spawn` for
-        // rationale.
+        // Intercepted before the registry check so the unix socket can't reach it.
         if action == "system.spawn" {
             return Self::handle_system_spawn(params);
         }
         if self.registry.has(action) {
-            // Branch on blocking flag so we preserve the prior
-            // synchronous error semantics for sync registry actions.
-            // The TriggerEngine increments `fired` only on `Ok` and
-            // log::warn's on `Err`; collapsing every registry call to
-            // `Ok(queued)` would silently re-classify sync failures
-            // as successful queueing.
+            // Blocking actions return `Ok(queued)`; sync ones must keep returning their real
+            // result, since TriggerEngine counts `fired` only on `Ok` and logs `Err`.
             if self.registry.is_blocking(action) {
-                // Worker-thread path: callback fires from worker after
-                // we've returned `Ok(queued)` to the engine, so the
-                // engine never sees the underlying error — log here
-                // directly so misconfigured blocking actions stay
-                // visible.
+                // The callback fires after `Ok(queued)` went to the engine, which never sees the
+                // error, so log it here.
                 let action_owned = action.to_string();
                 self.registry.try_dispatch(
                     action,
@@ -159,18 +134,12 @@ impl TriggerSink for LiveTriggerSink {
                 );
                 return Ok(json!({ "queued": true }));
             }
-            // Sync path: propagate the ActionResult so the engine
-            // increments `fired` only on Ok and logs Err.
-            // `try_invoke` runs inline regardless of the blocking flag —
-            // already guarded against blocking above.
+            // Sync path: propagate the ActionResult so the engine counts `fired` only on Ok.
             return self
                 .registry
                 .try_invoke(action, params)
                 .expect("registry.has() just returned true");
         }
-        // Fall through to legacy `socket::dispatch`. The reply channel is
-        // shared with the consumer thread spawned in `new()` — that thread
-        // surfaces any non-ok response to logs.
         let cmd = SocketCommand {
             request: Request::new(
                 format!("trg-{}", uuid::Uuid::new_v4()),
@@ -244,8 +213,6 @@ mod tests {
             .dispatch_action("legacy.thing", json!({"x": 1}))
             .unwrap();
         assert_eq!(r, json!({"queued": true}));
-        // The fallthrough must have queued one SocketCommand on the
-        // dispatch channel.
         let cmd = rx.try_recv().expect("expected one queued legacy command");
         assert_eq!(cmd.request.method, "legacy.thing");
         assert_eq!(cmd.request.params, json!({"x": 1}));
@@ -301,10 +268,8 @@ mod tests {
     #[test]
     fn system_spawn_executes_program_and_reports_pid() {
         let (_r, sink, rx) = mk_sink_with_registry();
-        // `true` exits 0; intent is to assert the spawn path returns
-        // Ok with a pid AND does NOT fall through to socket::dispatch
-        // (rx empty). Linux ships `/bin/true`; macOS ships only
-        // `/usr/bin/true` (no `/bin/true` symlink), so probe both.
+        // Asserts the spawn path returns Ok with a pid and does NOT fall through to
+        // socket::dispatch. macOS has no `/bin/true`, so probe both paths.
         let true_path = if std::path::Path::new("/bin/true").exists() {
             "/bin/true"
         } else {
@@ -336,10 +301,8 @@ mod tests {
 
     #[test]
     fn system_spawn_is_not_registered_in_action_registry() {
-        // Trust-boundary regression guard: `system.spawn` MUST NOT be
-        // reachable through the registry, otherwise `coctl call
-        // system.spawn` (which goes registry-first via socket::dispatch)
-        // would arbitrary-spawn from any process holding COPAD_SOCKET.
+        // Trust boundary: `system.spawn` must not be in the registry, or `coctl call system.spawn`
+        // (registry-first via socket::dispatch) could spawn from any process holding COPAD_SOCKET.
         let (registry, _sink, _rx) = mk_sink_with_registry();
         assert!(
             !registry.has("system.spawn"),

@@ -116,12 +116,10 @@ fn build_bridge_js(plugin_name: &str, panel_name: &str, panel_id: &str) -> Strin
     )
 }
 
-/// Create a JSC string value for replying to script messages.
 fn jsc_string(ctx: &javascriptcore6::Context, s: &str) -> javascriptcore6::Value {
     javascriptcore6::Value::new_string(ctx, Some(s))
 }
 
-/// Send a Response back through the ScriptMessageReply using a JSC context.
 fn reply_json(
     reply: &webkit6::ScriptMessageReply,
     ctx: &javascriptcore6::Context,
@@ -146,7 +144,6 @@ impl PluginPanel {
 
         let content_manager = webkit6::UserContentManager::new();
 
-        // Inject theme CSS
         let theme_css = build_theme_css(theme);
         let style_sheet = webkit6::UserStyleSheet::new(
             &theme_css,
@@ -157,7 +154,6 @@ impl PluginPanel {
         );
         content_manager.add_style_sheet(&style_sheet);
 
-        // Inject bridge JS
         let bridge_js = build_bridge_js(&plugin_name, &panel_name, &id);
         let script = webkit6::UserScript::new(
             &bridge_js,
@@ -168,7 +164,6 @@ impl PluginPanel {
         );
         content_manager.add_script(&script);
 
-        // Dedicated web context for process isolation + sandbox paths
         let web_context = webkit6::WebContext::new();
         web_context.add_path_to_sandbox(&plugin.dir, true);
         web_context.add_path_to_sandbox("/tmp", false);
@@ -178,7 +173,6 @@ impl PluginPanel {
             .user_content_manager(&content_manager)
             .build();
 
-        // Settings
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
             settings.set_enable_javascript(true);
             settings.set_allow_file_access_from_file_urls(true);
@@ -189,14 +183,10 @@ impl PluginPanel {
 
         webview.set_hexpand(true);
         webview.set_vexpand(true);
-        // Make the webview composite transparently so the window-level
-        // BackgroundLayer shows through plugin panels (todo, etc.)
-        // when the page itself doesn't paint a solid bg. Plugin authors
-        // who want an opaque card UI add the bg themselves on inner
-        // elements.
+        // Composite transparently so the window-level BackgroundLayer shows through; plugin
+        // authors wanting an opaque card add the bg on inner elements.
         webview.set_background_color(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
 
-        // Register JS bridge message handler with reply
         let tx = dispatch_tx;
         content_manager.register_script_message_handler_with_reply("copad", None);
         content_manager.connect_script_message_with_reply_received(
@@ -255,29 +245,16 @@ impl PluginPanel {
             },
         );
 
-        // Load the HTML file
         let file_path = plugin.dir.join(&panel_def.file);
         let uri = format!("file://{}", file_path.display());
 
-        // Diagnostic instrumentation — without these, a stuck panel
-        // (the "fresh-boot shows blank panel, second copad process
-        // unsticks it" symptom users have hit on cold-boot only —
-        // hot reboots reproduce reliably, hot copad restarts don't)
-        // leaves no log trace because WebKit's load failures and
-        // WebProcess crashes go silent by default. Each handler
-        // eprintlns a one-line tag with the panel's id + plugin so
-        // we can correlate against the WebProcess pids in lsof /
-        // journalctl when reproduction happens. Cost: three signal
-        // connections per panel.
+        // Diagnostics: WebKit load failures and WebProcess crashes are silent by default, so a
+        // stuck panel (blank on cold boot) leaves no trace. Each handler eprintlns a tag with the
+        // panel's id + plugin.
         //
-        // No auto-reload here. Plugin panels carry side effects on
-        // load (`terminal.exec`, action invocations from `<script>`
-        // top-level), so a host-injected reload could duplicate
-        // those. Idempotent retries belong in the panel's own JS —
-        // see todo/panel.html's `loadGen` retry budget for the
-        // canonical pattern. The host's job is just to surface the
-        // failure mode loud enough that an authoring plugin knows
-        // when to retry.
+        // No auto-reload: panels carry load side effects (`terminal.exec`, top-level `<script>`
+        // actions) that a host reload could duplicate. Idempotent retries belong in the panel's
+        // JS (see todo/panel.html's `loadGen`).
         let panel_label = format!("{plugin_name}/{panel_name}");
         {
             let label = panel_label.clone();
@@ -299,27 +276,11 @@ impl PluginPanel {
             });
         }
 
-        // Note on the "panel freezes after Hyprland workspace switch"
-        // symptom — confirmed upstream limitation, NOT fixable in
-        // copad-side code. See `docs/troubleshooting.md` for the full
-        // history. Reproduced with the official WebKitGTK MiniBrowser
-        // (zero copad code) and on a separate integrated-graphics
-        // laptop, ruling out copad code, NVIDIA-specific paths, the
-        // GSK renderer, the WebKit DMA-BUF renderer, and EGL vendor
-        // selection. Application-level workarounds tried and proven
-        // ineffective: `connect_map` JS nudge (signal doesn't fire
-        // because Hyprland scene-graph hides without unmap),
-        // `is-active` + JS evaluate / queue_draw, `GdkToplevel:state`
-        // SUSPENDED-clear + queue_draw / set_visible toggle / full
-        // `webview.reload()`. Empirical workaround for users:
-        // click in the panel, or focus another window and back, or
-        // right-click → Inspect Element. Diagnostic signal hooks
-        // above (load_changed / load_failed / web_process_terminated)
-        // are general-purpose and stay in place.
+        // Panel freeze after a Hyprland workspace switch is an upstream WebKitGTK limitation with
+        // no app-level workaround; see docs/troubleshooting.md.
 
         webview.load_uri(&uri);
 
-        // Forward events from EventBus to webview JS
         {
             let wv = webview.clone();
             let rx = event_bus.subscribe("*");
@@ -337,7 +298,6 @@ impl PluginPanel {
             });
         }
 
-        // Container (full-bleed, no toolbar)
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.set_hexpand(true);
         container.set_vexpand(true);

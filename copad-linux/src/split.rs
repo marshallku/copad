@@ -36,7 +36,6 @@ impl SplitNode {
         }
     }
 
-    /// Find the sibling panels of target (panels in the other side of the same split)
     pub fn find_sibling_panels(&self, target: &Rc<PanelVariant>) -> Vec<Rc<PanelVariant>> {
         if let Some((parent_node, side)) = Self::find_parent_of_root(self, target) {
             let borrowed = parent_node.borrow();
@@ -79,7 +78,6 @@ impl SplitNode {
         None
     }
 
-    /// Same as find_parent but works on a non-Rc root (for sibling search)
     fn find_parent_of_root(
         node: &SplitNode,
         target: &Rc<PanelVariant>,
@@ -87,22 +85,16 @@ impl SplitNode {
         if let SplitNode::Branch { first, second, .. } = node {
             if let SplitNode::Leaf { panel } = &*first.borrow()
                 && Rc::ptr_eq(panel, target)
-            {
-                // Can't return a ref to ourselves without Rc, search children instead
-            }
-            // Delegate to Rc-based search
+            {}
             if let Some(found) = Self::find_parent(first, target) {
                 return Some(found);
             }
             if let Some(found) = Self::find_parent(second, target) {
                 return Some(found);
             }
-            // Check if target is direct child of this node
             if let SplitNode::Leaf { panel } = &*first.borrow()
                 && Rc::ptr_eq(panel, target)
-            {
-                // We need the Rc wrapper - use root-level find
-            }
+            {}
         }
         None
     }
@@ -176,11 +168,9 @@ fn set_paned_position_deferred(paned: &gtk4::Paned, orientation: gtk4::Orientati
     });
 }
 
-/// A tab's content: stable container + split tree
 pub struct TabContent {
-    /// The notebook page. It holds `container` directly, or — while this is the visible tab —
-    /// the window's comux chrome with `container` inside it, so the chrome sits inside the
-    /// tab column rather than outside it (see `window.rs`).
+    /// The notebook page. It holds `container` directly, or, while this is the visible tab, the
+    /// window's comux chrome with `container` inside it (see `window.rs`).
     pub page: gtk4::Box,
     pub container: gtk4::Box,
     pub root: Rc<RefCell<SplitNode>>,
@@ -205,7 +195,6 @@ impl TabContent {
         }
     }
 
-    /// Split the focused panel. Returns the sibling panels for focus fallback.
     pub fn split(
         &self,
         focused: &Rc<PanelVariant>,
@@ -285,9 +274,7 @@ impl TabContent {
         set_paned_position_deferred(&paned, orientation);
     }
 
-    /// Close a panel. Returns the sibling panel to focus, or None if the tab should close.
     pub fn close_panel(&self, target: &Rc<PanelVariant>) -> CloseResult {
-        // Root is a single leaf → close the tab
         {
             let root = self.root.borrow();
             if let SplitNode::Leaf { panel } = &*root
@@ -297,7 +284,6 @@ impl TabContent {
             }
         }
 
-        // Collect sibling panels before modifying the tree
         let sibling_panels = {
             let root = self.root.borrow();
             root.find_sibling_panels(target)
@@ -371,7 +357,6 @@ impl TabContent {
                 }
             }
 
-            // Return the closest sibling for focus
             let focus_target = sibling_panels.into_iter().next();
             CloseResult::Closed { focus_target }
         } else {

@@ -41,12 +41,10 @@ const DRAIN_QUIET: Duration = Duration::from_millis(50);
 /// …or for at most this long.
 const DRAIN_MAX: Duration = Duration::from_secs(1);
 
-/// State the workers publish for the key handler on the main thread.
 #[derive(Default)]
 struct Shared {
     flags: AtomicU8,
     app_cursor: AtomicBool,
-    /// Set by the main thread when the shell's exit status arrived.
     child_exited: AtomicBool,
     /// Set by the output worker when it has delivered everything and closed its side of R.
     output_done: AtomicBool,
@@ -55,25 +53,19 @@ struct Shared {
     resize: Mutex<Option<(u16, u16)>>,
 }
 
-/// What a relay does besides carrying bytes.
 pub struct RelayOptions {
-    /// Speak the kitty keyboard protocol (`[terminal] kitty_keyboard`).
     pub kitty: bool,
-    /// Keep a shadow terminal for images (`[terminal] images`).
     pub images: Option<Arc<ImageShared>>,
 }
 
 pub struct Relay {
     shared: Arc<Shared>,
-    /// Write end of the stop pipe. Dropping it is the stop signal.
     _stop: OwnedFd,
     wake_output: OwnedFd,
-    /// The shell's PTY, kept on the main thread for `TIOCSWINSZ`.
     p_master: OwnedFd,
     size: std::cell::Cell<(u16, u16, u16, u16)>,
 }
 
-/// A raw PTY pair for VTE: `(master for VtePty::foreign_sync, slave for the workers)`.
 pub fn open_raw_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     let (mut m, mut s) = (-1, -1);
     // SAFETY: openpty writes two descriptors; the name/termios/winsize pointers may be null.
@@ -165,17 +157,14 @@ impl Relay {
         })
     }
 
-    /// Have the output worker look again (a publication was acknowledged, so another may go).
     pub fn wake_output(&self) {
         wake(self.wake_output.as_raw_fd());
     }
 
-    /// The flags the program negotiated on the screen that is up.
     pub fn flags(&self) -> u8 {
         self.shared.flags.load(Ordering::Acquire)
     }
 
-    /// DECCKM, for the legacy cursor-key forms.
     pub fn app_cursor(&self) -> bool {
         self.shared.app_cursor.load(Ordering::Acquire)
     }
@@ -226,7 +215,6 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// `(read end, write end)`, both nonblocking and close-on-exec.
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1; 2];
     // SAFETY: pipe2 writes two descriptors into the array.
@@ -251,9 +239,7 @@ fn drain_pipe(fd: RawFd) {
 
 enum Io {
     Done(usize),
-    /// Nothing to do right now.
     Again,
-    /// The other side is gone (EOF / EIO / a hangup).
     Closed,
 }
 
@@ -290,7 +276,6 @@ fn poll_fd(fd: RawFd, events: i16) -> libc::pollfd {
     }
 }
 
-/// `poll`, retried on EINTR. Returns how many descriptors are ready (0 on timeout).
 fn poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> usize {
     let ms = timeout.map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
     loop {
@@ -317,7 +302,6 @@ struct OutputIo {
     options: RelayOptions,
 }
 
-/// Shell output → tracker → (shadow) → VTE.
 fn output_worker(io: OutputIo) {
     let mut tracker = copad_keys::Tracker::new();
     let mut shadow = io
@@ -326,7 +310,6 @@ fn output_worker(io: OutputIo) {
         .clone()
         .map(|shared| Shadow::new(80, 24, shared));
     let mut splitter = ApcSplitter::default();
-    // What VTE is still to get, in order.
     let mut queue: VecDeque<Segment> = VecDeque::new();
     let mut out: Vec<u8> = Vec::new();
     let mut replies = Vec::new();
@@ -452,7 +435,6 @@ fn can_mark(queue: &VecDeque<Segment>) -> bool {
     !matches!(queue.front(), Some(Segment::Raw(_)))
 }
 
-/// Bytes waiting for VTE (APC bodies count: they are held too).
 fn queued(queue: &VecDeque<Segment>) -> usize {
     queue
         .iter()
@@ -506,7 +488,6 @@ fn write_front(
     }
 }
 
-/// VTE's writes and the tracker's answers → the shell.
 fn input_worker(r: OwnedFd, p: OwnedFd, stop: OwnedFd, wake_r: OwnedFd, shared: Arc<Shared>) {
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
@@ -583,7 +564,6 @@ mod tests {
     }
     use std::os::fd::AsFd;
 
-    /// A PTY pair standing in for the shell's: the test plays the shell on its slave.
     fn shell_pty() -> (OwnedFd, OwnedFd) {
         let (m, s) = open_raw_pty().unwrap();
         (m, s)

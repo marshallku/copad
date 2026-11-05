@@ -1,12 +1,8 @@
-//! Agent cockpit panel (GTK) — terminal panes listed with their AI-agent
-//! status, attention-sorted, double-click to focus. The Linux half of the
-//! cockpit; `CockpitViewController` is the AppKit counterpart. See
-//! `docs/agent-cockpit.md`.
+//! Agent cockpit panel (GTK); the Linux half of the cockpit (`CockpitViewController` is the AppKit
+//! counterpart). See `docs/agent-cockpit.md`.
 //!
-//! This is a *view* over the app-lifetime `AgentCockpit` model that `window.rs`
-//! owns and pumps — the panel holds no subscription of its own, so opening and
-//! closing it never loses state. Redraws arrive via
-//! `TabManager::notify_cockpit_views()`.
+//! A view over the app-lifetime `AgentCockpit` model that `window.rs` owns and pumps, so closing
+//! the panel never loses state. Redraws arrive via `TabManager::notify_cockpit_views()`.
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -19,7 +15,6 @@ use copad_core::theme::Theme;
 use crate::panel::Panel;
 use crate::tabs::TabManager;
 
-/// One rendered row: a live pane joined with its model state.
 struct Row {
     panel_id: String,
     title: String,
@@ -60,8 +55,7 @@ impl CockpitPanel {
         scroll.set_vexpand(true);
         let list = gtk4::ListBox::new();
         list.set_selection_mode(gtk4::SelectionMode::Browse);
-        // Double-click to activate, matching the macOS table's doubleAction —
-        // single-click would steal focus away on mere arrow-key browsing.
+        // Double-click only: single-click would steal focus on arrow-key browsing.
         list.set_activate_on_single_click(false);
         list.add_css_class("copad-cockpit-list");
         scroll.set_child(Some(&list));
@@ -110,18 +104,14 @@ impl CockpitPanel {
             let panel_id = unsafe { ptr.as_ref() }.clone();
             let Some(mgr) = mgr.upgrade() else { return };
 
-            // Acting on a pane clears its attention. Borrow as a statement
-            // temporary — activate_panel() below re-enters through the focus
-            // handler, and a live borrow here would panic.
+            // Borrow as a statement temporary: activate_panel() below re-enters through the
+            // focus handler, and a live borrow here would panic.
             cockpit.borrow_mut().acknowledge(&panel_id);
             mgr.activate_panel(&panel_id);
             mgr.notify_cockpit_views();
         });
     }
 
-    /// Rebuild the rows from the live pane snapshot joined with the model,
-    /// attention first. Cheap enough to run on any change: the pane count is
-    /// small and the model is a hash lookup.
     pub fn reload_rows(&self) {
         let Some(mgr) = self.mgr.upgrade() else {
             return;
@@ -173,7 +163,6 @@ fn build_row(row: &Row) -> gtk4::ListBoxRow {
     let subtitle = gtk4::Label::new(Some(&subtitle_text));
     subtitle.add_css_class("copad-cockpit-row-sub");
     subtitle.set_xalign(0.0);
-    // Middle-ellipsize so a deep cwd keeps both its project root and leaf.
     subtitle.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
 
     let text = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
@@ -194,9 +183,8 @@ fn build_row(row: &Row) -> gtk4::ListBoxRow {
     lb_row
 }
 
-/// Theme-derived CSS. Backgrounds stay transparent so the window wallpaper
-/// shows through, as every other panel does. State colors come from the ANSI
-/// palette (the theme has no semantic green/blue): 2=green, 3=yellow, 4=blue.
+/// State colors come from the ANSI palette (the theme has no semantic green/blue): 2=green,
+/// 3=yellow, 4=blue.
 pub fn build_cockpit_css(theme: &Theme) -> String {
     format!(
         r#"

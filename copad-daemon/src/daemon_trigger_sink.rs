@@ -1,17 +1,9 @@
-//! Daemon-side `TriggerSink` implementation. Mirrors
-//! [`crate::trigger_sink::LiveTriggerSink`] in semantics — registry-first
-//! dispatch with `system.spawn` intercepted before the registry — but
-//! routes GUI-owned action fallthrough through a registered GUI's
-//! `Invoke` channel instead of a GTK [`SocketCommand`] queue, which
-//! the daemon does not have.
+//! Daemon-side `TriggerSink`, mirroring [`crate::trigger_sink::LiveTriggerSink`] but routing
+//! GUI-owned actions through a registered GUI's `Invoke` channel.
 //!
-//! Fallthrough is fire-and-forget through a bounded mpsc queue + single
-//! worker thread. `dispatch_action` never blocks the trigger pump thread
-//! on a GUI Invoke (which can run up to `method_invoke_timeout(action)`
-//! — 5s for tabs/terminal, 120s for webview). Queue saturation logs a
-//! warning and drops; this matches today's GUI semantics where
-//! `LiveTriggerSink::dispatch_tx` is a `mpsc::Sender` and a wedged
-//! GTK dispatcher would back up the channel.
+//! Fallthrough is fire-and-forget through a bounded queue and a single worker, so
+//! `dispatch_action` never blocks the trigger pump on a GUI Invoke (up to
+//! `method_invoke_timeout(action)`: 5s tabs/terminal, 120s webview). Saturation logs and drops.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -24,20 +16,14 @@ use serde_json::{Value, json};
 
 use crate::gui_registry::{GuiRegistry, method_invoke_timeout};
 
-/// Worker queue capacity. Higher than the action pool's queue (64)
-/// because trigger fan-out can burst — completion events fan out to
-/// every matching trigger, each of which may fall through to a GUI
-/// Invoke. Bounded so a wedged GUI cannot grow daemon memory without
-/// limit.
+/// Larger than the action pool's queue (64): completion events fan out to every matching trigger.
+/// Bounded so a wedged GUI cannot grow daemon memory without limit.
 const FALLTHROUGH_QUEUE: usize = 256;
 
 pub struct DaemonTriggerSink {
     registry: Arc<ActionRegistry>,
-    /// Held so `system.spawn` can merge the registered GUI's curated
-    /// env (`HYPRLAND_INSTANCE_SIGNATURE`, `DISPLAY`, etc.) into the
-    /// child's environment. The fallthrough worker also reaches the
-    /// registry, but it holds its own clone via the worker's move
-    /// closure.
+    /// Lets `system.spawn` merge the registered GUI's curated env (`HYPRLAND_INSTANCE_SIGNATURE`,
+    /// `DISPLAY`, ...) into the child's environment.
     gui: Arc<GuiRegistry>,
     fallthrough_tx: mpsc::SyncSender<(String, Value)>,
 }
@@ -62,11 +48,8 @@ impl DaemonTriggerSink {
         }
     }
 
-    /// Spawn child for trigger-fired `system.spawn`. Merges the
-    /// registered primary GUI's curated env (Stage E) on top of the
-    /// daemon's inherited env, so triggers running under a graphical
-    /// session see `HYPRLAND_INSTANCE_SIGNATURE` etc. With no
-    /// registered GUI (headless), the child inherits daemon env only.
+    /// Merges the primary GUI's curated env on top of the daemon's inherited env, so triggers
+    /// see `HYPRLAND_INSTANCE_SIGNATURE` etc. With no GUI the child inherits the daemon env only.
     fn handle_system_spawn(&self, params: Value) -> ActionResult {
         let argv = params
             .get("argv")
@@ -93,9 +76,7 @@ impl DaemonTriggerSink {
         cmd.args(&argv_strs[1..])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null());
-        // Merge primary GUI's daemon-filtered env on top of inherited
-        // daemon env. `Command::envs` OVERRIDES matching keys without
-        // clearing unrelated ones (PATH etc. from the daemon stay).
+        // `Command::envs` overrides matching keys without clearing the daemon's PATH etc.
         if let Some(gui_env) = self.gui.primary_gui_env() {
             cmd.envs(gui_env);
         }
@@ -145,8 +126,7 @@ impl TriggerSink for DaemonTriggerSink {
                 .try_invoke(action, params)
                 .expect("registry.has() just returned true");
         }
-        // Fallthrough — push to the bounded queue. `try_send` so a wedged
-        // GUI can't stall the trigger pump.
+        // `try_send` so a wedged GUI can't stall the trigger pump.
         match self.fallthrough_tx.try_send((action.to_string(), params)) {
             Ok(()) => Ok(json!({ "queued": true })),
             Err(mpsc::TrySendError::Full(_)) => {
@@ -187,9 +167,6 @@ fn fallthrough_worker(
                 Response::error(String::new(), reason, &format!("no GUI to handle {action}"))
             }
         };
-        // Same vouch-publish as `dispatch_via_gui`: daemon-side chained
-        // triggers see `<action>.completed`/`.failed` whether the GUI
-        // ran the action successfully or the route/invoke itself failed.
         crate::socket::publish_legacy_completion(&event_bus, &action, false, &resp);
     }
 }
@@ -249,11 +226,8 @@ mod tests {
     #[test]
     fn unknown_action_fallthrough_with_no_gui_returns_queued() {
         let (_reg, _gui, sink) = mk_sink();
-        // Method is GUI-capability'd (tab.new) but no GUI registered → worker
-        // dequeues and logs `unroutable: no_gui`. dispatch_action returns
-        // `queued` immediately regardless of GUI state — matches
-        // LiveTriggerSink semantics where the reply consumer logs failures
-        // out-of-band.
+        // GUI-capability'd method (tab.new) with no GUI registered: returns `queued` at once and
+        // the worker logs `unroutable: no_gui`.
         let r = sink.dispatch_action("tab.new", json!({})).unwrap();
         assert_eq!(r, json!({"queued": true}));
     }
@@ -261,17 +235,7 @@ mod tests {
     #[test]
     fn fallthrough_queue_returns_err_when_saturated() {
         let (_reg, _gui, sink) = mk_sink();
-        // Saturate the queue by sending FALLTHROUGH_QUEUE + worker-in-flight
-        // entries. The worker is blocked waiting for an Invoke response from
-        // a non-existent GUI — so route() returns Err immediately and the
-        // worker spins fast. We need to keep ahead of the worker; do this
-        // by enqueueing rapidly via direct channel access. But the public
-        // API only enqueues via try_send → realistically this test cannot
-        // reliably observe the Full case without a synchronization barrier.
-        // We instead verify the dispatch path returns Ok when not saturated,
-        // and leave Full-path coverage to a focused integration test once
-        // we have a way to throttle the worker. For now: smoke-test that
-        // many dispatches don't panic.
+        // Cannot observe the Full path without a way to throttle the worker; smoke-test only.
         for _ in 0..50 {
             let _ = sink.dispatch_action("tab.new", json!({}));
         }

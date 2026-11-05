@@ -18,14 +18,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-/// The preview consumer the sidebar uses (an open overlay has its own).
 pub const HOVER_CONSUMER: &str = "hover";
 
-/// How long the pointer rests on a row before its preview shows.
 const HOVER_DELAY: Duration = Duration::from_millis(500);
 
-/// The keyboard selection: which half, the selected row's id, and its last index (for when that
-/// row goes away).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Kbd {
     pub agents: bool,
@@ -33,18 +29,11 @@ pub(crate) struct Kbd {
     pub index: usize,
 }
 
-/// What a key does in keyboard mode (pure, unit-tested).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Step {
-    /// The selection moved / switched half.
     To(Kbd),
-    /// Enter on this id (a session id in spaces, an agent token in agents).
-    Pick {
-        agents: bool,
-        id: String,
-    },
+    Pick { agents: bool, id: String },
     Exit,
-    /// Swallowed (keyboard mode takes every key, as the TUI's does).
     Swallow,
 }
 
@@ -92,31 +81,24 @@ pub(crate) fn step(k: &Kbd, key: &str, spaces: &[String], agents: &[String]) -> 
     }
 }
 
-/// One sidebar row as navigation sees it.
 struct Row {
     row: gtk4::ListBoxRow,
-    /// The id keyboard mode selects it by; `None` = not navigable (a band duplicate, a header).
     id: Option<String>,
-    /// The pane its preview shows.
     pane: Option<String>,
 }
 
 pub struct SidebarNav {
     kbd: RefCell<Option<Kbd>>,
-    /// Who had the keys before keyboard mode; they get them back.
     restore: RefCell<Option<gtk4::Widget>>,
     spaces: RefCell<Vec<Row>>,
     agents: RefCell<Vec<Row>>,
     pop: gtk4::Popover,
     head: gtk4::Label,
     body: gtk4::Label,
-    /// The pane the pointer rests on (after the delay), and the pane the popover shows.
     hover: RefCell<Option<String>>,
     shown: RefCell<Option<(String, PreviewReq)>>,
     timer: RefCell<Option<gtk4::glib::SourceId>>,
-    /// Bumped by every pointer enter/leave, so a stale timer does nothing.
     hover_gen: Cell<u64>,
-    /// The selection or the resting pointer changed since the last `apply` (this window's).
     dirty: Cell<bool>,
 }
 
@@ -165,13 +147,11 @@ impl SidebarNav {
         self.kbd.borrow().is_some()
     }
 
-    /// The lists are about to be rebuilt.
     pub fn clear_rows(&self) {
         self.spaces.borrow_mut().clear();
         self.agents.borrow_mut().clear();
     }
 
-    /// Register a rebuilt row (and give it the pointer-rest preview).
     pub fn add(
         self: &Rc<Self>,
         agents_half: bool,
@@ -208,9 +188,8 @@ impl SidebarNav {
         }
     }
 
-    /// The pointer entered a row with `pane` (after [`HOVER_DELAY`] its preview shows) or left
-    /// one. Rows are rebuilt under a resting pointer every state change, so an enter for the
-    /// pane already shown keeps it, and a leave closes only if no enter follows shortly.
+    /// Rows are rebuilt under a resting pointer every state change, so an enter for the pane
+    /// already shown keeps it, and a leave closes only if no enter follows shortly.
     fn pointer(self: &Rc<Self>, pane: Option<String>) {
         let g = self.hover_gen.get() + 1;
         self.hover_gen.set(g);
@@ -238,17 +217,14 @@ impl SidebarNav {
         *self.timer.borrow_mut() = Some(id);
     }
 
-    /// Ask the panel to re-apply (its next tick calls `apply`, see [`Self::needs_apply`]).
     fn signal_redraw(&self) {
         self.dirty.set(true);
     }
 
-    /// Whether this window's selection or resting pointer changed since the last `apply`.
     pub fn needs_apply(&self) -> bool {
         self.dirty.get()
     }
 
-    /// `Ctrl-b e`: take the keys, starting on `active` (the active session).
     pub fn enter(&self, window: &gtk4::ApplicationWindow, active: Option<String>) {
         if self.kbd.borrow().is_none() {
             *self.restore.borrow_mut() = gtk4::prelude::GtkWindowExt::focus(window);
@@ -265,7 +241,6 @@ impl SidebarNav {
             id: active,
             index,
         });
-        // The terminal must not keep the keys: park focus on the sidebar list.
         if let Some(r) = self.spaces.borrow().first() {
             r.row.grab_focus();
         }
@@ -282,7 +257,6 @@ impl SidebarNav {
         self.signal_redraw();
     }
 
-    /// A key in keyboard mode. Returns the command to run, if any.
     pub fn key(&self, name: &str) -> Option<Value> {
         let k = self.kbd.borrow().clone()?;
         let ids = |rows: &RefCell<Vec<Row>>| -> Vec<String> {
@@ -310,8 +284,8 @@ impl SidebarNav {
         }
     }
 
-    /// After a rebuild (or a selection/pointer change): mark the keyboard row, keep it in view,
-    /// and place / fill / close the preview popover. `preview` asks the host for a pane.
+    /// After a rebuild or a selection/pointer change: mark the keyboard row, keep it in view, and
+    /// place / fill / close the preview popover.
     pub fn apply(
         &self,
         state: &Value,
@@ -320,7 +294,6 @@ impl SidebarNav {
         preview: &dyn Fn(Option<PreviewReq>),
     ) {
         self.dirty.set(false);
-        // Keep the selection valid: the selected row may have gone (session killed).
         let kbd = {
             let mut kbd = self.kbd.borrow_mut();
             if let Some(k) = kbd.as_mut() {
@@ -350,7 +323,6 @@ impl SidebarNav {
                 }
             }
         }
-        // Keyboard selection first; otherwise the row the pointer rests on.
         if target.is_none()
             && let Some(p) = self.hover.borrow().clone()
         {
@@ -433,7 +405,6 @@ impl SidebarNav {
         }
     }
 
-    /// The window is going away: stop the preview.
     pub fn shutdown(&self, preview: &dyn Fn(Option<PreviewReq>)) {
         if self.shown.borrow_mut().take().is_some() {
             preview(None);
@@ -512,7 +483,6 @@ mod tests {
         );
         assert_eq!(step(&k, "Esc", &spaces, &agents), Step::Exit);
         assert_eq!(step(&k, "x", &spaces, &agents), Step::Swallow);
-        // The selected session went away: the row now at its index is the one picked.
         let gone = Kbd {
             agents: false,
             id: Some("s9".into()),
@@ -525,7 +495,6 @@ mod tests {
                 id: "s2".into()
             }
         );
-        // An empty half is not switched to.
         assert_eq!(step(&k, "Right", &spaces, &[]), Step::Swallow);
     }
 }

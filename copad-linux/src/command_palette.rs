@@ -12,12 +12,9 @@ use copad_daemon::socket::{LEGACY_DISPATCH_METHODS, SocketCommand};
 use crate::panel::Panel;
 use crate::tabs::TabManager;
 
-// Actions whose empty-param dispatch has irreversible side effects on
-// the user's session. `tab.close` is the only one today: empty params
-// close the active panel, which discards a live terminal's scrollback
-// + running process. Confirmed before dispatch with a Cancel-default
-// AlertDialog so a stray Enter (after the palette's Enter closes it)
-// doesn't fall through into the destructive action.
+// Actions whose empty-param dispatch is irreversible. `tab.close` closes the active panel,
+// discarding scrollback and the running process; it is confirmed through a Cancel-default
+// AlertDialog so the Enter that closed the palette cannot fall through into it.
 const DESTRUCTIVE_ACTIONS: &[&str] = &["tab.close"];
 
 pub fn open(
@@ -91,8 +88,6 @@ pub fn open(
         populate_for_change(entry.text().as_str());
     });
 
-    // Activate (Enter on the search entry): dispatch the currently
-    // selected row.
     let palette_for_activate = palette.clone();
     let dispatch_tx_for_activate = dispatch_tx.clone();
     let restore_for_activate = restore_focus.clone();
@@ -115,7 +110,6 @@ pub fn open(
         );
     });
 
-    // Mouse double-click activation: same dispatch path.
     let palette_for_row = palette.clone();
     let dispatch_tx_for_row = dispatch_tx.clone();
     let restore_for_row = restore_focus.clone();
@@ -134,9 +128,7 @@ pub fn open(
         );
     });
 
-    // Key controller for Esc and Up/Down navigation while typing.
-    // Capture phase so we run BEFORE the SearchEntry's built-in
-    // stop-search handler eats Escape.
+    // Capture phase so we run before the SearchEntry's built-in stop-search handler eats Escape.
     let key = gtk4::EventControllerKey::new();
     key.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let palette_for_key = palette.clone();
@@ -162,9 +154,8 @@ pub fn open(
     });
     palette.add_controller(key);
 
-    // SearchEntry's own "stop-search" (emitted on Esc even after our
-    // capture-phase handler, on some GTK versions) — backup close path
-    // so the palette can never get stuck open.
+    // SearchEntry's "stop-search" can fire on Esc even after our capture-phase handler on some
+    // GTK versions; this backup close path keeps the palette from getting stuck open.
     let palette_for_stop = palette.clone();
     let restore_for_stop = restore_focus.clone();
     search.connect_stop_search(move |_| {
@@ -202,10 +193,8 @@ fn confirm_then_dispatch(
     restore: Option<Rc<crate::panel::PanelVariant>>,
     action: String,
 ) {
-    // Cancel is index 0 = default button (a stray Enter cancels rather
-    // than confirms). Confirm is index 1, also the explicit cancel
-    // affordance (Esc) — separate from default to keep the keyboard UX
-    // intuitive.
+    // Cancel is index 0 = default button, so a stray Enter cancels. Confirm is index 1; Esc is
+    // the explicit cancel.
     let dialog = gtk4::AlertDialog::builder()
         .modal(true)
         .message(format!("Confirm action: {action}"))
@@ -240,12 +229,8 @@ fn dispatch_action(dispatch_tx: &Sender<SocketCommand>, action: &str) {
 }
 
 fn move_selection(list: &gtk4::ListBox, delta: i32) {
-    // Crucially: do NOT call `row.grab_focus()`. The SearchEntry must
-    // keep focus across Up/Down so the user can keep typing to refine
-    // the filter. Auto-scrolling to keep the selection in view is a v2
-    // follow-up — for ≤~10 rows the visible window covers the common
-    // case; scrolling matters only when filter narrows past the visible
-    // window during arrow navigation.
+    // Do NOT call `row.grab_focus()`: the SearchEntry must keep focus across Up/Down so the user
+    // can keep typing to refine the filter.
     let Some(current) = list.selected_row() else {
         if let Some(row) = list.row_at_index(0) {
             list.select_row(Some(&row));

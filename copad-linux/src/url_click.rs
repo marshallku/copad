@@ -3,20 +3,13 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use vte4::prelude::*;
 
-// VTE rejects the regex unless PCRE2_MULTILINE is set. The Rust binding
-// doesn't re-export PCRE2 constants from `pcre2.h`, but the values are
-// stable across PCRE2 versions. Caseless matching is expressed inline
-// with `(?i:...)` rather than via `PCRE2_CASELESS`: empirically, mixing
-// the compile-time flag with a non-trivial pattern made VTE 0.84's
-// `check_match_at` return no matches on otherwise valid hits (gnome-
-// console also uses bare `PCRE2_MULTILINE` and inline case flags).
+// VTE rejects the regex unless PCRE2_MULTILINE is set; the binding does not re-export the PCRE2
+// constants. Caseless matching is inline `(?i:...)`: mixing PCRE2_CASELESS with a non-trivial
+// pattern made VTE 0.84's `check_match_at` return no matches on valid hits.
 const PCRE2_MULTILINE: u32 = 0x0000_0400;
 
 const URL_PATTERN: &str = r"(?i:https?://[^\s<>'\x22]+)";
 
-// Characters that commonly trail a URL in prose ("see https://x.com.")
-// and almost never appear at the end of a real URL. Stripped post-match
-// so the regex stays a simple greedy run.
 const TRAIL_PUNCT: &str = ".,;:!?)]}>";
 
 pub fn normalize_url(raw: &str) -> Option<String> {
@@ -81,10 +74,7 @@ pub fn install(terminal: &vte4::Terminal, window: &gtk4::ApplicationWindow) {
 }
 
 fn check_url_at(term: &vte4::Terminal, x: f64, y: f64) -> Option<String> {
-    // OSC 8 hyperlinks beat the regex tag because their visible label
-    // can differ from the target — the regex would only see the label
-    // ("click here"), so the explicit hyperlink target is the only
-    // trustworthy source.
+    // OSC 8 beats the regex tag: the visible label can differ from the target.
     if let Some(h) = term.check_hyperlink_at(x, y) {
         return Some(h.to_string());
     }

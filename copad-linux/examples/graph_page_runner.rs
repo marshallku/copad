@@ -1,11 +1,10 @@
-//! Runs one scenario page of `scripts/e2e-graph-page.sh` in WebKitGTK (the engine copad's Linux
-//! host loads the work-graph page in), with a real `comux` message handler — the Linux twin of
-//! `scripts/lib/webkit-page-runner.swift`.
+//! Runs one scenario page of `scripts/e2e-graph-page.sh` in WebKitGTK with a real `comux` message
+//! handler (the Linux twin of `scripts/lib/webkit-page-runner.swift`).
 //!
 //!   cargo run -q -p copad-linux --example graph_page_runner -- <scenario.html>
 //!
-//! Prints the scenario's result JSON (what it wrote between @@OUT@@ … @@END@@), with `posts`
-//! replaced by the messages the page really posted. Needs a display (Broadway works).
+//! Prints the scenario's result JSON with `posts` replaced by the messages the page really posted.
+//! Needs a display (Broadway works).
 use gtk4::glib;
 use gtk4::prelude::*;
 use serde_json::Value;

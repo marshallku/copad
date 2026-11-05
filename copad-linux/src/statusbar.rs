@@ -26,16 +26,13 @@ pub struct StatusBar {
     pub container: gtk4::Box,
     bar: gtk4::Box,
     modules: Rc<RefCell<Vec<ModuleHandle>>>,
-    /// Label widgets keyed by dom_id for reload lookups
     labels: Rc<RefCell<HashMap<String, gtk4::Label>>>,
-    /// Bumped by every (re)schedule. Each module's poll chain re-arms itself forever, so a
-    /// chain from before a reload must see it is stale and stop — otherwise every config
-    /// reload added another chain per module, each forking its module and holding a label
-    /// that was no longer in the bar.
+    /// Bumped by every (re)schedule. Each module's poll chain re-arms forever, so a chain from
+    /// before a reload must see it is stale and stop; otherwise every reload adds a chain per
+    /// module.
     generation: Rc<Cell<u64>>,
 }
 
-/// JSON `{text, tooltip?}` if it parses, otherwise the raw trimmed string.
 fn parse_output(output: &str) -> (String, Option<String>) {
     let trimmed = output.trim();
     if trimmed.starts_with('{')
@@ -48,11 +45,8 @@ fn parse_output(output: &str) -> (String, Option<String>) {
     (trimmed.to_string(), None)
 }
 
-/// Fire a `_module.run` RPC to copadd and yield the module's stdout
-/// through a channel. Daemon owns the shell exec now; the GUI keeps
-/// the per-module timer and label update. On connect/transport failure
-/// (no daemon, slow daemon) the channel receives an empty string —
-/// same UX as the legacy "module errored → blank label".
+/// Fire a `_module.run` RPC to copadd and yield the module's stdout through a channel. A
+/// connect/transport failure yields an empty string (blank label).
 fn run_module_via_daemon(plugin: &str, module: &str) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     let plugin = plugin.to_string();
@@ -64,13 +58,11 @@ fn run_module_via_daemon(plugin: &str, module: &str) -> mpsc::Receiver<String> {
 }
 
 fn invoke_module(plugin: &str, module: &str) -> Option<String> {
-    // `daemon_socket_path()` (vs `socket_path()`) skips an inherited
-    // per-GUI COPAD_SOCKET override and refuses untrusted runtime dirs
-    // — same guard `gui_client` uses. None on no-daemon → blank label.
+    // `daemon_socket_path()` (not `socket_path()`) skips an inherited per-GUI COPAD_SOCKET
+    // override and refuses untrusted runtime dirs, like `gui_client`.
     let socket_path = copad_core::paths::daemon_socket_path()?;
     let stream = UnixStream::connect(&socket_path).ok()?;
-    // Module ticks must not stall: bound both directions on the
-    // daemon's MODULE_RUN_TIMEOUT (8 s) + a small margin.
+    // Bound both directions on the daemon's MODULE_RUN_TIMEOUT (8 s) plus a margin.
     let timeout = Duration::from_secs(10);
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
@@ -132,7 +124,6 @@ fn apply_theme_css(theme: &Theme, height: u32, position: &str) {
     );
 }
 
-/// Sorted module entries for a section
 struct ModuleEntry {
     order: i32,
     label: gtk4::Label,
@@ -162,12 +153,8 @@ impl StatusBar {
         let labels: Rc<RefCell<HashMap<String, gtk4::Label>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
-        // Dedup duplicate plugin names so the bar reflects the same
-        // winner as daemon `_module.run` resolution.
-        // rev → filter (sorted-last wins) → rev again to restore the
-        // sorted slice's original traversal order. Without the second
-        // rev, equal-`order` modules would render reversed across the
-        // plugin list.
+        // Dedup duplicate plugin names so the bar matches daemon `_module.run` resolution:
+        // rev -> filter (sorted-last wins) -> rev restores the sorted traversal order.
         let mut seen = std::collections::HashSet::new();
         let mut winners: Vec<&LoadedPlugin> = plugins
             .iter()
@@ -273,7 +260,6 @@ impl StatusBar {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         apply_theme_css(&theme, config.statusbar.height, &config.statusbar.position);
 
-        // Clear existing labels from the bar sections
         let mut child = self.bar.first_child();
         while let Some(section) = child {
             child = section.next_sibling();
@@ -293,10 +279,8 @@ impl StatusBar {
         self.modules.borrow_mut().clear();
         self.labels.borrow_mut().clear();
 
-        // rev → filter (sorted-last wins) → rev again to restore the
-        // sorted slice's original traversal order. Without the second
-        // rev, equal-`order` modules would render reversed across the
-        // plugin list.
+        // rev -> filter (sorted-last wins) -> rev restores the sorted traversal order, so
+        // equal-`order` modules do not render reversed.
         let mut seen = std::collections::HashSet::new();
         let mut winners: Vec<&LoadedPlugin> = plugins
             .iter()
@@ -335,7 +319,6 @@ impl StatusBar {
             }
         }
 
-        // Re-populate sections (bar has 3 children: left, center, right)
         let sections: Vec<gtk4::Box> = {
             let mut v = Vec::new();
             let mut child = self.bar.first_child();
@@ -368,7 +351,7 @@ impl StatusBar {
         self.container
             .set_visible(config.statusbar.enabled && has_modules);
 
-        // Stop the previous chains whether or not new ones start (a disabled bar polls nothing).
+        // Stop the previous chains even if no new ones start (a disabled bar polls nothing).
         self.generation.set(self.generation.get() + 1);
         if config.statusbar.enabled && has_modules {
             schedule_modules(&self.modules, &self.generation);
@@ -408,7 +391,6 @@ struct ModuleRunCtx {
     module: String,
     interval: u64,
     generation: Rc<Cell<u64>>,
-    /// The schedule this chain belongs to; a newer one retires it.
     gen_at: u64,
 }
 

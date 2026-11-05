@@ -1,11 +1,6 @@
-//! Per-tick drain targets shared by the daemon's trigger thread and the
-//! config hot-reload path. Ported from `copad-linux/src/window.rs` so
-//! the daemon can host TriggerEngine + ContextService independently of
-//! the GTK timer that historically drove the pump.
-//!
-//! Identity with the GUI version is intentional: the GUI's copy stays in
-//! place during the cut-over (env-gated by `COPADD_HOST_TRIGGERS`) so a
-//! rollback is one env flip. A follow-up step removes the GUI copy.
+//! Per-tick drain targets shared by the daemon's trigger thread and the config hot-reload path.
+//! Ported from `copad-linux/src/window.rs`; the GUI copy stays during the cut-over, gated by
+//! `COPADD_HOST_TRIGGERS`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,9 +9,6 @@ use copad_core::context::ContextService;
 use copad_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus, EventReceiver};
 use copad_core::trigger::{Trigger, TriggerEngine, covering_patterns};
 
-/// Three context-driving receivers + the dynamic trigger subscription
-/// set. The pump drains context first (so `{context.*}` interpolation
-/// reflects the latest panel/cwd), then triggers.
 pub struct PumpState {
     ctx_focused: EventReceiver,
     ctx_exited: EventReceiver,
@@ -56,8 +48,7 @@ impl PumpState {
         }
     }
 
-    /// Context first (so `{context.*}` interpolation is fresh), then
-    /// triggers. One context snapshot per dispatched event.
+    /// Context first, so `{context.*}` interpolation is fresh, then triggers.
     pub fn pump_all(&self, ctx: &ContextService, engine: &TriggerEngine) {
         self.drain_context_only(ctx);
         self.trigger_subs.drain_into(|event| {
@@ -75,10 +66,8 @@ impl PumpState {
     }
 }
 
-/// One bus receiver per unique `event_kind` pattern across active triggers.
-/// Reconciled at startup and on hot reload: still-needed patterns keep
-/// their existing receivers (so pending events survive unrelated reloads),
-/// removed patterns drop (queues GC'd on next publish).
+/// One bus receiver per unique `event_kind` pattern across active triggers. Still-needed patterns
+/// keep their receivers on reload so pending events survive unrelated reloads.
 pub struct TriggerSubscriptions {
     receivers: HashMap<String, EventReceiver>,
 }
@@ -98,23 +87,15 @@ impl TriggerSubscriptions {
         self.receivers.is_empty()
     }
 
-    /// Reduces requested patterns via `covering_patterns` first so
-    /// overlap (`*` plus `panel.focused`) collapses to a single
-    /// broader receiver — otherwise duplicate delivery would
-    /// double-fire side effects. New patterns get fresh
-    /// `subscribe_unbounded` receivers.
+    /// Requested patterns are reduced via `covering_patterns` first so overlap (`*` plus
+    /// `panel.focused`) collapses to one receiver; duplicates would double-fire side effects.
     pub fn reconcile(&mut self, bus: &Arc<CoreEventBus>, triggers: &[Trigger]) {
-        // Three flavors of event must be subscribed per trigger:
-        // (1) `when.event_kind`, (2) `await.event_kind`,
-        // (3) `<action>.completed`/`.failed` for await-bearing triggers.
-        // Missing #3 degrades await to "registers preflight, never
-        // promotes" — see docs/workflow-runtime.md "Async correlation".
+        // Subscribe per trigger to (1) `when.event_kind`, (2) `await.event_kind`, (3)
+        // `<action>.completed`/`.failed` for await-bearing triggers. Missing #3 means await
+        // registers a preflight and never promotes (docs/workflow-runtime.md "Async correlation").
         let mut raw: Vec<String> = Vec::with_capacity(triggers.len() * 3);
         for t in triggers {
-            // Cron-source triggers fire via `CronScheduler`, not the
-            // bus pump — skip subscription for them so we don't allocate
-            // dead receivers. (`Trigger::matches` would no-op anyway,
-            // but keeping the receiver count tight matters at scale.)
+            // Cron-source triggers fire via `CronScheduler`, not the bus pump: no receiver.
             let Some(when) = &t.when else { continue };
             raw.push(when.event_kind.clone());
             if let Some(aw) = &t.r#await {
@@ -133,11 +114,10 @@ impl TriggerSubscriptions {
         }
     }
 
-    /// Drain every receiver fully. Ordering invariant: registry-sourced
-    /// `<X>.completed`/`.failed` events must run BEFORE `await.event_kind`
-    /// in the same tick — otherwise a same-tick awaited reply hits a
-    /// preflight that hasn't promoted yet and the workflow times out.
-    /// HashMap iteration order is unspecified, so drain → Vec → stable-sort.
+    /// Ordering invariant: registry-sourced `<X>.completed`/`.failed` events must run BEFORE
+    /// `await.event_kind` in the same tick, or a same-tick awaited reply hits a preflight that
+    /// has not promoted yet and the workflow times out. HashMap order is unspecified, so drain
+    /// into a Vec and stable-sort.
     pub fn drain_into<F: FnMut(BusEvent)>(&self, mut f: F) {
         let mut events: Vec<BusEvent> = Vec::new();
         for rx in self.receivers.values() {
@@ -232,7 +212,6 @@ mod tests {
                 mk_trigger("b", "panel.focused", "y"),
             ],
         );
-        // covering_patterns collapses panel.focused into the `*` umbrella.
         assert_eq!(subs.len(), 1);
     }
 
@@ -276,8 +255,6 @@ mod tests {
                 "user.reply",
             )],
         );
-        // when + await + .completed + .failed → 4 patterns,
-        // none of which overlap so all 4 survive covering_patterns.
         assert_eq!(subs.len(), 4);
     }
 
@@ -286,8 +263,6 @@ mod tests {
         let bus = Arc::new(CoreEventBus::new());
         let mut subs = TriggerSubscriptions::new();
         subs.reconcile(&bus, &[mk_trigger("a", "*", "x")]);
-        // Publish in "wrong" order: plain event first, then a registry
-        // completion. drain_into must reorder so completion fires first.
         bus.publish(Event::new("plain.event", "test", json!({})));
         bus.publish(Event::new(
             "x.completed",
@@ -308,8 +283,7 @@ mod tests {
         let bus = Arc::new(CoreEventBus::new());
         let mut subs = TriggerSubscriptions::new();
         subs.reconcile(&bus, &[mk_trigger("a", "*", "x")]);
-        // Plugin publishes a fake `.completed` kind from a NON-registry source —
-        // should stay at normal priority.
+        // A `.completed` kind from a NON-registry source stays at normal priority.
         bus.publish(Event::new(
             "plugin.work.completed",
             "plugin.todo",
