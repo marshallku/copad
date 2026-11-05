@@ -32,10 +32,9 @@ pub fn broadcast(bus: &EventBus, event: &Event) {
 pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<SocketCommand> {
     let (tx, rx) = mpsc::channel();
 
-    // Reuse `copadd`'s hardened prep+bind: atomic 0700 parent with
-    // ownership check (DirBuilder::mode only sets perms on fresh
-    // creates — naive code lets an attacker-precreated lax dir slip
-    // through), and chmod 0600 on the bound socket.
+    // Reuse `copadd`'s hardened prep+bind: atomic 0700 parent with an ownership check
+    // (DirBuilder::mode only sets perms on fresh creates, so an attacker-precreated lax dir
+    // would slip through), and chmod 0600 on the bound socket.
     let path = std::path::Path::new(socket_path);
     match copad_daemon::socket::prepare_socket_path(path) {
         copad_daemon::socket::SocketPrep::Fresh
@@ -101,9 +100,8 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
                                 let _ =
                                     writeln!(writer, "{}", serde_json::to_string(&err).unwrap());
                                 let _ = writer.flush();
-                                // Fail-fast: helper never consumed the cap-overflow
-                                // bytes, so the next call would loop on the same
-                                // data. Close the connection.
+                                // Fail-fast: the helper never consumed the cap-overflow bytes,
+                                // so the next call would loop on them. Close the connection.
                                 break;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
@@ -134,7 +132,6 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
                         }
                     };
 
-                    // Handle event.subscribe in the socket thread (long-lived connection)
                     if request.method == "event.subscribe" {
                         let resp = Response::success(
                             request.id.clone(),
@@ -143,7 +140,8 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
                         let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
                         let _ = writer.flush();
 
-                        // Unbounded: external wire contract must not drop events on slow clients.
+                        // Unbounded: the external wire contract must not drop events on slow
+                        // clients.
                         let rx = event_bus.subscribe_unbounded("*");
                         while let Some(ev) = rx.recv() {
                             let wire = Event::new(ev.kind, ev.payload).with_source(ev.source);
@@ -188,8 +186,6 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
     rx
 }
 
-/// Dispatch consumes the SocketCommand so async handlers (webview.execute_js) can
-/// capture the reply sender and respond from a callback.
 pub fn dispatch(
     cmd: SocketCommand,
     mgr: &Rc<TabManager>,
@@ -201,22 +197,14 @@ pub fn dispatch(
 ) {
     let req = &cmd.request;
 
-    // Action Registry: try registered handlers first. New commands register
-    // through the registry; legacy commands stay in the match below until
-    // migrated. `try_dispatch` returns false on miss so we fall through.
+    // Action Registry first; legacy commands stay in the match below until migrated.
+    // `try_dispatch` runs synchronous handlers inline and spawns blocking ones (service-plugin
+    // RPC) onto a worker thread, so a slow plugin can't stall the socket-server thread or the
+    // GTK timer that pumps it. Either way `cmd.reply.send` lands exactly once.
     //
-    // `try_dispatch` (vs the old `try_invoke`) is what keeps the GTK main
-    // loop responsive: synchronous handlers (system.ping, context.snapshot,
-    // etc.) still run inline so fast paths pay no scheduling overhead, but
-    // blocking handlers — i.e. service-plugin RPC — are spawned onto a
-    // worker thread by the registry. Either way `cmd.reply.send` lands
-    // exactly once with the response, and the dispatcher returns
-    // immediately for the blocking case so a slow plugin can't stall the
-    // socket-server thread or the GTK timer that pumps it.
-    // Browser Workbench gate (B1c). Runs BEFORE `try_dispatch`, not before the
-    // legacy match: a browser method registered as an action would otherwise
-    // route around the gate entirely. The decision itself is
-    // `copad_core::browser::authorize` — see `crate::browser`.
+    // Browser Workbench gate: runs BEFORE `try_dispatch`, not before the legacy match; a browser
+    // method registered as an action would otherwise route around it. The decision is
+    // `copad_core::browser::authorize` (see `crate::browser`).
     let browser_ctx = match crate::browser::gate(req, mgr) {
         crate::browser::Gate::NotBrowser => None,
         crate::browser::Gate::Refused(err) => {
@@ -250,12 +238,10 @@ pub fn dispatch(
         return;
     }
 
-    // Legacy match-arm path: every reply funnels through
-    // `cmd.reply_with_completion` so chained triggers see
-    // `<action>.completed` / `<action>.failed` uniformly across registry
-    // and legacy actions. `silent_completion = true` (set by
-    // `gui_client::handle_invoke` for daemon-proxied Invokes) suppresses
-    // local publish — daemon publishes on its own bus for those.
+    // Legacy match-arm path: every reply goes through `cmd.reply_with_completion` so chained
+    // triggers see `<action>.completed` / `.failed` uniformly. `silent_completion = true` (set
+    // by `gui_client::handle_invoke` for daemon-proxied Invokes) suppresses the local publish;
+    // the daemon publishes on its own bus.
 
     match req.method.as_str() {
         "background.set" => {
@@ -295,8 +281,6 @@ pub fn dispatch(
                 .send(Response::success(req.id.clone(), json!({ "status": "ok" })));
         }
 
-        // The work-graph panel (decisions #204): `open` / `mode` set it; the answer is its
-        // state, with the page's own read-out under `page` (read asynchronously).
         "comux.graph" => {
             let open = req.params.get("open").and_then(|v| v.as_bool());
             let mode = req
@@ -321,14 +305,12 @@ pub fn dispatch(
             });
         }
 
-        // The notification dropdown under the top bar's bell (decisions #204).
         "comux.notifications" => {
             let open = req.params.get("open").and_then(|v| v.as_bool());
             let v = crate::comux_panel::notifications_global(open);
             let _ = cmd.reply.send(Response::success(req.id.clone(), v));
         }
 
-        // Open a remote comux natively (decisions #171). No `dest` = ask for it.
         "comux.open_remote" => {
             let comux = req
                 .params
@@ -412,10 +394,8 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
-        // -- WebView commands --
-        // `browser_ctx` is `Some` for exactly the methods `browser::classify`
-        // knows, which is exactly the arms below; a `None` here would mean the
-        // gate and this match disagree about what a browser method is.
+        // `browser_ctx` is `Some` for exactly the methods `browser::classify` knows, which is
+        // exactly the arms below; `None` here would mean the gate and this match disagree.
         "webview.open" => {
             let ctx = browser_ctx.as_ref().expect("gate classified webview.open");
             let resp = handle_webview_open(req, mgr, window);
@@ -466,7 +446,6 @@ pub fn dispatch(
                 .as_ref()
                 .expect("gate classified webview.execute_js");
             handle_webview_execute_js(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.get_content" => {
@@ -474,7 +453,6 @@ pub fn dispatch(
                 .as_ref()
                 .expect("gate classified webview.get_content");
             handle_webview_get_content(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.screenshot" => {
@@ -482,13 +460,11 @@ pub fn dispatch(
                 .as_ref()
                 .expect("gate classified webview.screenshot");
             handle_webview_screenshot(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.query" => {
             let ctx = browser_ctx.as_ref().expect("gate classified webview.query");
             handle_webview_query(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.query_all" => {
@@ -496,7 +472,6 @@ pub fn dispatch(
                 .as_ref()
                 .expect("gate classified webview.query_all");
             handle_webview_query_all(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.get_styles" => {
@@ -504,19 +479,16 @@ pub fn dispatch(
                 .as_ref()
                 .expect("gate classified webview.get_styles");
             handle_webview_get_styles(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.click" => {
             let ctx = browser_ctx.as_ref().expect("gate classified webview.click");
             handle_webview_click(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.fill" => {
             let ctx = browser_ctx.as_ref().expect("gate classified webview.fill");
             handle_webview_fill(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.scroll" => {
@@ -524,7 +496,6 @@ pub fn dispatch(
                 .as_ref()
                 .expect("gate classified webview.scroll");
             handle_webview_scroll(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
         "webview.page_info" => {
@@ -532,12 +503,10 @@ pub fn dispatch(
                 .as_ref()
                 .expect("gate classified webview.page_info");
             handle_webview_page_info(cmd, mgr, event_bus, ctx);
-            // Response sent from callback
         }
 
-        // Requires `id`, unlike macOS which falls back to the active webview.
-        // Deliberate: every other Linux `webview.*` method requires `id`, and
-        // internal consistency beats matching macOS's resolver here.
+        // Requires `id`, unlike macOS which falls back to the active webview, for consistency
+        // with every other Linux `webview.*` method.
         "webview.state" => {
             use webkit6::prelude::WebViewExt;
             let ctx = browser_ctx.as_ref().expect("gate classified webview.state");
@@ -564,9 +533,8 @@ pub fn dispatch(
             browser_reply(&cmd, event_bus, mgr, ctx, resp);
         }
 
-        // Zero-based, matching the index `tab.info` reports. Diverges from
-        // macOS (which silently no-ops a bad index) by erroring: a coctl caller
-        // has no other channel to learn the index was wrong.
+        // Zero-based, as `tab.info` reports. Errors on a bad index (macOS silently no-ops)
+        // because a coctl caller has no other channel to learn it was wrong.
         "tab.switch" => {
             let resp = match req.params.get("index").and_then(|v| v.as_u64()) {
                 Some(index) => {
@@ -589,31 +557,24 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
-        // Focus one specific pane by id and bring the window forward — the comux
-        // notification-jump path (decision #115). `activate_panel` is the same
-        // call a cockpit row click makes, so the two cannot drift.
+        // Focus one pane by id and bring the window forward: the comux notification-jump path
+        // (decision #115). `activate_panel` is what a cockpit row click calls.
         "panel.focus" => {
             let resp = match req.params.get("panel_id").and_then(|v| v.as_str()) {
                 Some(panel_id) if !panel_id.is_empty() => {
                     let focused = mgr.activate_panel(panel_id);
                     if focused {
-                        // Only on a hit. Raising after a miss would bring forward
-                        // an instance that did NOT satisfy the request, right as
-                        // the caller falls back to activating the owner.
-                        //
-                        // `raised: false` regardless, and it is not pessimism: a
-                        // Wayland client holding no activation token has its
-                        // `present()` accepted and IGNORED (measured on Hyprland),
-                        // and X11 focus-stealing prevention can refuse it too. So
-                        // this asks, and reports that it cannot promise — the
-                        // caller then runs the compositor-level raise, which works
-                        // precisely because it is not the GUI asking for itself.
+                        // Only on a hit: raising after a miss would bring forward an instance that
+                        // did not satisfy the request. `raised: false` regardless: a Wayland client
+                        // without an activation token has its `present()` accepted and IGNORED
+                        // (measured on Hyprland) and X11 focus-stealing prevention can refuse it,
+                        // so this asks and reports it cannot promise; the caller then runs the
+                        // compositor-level raise.
                         window.present();
                     }
-                    // `focused: false` is a SUCCESSFUL call that found nothing,
-                    // not an error: the id may belong to another copad instance,
-                    // and comux branches on exactly this to decide whether to
-                    // fall back (`copad-mux/src/copadlink.rs`).
+                    // `focused: false` is a SUCCESSFUL call that found nothing, not an error: the
+                    // id may belong to another copad instance, and comux branches on it to decide
+                    // whether to fall back (`copad-mux/src/copadlink.rs`).
                     Response::success(
                         req.id.clone(),
                         json!({ "ok": true, "focused": focused, "raised": false }),
@@ -628,8 +589,6 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
-        // Pane focus movement. Already keybound (Ctrl+Shift+N / Left); exposing
-        // it so an agent can drive what a human could already do.
         "pane.focus_next" => {
             mgr.focus_direction(FocusDirection::Next);
             cmd.reply_with_completion(
@@ -646,7 +605,6 @@ pub fn dispatch(
             );
         }
 
-        // -- Tab bar commands --
         "tabs.toggle_bar" => {
             let visible = mgr.toggle_tab_bar();
             cmd.reply_with_completion(
@@ -680,7 +638,6 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
-        // -- Terminal agent commands --
         "terminal.read" => {
             let resp = handle_terminal_read(req, mgr);
             cmd.reply_with_completion(event_bus, resp);
@@ -776,10 +733,9 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
-        // Opens the cockpit, or focuses it if already open. The Ctrl+Shift+Y
-        // default can be shadowed by a user `[keybindings]` entry (those are
-        // checked first), so this keeps the panel reachable — and scriptable —
-        // regardless of what the keymap looks like.
+        // Opens the cockpit, or focuses it. The Ctrl+Shift+Y default can be shadowed by a user
+        // `[keybindings]` entry (checked first), so this keeps the panel reachable and
+        // scriptable.
         "cockpit.open" => {
             mgr.toggle_cockpit();
             cmd.reply_with_completion(
@@ -813,13 +769,10 @@ pub fn dispatch(
         }
 
         _ => {
-            // Unknown to GUI — proxy to the daemon on a worker thread.
             crate::daemon_forward::forward(cmd.request.clone(), cmd.reply.clone());
         }
     }
 }
-
-// -- Background helpers --
 
 fn handle_bg_set(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
     let path = req.params.get("path").and_then(|v| v.as_str());
@@ -833,9 +786,8 @@ fn handle_bg_set(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
                     &format!("File not found: {p}"),
                 );
             }
-            // A directory is a valid *config* source but not something we can
-            // decode. Without this it reaches the decoder and fails with an
-            // opaque pixbuf error.
+            // A directory is a valid config source but cannot be decoded; without this it
+            // fails in the decoder with an opaque pixbuf error.
             if path.is_dir() {
                 return Response::error(
                     req.id.clone(),
@@ -847,8 +799,7 @@ fn handle_bg_set(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
                 );
             }
             bg.set_image(path);
-            // A manual pick restarts the rotation countdown so the timer
-            // doesn't replace it a moment later.
+            // A manual pick restarts the rotation countdown.
             bg.arm_rotation();
             Response::success(req.id.clone(), json!({ "status": "ok" }))
         }
@@ -868,8 +819,7 @@ fn handle_bg_next(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
             json!({ "status": "ok", "mode": "deactive" }),
         );
     }
-    // `pick` already skips vanished entries, so a `None` here means the
-    // source is genuinely empty rather than merely stale.
+    // `pick` already skips vanished entries, so `None` means genuinely empty, not stale.
     match bg.pick() {
         Some(img) => {
             bg.set_image_from_list(Path::new(&img));
@@ -886,8 +836,7 @@ fn handle_bg_next(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
 
 fn handle_bg_toggle(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
     let now_active = bg.toggle_mode();
-    // Mark before the watcher's echo of our own write arrives — other
-    // instances react via their own mode-file monitors.
+    // Mark before the watcher's echo of our own write arrives.
     bg.note_mode_applied(now_active);
     if now_active {
         if let Some(img) = bg.pick() {
@@ -901,10 +850,9 @@ fn handle_bg_toggle(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
     Response::success(req.id.clone(), json!({ "status": "ok", "mode": mode }))
 }
 
-/// Delete the currently displayed wallpaper from disk AND the list file,
-/// then rotate to the next pick. Only operates on list-picked images
-/// (rotation / `background.next` / `toggle`) — a manually `set` file or a
-/// config `[background] image` is never deleted.
+/// Delete the currently displayed wallpaper from disk AND the list file, then rotate to the
+/// next pick. Only list-picked images (rotation / `background.next` / `toggle`); a manually
+/// `set` file or a config `[background] image` is never deleted.
 fn handle_bg_delete_current(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
     let Some(img) = bg.current_list_image() else {
         return Response::error(
@@ -954,15 +902,10 @@ fn handle_bg_set_tint(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
     }
 }
 
-// -- WebView command helpers --
-
-/// Reply to a browser method, applying the delivery-time half of the gate.
-///
-/// Every browser reply goes through here, including the early `invalid_params`
-/// / `not_found` errors, because a protected write's ERROR leaks the same bit
-/// its result does — "the selector was not found" is still an answer about the
-/// page. `finalize` collapses both into one fixed response, and only while the
-/// profile is protected.
+/// Reply to a browser method, applying the delivery-time half of the gate. Every browser reply
+/// goes through here, including early `invalid_params` / `not_found` errors: a protected write's
+/// ERROR leaks the same bit its result does. `finalize` collapses both into one fixed response,
+/// only while the profile is protected.
 fn browser_reply(
     cmd: &SocketCommand,
     event_bus: &EventBus,
@@ -1124,9 +1067,8 @@ fn handle_webview_execute_js(
     let silent = cmd.silent_completion;
     let bus = event_bus.clone();
     let reply = cmd.reply;
-    // The delivery-time half of the gate: re-asks `authorize` against live
-    // state, so a read that was in flight when the tab entered `Protected` is
-    // suppressed rather than answered with what it already had.
+    // Delivery-time half of the gate: re-asks `authorize` against live state, so a read in
+    // flight when the tab entered `Protected` is suppressed.
     let out = crate::browser::BrowserReply::new(reply, bus, silent, ctx.clone(), mgr.clone());
     wv.execute_js(&code, move |result| {
         let resp = match result {
@@ -1202,9 +1144,8 @@ fn handle_webview_get_content(
     let silent = cmd.silent_completion;
     let bus = event_bus.clone();
     let reply = cmd.reply;
-    // The delivery-time half of the gate: re-asks `authorize` against live
-    // state, so a read that was in flight when the tab entered `Protected` is
-    // suppressed rather than answered with what it already had.
+    // Delivery-time half of the gate: re-asks `authorize` against live state, so a read in
+    // flight when the tab entered `Protected` is suppressed.
     let out = crate::browser::BrowserReply::new(reply, bus, silent, ctx.clone(), mgr.clone());
     wv.execute_js(&js_code, move |result| {
         let resp = match result {
@@ -1271,9 +1212,8 @@ fn handle_webview_screenshot(
     let silent = cmd.silent_completion;
     let bus = event_bus.clone();
     let reply = cmd.reply;
-    // The delivery-time half of the gate: re-asks `authorize` against live
-    // state, so a read that was in flight when the tab entered `Protected` is
-    // suppressed rather than answered with what it already had.
+    // Delivery-time half of the gate: re-asks `authorize` against live state, so a read in
+    // flight when the tab entered `Protected` is suppressed.
     let out = crate::browser::BrowserReply::new(reply, bus, silent, ctx.clone(), mgr.clone());
     let path = req
         .params
@@ -1285,7 +1225,6 @@ fn handle_webview_screenshot(
         let resp = match result {
             Ok(base64_png) => {
                 if let Some(path) = path {
-                    // Decode and save to file
                     match gtk4::glib::base64_decode(&base64_png) {
                         data if !data.is_empty() => match std::fs::write(&path, &data) {
                             Ok(_) => Response::success(req_id, json!({ "path": path })),
@@ -1303,7 +1242,6 @@ fn handle_webview_screenshot(
     });
 }
 
-/// Helper: run a JS snippet from webview::js module on a webview panel, send result via reply
 fn run_js_command(
     cmd: SocketCommand,
     mgr: &Rc<TabManager>,
@@ -1361,19 +1299,15 @@ fn run_js_command(
     let silent = cmd.silent_completion;
     let bus = event_bus.clone();
     let reply = cmd.reply;
-    // The delivery-time half of the gate: re-asks `authorize` against live
-    // state, so a read that was in flight when the tab entered `Protected` is
-    // suppressed rather than answered with what it already had.
+    // Delivery-time half of the gate: re-asks `authorize` against live state, so a read in
+    // flight when the tab entered `Protected` is suppressed.
     let out = crate::browser::BrowserReply::new(reply, bus, silent, ctx.clone(), mgr.clone());
     wv.execute_js(&js_code, move |result| {
         let resp = match result {
-            Ok(json_str) => {
-                // Parse the JSON string returned by JS to embed as structured data
-                match serde_json::from_str::<serde_json::Value>(&json_str) {
-                    Ok(val) => Response::success(req_id, json!({ "result": val })),
-                    Err(_) => Response::success(req_id, json!({ "result": json_str })),
-                }
-            }
+            Ok(json_str) => match serde_json::from_str::<serde_json::Value>(&json_str) {
+                Ok(val) => Response::success(req_id, json!({ "result": val })),
+                Err(_) => Response::success(req_id, json!({ "result": json_str })),
+            },
             Err(e) => Response::error(req_id, "js_error", &e),
         };
         out.send(resp);
@@ -1612,16 +1546,13 @@ fn handle_webview_devtools(req: &Request, mgr: &Rc<TabManager>) -> Response {
     })
 }
 
-// -- Utility functions --
-
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// Resolve the cwd a `workflow.run` spawns its tab in: a resolved project's
-/// workspace path wins, else the active pane's cwd, else `$HOME`. The final
-/// fallback lets project-agnostic workflows (e.g. `/catchup`) launch from the
-/// panel — whose own pane carries no cwd — instead of failing.
+/// Resolve the cwd a `workflow.run` spawns its tab in: a resolved project's workspace path, else
+/// the active pane's cwd, else `$HOME`, so project-agnostic workflows (e.g. `/catchup`) can
+/// launch from a panel whose own pane carries no cwd.
 fn resolve_workflow_workspace(
     project: Option<&copad_core::project::Project>,
     active_cwd: Option<PathBuf>,
@@ -1636,13 +1567,10 @@ pub fn cleanup(socket_path: &str) {
     let _ = std::fs::remove_file(socket_path);
 }
 
-// -- Terminal agent command helpers --
-
 fn resolve_terminal(
     req: &Request,
     mgr: &Rc<TabManager>,
 ) -> Result<Rc<crate::panel::PanelVariant>, Response> {
-    // If id is provided, find that specific panel
     if let Some(id) = req.params.get("id").and_then(|v| v.as_str()) {
         let panel = mgr.find_panel_by_id(id).ok_or_else(|| {
             Response::error(
@@ -1661,14 +1589,12 @@ fn resolve_terminal(
         return Ok(panel);
     }
 
-    // No id: try active panel first, then fall back to any terminal panel
     if let Some(panel) = mgr.active_panel()
         && panel.as_terminal().is_some()
     {
         return Ok(panel);
     }
 
-    // Active panel is not a terminal (e.g. plugin/webview) — find any terminal
     mgr.find_first_terminal()
         .ok_or_else(|| Response::error(req.id.clone(), "no_terminal", "No terminal panel found"))
 }
@@ -1680,7 +1606,6 @@ fn handle_terminal_read(req: &Request, mgr: &Rc<TabManager>) -> Response {
     };
     let term = panel.as_terminal().unwrap();
 
-    // Optional range params
     let has_range = req.params.get("start_row").is_some();
     let text = if has_range {
         let start_row = req
@@ -1741,7 +1666,6 @@ fn handle_terminal_exec(req: &Request, mgr: &Rc<TabManager>) -> Response {
         }
     };
     let term = panel.as_terminal().unwrap();
-    // Send command + newline to execute
     term.feed_input(&format!("{command}\n"));
     Response::success(req.id.clone(), json!({ "status": "ok" }))
 }
@@ -1756,7 +1680,6 @@ fn handle_terminal_feed(req: &Request, mgr: &Rc<TabManager>) -> Response {
         None => return Response::error(req.id.clone(), "invalid_params", "Missing 'text' param"),
     };
     let term = panel.as_terminal().unwrap();
-    // Send raw text (no newline appended)
     term.feed_input(text);
     Response::success(req.id.clone(), json!({ "status": "ok" }))
 }
@@ -1768,7 +1691,6 @@ fn handle_terminal_history(req: &Request, mgr: &Rc<TabManager>) -> Response {
     };
     let term = panel.as_terminal().unwrap();
 
-    // Number of scrollback lines to read (default 100)
     let lines = req
         .params
         .get("lines")
@@ -1778,7 +1700,6 @@ fn handle_terminal_history(req: &Request, mgr: &Rc<TabManager>) -> Response {
     let row_count = term.terminal.row_count();
     let col_count = term.terminal.column_count();
 
-    // History is the `lines` rows above the screen, in VTE's absolute row numbers.
     let top = term.screen_top_row();
     let start_row = (top - lines).max(0);
     let end_row = top + row_count - 1;
@@ -1805,7 +1726,6 @@ fn handle_terminal_context(req: &Request, mgr: &Rc<TabManager>) -> Response {
     let state = term.state();
     let screen = term.read_screen();
 
-    // Recent scrollback (last 50 lines above visible area)
     let history_lines = req
         .params
         .get("history_lines")
@@ -1829,13 +1749,11 @@ fn handle_terminal_context(req: &Request, mgr: &Rc<TabManager>) -> Response {
     )
 }
 
-/// Spawns a tab at `workspace_path` and runs `tmux new-session -A -s
-/// <name> 'claude [...]'`. The `-A` attaches to an existing same-name
-/// session (re-running on a worktree re-attaches live claude rather
-/// than stacking duplicates) or creates one. `prompt` (mutually
-/// exclusive with `resume_session`) is paste-seeded via
-/// `spawn_claude_prompt_seeder` once two readiness checks confirm the
-/// pane is claude — failures log but don't propagate.
+/// Spawns a tab at `workspace_path` and runs `tmux new-session -A -s <name> 'claude [...]'`.
+/// `-A` attaches to an existing same-name session (re-running on a worktree re-attaches live
+/// claude instead of stacking duplicates) or creates one. `prompt` (mutually exclusive with
+/// `resume_session`) is paste-seeded via `spawn_claude_prompt_seeder` once two readiness checks
+/// confirm the pane is claude; failures log but don't propagate.
 fn handle_claude_start(
     req: &Request,
     mgr: &Rc<TabManager>,
@@ -1877,12 +1795,8 @@ fn handle_claude_start(
         );
     }
 
-    // `fresh_session` (Phase 22.2): mirror of life-assistant's `ship`
-    // contract — side-effecting flows force a brand-new tmux session
-    // so they never accidentally attach onto a stale one. v1 implements
-    // by suffixing the derived/explicit session_name with the current
-    // unix seconds, which guarantees uniqueness in practice (1-sec
-    // granularity is finer than any realistic re-dispatch cadence).
+    // `fresh_session`: side-effecting flows force a brand-new tmux session so they never attach
+    // onto a stale one, by suffixing the session name (see the uniquifier below).
     let fresh_session = match req.params.get("fresh_session") {
         Some(serde_json::Value::Bool(b)) => *b,
         Some(serde_json::Value::Null) | None => false,
@@ -1895,10 +1809,8 @@ fn handle_claude_start(
         }
     };
 
-    // session_name: explicit or derived. tmux forbids `:` and `.`
-    // in session names; we restrict further to ASCII alphanumeric
-    // + `-_` so the value stays safe to embed in shell commands
-    // without needing further escaping.
+    // session_name: explicit or derived. tmux forbids `:` and `.`; we restrict to ASCII
+    // alphanumeric + `-_` so the value is safe to embed in shell commands unescaped.
     let session_name = match req.params.get("session_name") {
         Some(serde_json::Value::String(s)) if !s.is_empty() => {
             if let Err(e) = validate_tmux_session_name(s) {
@@ -1920,18 +1832,11 @@ fn handle_claude_start(
         }
     };
 
-    // Apply fresh_session uniquification AFTER session_name resolution
-    // so explicit + derived paths share the same suffix logic. The unix
-    // timestamp suffix passes `validate_tmux_session_name` /
-    // `sanitize_session_name` because it's ASCII digits only.
-    //
-    // **Microsecond precision + atomic counter** (codex 22.2 retro-review C1):
-    // micros alone leave a 1µs window where two concurrent dispatches in
-    // the same workspace produce identical session names → `tmux
-    // new-session -A` attaches the second to the first, breaking the
-    // fresh contract. Combining wall-clock micros with a process-local
-    // atomic counter closes the window — same uniqueness pattern used
-    // for goal/mission/approval ids in the 22.4-22.7 audit.
+    // Uniquify AFTER session_name resolution so explicit and derived names share the suffix
+    // logic; the digits-only suffix passes `validate_tmux_session_name`. Micros alone leave a
+    // 1us window where two concurrent dispatches in a workspace get identical names and `tmux
+    // new-session -A` attaches the second to the first, so a process-local atomic counter is
+    // combined with the wall-clock micros.
     let session_name = if fresh_session {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1943,9 +1848,8 @@ fn handle_claude_start(
         session_name
     };
 
-    // resume_session: optional claude session id. Validated
-    // permissively (anything non-empty), single-quote-escaped
-    // before embedding in the tmux command.
+    // resume_session: optional claude session id, validated permissively (non-empty) and
+    // single-quote-escaped before embedding in the tmux command.
     let resume_session = match req.params.get("resume_session") {
         Some(serde_json::Value::String(s)) if !s.is_empty() => {
             for c in s.chars() {
@@ -1969,12 +1873,9 @@ fn handle_claude_start(
         }
     };
 
-    // Prompt seeding via tmux paste-buffer. Caller can
-    // pass a (possibly multi-line) prompt that we deliver to claude's
-    // REPL once the session is alive. `prompt` and `resume_session`
-    // are mutually exclusive — `--resume` restores an existing
-    // conversation (its own context wins), seeding new text on top
-    // would just confuse claude.
+    // Prompt seeding via tmux paste-buffer. `prompt` and `resume_session` are mutually
+    // exclusive: `--resume` restores an existing conversation, and seeding on top would
+    // confuse claude.
     let prompt_to_seed = match req.params.get("prompt") {
         Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
         Some(serde_json::Value::String(_)) | Some(serde_json::Value::Null) | None => None,
@@ -2013,17 +1914,13 @@ fn handle_claude_start(
         shell_single_quote(&claude_cmd),
     );
 
-    // Pass the tmux command as `initial_input` so it's fed from
-    // inside VTE's spawn_async success callback — eliminates
-    // the race where a feed_input call after add_tab_with_cwd
-    // could write to a PTY whose child shell isn't attached yet.
+    // Passed as `initial_input` so it is fed from VTE's spawn_async success callback, avoiding a
+    // write to a PTY whose child shell isn't attached yet.
     let (panel, tab_index) =
         mgr.add_tab_with_cwd_and_initial_input(window, Some(&canon), Some(tmux_command));
     let panel_id = panel.id().to_string();
     if panel.as_terminal().is_none() {
-        // add_tab_with_cwd_and_initial_input always returns a
-        // terminal panel today. If that ever changes, we want to
-        // know.
+        // Always a terminal panel today; fail loudly if that changes.
         return Response::error(
             req.id.clone(),
             "internal_error",
@@ -2031,19 +1928,12 @@ fn handle_claude_start(
         );
     }
 
-    // Background-seed the prompt once claude's REPL is up. Polling
-    // `tmux capture-pane` for a readiness signal avoids a fixed
-    // sleep that's either too short (race) or too long (wastes the
-    // user's time before they can interact). Runs in its own thread
-    // so claude.start returns to the caller immediately.
+    // Seed the prompt in a background thread once claude's REPL is up; polling `tmux
+    // capture-pane` avoids a fixed sleep that is either racy or wasteful.
     if let Some(prompt) = prompt_to_seed {
         spawn_claude_prompt_seeder(session_name.clone(), prompt);
     }
 
-    // Return both identifiers — `panel_id` is the UUID consumed by
-    // session.info / session.list, `tab` is the numeric index
-    // consumed by tab-bar UI. Same shape as the `tab.created`
-    // event payload so caller code can be uniform.
     Response::success(
         req.id.clone(),
         json!({
@@ -2055,13 +1945,10 @@ fn handle_claude_start(
     )
 }
 
-/// `workflow.run` — Phase 22.2 dispatcher. Resolves the spec, validates
-/// form values, substitutes the prompt template, then reuses
-/// `handle_claude_start` in-process by constructing a synthetic `Request`
-/// with the resolved params. Emits `workflow.started` on the bus regardless
-/// of caller; `workflow.timed_out` is registered as a one-shot timer when
-/// `timeout_secs` is set (event only — does not kill the subprocess in v1;
-/// hard kill lands in 22.6).
+/// `workflow.run`: resolves the spec, validates form values, substitutes the prompt template,
+/// then reuses `handle_claude_start` in-process with a synthetic `Request`. Emits
+/// `workflow.started` on the bus; `workflow.timed_out` is a one-shot timer when `timeout_secs`
+/// is set (event only, it does not kill the subprocess).
 fn handle_workflow_run(
     req: &Request,
     mgr: &Rc<TabManager>,
@@ -2091,7 +1978,6 @@ fn handle_workflow_run(
         }
     };
 
-    // Form values: accept object map or null/missing (= empty).
     let values: std::collections::HashMap<String, String> = match req.params.get("values") {
         None | Some(serde_json::Value::Null) => std::collections::HashMap::new(),
         Some(serde_json::Value::Object(map)) => {
@@ -2119,7 +2005,6 @@ fn handle_workflow_run(
         return Response::error(req.id.clone(), "invalid_params", &e.to_string());
     }
 
-    // Project resolution: explicit param → active context fallback → None.
     let explicit_project = req.params.get("project").and_then(|v| v.as_str());
     let registry = mgr.project_registry().lock().unwrap();
     let resolved_project: Option<copad_core::project::Project> =
@@ -2150,20 +2035,16 @@ fn handle_workflow_run(
         );
     }
 
-    // A resolved project wins; otherwise the active pane's cwd; otherwise
-    // $HOME so project-agnostic workflows (require_project is false here —
-    // required ones already errored above) still get a usable directory
-    // instead of failing with no_workspace.
+    // A resolved project wins; otherwise the active pane's cwd; otherwise $HOME so
+    // project-agnostic workflows still get a usable directory instead of `no_workspace`.
     let workspace_path = resolve_workflow_workspace(
         resolved_project.as_ref(),
         mgr.context().snapshot().active_cwd,
     );
 
-    // Codex round-8 C1: merge unfilled optional fields as either their
-    // `default` or "" before substitute, so `cross-review` with no
-    // `intent_brief` doesn't fail as `template_error: unknown
-    // placeholder 'intent_brief'`. Required fields are already
-    // validated above.
+    // Merge unfilled optional fields as their `default` or "" before substitute, so
+    // `cross-review` without `intent_brief` doesn't fail with `template_error: unknown
+    // placeholder`. Required fields are validated above.
     let mut effective_values = values.clone();
     for field in &spec.form_fields {
         if !effective_values.contains_key(&field.name) {
@@ -2200,10 +2081,8 @@ fn handle_workflow_run(
         );
     }
 
-    // Codex 22.2 retro-review C1: micros alone collide under same-
-    // microsecond concurrent dispatches; the seq closes the window so
-    // workflow.started / workflow.timed_out events can be correlated
-    // unambiguously even under load.
+    // Micros alone collide under same-microsecond concurrent dispatches; the seq lets
+    // workflow.started / workflow.timed_out be correlated under load.
     let run_id = format!(
         "wfr-{}-{}",
         std::time::SystemTime::now()
@@ -2213,9 +2092,6 @@ fn handle_workflow_run(
         next_fresh_session_seq()
     );
 
-    // Construct synthetic Request for handle_claude_start. Reusing the
-    // existing handler in-process is cheaper than duplicating the
-    // workspace_path / session_name / paste-buffer pipeline.
     let claude_params = json!({
         "workspace_path": workspace_path.display().to_string(),
         "prompt": prompt,
@@ -2229,9 +2105,7 @@ fn handle_workflow_run(
     };
     let claude_resp = handle_claude_start(&claude_req, mgr, window);
     if !claude_resp.ok {
-        // Propagate the error verbatim — caller sees the same shape they'd
-        // have seen had they called claude.start directly, with workflow.run's
-        // request id.
+        // Propagate verbatim: same shape as calling claude.start directly, with workflow.run's id.
         return claude_resp;
     }
 
@@ -2273,8 +2147,7 @@ fn handle_workflow_run(
         let workflow_id = spec.id.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
-            // v1: emit-only signal. Does NOT kill the claude subprocess
-            // — hard kill lands in 22.6 with runledger + tab-exit watcher.
+            // Emit-only: does NOT kill the claude subprocess.
             bus_clone.publish(BusEvent::new(
                 "workflow.timed_out".to_string(),
                 BUS_SOURCE_COPAD_LINUX,
@@ -2298,18 +2171,16 @@ fn handle_workflow_run(
     )
 }
 
-/// Last 1-2 path components joined by `-`, lowercased + sanitized.
-/// Two components, not one, so `<root>/feature/foo` doesn't collapse
-/// to `foo` and collide with siblings sharing a leaf name.
-/// Process-local atomic counter for breaking ties on `fresh_session`
-/// uniqueness and `wfr-<…>` run id generation when two calls land in
-/// the same wall microsecond. Codex 22.2 retro-review C1.
+/// Process-local counter breaking ties on `fresh_session` and `wfr-<...>` run ids when two calls
+/// land in the same wall microsecond.
 fn next_fresh_session_seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Last two path components, so `<root>/feature/foo` does not collapse to `foo` and collide with
+/// siblings sharing a leaf name.
 fn derive_session_name(path: &std::path::Path) -> String {
     let mut parts: Vec<String> = Vec::new();
     for comp in path.components().rev() {
@@ -2362,23 +2233,19 @@ fn validate_tmux_session_name(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Waits for claude's REPL in `session_name`'s tmux pane, then pastes
-/// `prompt` via tmux load-buffer + paste-buffer + Enter.
+/// Waits for claude's REPL in `session_name`'s tmux pane, then pastes `prompt` via tmux
+/// load-buffer + paste-buffer + Enter.
 ///
-/// **Trust boundary**: `tmux new-session -A` attaches if the session
-/// already exists, ignoring our `claude` command. Pasting into a
-/// pre-existing shell pane would EXECUTE the prompt as a shell command
-/// and exfiltrate `linked_kb` content into history. The seeder pastes
-/// only when BOTH gates pass:
-/// 1. `pane_current_command` is claude (or the node binary it's built
-///    on); shells (`zsh`/`bash`/`sh`/`fish`) hard-skip.
-/// 2. `capture-pane` shows claude-specific markers (banner / `Try "`);
-///    generic `> ` or box-drawing are insufficient since shells emit those.
+/// Trust boundary: `tmux new-session -A` attaches to an existing session and ignores our
+/// `claude` command, and pasting into a pre-existing shell pane would EXECUTE the prompt as a
+/// shell command. The seeder pastes only when BOTH gates pass:
+/// 1. `pane_current_command` is claude (or the node binary it runs on); shells hard-skip.
+/// 2. `capture-pane` shows claude-specific markers (banner / `Try "`); generic `> ` or
+///    box-drawing is insufficient since shells emit those.
 ///
-/// Failures log; never propagated (claude.start already returned).
+/// Failures log and are never propagated (claude.start already returned).
 fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
     std::thread::spawn(move || {
-        // Initial settle so capture-pane has SOMETHING to inspect.
         std::thread::sleep(std::time::Duration::from_millis(400));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
@@ -2392,8 +2259,7 @@ fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
                 .output()
             {
                 let s = String::from_utf8_lossy(&out.stdout);
-                // Claude-specific markers only. Dropped the generic
-                // "> " / box-drawing matchers — they fire on shells too.
+                // Claude-specific markers only: generic "> " / box-drawing also match shells.
                 if s.contains("Anthropic")
                     || s.contains("Try \"")
                     || s.contains("claude --")
@@ -2406,10 +2272,8 @@ fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
-        // Cross-check: what's the current foreground command in the
-        // pane? `pane_current_command` is the kernel's view, not
-        // capture-pane's rendered text — survives even if claude's
-        // banner has scrolled off.
+        // `pane_current_command` is the kernel's view, not the rendered text, so it survives
+        // claude's banner scrolling off.
         let current_cmd = std::process::Command::new("tmux")
             .args([
                 "display-message",
@@ -2435,10 +2299,8 @@ fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
             return;
         }
 
-        // Write the prompt to a temp file → load-buffer → paste-buffer.
-        // Going through a buffer is what makes multi-line + special-char
-        // payloads safe; send-keys -l would also work but each special
-        // character needs care.
+        // Through a temp file -> load-buffer -> paste-buffer, which keeps multi-line and
+        // special-char payloads safe.
         let mut tmpf = match tempfile::NamedTempFile::new() {
             Ok(f) => f,
             Err(e) => {
@@ -2472,15 +2334,9 @@ fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
             eprintln!("[claude.start] tmux paste-buffer failed: {paste:?}");
             return;
         }
-        // Submit. claude's REPL needs TWO Enters for long pastes:
-        // bracketed-paste-collapse mode renders the input as
-        // `[Pasted text #1 +N lines]` once a paste exceeds claude's
-        // inline threshold, so the first Enter commits/expands the
-        // paste placeholder and the second sends it to the model.
-        // Short pastes that don't collapse get submitted by the
-        // first Enter; the second hits an already-empty input and
-        // claude no-ops on it. Two-Enter covers both cases without
-        // inspecting claude's UI state.
+        // Submit. Claude's REPL needs TWO Enters for long pastes: a paste over its inline
+        // threshold collapses to `[Pasted text #1 +N lines]`, the first Enter expands it and the
+        // second sends it. For short pastes the second Enter hits an empty input and no-ops.
         let _ = std::process::Command::new("tmux")
             .args(["send-keys", "-t", &session_name, "Enter"])
             .status();
@@ -2491,8 +2347,7 @@ fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
     });
 }
 
-/// POSIX-safe single-quote escape: wrap in `'…'`, replace any
-/// embedded `'` with `'\''`. Result is a single shell token.
+/// POSIX single-quote escape: wrap in `'...'`, replace embedded `'` with `'\''`.
 fn shell_single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -2581,8 +2436,6 @@ fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow, event_bu
     });
 }
 
-// -- Plugin command helpers --
-
 fn handle_plugin_open(req: &Request, mgr: &Rc<TabManager>) -> Response {
     let plugin_name = match req.params.get("plugin").and_then(|v| v.as_str()) {
         Some(n) => n,
@@ -2594,9 +2447,6 @@ fn handle_plugin_open(req: &Request, mgr: &Rc<TabManager>) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("main");
 
-    // `resolve_by_name` honors the duplicate-winner rule the daemon
-    // uses for `plugin.<name>.<cmd>` / `_module.run`, so panel open
-    // targets the same manifest as command dispatch and module exec.
     let plugin = match copad_core::plugin::resolve_by_name(mgr.plugins(), plugin_name) {
         Some(p) => p.clone(),
         None => {
@@ -2653,8 +2503,7 @@ mod tests {
         assert_eq!(sanitize_session_name("v1.2.3"), "v1-2-3");
         assert_eq!(sanitize_session_name("ALL-CAPS"), "all-caps");
         assert_eq!(sanitize_session_name("---trim---"), "trim");
-        // Empty-after-sanitize falls back to a non-empty default
-        // so callers always have a usable session name.
+        // Empty after sanitizing falls back to a usable default.
         assert_eq!(sanitize_session_name("///"), "claude");
     }
 
@@ -2663,7 +2512,6 @@ mod tests {
         let p = std::path::Path::new("/home/user/dev/copad-worktrees/feature/foo");
         assert_eq!(derive_session_name(p), "feature-foo");
         let p2 = std::path::Path::new("/home/user/dev/myrepo");
-        // Only one path-after-root component left? "dev-myrepo".
         assert_eq!(derive_session_name(p2), "dev-myrepo");
     }
 
@@ -2684,12 +2532,10 @@ mod tests {
             aliases: vec![],
             git_remote: None,
         };
-        // Project wins even when an active cwd is present.
         assert_eq!(
             resolve_workflow_workspace(Some(&proj), Some(PathBuf::from("/elsewhere"))),
             PathBuf::from("/home/u/dev/copad")
         );
-        // A project's subpath is honored.
         let sub = Project {
             subpath: Some(PathBuf::from("crates/inner")),
             ..proj.clone()
@@ -2698,26 +2544,18 @@ mod tests {
             resolve_workflow_workspace(Some(&sub), None),
             PathBuf::from("/home/u/dev/copad/crates/inner")
         );
-        // No project: active cwd is used.
         assert_eq!(
             resolve_workflow_workspace(None, Some(PathBuf::from("/work/here"))),
             PathBuf::from("/work/here")
         );
-        // No project and no cwd: $HOME fallback (the project-agnostic path).
         assert_eq!(resolve_workflow_workspace(None, None), home_dir());
     }
 
     #[test]
     fn shell_single_quote_round_trips() {
-        // No special chars: just wrapping.
         assert_eq!(shell_single_quote("simple"), "'simple'");
-        // Embedded single quote uses '\''.
         assert_eq!(shell_single_quote("foo'bar"), "'foo'\\''bar'");
-        // Empty string is still quoted (a valid empty shell arg).
         assert_eq!(shell_single_quote(""), "''");
-        // Whitespace and special chars passed through inside the
-        // quotes — the whole point of single-quoting is shell
-        // doesn't interpret them.
         assert_eq!(shell_single_quote("a; b $C"), "'a; b $C'");
     }
 }

@@ -16,9 +16,7 @@ use crate::kitty_relay::{self, Relay, RelayOptions};
 use crate::panel::Panel;
 use crate::search::SearchBar;
 
-/// POSIX single-quote escape: every `'` becomes `'\''` and the whole string is
-/// wrapped in `'...'`. Safe for any shell-interpreted character (spaces, `$`,
-/// backticks, `;`, glob chars, newlines). Empty string round-trips as `''`.
+/// POSIX single-quote escape: every `'` becomes `'\''` and the string is wrapped in `'...'`.
 /// Mirrors the Swift port's `shellQuote`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -26,16 +24,12 @@ fn shell_quote(s: &str) -> String {
 
 /// Turn a dropped `GdkFileList` into one shell-quoted, space-joined payload.
 ///
-/// Two cases the naive version gets wrong:
-/// - **Non-local URIs.** GTK deserializes `text/uri-list` into a `FileList`, so a
-///   dragged *web* URL can arrive here rather than as a string, and `File::path()`
-///   is `None` for it. Falling back to the URI keeps the drop useful instead of
-///   silently doing nothing.
-/// - **Non-UTF-8 paths.** Linux filenames are arbitrary bytes but `paste_text`
-///   takes `&str`. `to_string_lossy` would paste a corrupted path that doesn't
-///   exist, so such entries are skipped loudly rather than mangled.
+/// - Non-local URIs: a dragged web URL can arrive as a `FileList` with `File::path()` `None`;
+///   falling back to the URI keeps the drop useful.
+/// - Non-UTF-8 paths: `paste_text` takes `&str` and `to_string_lossy` would paste a path that
+///   does not exist, so such entries are skipped loudly.
 ///
-/// Returns `None` when nothing usable survived (caller rejects the drop).
+/// Returns `None` when nothing usable survived (the caller rejects the drop).
 fn quote_dropped_files(files: &[gtk4::gio::File]) -> Option<String> {
     let mut out = Vec::new();
     for file in files {
@@ -47,20 +41,17 @@ fn quote_dropped_files(files: &[gtk4::gio::File]) -> Option<String> {
                     path
                 ),
             },
-            // Non-local (e.g. a web URL, or a remote gvfs mount). Quoted like the
-            // paths beside it — this lands in a shell command line, where an
-            // unquoted `?`/`&` in a URL would break the command.
+            // Non-local (a web URL, a remote gvfs mount): quoted like the paths beside it, since
+            // an unquoted `?`/`&` would break the shell command line.
             None => out.push(shell_quote(&file.uri())),
         }
     }
     (!out.is_empty()).then(|| out.join(" "))
 }
 
-/// Save dropped image bytes as PNG under `<cache>/drops/` and return the path.
-///
-/// `create_new` + a counter rather than trusting `<millis>-<n>`: two copad
-/// processes start their counters at the same value, so a bare timestamp+counter
-/// name can collide and truncate the other process's file.
+/// Save dropped image bytes as PNG under `<cache>/drops/` and return the path. Uses `create_new`
+/// plus a counter: two copad processes start their counters at the same value, so a bare
+/// timestamp+counter name can collide and truncate the other process's file.
 fn save_dropped_image(texture: &gdk::Texture) -> Option<std::path::PathBuf> {
     let dir = copad_core::paths::cache_dir().join("drops");
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -99,24 +90,20 @@ fn save_dropped_image(texture: &gdk::Texture) -> Option<std::path::PathBuf> {
     None
 }
 
-/// VTE reports cwd as `file://<hostname>/abs/path`. Naive
-/// `strip_prefix("file://")` would leave the hostname mixed in. Shared
-/// by `terminal.cwd_changed` emission and `terminal.state` for shape parity.
+/// VTE reports cwd as `file://<hostname>/abs/path`; a naive `strip_prefix("file://")` would keep
+/// the hostname. Shared by `terminal.cwd_changed` and `terminal.state`.
 pub(crate) fn normalize_osc7_uri(uri: &str) -> String {
     let path = if let Some(rest) = uri.strip_prefix("file://") {
         if let Some(idx) = rest.find('/') {
             &rest[idx..]
         } else {
-            // Bare host with no path — fall back to whatever's left so the
-            // value is at least non-empty.
             rest
         }
     } else {
         uri
     };
-    // OSC 7 paths are URI-encoded ("My%20Project"). Decode so the
-    // restored cwd is a real filesystem path. Falls back to the raw
-    // string on decode failure rather than dropping the value.
+    // OSC 7 paths are URI-encoded ("My%20Project"); decode so the restored cwd is a real path,
+    // falling back to the raw string on failure.
     glib::Uri::unescape_string(path, None)
         .map(|s| s.to_string())
         .unwrap_or_else(|| path.to_string())
@@ -146,22 +133,16 @@ pub struct TerminalPanel {
     pub terminal: Terminal,
     pub child_pid: Rc<Cell<i32>>,
     pub search_bar: SearchBar,
-    /// Last known cwd of the spawned shell. Seeded by the constructor's
-    /// `cwd` arg, then refreshed by tabs.rs's OSC 7 handler. Read at
-    /// window-close time by session persistence.
+    /// Last known cwd of the shell: seeded by the constructor, refreshed by tabs.rs's OSC 7
+    /// handler, read by session persistence at window close.
     pub last_cwd: Rc<std::cell::RefCell<Option<String>>>,
-    /// The kitty keyboard protocol relay between the shell and VTE, when the panel runs
-    /// behind one (`[terminal] kitty_keyboard`, decisions #164).
     relay: Rc<RefCell<Option<Relay>>>,
     exit: Rc<ExitLatch>,
-    /// The relay's shadow terminal for images and the layers drawing them, when the panel was
-    /// created with `[terminal] images` (decisions #190).
     images: Option<(Arc<ImageShared>, crate::image_layers::ImageLayers)>,
 }
 
-/// A relayed panel's exit: VTE has consumed every byte (its `eof`) AND the shell's status is
-/// in. They arrive in either order — a shell can close its terminal and keep running, or
-/// exit while a descendant still writes — and `child-exited` is emitted once both are.
+/// A relayed panel's exit: VTE has consumed every byte (its `eof`) AND the shell's status is in.
+/// They arrive in either order, and `child-exited` is emitted once both are.
 #[derive(Default)]
 struct ExitLatch {
     eof: Cell<bool>,
@@ -184,8 +165,7 @@ impl ExitLatch {
 
 impl Drop for TerminalPanel {
     fn drop(&mut self) {
-        // The panel is going away: no exit to report, and stopping the relay closes the
-        // shell's PTY, which hangs the shell up.
+        // No exit to report; stopping the relay closes the shell's PTY, which hangs it up.
         self.exit.done.set(true);
         self.relay.borrow_mut().take();
     }
@@ -212,7 +192,6 @@ fn prepare_relay(
     Ok(p_pty)
 }
 
-/// Give the shell (and the image shadow) VTE's grid and cell size in device pixels.
 fn sync_relay_size(terminal: &Terminal, relay: &Relay, images: Option<&ImageShared>) {
     let scale = terminal.scale_factor().max(1) as i64;
     let px = |v: i64| (v * scale).clamp(0, u16::MAX as i64) as u16;
@@ -236,10 +215,8 @@ fn sync_relay_size(terminal: &Terminal, relay: &Relay, images: Option<&ImageShar
 }
 
 impl TerminalPanel {
-    /// `cwd = None` inherits the copad process cwd. `initial_input` is
-    /// fed to the PTY only after `spawn_async`'s success callback fires
-    /// (writing pre-attach would race against child wiring); on spawn
-    /// failure it's dropped (no child = nowhere to deliver).
+    /// `cwd = None` inherits the copad process cwd. `initial_input` is fed to the PTY only after
+    /// `spawn_async` succeeds (writing earlier races the child wiring) and is dropped on failure.
     pub fn new_with_cwd_and_initial_input(
         config: &CopadConfig,
         cwd: Option<&std::path::Path>,
@@ -248,7 +225,6 @@ impl TerminalPanel {
     ) -> Self {
         let terminal = Terminal::new();
 
-        // Font
         let font_desc = gtk4::pango::FontDescription::from_string(&format!(
             "{} {}",
             config.terminal.font_family, config.terminal.font_size
@@ -256,10 +232,8 @@ impl TerminalPanel {
         terminal.set_font(Some(&font_desc));
         terminal.set_font_scale(DEFAULT_FONT_SCALE);
 
-        // Colors from theme. Background is forced transparent (and
-        // `set_clear_background(false)` skips the GL clear) so the
-        // window-level `BackgroundLayer` shows through every terminal,
-        // image or no image. The window's own CSS supplies the solid
+        // Background is forced transparent (and `set_clear_background(false)` skips the GL clear)
+        // so the window-level `BackgroundLayer` shows through; the window CSS supplies the solid
         // theme color when no background image is set.
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         let fg = parse_color(&theme.foreground);
@@ -276,7 +250,6 @@ impl TerminalPanel {
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
 
-        // Zoom shortcuts
         let zoom_controller = gtk4::EventControllerKey::new();
         let term_clone = terminal.clone();
         zoom_controller.connect_key_pressed(move |_, keyval, _, modifier| {
@@ -303,17 +276,12 @@ impl TerminalPanel {
         });
         terminal.add_controller(zoom_controller);
 
-        // Drag-and-drop: files / images / URLs, mirroring the macOS terminal.
-        // Routed through `paste_text` (not `feed_child`) so bracketed-paste mode
-        // is honored exactly like a clipboard paste — dropping several paths into
-        // an editor must not be interpreted as keystrokes.
+        // Drag-and-drop: files / images / URLs. Routed through `paste_text` (not `feed_child`) so
+        // bracketed-paste mode is honored; dropped paths must not be interpreted as keystrokes.
         //
-        // GTK negotiates ONE type and hands back one Value, so unlike macOS
-        // (which probes the pasteboard in priority order) precedence is the
-        // `set_types` order plus the match below. That is also why
-        // `quote_dropped_files` handles non-local URIs itself: a dragged web URL
-        // deserializes to a FileList, and there is no falling back to the String
-        // branch once GTK has chosen.
+        // GTK negotiates ONE type and hands back one Value, so precedence is the `set_types`
+        // order plus the match below, and `quote_dropped_files` handles non-local URIs itself: a
+        // dragged web URL deserializes to a FileList, with no falling back to the String branch.
         {
             let drop_target = gtk4::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
             drop_target.set_types(&[
@@ -329,8 +297,8 @@ impl TerminalPanel {
                             term_for_drop.paste_text(&text);
                             return true;
                         }
-                        // Everything was unusable (e.g. only non-UTF-8 paths) —
-                        // reject so the user sees the drop bounce back.
+                        // Everything unusable (e.g. only non-UTF-8 paths): reject so the drop
+                        // bounces back.
                         None => return false,
                     }
                 }
@@ -347,8 +315,6 @@ impl TerminalPanel {
                     };
                 }
                 if let Ok(text) = value.get::<String>() {
-                    // Bare, matching macOS priority 3: a dropped URL is text for
-                    // the shell/CLI to do something with.
                     term_for_drop.paste_text(&text);
                     return true;
                 }
@@ -357,12 +323,8 @@ impl TerminalPanel {
             terminal.add_controller(drop_target);
         }
 
-        // Spawn shell. Panel id is allocated here (not in the
-        // `Self { id, ... }` initializer below) so it can be
-        // injected into the child env BEFORE spawn — the shell's
-        // precmd hook reads `$COPAD_PANEL_ID` to attribute
-        // `pane.context_changed` events back to this pane. macOS
-        // already follows this pattern in TerminalViewController.swift.
+        // Panel id is allocated before spawn so it can go into the child env: the shell's precmd
+        // hook reads `$COPAD_PANEL_ID` to attribute `pane.context_changed` events to this pane.
         let id = uuid::Uuid::new_v4().to_string();
         let shell = config.terminal.shell.clone();
         let socket_env = format!(
@@ -372,35 +334,18 @@ impl TerminalPanel {
         let panel_id_env = format!("COPAD_PANEL_ID={id}");
         let child_pid: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
         let pid_cell = child_pid.clone();
-        // Resolve cwd once upfront. We pass `Option<&str>` to
-        // VTE's spawn_async, which interprets it as the working
-        // directory (None = inherit from copad). On Linux paths
-        // are arbitrary bytes; `to_string_lossy` substitutes
-        // U+FFFD for non-UTF-8 components rather than failing.
-        // In practice every cwd we receive flows through
-        // `std::fs::canonicalize` upstream, which itself
-        // operates on `OsStr` and produces canonical paths the
-        // user already typed somewhere, so non-UTF-8 cwds are a
-        // theoretical concern only.
+        // `to_string_lossy` substitutes U+FFFD for non-UTF-8 components rather than failing; cwds
+        // arrive canonicalized from upstream, so that is theoretical.
         let cwd_str = cwd.map(|p| p.to_string_lossy().into_owned());
         let cwd_arg: Option<&str> = cwd_str.as_deref();
-        // Clone the VTE Terminal handle (it's a refcounted
-        // GObject) into the spawn callback so we can reach the
-        // child after spawn completes. Then feed the initial
-        // input from THERE — not from the caller — to remove
-        // the race where the caller writes before the child
-        // is actually attached to the PTY.
+        // Feed the initial input from the spawn callback, not the caller: a caller write before
+        // the child is attached to the PTY would race.
         let terminal_for_init = terminal.clone();
         let on_spawned = move |result: Result<glib::Pid, glib::Error>| match &result {
             Ok(pid) => {
                 eprintln!("[copad] shell spawned, child_pid={}", pid.0);
                 pid_cell.set(pid.0);
                 if let Some(text) = &initial_input {
-                    // feed_child writes directly to the PTY
-                    // master — at this point the slave is
-                    // attached to the just-spawned shell, so
-                    // the bytes land in the shell's stdin
-                    // queue without ambiguity.
                     terminal_for_init.feed_child(text.as_bytes());
                 }
             }
@@ -434,7 +379,6 @@ impl TerminalPanel {
         } else {
             None
         };
-        // Without the relay there is no shadow to draw images from.
         let image_shared = image_shared.filter(|_| p_pty.is_some());
         match p_pty {
             Some(p_pty) => {
@@ -458,8 +402,8 @@ impl TerminalPanel {
                     -1,
                     gtk4::gio::Cancellable::NONE,
                     move |result| {
-                        // The shell's PTY object lives until the spawn finished; the relay
-                        // holds its own copies of the descriptor.
+                        // The shell's PTY object lives until the spawn finished; the relay holds
+                        // its own copies of the descriptor.
                         drop(keep);
                         if let Ok(pid) = &result {
                             glib::child_watch_add_local(*pid, move |_, status| {
@@ -495,8 +439,8 @@ impl TerminalPanel {
             on_exit();
         });
 
-        // VTE transparent CSS — required so the GTK widget composites
-        // its content against the window-level `BackgroundLayer`.
+        // VTE transparent CSS: the widget must composite against the window-level
+        // `BackgroundLayer`.
         let css_provider = gtk4::CssProvider::new();
         css_provider.load_from_string("vte-terminal { background-color: transparent; }");
         gtk4::style_context_add_provider_for_display(
@@ -505,18 +449,14 @@ impl TerminalPanel {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         );
 
-        // Search bar
         let search_bar = SearchBar::new(&terminal, &theme);
 
-        // Overlay only exists to host the search bar above the terminal.
-        // The background image moved to `BackgroundLayer` at the window
-        // level so every panel (terminals, plugins, webviews) sits over
-        // the same image instead of each terminal owning its own copy.
+        // The overlay only hosts the search bar; the background image is on `BackgroundLayer` at
+        // the window level.
         let overlay = gtk4::Overlay::new();
         let images = image_shared.map(|shared| {
             let layers =
                 crate::image_layers::attach(&terminal, shared.clone(), Rc::downgrade(&relay));
-            // z < 0 images go under the (transparent) terminal, the rest over it.
             let inner = gtk4::Overlay::new();
             inner.set_child(Some(&layers.below));
             inner.add_overlay(&terminal);
@@ -529,10 +469,10 @@ impl TerminalPanel {
             overlay.set_child(Some(&terminal));
         }
         if relay.borrow().is_some() {
-            // VTE sizes its own PTY (R) when it is allocated; the shell's (P) follows. An
-            // invisible overlay child is allocated right after the terminal in the same
-            // pass, so its `resize` sees the new grid. A font change moves the grid without
-            // resizing anything, hence the second hook.
+            // VTE sizes its own PTY (R) when allocated; the shell's (P) follows. An invisible
+            // overlay child is allocated right after the terminal in the same pass, so its
+            // `resize` sees the new grid. A font change moves the grid without resizing anything,
+            // hence the second hook.
             let sync = {
                 let (term, relay) = (terminal.downgrade(), Rc::downgrade(&relay));
                 let shared = images.as_ref().map(|(s, _)| s.clone());
@@ -574,7 +514,6 @@ impl TerminalPanel {
         }
     }
 
-    /// Read visible terminal screen text
     pub fn read_screen(&self) -> String {
         self.terminal
             .text_format(vte4::Format::Text)
@@ -587,15 +526,14 @@ impl TerminalPanel {
     /// row is not "N lines up" but a row that does not exist (reads as blank).
     pub fn screen_top_row(&self) -> i64 {
         let rows = self.terminal.row_count();
-        // The adjustment's upper bound is the buffer's end — but only once the widget has been
-        // laid out; the cursor row is a floor for it that is always current.
+        // The adjustment's upper bound is the buffer's end only once the widget is laid out; the
+        // cursor row is a floor for it that is always current.
         let upper = self.terminal.vadjustment().map_or(0, |a| a.upper() as i64);
         let (_, cursor_row) = self.terminal.cursor_position();
         (upper.max(cursor_row + 1) - rows).max(0)
     }
 
-    /// Read a specific range of terminal text (rows are VTE's absolute rows, see
-    /// [`Self::screen_top_row`]; cols are 0-based)
+    /// Rows are VTE's absolute rows (see [`Self::screen_top_row`]); cols are 0-based.
     pub fn read_range(&self, start_row: i64, start_col: i64, end_row: i64, end_col: i64) -> String {
         let (text, _len) = self.terminal.text_range_format(
             vte4::Format::Text,
@@ -608,11 +546,7 @@ impl TerminalPanel {
             .unwrap_or_default()
     }
 
-    /// Best-effort current cwd: OSC 7 (`current_directory_uri`) first,
-    /// then `/proc/<pid>/cwd`. Used by both `state()` (socket query)
-    /// and session persistence (window-close snapshot). Shells that
-    /// don't emit OSC 7 still produce a usable cwd through the proc
-    /// fallback as long as the child is alive.
+    /// Best-effort current cwd: OSC 7 first, then `/proc/<pid>/cwd` for shells that do not emit it.
     pub fn current_cwd(&self) -> Option<String> {
         if let Some(u) = self.terminal.current_directory_uri() {
             return Some(normalize_osc7_uri(u.as_str()));
@@ -623,12 +557,10 @@ impl TerminalPanel {
         {
             return Some(p.to_string_lossy().to_string());
         }
-        // Child PID gone (shell exited) — last_cwd preserves the OSC 7
-        // value or the spawn-time cwd.
+        // Child gone (shell exited): last_cwd keeps the OSC 7 value or the spawn-time cwd.
         self.last_cwd.borrow().clone()
     }
 
-    /// Get terminal state: cursor, dimensions, CWD, title
     pub fn state(&self) -> serde_json::Value {
         let (cursor_col, cursor_row) = self.terminal.cursor_position();
         let cwd = self.current_cwd();
@@ -641,7 +573,6 @@ impl TerminalPanel {
         })
     }
 
-    /// Send text to the terminal PTY (execute a command)
     pub fn feed_input(&self, text: &str) {
         self.terminal.feed_child(text.as_bytes());
     }
@@ -659,8 +590,8 @@ impl TerminalPanel {
         if self.terminal.enables_sixel() != config.terminal.images {
             apply_images(&self.terminal, config.terminal.images);
         }
-        // Images are drawn from a shadow kept since the panel opened: turning them off stops
-        // drawing and answering at once; turning them on reaches panels opened afterwards.
+        // The image shadow exists only for panels created with `[terminal] images`, so turning
+        // images on later reaches new panels only (decisions #190).
         if let Some((shared, layers)) = &self.images {
             let on = config.terminal.images;
             if shared
@@ -712,10 +643,8 @@ pub fn parse_color(hex: &str) -> gdk::RGBA {
     gdk::RGBA::new(r, g, b, 1.0)
 }
 
-/// Clamp an opacity into [0, 1]. Non-finite input (NaN / ±inf, reachable
-/// from a malformed TOML float) collapses to fully opaque rather than
-/// poisoning a CSS string or widget alpha — `f64::clamp` would otherwise
-/// propagate NaN through.
+/// Clamp into [0, 1]. Non-finite input (reachable from a malformed TOML float) collapses to
+/// fully opaque; `f64::clamp` would propagate NaN into CSS strings and widget alpha.
 pub fn norm_opacity(o: f64) -> f64 {
     if o.is_finite() {
         o.clamp(0.0, 1.0)
@@ -724,7 +653,6 @@ pub fn norm_opacity(o: f64) -> f64 {
     }
 }
 
-/// CSS `rgba(...)` literal for a `#rrggbb` color at the given alpha.
 pub fn rgba_css(hex: &str, alpha: f64) -> String {
     let c = parse_color(hex);
     format!(
@@ -757,13 +685,11 @@ mod shell_quote_tests {
 
     #[test]
     fn single_quote_is_escaped() {
-        // POSIX has no escape inside '...', so it must be closed, escaped, reopened.
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
     #[test]
     fn shell_metacharacters_are_inert() {
-        // The whole point: a hostile filename must stay one literal argument.
         assert_eq!(shell_quote("a; rm -rf /"), "'a; rm -rf /'");
         assert_eq!(shell_quote("$(whoami)"), "'$(whoami)'");
         assert_eq!(shell_quote("`id`"), "'`id`'");
@@ -773,12 +699,10 @@ mod shell_quote_tests {
 
     #[test]
     fn quote_breakout_attempt_stays_quoted() {
-        // The classic escape: a filename that tries to close our quote and append
-        // a command. Every `'` is neutralized, so the payload stays one word.
+        // A filename that tries to close our quote and append a command stays one word.
         let hostile = "'; rm -rf / #";
         let quoted = shell_quote(hostile);
         assert_eq!(quoted, r"''\''; rm -rf / #'");
-        // No bare (unescaped) closing quote can appear before the final char.
         assert!(quoted.ends_with('\''));
         assert!(quoted.starts_with('\''));
     }
@@ -820,16 +744,13 @@ mod osc7_tests {
 
     #[test]
     fn malformed_no_slash_after_host_is_preserved() {
-        // Edge: bare host, no path. Don't try to invent a value, just don't
-        // crash — return whatever's left so the caller sees a non-empty hint.
+        // Bare host, no path: return whatever is left so the caller gets a non-empty hint.
         assert_eq!(normalize_osc7_uri("file://lonely-host"), "lonely-host");
     }
 
     #[test]
     fn percent_decodes_path_segments() {
-        // VTE emits the path as URI-encoded. Without decoding, the
-        // restored cwd would not exist on disk for any path containing
-        // a space, accented character, etc.
+        // The restored cwd would not exist on disk for a path with a space or accent otherwise.
         assert_eq!(
             normalize_osc7_uri("file://arch/home/me/My%20Project"),
             "/home/me/My Project"
@@ -857,7 +778,6 @@ mod color_tests {
         assert_eq!(rgba_css("#1e1e2e", 0.85), "rgba(30,30,46,0.85)");
         assert_eq!(rgba_css("1e1e2e", 1.0), "rgba(30,30,46,1)");
         assert_eq!(rgba_css("#000000", 0.0), "rgba(0,0,0,0)");
-        // Out-of-range alpha is normalized before formatting.
         assert_eq!(rgba_css("#ffffff", 2.0), "rgba(255,255,255,1)");
     }
 }

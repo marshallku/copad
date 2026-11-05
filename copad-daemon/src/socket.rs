@@ -1,6 +1,3 @@
-//! Socket transport for copadd: bind well-known path, accept connections,
-//! route requests through `ActionRegistry`.
-
 use std::fs;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -23,12 +20,9 @@ use crate::gui_registry::{GuiRegistry, method_capability, method_invoke_timeout}
 
 pub type EventBus = Arc<CoreEventBus>;
 
-/// Legacy match-arm methods whose `<method>.completed` publication would
-/// dwarf real workflow events on the bus. These are read-only / agent-
-/// polled paths; their "completion" is the response itself. Mirror of
-/// `register_silent` for the legacy dispatch surface. copad-linux's
-/// socket::dispatch wrapper + the daemon-side `dispatch_via_gui` publish
-/// helper both consult this list before emitting.
+/// Legacy match-arm methods whose `<method>.completed` would dwarf real workflow events: they
+/// are read-only or agent-polled, and their completion is the response itself. Consulted by
+/// copad-linux's socket::dispatch wrapper and the daemon's `dispatch_via_gui`.
 pub const LEGACY_SILENT_METHODS: &[&str] = &[
     "terminal.read",
     "terminal.state",
@@ -38,10 +32,8 @@ pub const LEGACY_SILENT_METHODS: &[&str] = &[
     "tab.info",
     "session.list",
     "session.info",
-    // Read-only and pollable — without this, a client polling it over the
-    // daemon emits a `.completed` event per call, which triggers can see.
-    // (`webview.page_info` is missing here for the same reason; pre-existing,
-    // left alone rather than widened into this change.)
+    // Read-only and pollable: otherwise each polled call emits a `.completed` event that
+    // triggers can see.
     "webview.state",
 ];
 
@@ -50,22 +42,16 @@ pub fn is_legacy_silent(method: &str) -> bool {
 }
 
 impl SocketCommand {
-    /// Publish `<method>.completed` / `<method>.failed` on `bus` (when
-    /// the command is not marked silent and the method is not in
-    /// [`LEGACY_SILENT_METHODS`]) and forward `resp` to the original
-    /// caller. Convenience wrapper used by every copad-linux
-    /// `socket::dispatch` legacy match arm so chained triggers see
-    /// completion events uniformly across registry and legacy actions.
+    /// Publishes `<method>.completed`/`.failed` on `bus` (unless the command is silent or the
+    /// method is in [`LEGACY_SILENT_METHODS`]) and forwards `resp` to the caller.
     pub fn reply_with_completion(&self, bus: &EventBus, resp: Response) {
         publish_legacy_completion(bus, &self.request.method, self.silent_completion, &resp);
         let _ = self.reply.send(resp);
     }
 }
 
-/// Free-function variant of [`SocketCommand::reply_with_completion`]'s
-/// publish step. Used by callback-deferred handlers (webview JS exec,
-/// agent.approve dialog) that move `cmd.reply` into a closure and can no
-/// longer reach the SocketCommand method.
+/// Free-function form of [`SocketCommand::reply_with_completion`]'s publish step, for
+/// callback-deferred handlers that move `cmd.reply` into a closure.
 pub fn publish_legacy_completion(bus: &EventBus, method: &str, silent: bool, resp: &Response) {
     if silent || is_legacy_silent(method) {
         return;
@@ -88,10 +74,8 @@ fn response_to_action_result(resp: &Response) -> copad_core::action_registry::Ac
     }
 }
 
-/// GUI-owned methods that `ServiceSupervisor::new` reserves against plugin
-/// `provides[]` claims so a plugin can't shadow a GUI handler. copad-linux
-/// re-exports for its own dispatch match. Remove an entry when its method
-/// migrates into `ActionRegistry`.
+/// GUI-owned methods that `ServiceSupervisor::new` reserves against plugin `provides[]` claims
+/// so a plugin can't shadow a GUI handler. copad-linux re-exports it for its dispatch match.
 pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "background.set",
     "background.clear",
@@ -149,20 +133,13 @@ pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
 
 /// Browser Workbench methods a GUI has REGISTERED but not yet implemented.
 ///
-/// Reserved against plugin `provides[]` for the same reason as
-/// [`LEGACY_DISPATCH_METHODS`], but kept separate because they are not
-/// dispatchable yet: the command palette lists that one, and offering the user
-/// `browser.secret.fill` before it exists would advertise a non-feature.
+/// Reserved against plugin `provides[]` like [`LEGACY_DISPATCH_METHODS`], but separate: they are
+/// not dispatchable yet, and the command palette lists that one, so offering
+/// `browser.secret.fill` early would advertise a non-feature.
 ///
-/// The reservation is what stops a plugin claiming a name in the window between
-/// a method being registered and being built. That window is the dangerous one:
-/// `coctl secret fill` would reach the plugin instead of the GUI, and the
-/// credential boundary these methods exist to enforce
-/// (`copad_core::browser::authorize`) would never run. A plugin cannot read the
-/// secret that way — it never leaves the keychain — but it can impersonate the
-/// surface that handles it.
-///
-/// Move an entry into [`LEGACY_DISPATCH_METHODS`] when a GUI implements it.
+/// The reservation stops a plugin claiming a name between registration and implementation: then
+/// `coctl secret fill` would reach the plugin, `copad_core::browser::authorize` would never run,
+/// and the plugin could impersonate the surface that handles the credential.
 pub const BROWSER_RESERVED_METHODS: &[&str] = &[
     "webview.tab.new",
     "webview.tab.list",
@@ -185,18 +162,13 @@ pub fn new_event_bus() -> EventBus {
     Arc::new(CoreEventBus::new())
 }
 
-/// Socket request + reply channel, shared between the GUI's GTK main-loop
-/// pump and the daemon's stdio plugin dispatch.
 pub struct SocketCommand {
     pub request: Request,
     pub reply: mpsc::Sender<Response>,
-    /// Set true when this SocketCommand was constructed by
-    /// `gui_client::handle_invoke` (i.e., a daemon-Invoke proxy reaching
-    /// the GUI's local dispatch). The dispatch wrapper skips local
-    /// completion publishing in that case — the daemon already publishes
-    /// on its own bus after `client.invoke` returns, and the daemon→GUI
-    /// event forwarder bridges that event back so GUI-side triggers see
-    /// it exactly once.
+    /// Set when built by `gui_client::handle_invoke` (a daemon-Invoke proxy). The dispatch
+    /// wrapper then skips local completion publishing: the daemon publishes after
+    /// `client.invoke` returns and its event forwarder bridges that back, so GUI triggers see it
+    /// exactly once.
     pub silent_completion: bool,
 }
 
@@ -207,26 +179,22 @@ const SOCKET_FILE_MODE: u32 = 0o600;
 pub enum SocketPrep {
     Fresh,
     StaleCleared,
-    /// A live `copadd` is already listening — caller must not bind.
     InUse,
-    /// Path exists but is not a Unix socket — refuse to unlink. Caller
-    /// likely pointed `COPAD_SOCKET` at a regular file by mistake.
+    /// Path exists but is not a Unix socket; refuse to unlink (likely `COPAD_SOCKET` pointed at
+    /// a regular file).
     NotSocket,
-    /// Filesystem error while preparing.
     Error(String),
 }
 
-/// Idempotent. Creates parent dir (0700 atomically if it's our runtime
-/// dir), verifies ownership, then probes the path. Only `ConnectionRefused`
-/// on connect proves stale-ness; other errors → `Error` (refuse to unlink
-/// a possibly-live socket). Non-socket inodes are never unlinked.
+/// Idempotent. Creates the parent dir (0700 atomically if it's our runtime dir), verifies
+/// ownership, then probes the path. Only `ConnectionRefused` proves staleness; other errors
+/// give `Error` (never unlink a possibly-live socket). Non-socket inodes are never unlinked.
 pub fn prepare_socket_path(path: &Path) -> SocketPrep {
     if let Some(parent) = path.parent() {
         let owns_parent = parent == copad_core::paths::runtime_dir();
         if owns_parent {
-            // Atomic create with mode 0700 closes the umask window where
-            // another local user could pre-create the predictable
-            // `/tmp/copad-{uid}/` and slip a listener in.
+            // Atomic 0700 create closes the umask window where another local user could
+            // pre-create the predictable `/tmp/copad-{uid}/` and slip a listener in.
             use std::os::unix::fs::DirBuilderExt;
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true);
@@ -238,8 +206,8 @@ pub fn prepare_socket_path(path: &Path) -> SocketPrep {
                 ));
             }
 
-            // Atomic create no-ops on existing dirs — verify ownership in
-            // case an attacker created it first.
+            // Atomic create no-ops on an existing dir: verify ownership in case an attacker
+            // created it first.
             use std::os::unix::fs::MetadataExt;
             match fs::metadata(parent) {
                 Ok(meta) => {
@@ -257,8 +225,7 @@ pub fn prepare_socket_path(path: &Path) -> SocketPrep {
                 }
             }
 
-            // Repair perms on a dir created by an older copadd that
-            // didn't use the atomic-mode path.
+            // Repair perms on a dir created by an older copadd without the atomic-mode path.
             if let Err(e) =
                 fs::set_permissions(parent, fs::Permissions::from_mode(RUNTIME_DIR_MODE))
             {
@@ -301,9 +268,8 @@ fn is_unix_socket(path: &Path) -> std::io::Result<bool> {
     Ok(meta.file_type().is_socket())
 }
 
-/// Caller MUST have called `prepare_socket_path` first and not received
-/// `InUse`/`Error`. Socket file chmod'd to 0600 — fs perms gate `connect()`
-/// on Unix sockets, so this enforces owner-only access even if the parent
+/// Caller MUST have called `prepare_socket_path` first and not received `InUse`/`Error`. The
+/// socket is chmod'd 0600: fs perms gate `connect()`, so access is owner-only even if the parent
 /// dir mode is lax.
 pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
@@ -319,22 +285,13 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 pub struct DaemonState {
     pub actions: Arc<ActionRegistry>,
     pub gui: Arc<GuiRegistry>,
-    /// Forwarded to each registered GUI via `start_event_forwarder`.
     pub event_bus: EventBus,
-    /// Discovered once at startup, sorted by `manifest.plugin.name`
-    /// then `dir` as tiebreaker. Will back `plugin.<name>.<cmd>` and
-    /// `_module.run` dispatch in the next commit; currently consumed
-    /// by `plugin.list` only.
+    /// Discovered once at startup, sorted by `manifest.plugin.name` then `dir`.
     pub plugins: Arc<Vec<LoadedPlugin>>,
-    /// Path the daemon actually bound. Will be passed as
-    /// `COPAD_SOCKET` to plugin shell children in the next commit;
-    /// currently unused by dispatch.
     pub socket_path: PathBuf,
-    /// Daemon-side dispatch authority signal. Set from
-    /// `COPADD_HOST_TRIGGERS` at startup; advertised in
-    /// `gui.register` ack + `daemon.info`. When `true`, the daemon's
-    /// pump thread drives trigger dispatch; the GUI is expected
-    /// (Stage C) to empty its local engine in response.
+    /// Set from `COPADD_HOST_TRIGGERS`; advertised in the `gui.register` ack and `daemon.info`.
+    /// When true the daemon's pump thread drives trigger dispatch and the GUI is expected to
+    /// empty its local engine.
     pub host_triggers: bool,
 }
 
@@ -357,9 +314,6 @@ impl DaemonState {
         })
     }
 
-    /// Test-only constructor with empty plugins + placeholder socket path
-    /// and a fresh `GuiRegistry`. Production callers should pass real
-    /// values and share the registry with the trigger sink.
     #[cfg(test)]
     pub fn new_for_test(actions: Arc<ActionRegistry>, event_bus: EventBus) -> Arc<Self> {
         Self::new(
@@ -373,9 +327,8 @@ impl DaemonState {
     }
 }
 
-/// Returns on listener fatal error (caller runs `cleanup_socket`). We
-/// don't swallow accept errors — `accept(2)` on a Unix socket fails for
-/// fd exhaustion / bad listener fd, which we can't recover from.
+/// Returns on listener fatal error (caller runs `cleanup_socket`). Accept errors are not
+/// swallowed: they mean fd exhaustion or a bad listener fd, which is unrecoverable.
 pub fn run_accept_loop(listener: UnixListener, state: Arc<DaemonState>) {
     for stream in listener.incoming() {
         match stream {
@@ -393,12 +346,8 @@ pub fn run_accept_loop(listener: UnixListener, state: Arc<DaemonState>) {
     }
 }
 
-/// Extract the peer process's pid from a Unix socket via
-/// `SO_PEERCRED`. Used by `events.publish` to stamp the event's
-/// `source = "client.<pid>"` so trigger configs can correlate
-/// publishes to their originating script. Linux-only; non-Linux
-/// builds return `None` and the handler falls back to
-/// `client.unknown`.
+/// Peer pid via `SO_PEERCRED`, used by `events.publish` to stamp `source = "client.<pid>"`.
+/// Linux-only; elsewhere `None` and the handler uses `client.unknown`.
 #[cfg(target_os = "linux")]
 fn peer_pid(stream: &UnixStream) -> Option<u32> {
     use std::mem::MaybeUninit;
@@ -423,8 +372,8 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 
 #[cfg(not(target_os = "linux"))]
 fn peer_pid(_stream: &UnixStream) -> Option<u32> {
-    // Other platforms use `LOCAL_PEERCRED` / `getpeereid` — out of
-    // scope for v1; callers fall back to `client.unknown`.
+    // Other platforms would need `LOCAL_PEERCRED` / `getpeereid`; callers fall back to
+    // `client.unknown`.
     None
 }
 
@@ -437,13 +386,11 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
         }
     };
     let peer = peer_pid(&stream);
-    // Third fd handed to GuiClient so unregister (heartbeat or other)
-    // can shutdown(Both) from outside this reader thread.
+    // Lets unregister shutdown(Both) from outside this reader thread.
     let shutdown_stream = stream.try_clone().ok();
 
-    // Bounded so the event forwarder can't accumulate unbounded memory
-    // behind a wedged socket writer. Caller (heartbeat / invoke) treats
-    // Full as disconnect; see `GuiClient::invoke`.
+    // Bounded so a wedged socket writer can't accumulate event-forwarder memory; the caller
+    // treats Full as disconnect (see `GuiClient::invoke`).
     let (writer_tx, writer_rx) = mpsc::sync_channel::<String>(512);
     thread::spawn(move || {
         let mut writer = write_stream;
@@ -469,10 +416,8 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                     &writer_tx,
                     &Response::error(String::new(), "frame_too_large", &e.to_string()),
                 );
-                // Connection-fatal: read_line_capped fail-fasts on cap
-                // overflow without consuming the offending bytes, so
-                // continuing would re-trigger on the same data. Drop
-                // the connection instead.
+                // Connection-fatal: read_line_capped fails fast without consuming the offending
+                // bytes, so continuing would re-trigger on the same data.
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
@@ -514,8 +459,7 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                     );
                     send_line(&writer_tx, &resp);
                     if let Some(cid) = new_client_id {
-                        // MUST come after the ack is queued — see
-                        // `start_event_forwarder` doc.
+                        // MUST come after the ack is queued (see `start_event_forwarder`).
                         state
                             .gui
                             .start_event_forwarder(&cid, state.event_bus.clone());
@@ -524,29 +468,23 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                     continue;
                 }
                 if req.method == "_bus.publish" {
-                    // Wire-only bridge method — not in ActionRegistry so
-                    // a generic socket client can't reach it via the
-                    // registry path (and so the bus doesn't fan out a
-                    // `_bus.publish.completed` event for every forwarded
-                    // GUI event). Auth: registered-GUI convention under
-                    // the 0600 socket trust model.
+                    // Wire-only bridge method, kept out of ActionRegistry so a generic socket
+                    // client can't reach it and the bus emits no `_bus.publish.completed` per
+                    // forwarded event. Auth: registered-GUI convention under the 0600 socket.
                     let resp = handle_bus_publish(&req, &state, registered_client_id.as_deref());
                     send_line(&writer_tx, &resp);
                     continue;
                 }
                 if req.method == "events.publish" {
-                    // Public external surface — no registered-GUI gate.
-                    // 0600 socket reachability IS the auth. `source` and
-                    // `timestamp_ms` are daemon-controlled to prevent
-                    // spoofing of action-registry completion events.
+                    // No registered-GUI gate: 0600 socket reachability IS the auth. `source` and
+                    // `timestamp_ms` are daemon-controlled to prevent spoofing of completions.
                     let resp = handle_events_publish(&req, &state, peer);
                     send_line(&writer_tx, &resp);
                     continue;
                 }
                 if req.method == "event.subscribe" {
-                    // Registered GUIs already receive events via
-                    // start_event_forwarder. Allowing a second pump
-                    // here would duplicate every event.
+                    // Registered GUIs already get events via start_event_forwarder; a second
+                    // pump would duplicate them.
                     if registered_client_id.is_some() {
                         send_line(
                             &writer_tx,
@@ -565,10 +503,8 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                             continue;
                         }
                     };
-                    // Subscribe BEFORE the ack so an event published on
-                    // another connection between the client receiving
-                    // the ack and the daemon entering the recv loop is
-                    // never dropped on the floor.
+                    // Subscribe BEFORE the ack so an event published between the client getting
+                    // the ack and the recv loop starting is not dropped.
                     let rx = state.event_bus.subscribe_unbounded("*");
                     send_line(
                         &writer_tx,
@@ -584,7 +520,6 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                 send_line(&writer_tx, &resp);
             }
             WireMessage::Response(resp) => {
-                // From a registered GUI replying to one of our Invokes.
                 if let Some(ref cid) = registered_client_id
                     && let Some(client) = state.gui.get(cid)
                 {
@@ -639,15 +574,13 @@ fn send_line(tx: &mpsc::SyncSender<String>, response: &Response) {
     }
 }
 
-/// `_bus.publish` ingest. Validates the GUI is registered on the
-/// current connection (the only auth surface the 0600-socket trust
-/// model provides), then publishes onto the daemon bus with a fresh
-/// `bridge_id` so the symmetric daemon→GUI forwarder skips the echo.
+/// `_bus.publish` ingest. Requires the GUI to be registered on this connection (the only auth
+/// the 0600-socket trust model offers), then publishes with a fresh `bridge_id` so the
+/// daemon->GUI forwarder skips the echo.
 ///
-/// Provenance rejections (`COMPLETION_EVENT_SOURCE`, reserved
-/// `.completed`/`.failed` kinds) close the door on a malicious GUI
-/// spoofing action-registry completions, which the trigger engine's
-/// `try_promote_or_drop_preflight` gate trusts.
+/// Provenance rejections (`COMPLETION_EVENT_SOURCE`, reserved `.completed`/`.failed` kinds)
+/// stop a malicious GUI spoofing action-registry completions, which
+/// `try_promote_or_drop_preflight` trusts.
 fn handle_bus_publish(
     req: &Request,
     state: &Arc<DaemonState>,
@@ -695,9 +628,7 @@ fn handle_bus_publish(
             "_bus.publish refuses reserved `copad.action` source",
         );
     }
-    // Required field. Defaulting silently to 0 would corrupt
-    // `{event.timestamp_ms}` interpolation on the daemon side for any
-    // trigger that reads it.
+    // Required: defaulting to 0 would corrupt `{event.timestamp_ms}` interpolation in triggers.
     let timestamp_ms = match params.get("timestamp_ms").and_then(|v| v.as_u64()) {
         Some(n) => n,
         None => {
@@ -716,13 +647,9 @@ fn handle_bus_publish(
     Response::success(req.id.clone(), serde_json::json!({ "queued": true }))
 }
 
-/// `events.publish` public socket method. Anyone reaching the
-/// 0600 socket can call it (same trust band as `coctl call`).
-/// Daemon-controls `source` (peer-pid stamped) and `timestamp_ms`
-/// (via `BusEvent::new`) so the caller cannot spoof an
-/// action-registry completion event — the trigger engine's
-/// preflight-promotion gate reads top-level `source` and trusts
-/// only `copad.action`.
+/// `events.publish` public socket method; anyone reaching the 0600 socket can call it. `source`
+/// (peer-pid stamped) and `timestamp_ms` are daemon-controlled so a caller cannot spoof an
+/// action-registry completion: the preflight-promotion gate trusts only `copad.action`.
 fn handle_events_publish(req: &Request, state: &Arc<DaemonState>, peer: Option<u32>) -> Response {
     let kind = match req.params.get("kind").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -746,11 +673,9 @@ fn handle_events_publish(req: &Request, state: &Arc<DaemonState>, peer: Option<u
         Some(pid) => format!("client.{pid}"),
         None => "client.unknown".into(),
     };
-    // `events.publish` is the trust-boundary chokepoint for socket-driven
-    // event injection — any same-UID process holding the daemon socket
-    // (including SSH-forwarded harness hooks) can reach here. Tag the
-    // event `External` so `TriggerEngine` fan-out skips it for any
-    // trigger that didn't opt in via `[security] accept_external = true`.
+    // Trust-boundary chokepoint for socket event injection (any same-UID process, including
+    // SSH-forwarded harness hooks). Tagged `External` so TriggerEngine skips it for triggers
+    // without `[security] accept_external = true`.
     state.event_bus.publish(
         copad_core::event_bus::Event::new(kind, source, payload)
             .with_origin(copad_core::event_bus::Origin::External),
@@ -793,23 +718,15 @@ fn parse_subscribe_patterns(req: &Request) -> Result<Vec<String>, Response> {
 
 const SUBSCRIBE_KEEPALIVE: Duration = Duration::from_secs(15);
 
-/// Maximum bytes accepted for a single newline-delimited frame on the
-/// daemon socket. `BufRead::lines` / `read_until` would otherwise buffer
-/// without bound — a malicious or stuck client that streams bytes
-/// without `\n` could exhaust daemon memory. 1 MiB is well above any
-/// legitimate JSON frame (the largest action payloads we ship —
-/// webview content reads, screenshot base64 — stay below ~256 KiB);
-/// callers should chunk anything bigger over multiple actions.
+/// Max bytes for one newline-delimited frame: without a cap, a client streaming bytes without
+/// `\n` could exhaust daemon memory. The largest legitimate payloads (webview reads, screenshot
+/// base64) stay below ~256 KiB.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Reads one newline-delimited frame, refusing to grow the buffer past
-/// [`MAX_FRAME_BYTES`]. Returns `Ok(None)` on clean EOF, `Ok(Some(s))`
-/// on a full line, `Err(InvalidData)` AS SOON AS the running total
-/// would exceed the cap — no resync attempt, because a peer that never
-/// sends `\n` would otherwise pin the helper indefinitely. Callers
-/// must treat `InvalidData` as a connection-fatal signal (send a
-/// `frame_too_large` reply, then drop the connection). Reused by
-/// copad-linux's per-connection socket reader.
+/// Reads one newline-delimited frame without growing past [`MAX_FRAME_BYTES`]. `Ok(None)` on
+/// clean EOF; `Err(InvalidData)` AS SOON AS the total would exceed the cap, with no resync
+/// (a peer that never sends `\n` would pin the helper). Callers treat `InvalidData` as
+/// connection-fatal: reply `frame_too_large`, then drop. Reused by copad-linux's socket reader.
 pub fn read_line_capped(
     reader: &mut std::io::BufReader<UnixStream>,
     buf: &mut Vec<u8>,
@@ -855,8 +772,8 @@ pub fn read_line_capped(
     }
     match String::from_utf8(std::mem::take(buf)) {
         Ok(s) => Ok(Some(s)),
-        // `InvalidInput` distinguishes "decode failed" from `InvalidData`'s
-        // "frame too large" so callers can pick precise wire error codes.
+        // `InvalidInput` (decode failed) is distinct from `InvalidData` (frame too large) so
+        // callers can pick wire error codes.
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("invalid utf-8: {e}"),
@@ -864,13 +781,10 @@ pub fn read_line_capped(
     }
 }
 
-/// Runs until the socket dies or the bus is dropped. `bus.subscribe_unbounded("*")`
-/// honors the lossless contract for external `event.subscribe`; pattern filtering
-/// happens here via [`pattern_matches`] OR'd across `patterns`. The 15s
-/// keep-alive probe is the disconnect detector during quiet bus periods:
-/// `writer_tx.send(String::new())` makes the writer thread write a `\n`, which
-/// fails with EPIPE once the client has closed the socket and unwinds this
-/// loop. coctl's subscribe reader already skips empty lines.
+/// `subscribe_unbounded("*")` keeps `event.subscribe` lossless; patterns are filtered here via
+/// [`pattern_matches`]. The 15s keep-alive sends an empty string, which the writer thread writes
+/// as `\n`; it fails with EPIPE once the client closed, unwinding this loop. coctl's subscribe
+/// reader skips empty lines.
 fn run_event_subscribe(
     rx: copad_core::event_bus::EventReceiver,
     writer_tx: &mpsc::SyncSender<String>,
@@ -882,9 +796,7 @@ fn run_event_subscribe(
                 if !patterns.iter().any(|p| pattern_matches(p, &ev.kind)) {
                     continue;
                 }
-                // `origin` round-trips alongside `source` so subscribers
-                // (e.g. coctl wrappers, future GUI bridges) can see the
-                // trust-boundary tag set at `events.publish` ingest.
+                // `origin` round-trips with `source` so subscribers see the trust-boundary tag.
                 let wire = WireEvent::new(ev.kind, ev.payload)
                     .with_source(ev.source)
                     .with_origin(ev.origin);
@@ -948,9 +860,8 @@ fn handle_gui_register(
         );
     }
 
-    // Daemon-side env filter at the trust boundary: any registered
-    // client could be a mock, so the GUI-side curation list is not
-    // load-bearing. Only keys in `GUI_ENV_ALLOWED_KEYS` survive.
+    // A registered client could be a mock, so GUI-side curation is not load-bearing: only
+    // `GUI_ENV_ALLOWED_KEYS` survive.
     let gui_env = req
         .params
         .get("gui_env")
@@ -973,8 +884,6 @@ fn handle_gui_register(
     (resp, Some(client_id))
 }
 
-/// `state.actions` first, then GUI-owned proxy via `gui_registry`, else
-/// `unknown_method`.
 pub fn dispatch(req: &Request, state: &Arc<DaemonState>) -> Response {
     if state.actions.has(&req.method) {
         return dispatch_via_registry(req, &state.actions);
@@ -982,15 +891,10 @@ pub fn dispatch(req: &Request, state: &Arc<DaemonState>) -> Response {
 
     if method_capability(&req.method).is_some() {
         let resp = dispatch_via_gui(req, &state.gui);
-        // Daemon vouches that the GUI-owned action returned this
-        // response; publish `<method>.completed`/`.failed` on the
-        // daemon bus so daemon-side chained triggers fire. The
-        // GUI suppresses local publish for daemon-Invoke origins
-        // (`silent_completion=true` set by `handle_invoke`), and the
-        // daemon→GUI forwarder bridges this event back so GUI-side
-        // triggers also see it exactly once. Failure paths (no_gui,
-        // unknown_client, invoke timeout) emit `<method>.failed`
-        // identically.
+        // The daemon vouches for the GUI's response and publishes `<method>.completed`/`.failed`
+        // so daemon-side chained triggers fire (also on no_gui/unknown_client/timeout). The GUI
+        // suppresses its own publish for daemon-Invoke origins (`silent_completion`), and the
+        // daemon->GUI forwarder bridges this event back so GUI triggers see it once.
         publish_legacy_completion(&state.event_bus, &req.method, false, &resp);
         return resp;
     }
@@ -1007,8 +911,7 @@ fn dispatch_via_gui(req: &Request, gui: &Arc<GuiRegistry>) -> Response {
         Ok(client) => {
             let timeout = method_invoke_timeout(&req.method);
             let resp = client.invoke(&req.method, req.params.clone(), timeout);
-            // The GUI Response carries the invoke_id; rewrite to the
-            // original caller's request id.
+            // Rewrite the GUI Response's invoke_id to the original caller's request id.
             Response {
                 id: req.id.clone(),
                 ok: resp.ok,
@@ -1033,8 +936,7 @@ fn dispatch_via_gui(req: &Request, gui: &Arc<GuiRegistry>) -> Response {
     }
 }
 
-/// Bridges callback-based `try_dispatch` to a sync return so the
-/// per-connection thread can block on plugin replies.
+/// Bridges callback-based `try_dispatch` to a sync return for the per-connection thread.
 fn dispatch_via_registry(req: &Request, actions: &Arc<ActionRegistry>) -> Response {
     let (tx, rx) = std::sync::mpsc::channel();
     let req_id = req.id.clone();
@@ -1086,7 +988,6 @@ mod tests {
     }
 
     fn tempfile_dir() -> PathBuf {
-        // Avoid pulling tempfile crate as a dep for one test helper.
         let pid = std::process::id();
         let nano = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1180,7 +1081,6 @@ mod tests {
 
     #[test]
     fn prepare_socket_path_leaves_foreign_parent_perms_alone() {
-        // tempfile_dir() is not runtime_dir(); chmod must NOT fire.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile_dir();
         let path = dir.join("test-foreign-parent-sock");
@@ -1292,8 +1192,7 @@ mod tests {
         let stream = UnixStream::connect(&path_clone).expect("connect");
         let mut writer = stream.try_clone().expect("clone");
         let mut reader = BufReader::new(stream);
-        // Register first so we pass the auth gate; the reserved-source
-        // rejection should still bite.
+        // Register first to pass the auth gate; the reserved-source rejection must still bite.
         let reg = Request::new(
             "reg",
             "gui.register",
@@ -1309,7 +1208,6 @@ mod tests {
             .expect("write reg");
         let mut ack = String::new();
         reader.read_line(&mut ack).expect("read ack");
-        // Now attempt the spoof.
         let req = Request::new(
             "p-2",
             "_bus.publish",
@@ -1392,8 +1290,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let listener = bind_listener(&path).expect("bind");
         let state = mk_state_with_ping();
-        // Subscribe BEFORE running the accept loop so the event handler
-        // sees us as soon as it publishes.
         let rx = state.event_bus.subscribe_unbounded("panel.focused");
         let path_clone = path.clone();
         let _server = thread::spawn(move || run_accept_loop(listener, state));
@@ -1434,7 +1330,6 @@ mod tests {
         reader.read_line(&mut line).expect("read");
         let resp: Response = serde_json::from_str(line.trim()).expect("parse");
         assert!(resp.ok, "expected success: {resp:?}");
-        // The published event landed on the bus with bridge_id set.
         let ev = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
             copad_core::event_bus::RecvOutcome::Event(e) => e,
             other => panic!("expected event, got {other:?}"),
@@ -1475,7 +1370,6 @@ mod tests {
             resp.ok,
             "events.publish should succeed without register: {resp:?}"
         );
-        // Event landed on the bus with daemon-assigned source.
         let ev = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
             copad_core::event_bus::RecvOutcome::Event(e) => e,
             other => panic!("expected event, got {other:?}"),
@@ -1636,7 +1530,6 @@ mod tests {
         let _server = thread::spawn(move || run_accept_loop(listener, state));
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // 1) GUI connects and registers.
         let gui_stream = UnixStream::connect(&path_clone).expect("connect gui");
         let mut gui_write = gui_stream.try_clone().expect("clone gui");
         let mut gui_read = BufReader::new(gui_stream);
@@ -1660,11 +1553,8 @@ mod tests {
         let result = reg_resp.result.expect("register has result");
         assert_eq!(result["primary"], json!(true));
         assert!(result["client_id"].is_string());
-        // host_triggers from the ack must reflect daemon state (false here
-        // — `new_for_test` defaults to false).
         assert_eq!(result["host_triggers"], json!(false));
 
-        // 2) Separate client invokes tab.list. Daemon must route to our GUI.
         let client_stream = UnixStream::connect(&path_clone).expect("connect client");
         let mut client_write = client_stream.try_clone().expect("clone client");
         let mut client_read = BufReader::new(client_stream);
@@ -1673,7 +1563,6 @@ mod tests {
             .write_all((serde_json::to_string(&tab_req).unwrap() + "\n").as_bytes())
             .expect("write tab.list");
 
-        // 3) GUI side reads the Invoke and replies.
         let mut invoke_line = String::new();
         gui_read.read_line(&mut invoke_line).expect("read invoke");
         let invoke: copad_core::protocol::Invoke =
@@ -1684,7 +1573,6 @@ mod tests {
             .write_all((serde_json::to_string(&gui_resp).unwrap() + "\n").as_bytes())
             .expect("write gui response");
 
-        // 4) Client receives the forwarded response with its own request id.
         let mut client_line = String::new();
         client_read
             .read_line(&mut client_line)
@@ -1785,8 +1673,6 @@ mod tests {
         assert!(ack_resp.ok);
         assert_eq!(ack_resp.id, "sub-1");
 
-        // Publish a non-matching event followed by a matching one. The
-        // first must not show up; the second must.
         bus_handle.publish(BusEvent::new("other.kind", "test", json!({ "skip": true })));
         bus_handle.publish(BusEvent::new(
             "unit.test.fire",
@@ -1875,13 +1761,10 @@ mod tests {
 
     fn capped_reader_for(input: &[u8]) -> BufReader<UnixStream> {
         let (mut a, b) = UnixStream::pair().expect("pair");
-        // Linux unix-socket buffers default to ~208 KiB; oversized-frame
-        // test inputs run past 1 MiB, so writing must happen on a thread
-        // alongside the reader to avoid kernel-buffer deadlock.
+        // Oversized-frame inputs exceed the kernel socket buffer, so write on a thread.
         let payload = input.to_vec();
         std::thread::spawn(move || {
             let _ = a.write_all(&payload);
-            // a dropped on thread exit → reader sees EOF after data
         });
         BufReader::new(b)
     }
@@ -1903,9 +1786,7 @@ mod tests {
 
     #[test]
     fn read_line_capped_rejects_oversized_frame_fail_fast() {
-        // Stream past MAX_FRAME_BYTES with no newline. Helper must
-        // fail-fast (NOT block draining toward a newline that never
-        // arrives). Caller is responsible for closing the connection.
+        // No newline: must fail fast, not block draining toward one.
         let oversized: Vec<u8> = std::iter::repeat_n(b'x', MAX_FRAME_BYTES + 32).collect();
         let mut r = capped_reader_for(&oversized);
         let mut buf = Vec::new();
@@ -1915,8 +1796,7 @@ mod tests {
 
     #[test]
     fn read_line_capped_rejects_overflow_even_when_newline_eventually_arrives() {
-        // Even if the peer DOES send a newline past the cap, fail-fast —
-        // we don't read past the cap to confirm.
+        // Fail fast even if a newline arrives past the cap; never read on to confirm.
         let mut input: Vec<u8> = std::iter::repeat_n(b'y', MAX_FRAME_BYTES + 1).collect();
         input.push(b'\n');
         let mut r = capped_reader_for(&input);

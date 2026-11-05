@@ -1,7 +1,6 @@
-//! Daemon-client thread: connects to `copadd`, advertises GUI
-//! capabilities via `gui.register`, and forwards inbound `Invoke`
-//! requests through the existing dispatch pump. A missing daemon is
-//! benign — the reconnect loop polls quietly with capped backoff.
+//! Daemon-client thread: connects to `copadd`, advertises GUI capabilities via `gui.register`,
+//! and forwards inbound `Invoke` requests through the dispatch pump. A missing daemon is benign:
+//! the reconnect loop polls quietly with capped backoff.
 
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -20,10 +19,8 @@ use crate::socket::SocketCommand;
 
 const PROTOCOL_VERSION: u32 = copad_core::protocol::PROTOCOL_VERSION;
 
-/// GUI bus → daemon bus forwarder kind list. Only events relevant to
-/// daemon-side triggers / context cross the bridge; `terminal.output`
-/// is excluded because it fires per-keystroke and would saturate the
-/// wire without any trigger-facing value.
+/// GUI bus kinds forwarded to the daemon bus. `terminal.output` is excluded: it fires
+/// per-keystroke and would saturate the wire.
 const GUI_TO_DAEMON_FORWARD_KINDS: &[&str] = &[
     "doc.opened",
     "pane.context_changed",
@@ -33,12 +30,8 @@ const GUI_TO_DAEMON_FORWARD_KINDS: &[&str] = &[
     "tab.closed",
     "tab.created",
     "tab.renamed",
-    // Phase 22.2 — workflow lifecycle. `workflow.started` /
-    // `workflow.timed_out` originate on the GUI bus (workflow.run lives
-    // GUI-side) but `coctl recent --kind workflow.*` queries the daemon
-    // ring buffer; without forwarding here, the interim/final e2e gate
-    // ("verify via coctl recent") would only see workflow events from a
-    // restart of the daemon-process bus, not from the GUI-spawned tab.
+    // Raised on the GUI bus (workflow.run lives GUI-side), while `coctl recent --kind workflow.*`
+    // reads the daemon ring buffer.
     "workflow.started",
     "workflow.timed_out",
     "terminal.cwd_changed",
@@ -50,18 +43,11 @@ const GUI_TO_DAEMON_FORWARD_KINDS: &[&str] = &[
     "window.restored",
 ];
 
-/// How often each forwarder thread checks the shutdown flag when no
-/// matching events have arrived. 100 ms is responsive enough for
-/// reconnect (~3 cycles per backoff tick) without burning CPU.
+/// How often each forwarder thread checks the shutdown flag when idle.
 const FORWARDER_POLL: Duration = Duration::from_millis(100);
 
-/// Bound on the daemon-client writer channel. Mirror of the daemon
-/// side's 512-cap from Step 5b R2 INFO; same purpose, same recovery
-/// path.
 const GUI_CLIENT_WRITER_BUFFER: usize = 512;
 
-/// Workers spend most of their time waiting on the GTK reply channel,
-/// so the cap is concurrency-limiting, not throughput-tuning.
 const POOL_WORKERS: usize = 8;
 const POOL_QUEUE: usize = 32;
 
@@ -76,17 +62,13 @@ const CAPABILITIES: &[&str] = &[
     "plugin.open",
     "session",
     "search",
-    // Phase 22.2 — project + workflow routes (see
-    // `copad-daemon::gui_registry::method_capability`).
     "project",
     "workflow",
 ];
 
-/// Curated env keys the GUI exports to the daemon via `gui.register`'s
-/// `gui_env` field. Daemon re-validates against its own whitelist
-/// (see `copad-daemon::gui_registry::GUI_ENV_ALLOWED_KEYS`), so this
-/// list is a UX nicety, not a trust boundary — keys not in the
-/// daemon's whitelist get silently dropped server-side.
+/// Curated env keys exported to the daemon via `gui.register`'s `gui_env`. The daemon
+/// re-validates against `copad-daemon::gui_registry::GUI_ENV_ALLOWED_KEYS`, so this is not a
+/// trust boundary.
 const GUI_ENV_CURATED_KEYS: &[&str] = &[
     "HYPRLAND_INSTANCE_SIGNATURE",
     "DISPLAY",
@@ -97,9 +79,6 @@ const GUI_ENV_CURATED_KEYS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
 ];
 
-/// Build a `{key: value}` JSON object of the GUI process's curated
-/// session env vars to send in `gui.register`. Only keys actually
-/// present in the GUI env are included; absent ones are skipped.
 fn capture_gui_env() -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
     for k in GUI_ENV_CURATED_KEYS {
@@ -121,9 +100,8 @@ pub fn spawn(
     thread::Builder::new()
         .name("copad-gui-client".into())
         .spawn(move || {
-            // Pool is process-lifetime: per-reconnect Drop would block
-            // up to `pool_queue * 125s` joining slow invoke workers.
-            // `generation` invalidates jobs admitted under an older
+            // Pool is process-lifetime: a per-reconnect Drop would block up to `pool_queue * 125s`
+            // joining slow invoke workers. `generation` invalidates jobs admitted under an older
             // connection so they bail out before mutating GTK state.
             let pool = copad_core::thread_pool::ThreadPool::new(POOL_WORKERS, POOL_QUEUE);
             let generation = Arc::new(AtomicU64::new(0));
@@ -141,8 +119,6 @@ fn reconnect_loop(
 ) {
     let mut backoff = BACKOFF_INITIAL;
     loop {
-        // daemon_socket_path filters inherited per-instance COPAD_SOCKET
-        // and refuses untrusted runtime dirs.
         let Some(socket_path) = copad_core::paths::daemon_socket_path() else {
             log::debug!(
                 "gui_client: daemon socket path untrusted; sleeping {:?}",
@@ -162,17 +138,13 @@ fn reconnect_loop(
             event_bus.clone(),
             host_triggers_tx.clone(),
         ) {
-            // log::debug so a daemon-never-starts run stays silent on
-            // stderr — the loop polls at most every 30s anyway, but a
-            // line per attempt would still be visible noise. Surface
-            // with RUST_LOG=debug if you need to see the cadence.
+            // log::debug so a daemon-never-starts run stays silent on stderr.
             Ok(()) => log::debug!("gui_client disconnected from daemon"),
             Err(e) => log::debug!("gui_client error: {e}"),
         }
         log::debug!("gui_client reconnect in {:?}", backoff);
         thread::sleep(backoff);
-        // Bump AFTER the sleep so the first retry waits BACKOFF_INITIAL,
-        // not 2× it. Reset on success.
+        // Bump AFTER the sleep so the first retry waits BACKOFF_INITIAL, not 2x it.
         if registered.load(std::sync::atomic::Ordering::SeqCst) {
             backoff = BACKOFF_INITIAL;
         } else {
@@ -190,9 +162,8 @@ fn run(
     event_bus: Arc<EventBus>,
     host_triggers_tx: Sender<bool>,
 ) -> Result<(), String> {
-    // Exit bump invalidates queued stale jobs IMMEDIATELY on disconnect,
-    // not on the next `run()` — otherwise the reconnect backoff sleep
-    // is a window where a stale job can still pass the generation check.
+    // Bump on exit so queued stale jobs are invalidated immediately on disconnect; otherwise the
+    // reconnect backoff sleep is a window where a stale job passes the generation check.
     struct GenGuard<'a>(&'a Arc<AtomicU64>);
     impl Drop for GenGuard<'_> {
         fn drop(&mut self) {
@@ -207,14 +178,10 @@ fn run(
         .try_clone()
         .map_err(|e| format!("clone stream: {e}"))?;
 
-    // Bounded for the same reason the daemon side is bounded (Step 5b
-    // R2 INFO): a wedged daemon-side reader stalls the writer thread,
-    // and an unbounded sender lets the outgoing event forwarder
-    // (start_gui_event_forwarder) accumulate events without limit.
-    // 512 absorbs normal bursts; when full, senders block, which
-    // backpressures the bus subscriber. Recovery: daemon disconnect →
-    // writeln fails → writer thread exits → writer_rx drops →
-    // subsequent send returns Err and the forwarder shuts down.
+    // Bounded: a wedged daemon-side reader stalls the writer thread, and an unbounded sender
+    // would let the event forwarder accumulate events without limit. When full, senders block
+    // (backpressuring the bus subscriber); on daemon disconnect the writer exits, `writer_rx`
+    // drops, and the forwarder's next send fails and shuts it down.
     let (writer_tx, writer_rx) = sync_channel::<String>(GUI_CLIENT_WRITER_BUFFER);
     thread::spawn(move || {
         let mut writer = write_stream;
@@ -230,26 +197,18 @@ fn run(
     let ack = await_register_ack(&mut reader, &register_id)?;
     registered.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // Daemon advertises whether IT will dispatch triggers. If true,
-    // start the GUI→daemon event forwarder so the daemon's engine
-    // sees GUI-published events. Otherwise the GUI's local engine
-    // remains authoritative (Stage A semantics) and the forwarder
-    // stays dormant.
+    // If the daemon will dispatch triggers, start the GUI->daemon event forwarder; otherwise the
+    // GUI's local engine stays authoritative and the forwarder stays dormant.
     let forwarder_stop = Arc::new(AtomicBool::new(false));
     let _forwarder_guard = ForwarderGuard(forwarder_stop.clone());
     if ack.host_triggers {
         start_gui_event_forwarder(event_bus.clone(), writer_tx.clone(), forwarder_stop.clone());
     }
 
-    // Cut-over signal: send AFTER the forwarder subscribes so that
-    // events published in the window between forwarder-start and the
-    // GTK timer clearing the local engine are caught by the forwarder
-    // (and dispatched daemon-side). Sending before would let the timer
-    // clear local subscriptions while the forwarder is not yet
-    // subscribed — events in that gap would be lost by both engines.
-    // The drop guard symmetrically sends `false` on every `run()`
-    // exit, so a daemon crash mid-session restores local authority
-    // before the reconnect-backoff window opens.
+    // Sent AFTER the forwarder subscribes: events published between forwarder start and the GTK
+    // timer clearing the local engine must be caught by the forwarder, else both engines lose
+    // them. The drop guard sends `false` on every `run()` exit, so a daemon crash restores local
+    // authority before the reconnect-backoff window opens.
     let _ht_guard = HostTriggersGuard(host_triggers_tx.clone());
     let _ = host_triggers_tx.send(ack.host_triggers);
 
@@ -276,8 +235,6 @@ fn run(
         };
 
         if let Some(method) = value.get("invoke").and_then(|v| v.as_str()) {
-            // _ping inline so heartbeat stays responsive even when the
-            // pool is saturated.
             if method == "_ping" {
                 if let Err(e) = handle_ping(value, &writer_tx) {
                     log::warn!("[copad] gui_client ping reply: {e}");
@@ -297,17 +254,14 @@ fn run(
         } else if value.get("ok").is_some() {
             log::debug!("[copad] gui_client response: {value}");
         } else if value.get("type").is_some() {
-            // `source` round-trips so the local trigger engine's
-            // preflight-promotion gates on COMPLETION_EVENT_SOURCE for
-            // daemon-hosted plugin completions. `origin` round-trips for
-            // the same reason on the trust-boundary axis — a daemon
-            // `External` tag (set at events.publish ingest) MUST survive
-            // the crossing or `[security] accept_external` triggers
-            // silently fire on hook-published events.
+            // `source` round-trips so the local trigger engine's preflight-promotion gates on
+            // COMPLETION_EVENT_SOURCE for daemon-hosted plugin completions. `origin` round-trips
+            // too: a daemon `External` tag (set at events.publish ingest) MUST survive the
+            // crossing or `[security] accept_external` triggers silently fire on hook-published
+            // events.
             //
-            // Stage B: stamp `bridge_id` on the republish so the
-            // GUI→daemon forwarder (Stage C) recognizes this as
-            // "already crossed once" and doesn't echo it back.
+            // `bridge_id` is stamped on the republish so the GUI->daemon forwarder knows it
+            // already crossed once and does not echo it back.
             match serde_json::from_value::<WireEvent>(value) {
                 Ok(wire) => {
                     let source = wire.source.unwrap_or_else(|| "daemon".to_string());
@@ -325,12 +279,8 @@ fn run(
     }
 }
 
-/// Drop-guard for the forwarder shutdown flag. Mirrors the existing
-/// `GenGuard` pattern: flips the AtomicBool on every `run()` exit
-/// (success OR error), guaranteeing the spawned forwarder threads
-/// observe it within one [`FORWARDER_POLL`] interval and exit. The
-/// per-kind `subscribe_unbounded` receivers drop when the threads
-/// exit, breaking the bus subscription cleanly.
+/// Drop-guard flipping the forwarder shutdown flag on every `run()` exit, so the forwarder
+/// threads exit within one [`FORWARDER_POLL`].
 struct ForwarderGuard(Arc<AtomicBool>);
 
 impl Drop for ForwarderGuard {
@@ -339,12 +289,9 @@ impl Drop for ForwarderGuard {
     }
 }
 
-/// Drop-guard that signals the GTK timer to restore local trigger
-/// authority on `run()` exit. Without this, a daemon crash mid-session
-/// leaves the local engine empty (set by the prior `host_triggers=true`
-/// cut-over) for the entire reconnect-backoff window. The `send` is
-/// best-effort: if the receiver is gone (window already shut down),
-/// the error is benign.
+/// Drop-guard that restores local trigger authority on `run()` exit; without it a daemon crash
+/// leaves the local engine empty (from the `host_triggers=true` cut-over) for the whole backoff
+/// window. The send is best-effort: a gone receiver means the window already shut down.
 struct HostTriggersGuard(Sender<bool>);
 
 impl Drop for HostTriggersGuard {
@@ -353,12 +300,6 @@ impl Drop for HostTriggersGuard {
     }
 }
 
-/// Spawn one thread per [`GUI_TO_DAEMON_FORWARD_KINDS`] entry. Each
-/// thread subscribes unbounded to its kind and forwards GUI-native
-/// (non-bridged) events to the daemon via `_bus.publish` Request
-/// frames on `writer_tx`. Bridged events (those that crossed the
-/// daemon→GUI bridge) are skipped via the `bridge_id` check, so the
-/// loop is broken on the GUI side.
 fn start_gui_event_forwarder(
     event_bus: Arc<EventBus>,
     writer_tx: SyncSender<String>,
@@ -392,8 +333,6 @@ fn gui_forwarder_loop(
         match rx.recv_timeout(FORWARDER_POLL) {
             RecvOutcome::Event(ev) => {
                 if ev.bridge_id.is_some() {
-                    // Came in via the daemon→GUI bridge — already
-                    // crossed once, do not echo back.
                     continue;
                 }
                 let req = Request::new(
@@ -414,8 +353,6 @@ fn gui_forwarder_loop(
                     }
                 };
                 if writer_tx.send(line).is_err() {
-                    // Writer thread exited (stream closed) — nothing
-                    // more we can do; let the receiver drop on exit.
                     return;
                 }
             }
@@ -447,10 +384,6 @@ fn register(writer_tx: &SyncSender<String>) -> Result<String, String> {
     Ok(req_id)
 }
 
-/// Captured fields from the daemon's `gui.register` success ack.
-/// Today only `host_triggers` flows back to the caller; future
-/// fields (negotiated protocol version, daemon-advertised
-/// capabilities) would join here.
 #[derive(Debug, Clone, Default)]
 struct RegisterAck {
     host_triggers: bool,
@@ -503,18 +436,15 @@ struct GuiInvokeJob {
     value: Value,
     dispatch_tx: Sender<SocketCommand>,
     writer_tx: SyncSender<String>,
-    /// Connection-generation gate: a worker that picks up a job after
-    /// its admitting connection died MUST NOT dispatch side-effecting
-    /// methods through GTK — the daemon has already failed the pending
-    /// invoke.
+    /// Connection-generation gate: a worker that picks up a job after its admitting connection
+    /// died MUST NOT dispatch side-effecting methods through GTK; the daemon already failed it.
     generation: Arc<AtomicU64>,
     admitted_gen: u64,
 }
 
 impl GuiInvokeJob {
     fn write_overloaded(value: &Value, writer_tx: &SyncSender<String>) {
-        // Best-effort id extraction — `cancel` MUST NOT panic on
-        // malformed input.
+        // Best-effort id extraction: `cancel` MUST NOT panic on malformed input.
         let id = value
             .get("id")
             .and_then(|v| v.as_str())
@@ -561,10 +491,8 @@ fn handle_invoke(
     let cmd = SocketCommand {
         request: Request::new(inv.id.clone(), &inv.invoke, inv.params),
         reply: reply_tx,
-        // Daemon-Invoke proxies suppress local completion publish; daemon's
-        // dispatch_via_gui publishes on its own bus and the daemon→GUI
-        // forwarder brings it back so GUI-side triggers see exactly one
-        // completion event.
+        // Daemon-Invoke proxies suppress the local completion publish: the daemon publishes on
+        // its own bus and the daemon->GUI forwarder brings it back, so triggers see one event.
         silent_completion: true,
     };
     if dispatch_tx.send(cmd).is_err() {
@@ -694,8 +622,6 @@ mod tests {
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let stop = Arc::new(AtomicBool::new(false));
         start_gui_event_forwarder(bus.clone(), writer_tx, stop.clone());
-        // Give the per-kind subscriber threads a tick to enter
-        // recv_timeout before we publish.
         thread::sleep(Duration::from_millis(50));
         bus.publish(BusEvent::new(
             "panel.focused",
@@ -720,14 +646,11 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         start_gui_event_forwarder(bus.clone(), writer_tx, stop.clone());
         thread::sleep(Duration::from_millis(50));
-        // Publish a BRIDGED event — forwarder must skip.
         bus.publish_bridged(BusEvent::new("panel.focused", "daemon-side", json!({})), 99);
-        // 200ms backstop — no Request should appear.
         match writer_rx.recv_timeout(Duration::from_millis(200)) {
             Err(_) => {}
             Ok(line) => panic!("forwarder leaked bridged event: {line}"),
         }
-        // Sanity: a native event DOES flow.
         bus.publish(BusEvent::new("panel.focused", "test", json!({})));
         writer_rx
             .recv_timeout(Duration::from_secs(1))
@@ -750,9 +673,8 @@ mod tests {
 
     #[test]
     fn stale_generation_skips_dispatch() {
-        // Job admitted under generation=1 but current generation=2 →
-        // run() must skip handle_invoke (no command on dispatch_tx) and
-        // write back an overloaded response.
+        // Job admitted under generation=1 but current generation=2: run() must skip handle_invoke
+        // and write back an overloaded response.
         let (dispatch_tx, dispatch_rx) = channel::<SocketCommand>();
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let generation = Arc::new(AtomicU64::new(2));

@@ -24,13 +24,9 @@ use std::time::{Duration, Instant};
 use crate::panel::Panel;
 use crate::tabs::TabManager;
 
-/// How often the visible-panel set is re-read (tab switches, splits and closes all change it).
 const SERVE_EVERY: Duration = Duration::from_secs(1);
-/// Usage gauge length, in pixels.
 const GAUGE_W: i32 = 56;
 
-/// The chrome's font and colours: the terminal's font and the copad theme mapped onto the roles
-/// the comux TUI paints with (macOS `ComuxStyle`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Style {
     pub(crate) family: String,
@@ -48,7 +44,6 @@ pub struct Style {
     pub(crate) blue: String,
     pub(crate) red: String,
     pub(crate) accent: String,
-    /// The terminal's default foreground and 16 ANSI colours (overlay previews, #180).
     pub(crate) fg: String,
     pub(crate) ansi: Vec<String>,
 }
@@ -91,8 +86,8 @@ impl Style {
         }
     }
 
-    /// Every rule the chrome needs, scoped to its three containers (class rules carry the
-    /// container id too: the font/colour rule on `#… *` would outrank a bare class).
+    /// Class rules carry the container id too: the font/colour rule on `#… *` would outrank a
+    /// bare class.
     fn css(&self) -> String {
         let Style {
             family,
@@ -144,7 +139,6 @@ impl Style {
         )
     }
 
-    /// An agent's glyph by [`agent_status`], the word it shows.
     pub(crate) fn agent(&self, a: &Value) -> (&'static str, &str) {
         self.status(agent_status(a))
     }
@@ -159,7 +153,6 @@ impl Style {
         }
     }
 
-    /// green < 70% ≤ yellow < 90% ≤ red, like the TUI's gauges.
     pub(crate) fn usage(&self, pct: f64) -> &str {
         if pct >= 90.0 {
             &self.red
@@ -180,7 +173,6 @@ fn reset_label(w: &Value) -> Option<String> {
     }
 }
 
-/// The windows a carousel page shows.
 fn page_windows<'a>(page: &Value, windows: &'a [Value]) -> Vec<&'a Value> {
     page["windows"]
         .as_array()
@@ -190,7 +182,6 @@ fn page_windows<'a>(page: &Value, windows: &'a [Value]) -> Vec<&'a Value> {
         .collect()
 }
 
-/// A cheap fingerprint of the values a part of the chrome is drawn from.
 fn sig(parts: &[&Value]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -200,7 +191,6 @@ fn sig(parts: &[&Value]) -> u64 {
     h.finish().max(1)
 }
 
-/// Where the dragged sidebar width is kept (decisions #181).
 fn sidebar_width_file() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
@@ -228,7 +218,6 @@ fn save_sidebar_width(w: i32) {
     }
 }
 
-/// `text` in `color`, escaped for Pango markup.
 pub(crate) fn span(color: &str, text: &str) -> String {
     format!(
         "<span foreground=\"{color}\">{}</span>",
@@ -240,21 +229,17 @@ pub(crate) fn bold(markup: String) -> String {
     format!("<b>{markup}</b>")
 }
 
-/// One agents-list row (decisions #179): every row the list shows, in order, so a row's index
-/// is also its action's index — headers and rules are rows too.
 #[derive(Debug, PartialEq, Eq)]
 enum AgentRow {
     /// A blocked agent pinned under the header (agents index). It is duplicated, not moved,
     /// so the list below never shifts under the pointer.
     Band(usize),
-    /// The rule closing the band off.
     Rule,
     /// A space's header (index of its first agent), only when agents span several spaces.
     Header(usize),
     Agent(usize),
 }
 
-/// The agents list's rows, and whether they are grouped under space headers.
 fn agent_rows(agents: &[Value]) -> (Vec<AgentRow>, bool) {
     let mut out: Vec<AgentRow> = agents
         .iter()
@@ -314,7 +299,6 @@ fn split_sidebar(
         .max(header.min(total))
 }
 
-/// A space's subtitle, like the TUI's: its git branch, else what its focused pane runs.
 pub(crate) fn space_subtitle(branch: &str, tabs: &[Value]) -> String {
     if !branch.is_empty() {
         return branch.to_string();
@@ -328,7 +312,6 @@ pub(crate) fn space_subtitle(branch: &str, tabs: &[Value]) -> String {
         .to_string()
 }
 
-/// `2h13m` / `5d19h` until `at` (unix seconds).
 fn until(at: i64) -> String {
     let m = ((at - now_unix()).max(0)) / 60;
     match m {
@@ -344,16 +327,12 @@ pub(crate) fn now_unix() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// What a native context-menu item does.
 #[derive(Clone)]
 enum Act {
-    /// Open a comux overlay (`rename-session`, …) for our client, with an optional target.
     Open(&'static str, Option<String>),
-    /// Run a control request.
     Cmd(Value),
 }
 
-/// A label showing `markup`, left-aligned and ellipsized.
 fn markup(m: &str) -> gtk4::Label {
     let l = gtk4::Label::new(None);
     l.set_markup(m);
@@ -362,7 +341,6 @@ fn markup(m: &str) -> gtk4::Label {
     l
 }
 
-/// A label showing `markup` at its full width: what the layout budgets for, never cut.
 fn fixed(m: &str) -> gtk4::Label {
     let l = gtk4::Label::new(None);
     l.set_markup(m);
@@ -377,7 +355,6 @@ fn rule() -> gtk4::Separator {
     s
 }
 
-/// `name ───`: a section or group header.
 fn header_row(m: &str, badge: Option<String>) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     b.set_margin_start(8);
@@ -394,7 +371,6 @@ fn header_row(m: &str, badge: Option<String>) -> gtk4::Box {
     b
 }
 
-/// The TUI's two-row entry: `left … right` over an indented subtitle.
 fn entry(left: &str, right: &str, sub: Option<&str>, indent: i32) -> gtk4::Box {
     let v = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
     v.set_margin_start(8);
@@ -443,7 +419,6 @@ pub(crate) fn agent_status(a: &Value) -> &str {
     }
 }
 
-/// `⇄2` when the agent shares its git worktree (the count includes it), as in the TUI.
 pub(crate) fn shared_marker(a: &Value) -> String {
     match a["worktree_peers"].as_u64() {
         Some(n) if n > 0 => format!("⇄{}", n + 1),
@@ -483,8 +458,6 @@ fn tokens(n: u64) -> String {
     }
 }
 
-/// Time in status, bucketed like the TUI's `fmt_elapsed` (nothing under a minute, then whole
-/// minutes), so the rows change once a minute and not every second.
 pub(crate) fn elapsed(since: i64) -> String {
     let s = (now_unix() - since).max(0);
     match s {
@@ -507,26 +480,19 @@ fn flat_button(icon: &str, tip: &str, name: &str) -> gtk4::Button {
 
 pub struct ComuxPanel {
     pub sidebar: gtk4::Box,
-    /// The top bar over the terminal (decisions #204): where the view is on the left; the
-    /// all-sessions view, the work graph and the bell on the right.
     pub top: gtk4::Box,
     top_where: gtk4::Label,
     graph_btn: gtk4::Button,
     all_btn: gtk4::Button,
     top_sig: Cell<u64>,
-    /// The right dock: the work-graph panel, slid in and out.
     pub right_dock: gtk4::Revealer,
     graph: Rc<crate::comux_graph::GraphPanel>,
     graph_state: RefCell<crate::comux_graph::Remembered>,
-    /// A drag on the dock's left edge: (pointer x at the start, the width then).
     graph_drag: Cell<Option<(f64, i32)>>,
     notifications: gtk4::Box,
-    /// comux's status bar, natively (decisions #170): under the notebook.
     pub status: gtk4::Box,
-    /// The overlay shown over the window (decisions #180), and the window overlay it sits in.
     overlay_ui: RefCell<Option<crate::comux_overlay::OverlayUi>>,
     overlay_root: RefCell<Option<gtk4::Overlay>>,
-    /// copad's own prompt over the window (Open Remote comux), drawn like comux's overlays.
     local_overlay: RefCell<Option<crate::comux_overlay::OverlayUi>>,
     /// `Ctrl-b e` keyboard mode and row previews on the sidebar (decisions #181).
     nav: Rc<crate::comux_nav::SidebarNav>,
@@ -537,26 +503,22 @@ pub struct ComuxPanel {
     agents_head: gtk4::Box,
     notif_list: gtk4::ListBox,
     bell_count: gtk4::Label,
-    /// Every comux this window hosts: the local one first, then remote ones copad opened
-    /// over SSH (decisions #171), by key.
     hosts: RefCell<Vec<(String, Rc<MuxHost>)>>,
     /// The one the visible panes host (the local one when none does).
     current: RefCell<Rc<MuxHost>>,
     /// `state_json()` of `current` at one generation: a tick that sees a change reads the
-    /// state from half a dozen places, and each read used to rebuild the whole JSON.
+    /// state from half a dozen places, and each read would rebuild the whole JSON.
     state_cache: RefCell<Option<(*const MuxHost, u64, Rc<Value>)>>,
     socket: String,
     last_gen: Cell<u64>,
     last_serve: Cell<Option<Instant>>,
     served: RefCell<Vec<String>>,
     notif_open: Cell<bool>,
-    /// What a click on row N of each list does (empty = nothing): aligned with EVERY row.
     space_actions: RefCell<Vec<Vec<Value>>>,
     agent_actions: RefCell<Vec<Vec<Value>>>,
     notif_actions: RefCell<Vec<Vec<Value>>>,
     style: RefCell<Style>,
     css: gtk4::CssProvider,
-    /// The overlay the notification panel floats in, and whether it does now.
     float_in: RefCell<Option<gtk4::Overlay>>,
     floating: Cell<bool>,
     /// Inputs of the last layout pass (window width, sidebar height, generation), so the
@@ -569,14 +531,12 @@ pub struct ComuxPanel {
     usage_fit: Cell<(i32, u64)>,
     usage_box: RefCell<Option<gtk4::Box>>,
     chips: RefCell<Option<gtk4::ScrolledWindow>>,
-    /// The wall-clock minute last drawn: ages and the clock move on.
     minute: Cell<i64>,
     /// What the lists and the status bar were last built from: a state change that leaves them
     /// as they were (a preview tick, a claim) must not rebuild the rows — that reset the row
     /// under the pointer every 0.7 s and made it flicker.
     lists_sig: Cell<u64>,
     status_sig: Cell<u64>,
-    /// The sidebar width the rows were laid out for (they are rebuilt when it changes).
     built_width: Cell<i32>,
     /// The sidebar width the user dragged to (decisions #181), kept across restarts.
     user_side: Cell<Option<i32>>,
@@ -624,7 +584,6 @@ impl ComuxPanel {
         head.append(&resume);
         sidebar.append(&head);
 
-        // The top bar (decisions #204): the bell moved here from the sidebar's head.
         let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         top.set_widget_name("comux-top");
         let top_where = gtk4::Label::new(None);
@@ -790,7 +749,6 @@ impl ComuxPanel {
                 }
             });
         }
-        // The dock's left edge resizes it.
         let drag = gtk4::GestureDrag::new();
         let w = Rc::downgrade(&this);
         drag.connect_drag_begin(move |g, x, _| {
@@ -839,7 +797,6 @@ impl ComuxPanel {
                 for r in reqs {
                     p.cur().command(r);
                 }
-                // An opened notification goes to its pane: the panel has done its job.
                 if which == 2 && acted && p.notif_open.get() {
                     p.notif_open.set(false);
                     p.relayout(true);
@@ -849,8 +806,6 @@ impl ComuxPanel {
         this
     }
 
-    /// Hand the panel the window and the overlay over the terminal area: the notification
-    /// panel floats there when the window is too narrow to dock it, and Esc closes it then.
     pub fn mount(
         self: &Rc<Self>,
         window: &gtk4::ApplicationWindow,
@@ -863,7 +818,6 @@ impl ComuxPanel {
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let w = Rc::downgrade(self);
         keys.connect_key_pressed(move |_, key, _, state| {
-            // Keyboard mode on the native sidebar takes every key (decisions #181).
             if let Some(p) = w.upgrade()
                 && p.nav.active()
             {
@@ -931,7 +885,6 @@ impl ComuxPanel {
             });
             area.add_controller(keep);
         }
-        // A click anywhere ends sidebar keyboard mode (the click itself goes through).
         let click = gtk4::GestureClick::new();
         click.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let w = Rc::downgrade(self);
@@ -954,8 +907,6 @@ impl ComuxPanel {
         });
     }
 
-    /// The split the sidebar sits in (window.rs): dragging its handle resizes the sidebar, and
-    /// the width is kept (decisions #181).
     pub fn set_paned(self: &Rc<Self>, paned: &gtk4::Paned) {
         *self.paned.borrow_mut() = Some(paned.clone());
         let w = Rc::downgrade(self);
@@ -966,7 +917,6 @@ impl ComuxPanel {
             }
             let pos = p.position();
             me.user_side.set(Some(pos));
-            // Written once the drag settles, not on every motion.
             if let Some(t) = me.save_timer.borrow_mut().take() {
                 t.remove();
             }
@@ -984,7 +934,6 @@ impl ComuxPanel {
         });
     }
 
-    /// Config hot-reload: the terminal font or the theme changed.
     pub fn apply_config(self: &Rc<Self>, config: &CopadConfig) {
         let style = Style::from_config(config);
         if *self.style.borrow() == style {
@@ -999,8 +948,6 @@ impl ComuxPanel {
         self.usage_fit.set((0, 0));
     }
 
-    /// Called from the window's main-loop timer: re-report the visible panels now and then,
-    /// rebuild the lists when the host's state moved, and re-fit the layout to the window.
     pub fn tick(self: &Rc<Self>, mgr: &TabManager, window: &gtk4::ApplicationWindow) {
         let window_visible = window.is_visible();
         if self
@@ -1025,7 +972,6 @@ impl ComuxPanel {
                 *self.served.borrow_mut() = panels;
             }
         }
-        // Any host moving is a change; then pick the one the visible panes host.
         let generation: u64 = self
             .hosts
             .borrow()
@@ -1033,7 +979,6 @@ impl ComuxPanel {
             .map(|(_, h)| h.generation())
             .sum();
         let minute = now_unix() / 60;
-        // A resized sidebar (its handle dragged, the window resized) needs rows laid out anew.
         let width = self.sidebar.width();
         if self.sidebar.is_visible() && width > 0 && width != self.built_width.get() {
             self.built_width.set(width);
@@ -1053,7 +998,6 @@ impl ComuxPanel {
             *self.current.borrow_mut() = pick;
             self.rebuild();
             self.present_overlay(window);
-            // `Ctrl-b e` from a comux client in this window (decisions #181).
             let served = self.served.borrow().clone();
             if served.iter().any(|p| self.cur().take_focus_request(p)) {
                 let active = self.state()["tree"]["active"].as_str().map(str::to_string);
@@ -1087,7 +1031,6 @@ impl ComuxPanel {
         v
     }
 
-    /// Place the sidebar's keyboard mark and row preview (decisions #181).
     fn apply_nav(&self) {
         let (w, h) = self
             .sidebar
@@ -1104,7 +1047,6 @@ impl ComuxPanel {
         self.current.borrow().clone()
     }
 
-    /// The width of one cell of the chrome's font.
     fn advance(&self) -> i32 {
         self.sidebar
             .create_pango_layout(Some("MMMMMMMMMM"))
@@ -1211,7 +1153,6 @@ impl ComuxPanel {
             return;
         }
         self.floating.set(floating);
-        // A dropdown under the top bar's bell (decisions #204), only there while open.
         if floating {
             self.notifications.set_halign(gtk4::Align::End);
             self.notifications.set_valign(gtk4::Align::Start);
@@ -1224,7 +1165,6 @@ impl ComuxPanel {
         }
     }
 
-    /// Share the sidebar's height between spaces and agents by what each list needs.
     fn split(&self) {
         let total = self.sidebar.height();
         if total <= 0 {
@@ -1272,7 +1212,6 @@ impl ComuxPanel {
         }
         self.lists_sig.set(lists_sig);
 
-        // ---- spaces ----
         self.nav.clear_rows();
         clear(&self.spaces);
         let mut sa = Vec::new();
@@ -1335,7 +1274,6 @@ impl ComuxPanel {
         }
         *self.space_actions.borrow_mut() = sa;
 
-        // ---- agents ----
         clear(&self.agents);
         let agents: Vec<Value> = s["agents"]["agents"]
             .as_array()
@@ -1363,7 +1301,6 @@ impl ComuxPanel {
                     );
                     let right = span(&st.yellow, &elapsed(a["since_unix"].as_i64().unwrap_or(0)));
                     let row = list_row(&entry(&left, &right, None, 0), true);
-                    // Previewed on hover, but not a keyboard stop: the agent's own row is.
                     self.nav
                         .add(true, &row, None, a["token"].as_str().map(str::to_string));
                     (row, vec![json!({"cmd": "jump", "target": a["token"]})])
@@ -1422,7 +1359,6 @@ impl ComuxPanel {
                         .as_str()
                         .or(a["tool"].as_str())
                         .unwrap_or_default();
-                    // The second line: what it is doing, with its context gauge flush right.
                     let body = entry(&left, &right, None, 0);
                     let sub = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
                     sub.set_margin_start(2 * self.advance());
@@ -1458,7 +1394,6 @@ impl ComuxPanel {
                         ),
                         ("Rename tab…", Act::Open("rename-tab", Some(tab))),
                     ];
-                    // Compaction on request is Claude's (`comux compact`).
                     if a["tool"] == "claude" {
                         let queued = a["compact_requested"] == true;
                         menu.push((
@@ -1555,7 +1490,6 @@ impl ComuxPanel {
         self.relayout(false);
     }
 
-    /// The top bar's left side: session › tab › the focused agent and what it is doing.
     fn rebuild_top(&self, s: &Value, st: &Style) {
         let g = self.graph_state.borrow().clone();
         let top_sig = sig(&[&s["tree"], &s["agents"], &json!([g.open, g.mode])]);
@@ -1612,7 +1546,6 @@ impl ComuxPanel {
         }
     }
 
-    /// The window's current comux link's key (`""` = local).
     fn cur_key(&self) -> String {
         let cur = self.cur();
         self.hosts
@@ -1623,12 +1556,10 @@ impl ComuxPanel {
             .unwrap_or_default()
     }
 
-    /// The window's graph page's consumer name at its comux.
     fn graph_consumer(&self) -> String {
         format!("{OVERLAY_CONSUMER}-graph")
     }
 
-    /// Open the work-graph panel on `mode`, or close it when it already shows that.
     pub fn toggle_graph(&self, mode: &str) {
         let g = self.graph_state.borrow().clone();
         self.set_graph(Some(!(g.open && g.mode == mode)), Some(mode));
@@ -1654,7 +1585,6 @@ impl ComuxPanel {
         self.feed_graph();
     }
 
-    /// Act on what the graph page asked for, then bring it up to date.
     fn service_graph(&self) {
         let s = self.state();
         let current = match s["graph"]["epoch"]
@@ -1721,8 +1651,6 @@ impl ComuxPanel {
         );
     }
 
-    /// `comux.graph` for the e2e: the panel's state, and the page's own read-out.
-    /// `comux.graph` with `snapshot`: WebKit's own render of the page into that PNG path.
     pub fn graph_snapshot(&self, path: &str, done: impl FnOnce(Value) + 'static) {
         self.graph
             .snapshot(path, move |ok| done(json!({"snapshot": ok})));
@@ -1743,7 +1671,6 @@ impl ComuxPanel {
         });
     }
 
-    /// `comux.notifications` for the e2e.
     pub fn set_notifications(&self, open: Option<bool>) -> Value {
         if let Some(o) = open {
             self.notif_open.set(o);
@@ -1778,8 +1705,6 @@ impl ComuxPanel {
         l
     }
 
-    /// comux's status bar (decisions #170, #179): session pill, tab chips (they scroll when
-    /// short of room), the armed prefix, the outcome line, counters, usage, update, clock, host.
     fn rebuild_status(self: &Rc<Self>, s: &Value, st: &Style) {
         clear_box(&self.status);
         let status = &s["status"];
@@ -1873,7 +1798,6 @@ impl ComuxPanel {
         scroller.set_propagate_natural_width(true);
         scroller.set_child(Some(&chips));
         self.status.append(&scroller);
-        // The active chip into view once the chips have their positions.
         if let Some(chip) = active_chip {
             let sc = scroller.clone();
             gtk4::glib::idle_add_local_once(move || {
@@ -1941,7 +1865,6 @@ impl ComuxPanel {
         }
     }
 
-    /// The carousel's pages when the readout is paged (and comux says what they are).
     fn pages(status: &Value) -> Option<Vec<Value>> {
         (status["usage"]["layout"] == "paged")
             .then(|| status["usage"]["pages"].as_array().cloned())
@@ -1956,8 +1879,6 @@ impl ComuxPanel {
             .unwrap_or_default()
     }
 
-    /// The usage readout at `level`: 0 gauge + % + reset per window, 1 without resets, 2
-    /// percentages only, 3 one window at a time (click for the next), 4 nothing.
     fn fill_usage(self: &Rc<Self>, into: &gtk4::Box, status: &Value, st: &Style, level: u8) {
         clear_box(into);
         let windows = Self::windows(status);
@@ -2145,7 +2066,6 @@ impl ComuxPanel {
         let windows = Self::windows(&status);
         let bars = status["usage"]["gauge"] != "text";
         let chosen = match Self::pages(&status) {
-            // Paged: with gauges, else without, else hidden.
             Some(pages) => [0u8, 1]
                 .into_iter()
                 .find(|&l| self.paged_width(&pages, &windows, l, bars) <= available)
@@ -2162,7 +2082,6 @@ impl ComuxPanel {
         }
     }
 
-    /// The width of the paged readout: its widest page, the `n/N` and the button padding.
     fn paged_width(&self, pages: &[Value], windows: &[Value], level: u8, bars: bool) -> i32 {
         let text = |t: &str| self.status.create_pango_layout(Some(t)).pixel_size().0;
         let bars = level == 0 && bars;
@@ -2200,8 +2119,6 @@ impl ComuxPanel {
         8 + widest + counter
     }
 
-    /// The width [`fill_usage`](Self::fill_usage) will take at `level`, from the same texts
-    /// and spacings.
     fn usage_width(&self, windows: &[Value], level: u8, bars: bool) -> i32 {
         if windows.is_empty() {
             return 0;
@@ -2262,7 +2179,6 @@ impl ComuxPanel {
     }
 }
 
-/// A usage gauge: a capsule track in `track`, filled to `pct` in `fill`.
 fn gauge_widget(pct: f64, track: &str, fill: &str, adv: i32) -> gtk4::DrawingArea {
     let d = gtk4::DrawingArea::new();
     let h = (adv / 2).clamp(4, 8);
@@ -2309,8 +2225,6 @@ fn gauge_widget(pct: f64, track: &str, fill: &str, adv: i32) -> gtk4::DrawingAre
 }
 
 impl ComuxPanel {
-    /// Prepare a REMOTE comux: start (or reuse) the L0 host for `dest` and mint a tag. Returns
-    /// the host, the tag (bind the panel to it once it exists) and the command the panel runs.
     pub fn prepare_remote(
         &self,
         dest: &str,
@@ -2363,7 +2277,6 @@ impl ComuxPanel {
         }
     }
 
-    /// Whether a visible panel runs a comux client whose sidebar we hold.
     fn hosting(&self, s: &Value) -> bool {
         let claimed: Vec<u64> = s["claimed"]
             .as_array()
@@ -2391,7 +2304,6 @@ impl ComuxPanel {
         let mine_id = mine.as_ref().and_then(|o| o["overlay"].as_u64());
         let shown = self.overlay_ui.borrow().as_ref().map(|u| u.id);
         if shown.is_some() && shown != mine_id {
-            // Answered elsewhere, or comux closed it.
             self.close_overlay();
         }
         let Some(o) = mine else { return };
@@ -2570,18 +2482,15 @@ fn clear_box(b: &gtk4::Box) {
 }
 
 thread_local! {
-    /// The window's panel, for socket commands (GTK main thread only).
     static PANEL: RefCell<Option<Rc<ComuxPanel>>> = const { RefCell::new(None) };
 }
 
-/// The panel's name for its overlay preview (one panel per window, so one consumer per host).
 const OVERLAY_CONSUMER: &str = "overlay";
 
 pub fn set_global(p: &Rc<ComuxPanel>) {
     PANEL.with(|g| *g.borrow_mut() = Some(p.clone()));
 }
 
-/// Ctrl+Shift+G: the work-graph panel (decisions #204).
 pub fn toggle_graph_global(mode: &str) {
     if let Some(p) = PANEL.with(|g| g.borrow().clone()) {
         p.toggle_graph(mode);
@@ -2600,7 +2509,6 @@ pub fn graph_global(
     match PANEL.with(|g| g.borrow().clone()) {
         Some(p) => {
             if let Some(w) = width {
-                // As a drag on the dock's edge would leave it.
                 p.graph_state.borrow_mut().width = Some(w.max(260));
             }
             if open.is_some() || mode.is_some() || width.is_some() {
@@ -2615,7 +2523,6 @@ pub fn graph_global(
     }
 }
 
-/// `comux.notifications` (decisions #204).
 pub fn notifications_global(open: Option<bool>) -> Value {
     PANEL
         .with(|g| g.borrow().clone())
@@ -2624,15 +2531,12 @@ pub fn notifications_global(open: Option<bool>) -> Value {
         })
 }
 
-/// Config hot-reload: restyle the window's comux chrome (font, theme).
 pub fn apply_config_global(config: &CopadConfig) {
     if let Some(p) = PANEL.with(|g| g.borrow().clone()) {
         p.apply_config(config);
     }
 }
 
-/// `comux.open_remote` (decisions #171): a new tab running the remote comux client with a
-/// fresh binding tag, and the L0 link to the same host, so the native chrome follows it.
 pub fn open_remote(
     mgr: &Rc<TabManager>,
     window: &gtk4::ApplicationWindow,
@@ -2646,14 +2550,13 @@ pub fn open_remote(
         return Err(format!("refused destination or command: {dest} / {comux}"));
     }
     let (host, tag, cmd) = panel.prepare_remote(dest, comux)?;
-    // Handed to the tab as INITIAL input, which the terminal feeds once its shell has spawned —
-    // input written before that can be lost (codex P4 C1).
+    // Handed to the tab as INITIAL input, which the terminal feeds once its shell has spawned;
+    // earlier input can be lost.
     let (term, _) = mgr.add_tab_with_cwd_and_initial_input(window, None, Some(format!("{cmd}\n")));
     host.bind(term.id(), &tag);
     Ok(())
 }
 
-/// Ask for the destination, then [`open_remote`].
 pub fn prompt_open_remote(mgr: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
     ask_remote(mgr, window, "", None);
 }
@@ -2695,8 +2598,6 @@ mod tests {
         json!({"space": space, "space_id": space, "status": status, "token": format!("{space}-{status}")})
     }
 
-    /// Every row the agents list shows has its action at the same index: headers and the
-    /// band's rule shift the rows (codex C2).
     #[test]
     fn agent_context_words_it_as_the_tui() {
         let a = json!({"context": {"used": 124000, "window": 200000, "cost_usd": 1.2, "cost_per_hour": 3.4}});
@@ -2709,6 +2610,8 @@ mod tests {
         assert!(agent_context(&json!({"status": "ready"})).is_none());
     }
 
+    /// Every row the agents list shows has its action at the same index: headers and the band's
+    /// rule shift the rows.
     #[test]
     fn agent_rows_put_the_band_first_and_group_by_space() {
         let agents = vec![
@@ -2748,15 +2651,10 @@ mod tests {
 
     #[test]
     fn the_sidebar_split_gives_slack_to_the_half_that_needs_it() {
-        // Both fit: spaces gets what it needs.
         assert_eq!(split_sidebar(600, 100, 200, 40, 40, 0), 100);
-        // Spaces small, agents overflow: spaces keeps its need.
         assert_eq!(split_sidebar(600, 120, 2000, 40, 40, 0), 120);
-        // Spaces overflow, agents small: agents keeps its need.
         assert_eq!(split_sidebar(600, 2000, 100, 40, 40, 0), 500);
-        // Both overflow: even.
         assert_eq!(split_sidebar(600, 2000, 2000, 40, 40, 0), 300);
-        // Floors that do not both fit: spaces yields first, down to its header.
         assert_eq!(split_sidebar(60, 2000, 2000, 40, 40, 20), 20);
     }
 

@@ -45,42 +45,21 @@ impl CopadWindow {
             .default_height(800)
             .build();
 
-        // Cold-boot WebKit prewarm: kicked off ASAP (before plugins
-        // load, before tabs build) so WebKit's host-side daemons —
-        // xdg-desktop-portal lazy systemd activation, the bubblewrap
-        // sandbox setup path, the session-bus connection to the
-        // portal, and the document-portal handshake that mediates
-        // file:// access from a sandboxed WebProcess — all finish
-        // handshaking while copad does the rest of its init in
-        // parallel. The first plugin panel the user opens then
-        // finds those daemons already running and avoids the
-        // cold-boot hang where `load_uri()` sits silent until a
-        // second copad process happens to wake them. See commit
-        // 78ebdb1 for the diagnostic instrumentation, and the teardown
-        // where the view is parked for when it is dropped.
+        // Cold-boot WebKit prewarm, started before plugins load so WebKit's host-side daemons
+        // (xdg-desktop-portal activation, bubblewrap setup, document-portal handshake) finish
+        // handshaking in parallel; otherwise the first plugin panel hits a cold-boot hang where
+        // `load_uri()` sits silent. See the teardown where the view is parked.
         //
-        // The prewarm uses its own `WebContext` so it doesn't share
-        // a sandbox / cookie jar with any plugin panel. Note that
-        // WebKitGTK process state (NetworkProcess, WebProcess) is
-        // per-WebContext, so each plugin panel still cold-spawns
-        // its own; what this prewarm warms is the SHARED host-side
-        // state (portal daemons, D-Bus name ownership, kernel
-        // bubblewrap setup) which is what's suspected of cold-boot
-        // hang. Loading a `file://` stub (not `about:blank`) and
-        // adding `/tmp` to the sandbox exercises the same code path
-        // plugin panels later traverse, including the portal-mediated
-        // file read that is the most likely hang site.
+        // It uses its own `WebContext`; WebKitGTK process state is per-WebContext, so each plugin
+        // panel still cold-spawns its own. What is warmed is the shared host-side state. Loading a
+        // `file://` stub with `/tmp` in the sandbox exercises the path plugin panels traverse,
+        // including the portal-mediated file read, the likely hang site.
         //
-        // Cost: a WebProcess + NetworkProcess (+ their bwrap/dbus-proxy
-        // helpers, ~35 MB together) only until the stub has loaded — the
-        // view is then dropped, since what it warmed lives outside this
-        // process (see the teardown below). Temp file is per-pid so
-        // concurrent copad instances don't collide; removed with the view.
+        // Costs a WebProcess + NetworkProcess (~35 MB) until the stub loads. The temp file is
+        // per-pid so concurrent instances don't collide.
         let prewarm_path =
             std::env::temp_dir().join(format!("copad-prewarm-{}.html", std::process::id()));
-        // Surface the write failure rather than swallow it — if the
-        // temp file isn't there, the file:// load fails silently and
-        // the cold-boot hypothesis can't be evaluated next reproduction.
+        // Surface the write failure: without the temp file the file:// load fails silently.
         if let Err(e) = std::fs::write(&prewarm_path, b"<!doctype html><title>p</title>") {
             eprintln!(
                 "[copad] prewarm: failed to write {}: {e} — cold-boot \
@@ -100,11 +79,9 @@ impl CopadWindow {
             wv
         };
 
-        // Window-level fallback bg: visible whenever no `BackgroundLayer`
-        // image is loaded. The provider handle is reused on hot reload so a
-        // theme switch updates this color in lockstep with the rest of the
-        // UI; without that the fallback bg sticks at the old theme color
-        // because terminals are permanently transparent now.
+        // Window-level fallback bg, visible when no `BackgroundLayer` image is loaded. The
+        // provider is reused on hot reload so a theme switch updates it in lockstep; terminals
+        // are permanently transparent.
         let window_css = gtk4::CssProvider::new();
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
         gtk4::style_context_add_provider_for_display(
@@ -115,33 +92,20 @@ impl CopadWindow {
 
         let event_bus = socket::new_event_bus();
 
-        // Context Service: live snapshot of "what the user is currently doing."
-        // Pumped from the GTK timer below; exposed via the `context.snapshot` action.
         let context = Arc::new(ContextService::new());
 
-        // `with_completion_bus` auto-publishes `<name>.completed/.failed`
-        // so chained triggers compose without per-plugin emit code.
-        // The bounded pool gives GUI-local blocking handlers (notify.show,
-        // project.last_commit) the same backpressure the daemon registry
-        // got in Phase 9.4 — without it they fall back to unbounded
-        // `thread::spawn` per dispatch. Smaller than the daemon's pool:
-        // the GUI hosts a handful of blocking actions, not a plugin fleet.
+        // `with_completion_bus` auto-publishes `<name>.completed/.failed` so chained triggers
+        // compose. The bounded pool gives GUI-local blocking handlers (notify.show,
+        // project.last_commit) backpressure instead of an unbounded `thread::spawn` per dispatch.
         let actions = Arc::new(ActionRegistry::with_completion_bus(event_bus.clone()))
             .with_pool(copad_core::thread_pool::ThreadPool::new(2, 32));
-        // High-frequency built-ins are registered "silent" so their
-        // completions don't dwarf real workflow events on the bus.
-        // system.ping fires from heartbeat probes; context.snapshot
-        // fires from anything that wants to see the active panel
-        // (potentially every keystroke in agent flows).
+        // High-frequency built-ins are registered "silent" so their completions don't dwarf real
+        // workflow events on the bus.
         actions.register_silent("system.ping", |_| Ok(json!({ "status": "ok" })));
         {
-            // Mirrors macOS `AppDelegate.registerSilent("system.list_actions")`.
-            // Weak, not a clone: the registry owns the handler, so an Arc here
-            // would be a cycle that never drops. Registered (rather than added
-            // as a socket arm) so it self-lists in the command palette, exactly
-            // like the macOS one. Reachable via the GUI socket; a daemon-routed
-            // call hits the daemon's own registry, which doesn't have it —
-            // same on macOS, since both platforms share `copadd`.
+            // Weak, not a clone: the registry owns the handler, so an Arc would be a cycle.
+            // Registered (not a socket arm) so it self-lists in the command palette, as on
+            // macOS. A daemon-routed call hits the daemon's own registry, which lacks it.
             let registry = std::sync::Arc::downgrade(&actions);
             actions.register_silent("system.list_actions", move |_| {
                 let Some(registry) = registry.upgrade() else {
@@ -154,9 +118,6 @@ impl CopadWindow {
             });
         }
         actions.register("system.log", |params| {
-            // Built-in observable action — useful as a trigger sink. Falls
-            // back to the full params JSON when no `message` field is present
-            // so the user always sees something even with a misshapen call.
             let msg = params
                 .get("message")
                 .and_then(|v| v.as_str())
@@ -173,19 +134,12 @@ impl CopadWindow {
             });
         }
         {
-            // `event.history` — recent bus events snapshot. Callers
-            // pass optional `since_ms` (epoch millis cutoff) and
-            // `kind` (event-kind glob, same matcher as
-            // `event.subscribe`). The bus owns the ring buffer
-            // (default cap 500); this action just projects + filters.
-            // Registered silent because its own `.completed` event on
-            // the bus would otherwise inflate every history call's
-            // result on the next call.
+            // `event.history`: the bus owns the ring buffer; this projects and filters by
+            // `since_ms` and `kind` (glob, as `event.subscribe`). Registered silent, or its own
+            // `.completed` event would inflate the next call's result.
             let bus = event_bus.clone();
             actions.register_silent("event.history", move |params| {
-                // Reject malformed types loudly instead of treating
-                // them as absent — `event.subscribe` also rejects
-                // bad `patterns`, so the surface stays consistent.
+                // Reject malformed types loudly, as `event.subscribe` does for bad `patterns`.
                 if let Some(v) = params.get("since_ms")
                     && !v.is_null()
                     && v.as_u64().is_none()
@@ -209,12 +163,6 @@ impl CopadWindow {
                 let arr: Vec<serde_json::Value> = events
                     .into_iter()
                     .map(|e| {
-                        // Wire shape matches `event.subscribe`'s
-                        // `{type, data, source}` (see `Event` in
-                        // `copad-core/src/protocol.rs`) with an added
-                        // `timestamp_ms` so the catch-up consumer can
-                        // render a per-event clock. Older `event.
-                        // subscribe` consumers ignore the extra field.
                         json!({
                             "type": e.kind,
                             "data": e.payload,
@@ -226,10 +174,6 @@ impl CopadWindow {
                 Ok(json!({ "events": arr }))
             });
         }
-        // `notify.show` — mirror of the daemon-side registration so
-        // the GUI's in-process trigger engine reaches the same action
-        // when `host_triggers = OFF`. Blocking-silent: subprocess off
-        // the dispatch thread, no `.completed` spam.
         {
             let notifier = copad_core::notifier::platform_notifier();
             actions.register_blocking_silent("notify.show", move |params| {
@@ -273,10 +217,6 @@ impl CopadWindow {
             });
         }
 
-        // Phase 22.2 — project + workflow registries. Built once at startup
-        // from config + ~/.config/copad/workflows/*.yaml; reload requires
-        // restart (matches existing config-reload semantics for triggers).
-        // See docs/project-orchestration.md.
         let project_registry = Arc::new(Mutex::new({
             let mut r =
                 copad_core::project::ProjectRegistry::from_projects(config.projects.clone());
@@ -326,11 +266,6 @@ impl CopadWindow {
             });
         }
         {
-            // `project.last_commit { name }` — shells `git log -1` against
-            // the resolved project's path and returns `{short_hash, subject,
-            // when_relative}`. Panel calls this per active-pane change rather
-            // than baking last_commit into `project.list`, so the per-project
-            // git shellout cost (~10ms) doesn't multiply with N projects.
             let reg = project_registry.clone();
             actions.register_blocking_silent("project.last_commit", move |params| {
                 let name = params
@@ -380,8 +315,6 @@ impl CopadWindow {
         {
             let reg = workflow_registry.clone();
             actions.register_silent("workflow.list", move |_| {
-                // Minimal listing — clients call workflow.get for full spec
-                // (prompt + form_fields). Keeps the per-tick re-render cheap.
                 let workflows: Vec<serde_json::Value> = reg
                     .list()
                     .into_iter()
@@ -417,24 +350,18 @@ impl CopadWindow {
             });
         }
 
-        // Dispatch channel: TabManager owns the original sender (used by
-        // plugin JS bridges). Trigger sink gets a clone so trigger-fired
-        // legacy actions (anything not in the registry yet) can fall through
-        // to `socket::dispatch` via the same path.
+        // TabManager owns the original sender (plugin JS bridges); the trigger sink gets a clone
+        // so legacy actions not in the registry fall through to `socket::dispatch`.
         let (dispatch_tx, plugin_dispatch_rx) = std::sync::mpsc::channel();
 
-        // `LiveTriggerSink` tries the in-process registry first and
-        // falls through to `socket::dispatch` (fire-and-forget caveat
-        // documented on the sink). PumpState bundles every per-tick
-        // drain target so the timer and the config
-        // hot-reload callback can both invoke the same `pump_all` sequence.
-        // Exact-match context subscriptions (not `*` and not glob) so high-
-        // frequency unrelated kinds cannot flood the bounded ctx queues.
+        // `LiveTriggerSink` tries the in-process registry first, then falls through to
+        // `socket::dispatch`. PumpState bundles every per-tick drain target so the timer and the
+        // hot-reload callback share one `pump_all`. Context subscriptions are exact-match (not
+        // `*` or glob) so high-frequency kinds cannot flood the bounded ctx queues.
         let sink: Arc<dyn TriggerSink> =
             Arc::new(LiveTriggerSink::new(actions.clone(), dispatch_tx.clone()));
-        // Engine needs the bus to publish synthesized
-        // `<trigger_name>.awaited` events; without `with_publish_bus`
-        // the `await` primitive silently no-ops.
+        // Needs the bus to publish `<trigger_name>.awaited`; without `with_publish_bus` `await`
+        // silently no-ops.
         let triggers = Arc::new(TriggerEngine::with_publish_bus(sink, event_bus.clone()));
         triggers.set_triggers(config.triggers.clone());
         let pump_state = Rc::new(RefCell::new(PumpState {
@@ -455,20 +382,15 @@ impl CopadWindow {
             pump_state.borrow().trigger_subs_len()
         );
 
-        // Cut-over state — daemon advertises via `gui.register` whether
-        // IT owns trigger dispatch. While the flag is `true`, this GUI's
-        // local engine is cleared and `watch_config` defers triggers to
-        // the daemon. The flag flips back to `false` whenever
-        // `gui_client::run` exits (disconnect / error), restoring local
-        // authority from the cached triggers — that's the
-        // disconnect-resilience contract for headless-daemon offline.
+        // Cut-over state: while true, the daemon owns trigger dispatch, this GUI's local engine
+        // is cleared and `watch_config` defers to the daemon. It flips to false whenever
+        // `gui_client::run` exits, restoring local authority from the cached triggers.
         let host_triggers_active = Arc::new(AtomicBool::new(false));
         let cached_triggers = Arc::new(Mutex::new(config.triggers.clone()));
         let (ht_tx, ht_rx) = channel::<bool>();
 
-        // Plugin discovery — sorted so plugin-by-name resolvers (panel
-        // open, statusbar module timer) agree with the daemon's
-        // `resolve_by_name` on duplicate manifest names.
+        // Sorted so plugin-by-name resolvers agree with the daemon's `resolve_by_name` on
+        // duplicate manifest names.
         let plugins = copad_core::plugin::discover_sorted_plugins();
         for p in &plugins {
             eprintln!(
@@ -477,27 +399,17 @@ impl CopadWindow {
             );
         }
 
-        // Plugin lifecycle belongs to copadd; the manifests discovered
-        // above stay for panel/statusbar/command rendering only.
-
-        // Per-instance under `runtime_dir()` (0700) — fs-perms gate connect(2).
         let socket_path = copad_core::paths::gui_socket_path(std::process::id())
             .to_string_lossy()
             .into_owned();
         let socket_rx = socket::start_server(&socket_path, event_bus.clone());
 
-        // Always attempt to attach to copadd. Daemon-absent is fine:
-        // gui_client's reconnect_loop quietly polls (1→30s backoff) and
-        // the GUI runs fully through its own in-process supervisor/socket
-        // in the meantime. When a daemon eventually shows up, the GUI
-        // auto-registers and starts serving daemon→GUI Invokes too.
-        // event_bus is passed so daemon-published events (chained
-        // workflow completions, plugin events) bridge into the GUI bus
-        // and feed the local TriggerEngine.
+        // Always attach to copadd. Daemon-absent is fine: the reconnect loop polls quietly
+        // (1->30s backoff) while the GUI runs on its own in-process supervisor/socket.
+        // `event_bus` lets daemon-published events bridge into the GUI bus and feed the local
+        // TriggerEngine.
         crate::gui_client::spawn(dispatch_tx.clone(), event_bus.clone(), ht_tx);
 
-        // App-lifetime agent-status model. Cockpit panels are views over it, so
-        // it must outlive them — opening and closing the panel never loses state.
         let cockpit = Rc::new(RefCell::new(copad_core::agent_cockpit::AgentCockpit::new()));
 
         let tab_manager = TabManager::new(
@@ -513,24 +425,20 @@ impl CopadWindow {
             cockpit.clone(),
         );
 
-        // Try restoring from the previous session, else seed a single
-        // default tab. We must do this before any window-close save can
-        // overwrite a persisted session with an empty snapshot.
+        // Restore the previous session, else seed a default tab. Must run before any
+        // window-close save can overwrite a persisted session with an empty snapshot.
         if let Some(session) = crate::session::load() {
             tab_manager.restore_session(&window, &session);
         } else {
             tab_manager.add_tab(&window);
         }
 
-        // Save the session on window close. Best-effort: any I/O error
-        // is logged but does not block exit.
         let tm_for_save = tab_manager.clone();
         window.connect_close_request(move |_| {
             let session = tm_for_save.snapshot_session();
             if session.tabs.is_empty() {
-                // The visible state has nothing terminal to restore.
-                // Leaving an older session.json on disk would surface
-                // stale tabs on next launch — delete instead.
+                // Nothing terminal to restore: delete the old session.json so stale tabs don't
+                // surface on next launch.
                 crate::session::clear();
             } else {
                 crate::session::save(&session);
@@ -538,34 +446,28 @@ impl CopadWindow {
             gtk4::glib::Propagation::Proceed
         });
 
-        // Status bar
         let statusbar = Rc::new(StatusBar::new(config, &plugins));
 
-        // Window-level background layer. Sits as the base child of an
-        // Overlay so every tab/panel above it (notebook, statusbar,
-        // terminals, plugin webviews) renders on top of the same image
-        // — no more "background only on the first terminal" surprise.
-        // `[window] background` overrides the theme color as the backdrop base.
+        // Window-level background layer: base child of an Overlay so every tab/panel above it
+        // renders over the same image. `[window] background` overrides the theme color as the
+        // backdrop base.
         let backdrop = config
             .window
             .background
             .as_deref()
             .unwrap_or(&theme.background);
         let background = BackgroundLayer::new(config, window_css, backdrop);
-        // Native wallpaper rotation: pick an image right away (the
-        // retired external daemon's apply-at-start behavior), then tick
-        // on the configured interval. No-op at interval 0.
+        // Pick an image right away, then tick on the configured interval (no-op at 0).
         if config.background.rotate_interval > 0 {
             background.rotate_once();
         }
         background.arm_rotation();
         background.arm_mode_watch();
 
-        // Layout: vertical box with notebook + statusbar
         let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         layout.set_hexpand(true);
         layout.set_vexpand(true);
-        // comux's sidebar / notification center beside the notebook — hidden unless a visible
+        // comux's sidebar / notification center beside the notebook; hidden unless a visible
         // pane runs a comux client whose sidebar this window claimed (decisions #169).
         let comux = crate::comux_panel::ComuxPanel::new(config);
         crate::comux_panel::set_global(&comux);
@@ -573,10 +475,9 @@ impl CopadWindow {
         middle.set_vexpand(true);
         tab_manager.notebook.set_hexpand(true);
         tab_manager.notebook.set_vexpand(true);
-        // The chrome lives INSIDE the visible notebook page, around that tab's content, so the
-        // order is tab column → comux sidebar → terminal → notifications like on macOS: the
-        // tabs are the window's, the comux chrome belongs to what the visible tab shows.
-        // The sidebar and the rest share a split: its handle resizes the sidebar (#181).
+        // The chrome lives INSIDE the visible notebook page, around that tab's content, giving
+        // tab column -> comux sidebar -> terminal -> notifications like macOS. The sidebar and
+        // the rest share a split whose handle resizes the sidebar (#181).
         let split = gtk4::Paned::new(gtk4::Orientation::Horizontal);
         split.set_hexpand(true);
         split.set_widget_name("comux-split");
@@ -588,17 +489,14 @@ impl CopadWindow {
         rest.set_hexpand(true);
         let center = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         center.set_hexpand(true);
-        // The notification panel floats over the terminal area when the window is too narrow
-        // to dock it (decisions #179). Its child is the visible tab's content.
+        // The notification panel floats over the terminal area when the window is too narrow to
+        // dock it (decisions #179).
         let term_over = gtk4::Overlay::new();
         term_over.set_vexpand(true);
-        // The top bar over the terminal (decisions #204); its bell's dropdown hangs into
-        // `term_over` just under it.
         center.append(&comux.top);
         center.append(&term_over);
         center.append(&comux.status);
         rest.append(&center);
-        // The work-graph panel docks on the right (decisions #204).
         rest.append(&comux.right_dock);
         split.set_end_child(Some(&rest));
         middle.append(&tab_manager.notebook);
@@ -616,17 +514,12 @@ impl CopadWindow {
         root_overlay.set_child(Some(&background.bg_picture));
         root_overlay.add_overlay(&background.tint_overlay);
         root_overlay.add_overlay(&layout);
-        // Park the prewarm WebView in the overlay tree so it
-        // realizes alongside the rest of the UI and its WebProcess
-        // actually spawns instead of sitting idle on an unparented
-        // widget. `can_target=false` + opacity 0 + 1×1 size keeps
-        // it inert and invisible.
+        // Parked in the overlay tree so it realizes and its WebProcess actually spawns;
+        // `can_target=false` + opacity 0 + 1x1 keeps it inert and invisible.
         root_overlay.add_overlay(&prewarm_webview);
-        // Once the stub has loaded, the host-side services are up and stay
-        // up without us, and every plugin panel spawns its own WebContext
-        // anyway, so keeping the view for the window's lifetime only kept
-        // its WebProcess and NetworkProcess alive for nothing. A load that
-        // never finishes is dropped after a minute all the same.
+        // Once the stub has loaded the host-side services stay up without us, so keeping the view
+        // only kept its WebProcess and NetworkProcess alive; a load that never finishes is
+        // dropped after a minute.
         {
             let overlay = root_overlay.downgrade();
             let path = prewarm_path.clone();
@@ -655,14 +548,12 @@ impl CopadWindow {
                 }
             });
         }
-        // Use the layout's natural size to drive the overlay so the bg
-        // image stretches/letterboxes against the real UI footprint
-        // rather than the picture's intrinsic size.
+        // The layout's natural size drives the overlay, so the bg image stretches against the
+        // real UI footprint rather than the picture's intrinsic size.
         root_overlay.set_measure_overlay(&layout, true);
         window.set_child(Some(&root_overlay));
         comux.mount(&window, &term_over, &root_overlay);
 
-        // Config hot-reload (also reloads triggers atomically)
         watch_config(
             &tab_manager,
             &statusbar,
@@ -676,12 +567,10 @@ impl CopadWindow {
             &cached_triggers,
         );
 
-        // ONE receiver for every cockpit-relevant kind, because these events do
-        // not commute: `panel.focused` then `claude.awaiting_input` must end
-        // Awaiting, while the reverse must end Idle. Separate per-kind receivers
-        // would drain in kind order and collapse both to the same result,
-        // silently clearing attention the user never saw. `subscribe("*")` would
-        // also preserve order but shares its buffer with `terminal.output`.
+        // ONE receiver for every cockpit-relevant kind: these events do not commute
+        // (`panel.focused` then `claude.awaiting_input` ends Awaiting, the reverse ends Idle),
+        // and per-kind receivers would drain in kind order and silently clear unseen attention.
+        // `subscribe("*")` keeps order but shares its buffer with `terminal.output`.
         let cockpit_rx = event_bus.subscribe_many([
             "claude.*",
             "panel.focused",
@@ -709,16 +598,12 @@ impl CopadWindow {
         let comux_tick = comux.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
             comux_tick.tick(&mgr, &win);
-            // Cut-over consumer runs BEFORE pump_all: when the daemon's
-            // register ack lands with `host_triggers=true`, clear the
-            // local engine on the SAME tick so no events dispatch
-            // locally before the cut-over is applied.
+            // Cut-over consumer runs BEFORE pump_all, so no event dispatches locally before the
+            // cut-over lands.
             //
-            // Edge-triggered: every `gui.register` ack sends a value
-            // (true OR false), and disconnect drop-guards always send
-            // `false`. Most are no-ops vs the current state — applying
-            // them anyway would clobber preflight/pending await state
-            // on every normal reconnect.
+            // Edge-triggered: every `gui.register` ack and disconnect guard sends a value, most
+            // equal to the current state; applying them anyway would clobber preflight/pending
+            // await state on every normal reconnect.
             if let Some(value) = drain_to_latest(&ht_rx)
                 && value != last_applied_ht.get()
             {
@@ -739,22 +624,13 @@ impl CopadWindow {
                 );
             }
 
-            // `pump_all` drains context-driving events first, then trigger
-            // events with per-event context snapshot. Single helper used by
-            // both this timer and the hot-reload callback so semantics match.
             pump_state_timer.borrow().pump_all(&ctx_pump, &trg_pump);
 
-            // Drop expired pending awaits and emit `<trigger>.awaited`
-            // with null payload for `on_timeout = "fire_with_default"`.
-            // Cheap on every tick: pending list is typically tiny.
             trg_pump.sweep_pending_awaits();
 
-            // Process socket commands. After each, drain ONLY context
-            // receivers (not trigger queues — those are handled at the start
-            // and end of tick). A dispatched command can publish events
-            // (`tab.new` → `panel.focused`) and the very next command in the
-            // same batch (e.g. `context.snapshot`) must see those events
-            // applied to ContextService.
+            // Process socket commands, draining ONLY context receivers after each (trigger queues
+            // are handled at tick start and end): a command can publish events (`tab.new` ->
+            // `panel.focused`) the next command (e.g. `context.snapshot`) must see applied.
             while let Ok(cmd) = socket_rx.try_recv() {
                 socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act, &bus_for_timer);
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
@@ -764,10 +640,9 @@ impl CopadWindow {
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
 
-            // Agent-cockpit pump. Runs after dispatch so a `tab.new` command's
-            // pane exists before an event referencing it is applied. Every
-            // borrow is a statement temporary — the cockpit view re-enters here
-            // through activate_panel's focus handler.
+            // Agent-cockpit pump, after dispatch so a `tab.new` pane exists before an event
+            // referencing it is applied. Every borrow is a statement temporary: the cockpit view
+            // re-enters here through activate_panel's focus handler.
             let mut cockpit_dirty = false;
             while let Some(event) = cockpit_rx.try_recv() {
                 let panel_id = event
@@ -778,18 +653,15 @@ impl CopadWindow {
                     .to_string();
                 match event.kind.as_str() {
                     kind if kind.starts_with("claude.") => {
-                        // Gate on live panes: a late event for an already-closed
-                        // pane would otherwise resurrect a dead entry and inflate
-                        // attention_count. Cheap — agent events are human-paced.
+                        // Gate on live panes: a late event for a closed pane would resurrect a
+                        // dead entry and inflate attention_count.
                         if mgr.live_terminal_ids().contains(&panel_id) {
                             cockpit_dirty |=
                                 cockpit_pump.borrow_mut().observe(kind, &event.payload);
                         }
                     }
                     "panel.exited" => {
-                        // Always dirty, not just when forget() evicted something:
-                        // a pane the model never tracked (no agent ever ran there)
-                        // still leaves the rendered list when it exits.
+                        // Always dirty: a pane the model never tracked still leaves the list.
                         cockpit_pump.borrow_mut().forget(&panel_id);
                         cockpit_dirty = true;
                     }
@@ -797,16 +669,13 @@ impl CopadWindow {
                         cockpit_dirty |= cockpit_pump.borrow_mut().acknowledge(&panel_id);
                     }
                     "tab.closed" => {
-                        // `tab.closed` names only one pane even when the tab held
-                        // several splits, so evict by reconciling against what is
-                        // actually still on screen. Always dirty regardless of
-                        // what retain dropped — the pane list itself shrank.
+                        // `tab.closed` names only one pane even when the tab held several splits,
+                        // so evict by reconciling against what is still on screen. Always dirty.
                         let live = mgr.live_terminal_ids();
                         cockpit_pump.borrow_mut().retain(|id| live.contains(id));
                         cockpit_dirty = true;
                     }
-                    // Remaining kinds don't touch the model; they just mean the
-                    // rendered pane list (title/cwd/membership) is stale.
+                    // Remaining kinds leave the model alone; the rendered list is stale.
                     _ => cockpit_dirty = true,
                 }
             }
@@ -817,36 +686,17 @@ impl CopadWindow {
             glib::ControlFlow::Continue
         });
 
-        // `window.restored` event publication.
+        // `window.restored`: published on the toplevel's SUSPENDED 1->0 transition. The Hyprland
+        // WebKit-panel freeze (docs/troubleshooting.md) leaves rendering stuck after it; users
+        // wire a `[[triggers]]` entry to run a cure command
+        // (examples/triggers/hyprland-webkit-fix.toml). Detection only; copad core has no
+        // Hyprland knowledge.
         //
-        // Watch the toplevel's `GDK_TOPLEVEL_STATE_SUSPENDED` bit and
-        // publish `window.restored` on the 1→0 transition — i.e. the
-        // compositor told us we were no longer visible/active and now
-        // we are again. The Hyprland WebKit-panel freeze (see
-        // `docs/troubleshooting.md`) leaves rendering stuck after this
-        // transition; user wires a trigger on this event to run
-        // two separate `hyprctl dispatch resizewindowpixel
-        // '<delta>,class:com.marshall.copad'` calls (the empirically
-        // verified cure form for the multi-window-on-workspace case;
-        // see `examples/triggers/hyprland-webkit-fix.toml`). Generic
-        // hook — copad core has no Hyprland knowledge, user supplies
-        // the cure command via `[[triggers]]`.
-        //
-        // Detection only — the `system.spawn` action that runs the
-        // cure lives in WR-2 (`trigger_sink::handle_system_spawn`).
-        // SUSPENDED toggling on Hyprland is verified end-to-end (see
-        // troubleshooting.md and the cure log captured during WR-2
-        // testing).
-        //
-        // Connected at `realize` because `Window::surface()` returns
-        // None until the window is realized; connecting at construct
-        // time silently no-ops.
+        // Connected at `realize`: `Window::surface()` is None until then, and connecting earlier
+        // silently no-ops.
         let bus_for_state = event_bus.clone();
         let last_suspended = Rc::new(Cell::new(false));
-        // Initialize so the FIRST 1→0 transition isn't suppressed by
-        // the leading-edge debounce. 1s back-dating is plenty: the
-        // user can't trigger a workspace cycle in the first 200ms of
-        // startup anyway.
+        // Back-dated so the FIRST 1->0 transition isn't suppressed by the leading-edge debounce.
         let last_fired = Rc::new(Cell::new(Instant::now() - Duration::from_secs(1)));
         window.connect_realize(move |w| {
             let Some(surface) = w.surface() else {
@@ -859,13 +709,9 @@ impl CopadWindow {
                 );
                 return;
             };
-            // Seed `last_suspended` with the toplevel's CURRENT state so
-            // a window that's already SUSPENDED at attach time (e.g.,
-            // copad launched on a non-current Hyprland workspace) still
-            // emits `window.restored` on the first 1→0 transition. The
-            // default `false` would suppress it because `prev == current`
-            // == false even though the surface had been suspended all
-            // along.
+            // Seed `last_suspended` with the toplevel's CURRENT state: a window already SUSPENDED
+            // at attach (e.g. launched on a non-current Hyprland workspace) must still emit
+            // `window.restored` on its first 1->0 transition.
             last_suspended
                 .set(toplevel.state().contains(gdk::ToplevelState::SUSPENDED));
             let bus = bus_for_state.clone();
@@ -874,14 +720,10 @@ impl CopadWindow {
             toplevel.connect_state_notify(move |tl| {
                 let suspended = tl.state().contains(gdk::ToplevelState::SUSPENDED);
                 let prev = last.replace(suspended);
-                // Only the 1→0 transition fires `window.restored`.
                 if !prev || suspended {
                     return;
                 }
-                // 1→0 transition. Apply 200ms leading-edge debounce
-                // so quick ping-pong (alt-tab back and forth) doesn't
-                // spam triggers — once we've fired, suppress until
-                // the window goes back into stable use.
+                // Leading-edge debounce so quick ping-pong (alt-tab) doesn't spam triggers.
                 let now = Instant::now();
                 if now.duration_since(last_fire.get()) < Duration::from_millis(200) {
                     return;
@@ -896,11 +738,9 @@ impl CopadWindow {
             });
         });
 
-        // Cleanup socket and tear down service plugins on window
-        // destroy. `shutdown_all` sends the documented `shutdown`
-        // notification, drops the writer-channel sender (so child
-        // stdin closes on EOF), and SIGKILLs anything still alive
-        // after a brief grace window — children don't outlive the GUI.
+        // Destroy: clean up the socket and `shutdown_all` the service plugins (shutdown
+        // notification, close child stdin, SIGKILL after a grace window), so children do not
+        // outlive the GUI.
         let socket_path_cleanup = socket_path.clone();
         let prewarm_path_cleanup = prewarm_path.clone();
         window.connect_destroy(move |_| {
@@ -918,7 +758,6 @@ impl CopadWindow {
 
     pub fn present(&self) {
         self.window.present();
-        // Focus the terminal after the window is mapped
         let mgr = self.tab_manager.clone();
         glib::idle_add_local_once(move || {
             if let Some(panel) = mgr.active_panel() {
@@ -983,21 +822,16 @@ fn watch_config(
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
         mgr.update_config(&config);
         sb.reload(&config, &pl);
-        // apply_config owns the window backdrop refresh (alpha tracks the new
-        // opacity, base color, and image state in one place).
         let backdrop = config
             .window
             .background
             .as_deref()
             .unwrap_or(&theme.background);
         bg.apply_config(&config, backdrop);
-        // Re-arm with the (possibly changed) interval — apply_config
-        // stored it; arming at 0 stops the timer.
         bg.arm_rotation();
 
-        // Always refresh the cache from disk — even when daemon is
-        // authoritative — so a later disconnect restores the freshest
-        // set, not the startup snapshot.
+        // Refresh the cache from disk even when the daemon is authoritative, so a later
+        // disconnect restores the freshest set.
         *cached.lock().unwrap() = config.triggers.clone();
 
         if ht_active.load(Ordering::SeqCst) {
@@ -1006,11 +840,8 @@ fn watch_config(
         }
 
         trg.set_triggers(config.triggers.clone());
-        // Pump_all (context drain → trigger drain) on the OLD receiver set
-        // before reconcile drops any: a pattern-narrowing reload (e.g.
-        // `terminal.*` → `terminal.cwd_changed`) would otherwise discard
-        // pending events the new trigger set would have matched, and stale
-        // `{context.*}` interpolation would feed any in-flight dispatches.
+        // Pump on the OLD receiver set before reconcile drops any: a pattern-narrowing reload
+        // would otherwise discard pending events the new trigger set would have matched.
         ps.borrow().pump_all(&ctx, &trg);
         ps.borrow_mut().reconcile_triggers(&bus, &config.triggers);
         eprintln!(
@@ -1024,9 +855,8 @@ fn watch_config(
     std::mem::forget(monitor);
 }
 
-/// Consume every queued value on `rx` and return the most recent.
-/// Used by the 50ms cut-over consumer to collapse a fast flap
-/// (`true→false→true` within one tick) to the final state.
+/// Consume every queued value on `rx` and return the most recent, collapsing a fast flap
+/// (`true->false->true` within one tick) to the final state.
 pub fn drain_to_latest<T>(rx: &Receiver<T>) -> Option<T> {
     let mut latest = None;
     while let Ok(v) = rx.try_recv() {
@@ -1035,10 +865,8 @@ pub fn drain_to_latest<T>(rx: &Receiver<T>) -> Option<T> {
     latest
 }
 
-/// Apply a host_triggers state change to the GUI's local
-/// TriggerEngine + PumpState. `true` clears the engine (daemon
-/// authoritative); `false` restores from the cached config triggers.
-/// Both branches reconcile pump subscriptions symmetrically.
+/// Apply a host_triggers state change: `true` clears the local engine (daemon authoritative);
+/// `false` restores from the cached config triggers. Both reconcile pump subscriptions.
 pub fn apply_host_triggers(
     value: bool,
     engine: &TriggerEngine,
@@ -1055,9 +883,6 @@ pub fn apply_host_triggers(
     }
 }
 
-/// Per-tick drain targets (context receivers + trigger subscriptions) so
-/// the GTK timer and hot-reload callback share one `pump_all` sequence
-/// with identical context-then-triggers ordering.
 pub struct PumpState {
     ctx_focused: EventReceiver,
     ctx_exited: EventReceiver,
@@ -1068,7 +893,6 @@ pub struct PumpState {
 }
 
 impl PumpState {
-    /// Order across the receivers is commutative for ContextService's state.
     pub fn drain_context_only(&self, ctx: &ContextService) {
         while let Some(event) = self.ctx_focused.try_recv() {
             ctx.apply_event(&event);
@@ -1087,8 +911,6 @@ impl PumpState {
         }
     }
 
-    /// Context first (so `{context.*}` interpolation is fresh), then
-    /// triggers. One context snapshot per dispatched event.
     pub fn pump_all(&self, ctx: &ContextService, engine: &TriggerEngine) {
         self.drain_context_only(ctx);
         self.trigger_subs.drain_into(|event| {
@@ -1106,10 +928,8 @@ impl PumpState {
     }
 }
 
-/// One bus receiver per unique `event_kind` pattern across active triggers.
-/// Reconciled at startup and on hot reload: still-needed patterns keep their
-/// existing receivers (pending events preserved across unrelated reloads),
-/// removed patterns drop (queues GC'd lazily on next publish).
+/// One bus receiver per unique `event_kind` pattern across active triggers. Still-needed
+/// patterns keep their receivers on reload (pending events preserved); removed ones drop.
 pub struct TriggerSubscriptions {
     receivers: HashMap<String, EventReceiver>,
 }
@@ -1125,22 +945,17 @@ impl TriggerSubscriptions {
         self.receivers.len()
     }
 
-    /// Reduces requested patterns via `covering_patterns` first so overlap
-    /// (`*` plus `panel.focused`) collapses to a single broader receiver —
-    /// otherwise duplicate delivery would double-fire side effects.
-    /// New patterns get fresh `subscribe_unbounded` receivers.
+    /// Requested patterns are reduced via `covering_patterns` so overlap (`*` plus
+    /// `panel.focused`) collapses to one receiver; duplicate delivery would double-fire side
+    /// effects.
     pub fn reconcile(&mut self, bus: &Arc<CoreEventBus>, triggers: &[Trigger]) {
-        // The pump drives three flavors of event into the engine:
-        // (1) `when.event_kind`, (2) `await.event_kind`, and
-        // (3) `<action>.completed`/`.failed` for await-bearing triggers.
-        // Missing subscription #3 degrades await to "registers preflight,
-        // never promotes" — see docs/workflow-runtime.md "Async correlation".
+        // Three flavors of event: (1) `when.event_kind`, (2) `await.event_kind`, (3)
+        // `<action>.completed`/`.failed` for await-bearing triggers. Missing #3 means await
+        // registers a preflight and never promotes (docs/workflow-runtime.md "Async correlation").
         let mut raw: Vec<String> = Vec::with_capacity(triggers.len() * 3);
         for t in triggers {
-            // Cron-source triggers fire via the daemon's `CronScheduler`,
-            // not the GUI's bus pump — skip subscription so we don't
-            // allocate dead receivers. Mirrors the equivalent skip in
-            // `copad-daemon/src/trigger_pump.rs::reconcile`.
+            // Cron-source triggers fire via the daemon's `CronScheduler`, not the bus pump; skip
+            // them (same as `copad-daemon/src/trigger_pump.rs::reconcile`).
             let Some(when) = &t.when else { continue };
             raw.push(when.event_kind.clone());
             if let Some(aw) = &t.r#await {
@@ -1159,11 +974,10 @@ impl TriggerSubscriptions {
         }
     }
 
-    /// Drain every receiver fully. Ordering invariant: registry-sourced
-    /// `<X>.completed`/`.failed` events must run BEFORE `await.event_kind`
-    /// in the same tick — otherwise a same-tick awaited reply hits a
-    /// preflight that hasn't promoted yet and the workflow times out.
-    /// HashMap iteration order is unspecified, so drain → Vec → stable-sort.
+    /// Drain every receiver fully. Registry-sourced `<X>.completed`/`.failed` events must run
+    /// BEFORE `await.event_kind` in the same tick, or a same-tick awaited reply hits a preflight
+    /// that has not promoted yet and the workflow times out. HashMap order is unspecified, so
+    /// drain -> Vec -> stable-sort.
     pub fn drain_into<F: FnMut(BusEvent)>(&self, mut f: F) {
         let mut events: Vec<BusEvent> = Vec::new();
         for rx in self.receivers.values() {
@@ -1171,11 +985,9 @@ impl TriggerSubscriptions {
                 events.push(event);
             }
         }
-        // Trust-bound priority: only `copad.action`-sourced
-        // `.completed`/`.failed` (the same gate `try_promote_or_drop_preflight`
-        // enforces) gets priority 0. A plugin-published event whose kind
-        // happens to end with `.completed` (Todo's watcher emits one) stays
-        // at normal priority so it can't reorder ahead of other follow-ups.
+        // Trust-bound priority: only `copad.action`-sourced `.completed`/`.failed` (the gate
+        // `try_promote_or_drop_preflight` enforces) gets priority 0; a plugin event whose kind
+        // merely ends with `.completed` (Todo's watcher) must not reorder ahead of follow-ups.
         events.sort_by_key(|e| {
             let is_completion_fan_out = e.source
                 == copad_core::action_registry::COMPLETION_EVENT_SOURCE
@@ -1194,8 +1006,8 @@ impl Default for TriggerSubscriptions {
     }
 }
 
-/// Move the comux chrome (`chrome`, with `term_over` holding the tab content) into whichever
-/// notebook page is visible, putting the previous page's content back into its own page.
+/// Move the comux chrome into whichever notebook page is visible, putting the previous page's
+/// content back into its own page.
 fn host_comux_chrome(mgr: &Rc<TabManager>, chrome: &gtk4::Paned, term_over: &gtk4::Overlay) {
     let hosted: Rc<RefCell<Option<(gtk4::Box, gtk4::Widget)>>> = Rc::new(RefCell::new(None));
     let host = {
@@ -1207,8 +1019,8 @@ fn host_comux_chrome(mgr: &Rc<TabManager>, chrome: &gtk4::Paned, term_over: &gtk
             if hosted.borrow().as_ref().is_some_and(|(p, _)| p == page) {
                 return;
             }
-            // The old page may already be out of the notebook (its tab closed); it is still
-            // ours, so the chrome is detached from it either way.
+            // The old page may already be out of the notebook (tab closed); the chrome is
+            // detached from it either way.
             if let Some((old, content)) = hosted.borrow_mut().take() {
                 term_over.set_child(None::<&gtk4::Widget>);
                 old.remove(&chrome);
@@ -1321,7 +1133,6 @@ mod tests {
             ctx_doc_opened: bus.subscribe("doc.opened"),
             trigger_subs: TriggerSubscriptions::new(),
         };
-        // Start in cut-over (daemon-authoritative) state.
         apply_host_triggers(true, &engine, &mut pump, &bus, &cached);
         assert_eq!(engine.count(), 0);
 

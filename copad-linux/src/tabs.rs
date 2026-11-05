@@ -28,32 +28,19 @@ pub struct TabManager {
     config: Rc<RefCell<CopadConfig>>,
     event_bus: EventBus,
     tab_css: gtk4::CssProvider,
-    /// Custom tab titles set via rename (overrides auto-titles)
     custom_titles: Rc<RefCell<std::collections::HashMap<String, String>>>,
-    /// Whether the tab bar is collapsed (icon-only mode)
     tab_bar_collapsed: Rc<RefCell<bool>>,
-    /// Whether the user has explicitly toggled the tab bar state
     user_toggled: Rc<RefCell<bool>>,
-    /// Loaded plugins
     plugins: Rc<Vec<LoadedPlugin>>,
-    /// Sender to dispatch socket commands (for plugin JS bridge)
     dispatch_tx: std::sync::mpsc::Sender<SocketCommand>,
-    /// In-process action registry; used by the Ctrl+Shift+P command
-    /// palette to enumerate registered actions.
     actions: std::sync::Arc<copad_core::action_registry::ActionRegistry>,
-    /// Phase 22.2 — project + workflow runtime state.
-    /// `workflow.run` (in `socket::dispatch`) reaches both via the
-    /// `project_registry()`/`workflow_registry()`/`context()` getters.
     project_registry: std::sync::Arc<std::sync::Mutex<copad_core::project::ProjectRegistry>>,
     workflow_registry: std::sync::Arc<copad_core::workflow::WorkflowRegistry>,
     context: std::sync::Arc<copad_core::context::ContextService>,
-    /// App-lifetime agent-status model, pumped by `window.rs`. Cockpit panels
-    /// are views over it, so it outlives any individual panel.
     cockpit: Rc<RefCell<copad_core::agent_cockpit::AgentCockpit>>,
     cockpit_css: gtk4::CssProvider,
 }
 
-/// One terminal pane as the cockpit sees it.
 pub struct CockpitPaneInfo {
     pub panel_id: String,
     pub title: String,
@@ -89,7 +76,6 @@ impl TabManager {
         };
         notebook.set_tab_pos(tab_pos);
 
-        // Tab bar CSS
         let tab_css = gtk4::CssProvider::new();
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
         tab_css.load_from_string(&build_tab_css(config.tabs.width, &theme));
@@ -99,8 +85,8 @@ impl TabManager {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
         );
 
-        // Cockpit CSS rides the same display-wide provider pattern as the tab
-        // bar so `update_config` can hot-reload it on a theme change.
+        // Cockpit CSS rides the same display-wide provider pattern as the tab bar, so
+        // `update_config` can hot-reload it.
         let cockpit_css = gtk4::CssProvider::new();
         cockpit_css.load_from_string(&crate::cockpit_panel::build_cockpit_css(&theme));
         gtk4::style_context_add_provider_for_display(
@@ -129,22 +115,18 @@ impl TabManager {
             cockpit_css,
         });
 
-        // Apply initial collapsed state
         if config.tabs.collapsed {
             manager.notebook.add_css_class("copad-collapsed");
         }
 
-        // Update tab bar visibility on page remove
         let tabs_ref = manager.tabs.clone();
         let collapsed = manager.tab_bar_collapsed.clone();
         manager
             .notebook
             .connect_page_removed(move |_notebook, _, _| {
-                // Keep references alive; tab bar always visible (collapsed or expanded)
                 let _ = (&tabs_ref, &collapsed);
             });
 
-        // Focus the right panel when switching tabs
         let focused = manager.focused.clone();
         let tabs_ref = manager.tabs.clone();
         manager.notebook.connect_switch_page(move |_, _, page_num| {
@@ -152,7 +134,6 @@ impl TabManager {
             if let Some(tab) = tabs.get(page_num as usize) {
                 let mut panels = Vec::new();
                 tab.root.borrow().collect_panels(&mut panels);
-                // Focus first panel in this tab, or the previously focused one if it's in this tab
                 let current_focused = focused.borrow().clone();
                 let should_focus = current_focused
                     .filter(|f| panels.iter().any(|p| Rc::ptr_eq(p, f)))
@@ -163,16 +144,12 @@ impl TabManager {
             }
         });
 
-        // Action buttons in the tab bar
         setup_tab_actions(&manager, window);
 
-        // Keyboard shortcuts
         setup_shortcuts(&manager, window);
 
-        // First-tab creation is the caller's responsibility: window.rs
-        // either restores a previous session (`restore_session`) or
-        // creates a default single tab. Doing it inside `new` would
-        // produce a phantom empty tab next to the restored ones.
+        // First-tab creation is the caller's job (window.rs restores a session or makes a
+        // default tab); doing it in `new` would leave a phantom empty tab beside restored ones.
 
         manager
     }
@@ -181,8 +158,6 @@ impl TabManager {
         let _ = self.add_tab_with_cwd(window, None);
     }
 
-    /// Add a new terminal tab whose shell is spawned with `cwd`
-    /// (None = inherit from copad). Returns `(panel, tab_index)`.
     pub fn add_tab_with_cwd(
         self: &Rc<Self>,
         window: &gtk4::ApplicationWindow,
@@ -191,8 +166,8 @@ impl TabManager {
         self.add_tab_with_cwd_and_initial_input(window, cwd, None)
     }
 
-    /// Pipes `initial_input` AFTER spawn_async's success callback fires —
-    /// without that ordering we'd write to a PTY with no child attached.
+    /// Pipes `initial_input` AFTER spawn_async's success callback fires; earlier would write to
+    /// a PTY with no child attached.
     pub fn add_tab_with_cwd_and_initial_input(
         self: &Rc<Self>,
         window: &gtk4::ApplicationWindow,
@@ -302,10 +277,8 @@ impl TabManager {
         Some(panel_id)
     }
 
-    /// Open the agent cockpit, or focus it if it is already open.
-    ///
-    /// Scans for the existing panel rather than caching its id — a cached id
-    /// would dangle once the user closes the tab.
+    /// Open the agent cockpit, or focus it if already open. Scans for the existing panel rather
+    /// than caching its id, which would dangle once the tab closes.
     pub fn toggle_cockpit(self: &Rc<Self>) {
         if let Some(id) = self.find_cockpit_panel_id() {
             self.activate_panel(&id);
@@ -348,7 +321,7 @@ impl TabManager {
         *self.focused.borrow_mut() = Some(panel.clone());
         panel.grab_focus();
 
-        // Populate before the user sees it — the pump only pushes on change.
+        // Populate before the user sees it; the pump only pushes on change.
         if let PanelVariant::Cockpit(cp) = &*panel {
             cp.reload_rows();
         }
@@ -368,8 +341,7 @@ impl TabManager {
         Some(panel_id)
     }
 
-    /// Redraw every open cockpit view. The pump calls this when the model or
-    /// the pane list actually changed, so the (cheap) scan stays off the hot path.
+    /// Redraw every open cockpit view; the pump calls this only when something changed.
     pub fn notify_cockpit_views(&self) {
         for tab in self.tabs.borrow().iter() {
             let mut panels = Vec::new();
@@ -382,9 +354,8 @@ impl TabManager {
         }
     }
 
-    /// Terminal panes only — agents run there, so webview/plugin/cockpit panels
-    /// are excluded. `cwd` is pulled live per call (OSC 7 → /proc), matching the
-    /// macOS cockpit's `reportedCwd` read; no polling timer needed.
+    /// Terminal panes only (agents run there). `cwd` is pulled live per call (OSC 7 -> /proc),
+    /// as the macOS cockpit's `reportedCwd` does; no polling timer.
     pub fn terminal_pane_snapshot(&self) -> Vec<CockpitPaneInfo> {
         let custom = self.custom_titles.borrow();
         let mut out = Vec::new();
@@ -405,8 +376,7 @@ impl TabManager {
         out
     }
 
-    /// Live terminal-pane ids — lets the cockpit pump reject events for, and
-    /// evict, panes that no longer exist.
+    /// Live terminal-pane ids, so the cockpit pump can reject events for, and evict, gone panes.
     pub fn live_terminal_ids(&self) -> std::collections::HashSet<String> {
         self.terminal_pane_snapshot()
             .into_iter()
@@ -414,8 +384,7 @@ impl TabManager {
             .collect()
     }
 
-    /// Focus a pane by id from anywhere (a cockpit row click): switch to its
-    /// tab, make it the focused panel, give it keyboard focus.
+    /// Focus a pane by id from anywhere (a cockpit row click): switch to its tab and focus it.
     pub fn activate_panel(&self, id: &str) -> bool {
         let Some(panel) = self.find_panel_by_id(id) else {
             return false;
@@ -424,13 +393,11 @@ impl TabManager {
             return false;
         };
 
-        // Seed `focused` BEFORE switching pages. `connect_switch_page` fires
-        // synchronously and focuses the target tab's FIRST pane whenever
-        // `focused` holds nothing from that tab — which would publish
-        // `panel.focused` for a pane the user never clicked, and the pump would
-        // acknowledge away its attention. Seeding makes that handler's filter
-        // find the intended pane instead. The borrow is a statement temporary:
-        // the handler takes a shared borrow, so holding it here would panic.
+        // Seed `focused` BEFORE switching pages: `connect_switch_page` fires synchronously and
+        // focuses the target tab's FIRST pane when `focused` holds nothing from that tab, which
+        // would publish `panel.focused` for a pane the user never clicked and let the pump
+        // acknowledge away its attention. The borrow is a statement temporary: the handler takes
+        // a shared borrow.
         *self.focused.borrow_mut() = Some(panel.clone());
         if self.notebook.current_page() != Some(tab_idx as u32) {
             self.notebook.set_current_page(Some(tab_idx as u32));
@@ -502,10 +469,9 @@ impl TabManager {
 
         *self.focused.borrow_mut() = Some(new_panel.clone());
         new_panel.grab_focus();
-        // Splitting adds a terminal pane without publishing `tab.created`, and
-        // the `panel.focused` it does emit leaves the pump clean (acknowledging
-        // a fresh idle pane changes nothing) — so an open cockpit would miss the
-        // new pane. Mirror of the close path in `close_focused`.
+        // Splitting adds a terminal pane without publishing `tab.created`, and the
+        // `panel.focused` it emits leaves the pump clean, so an open cockpit would miss the new
+        // pane. Mirror of the close path in `close_focused`.
         self.reconcile_cockpit();
     }
 
@@ -573,7 +539,6 @@ impl TabManager {
                     *self.focused.borrow_mut() = Some(panel.clone());
                     panel.grab_focus();
                 } else {
-                    // Fallback: focus any panel in the same tab
                     let tabs = self.tabs.borrow();
                     let mut panels = Vec::new();
                     tabs[tab_idx].root.borrow().collect_panels(&mut panels);
@@ -582,27 +547,23 @@ impl TabManager {
                         panel.grab_focus();
                     }
                 }
-                // Closing one pane of a split leaves the tab alive and publishes
-                // NOTHING, so the cockpit pump can't see the pane list shrink —
-                // it would keep rendering the dead pane. Reconcile directly.
+                // Closing one pane of a split publishes NOTHING, so the pump can't see the pane
+                // list shrink; reconcile directly.
                 self.reconcile_cockpit();
             }
         }
     }
 
-    /// Drop cockpit entries for panes that are gone and repaint open views.
-    /// For pane removals the pump can observe (`panel.exited`, `tab.closed`) it
-    /// does this itself; this is for the paths that emit no event.
+    /// Drop cockpit entries for panes that are gone and repaint open views, for removal paths
+    /// that emit no event (the pump handles `panel.exited` and `tab.closed` itself).
     pub fn reconcile_cockpit(&self) {
         let live = self.live_terminal_ids();
         self.cockpit.borrow_mut().retain(|id| live.contains(id));
         self.notify_cockpit_views();
     }
 
-    /// Switch to a tab by zero-based index (the same numbering `tab.info`
-    /// reports). `false` if out of range — the socket arm turns that into an
-    /// error rather than silently doing nothing, since a `coctl` caller has no
-    /// other way to learn the index was bad.
+    /// Switch to a tab by zero-based index (as `tab.info` reports); `false` if out of range, so
+    /// the socket arm can error instead of leaving a `coctl` caller unable to learn it was bad.
     pub fn switch_tab(&self, index: usize) -> bool {
         if index >= self.tabs.borrow().len() {
             return false;
@@ -611,7 +572,6 @@ impl TabManager {
         true
     }
 
-    /// Give the keyboard back to the focused panel (after its widgets were reparented).
     pub fn refocus(&self) {
         // Not `if let` on the borrow: grabbing focus re-enters `track_focus`, which writes it.
         let panel = self.focused.borrow().clone();
@@ -624,10 +584,6 @@ impl TabManager {
         self.focused.borrow().clone()
     }
 
-    // -- Tab bar toggle --
-
-    /// Toggle tab bar between expanded and collapsed (icon-only) mode.
-    /// Returns true if now expanded.
     pub fn toggle_tab_bar(&self) -> bool {
         *self.user_toggled.borrow_mut() = true;
         let collapsed = {
@@ -640,20 +596,17 @@ impl TabManager {
     }
 
     fn apply_collapsed_state(&self, collapsed: bool) {
-        // Toggle CSS class on notebook for width changes
         if collapsed {
             self.notebook.add_css_class("copad-collapsed");
         } else {
             self.notebook.remove_css_class("copad-collapsed");
         }
 
-        // Show/hide label + close button on each tab
         let tabs = self.tabs.borrow();
         for tab in tabs.iter() {
             if let Some(tab_label) = self.notebook.tab_label(&tab.page)
                 && let Some(hbox) = tab_label.downcast_ref::<gtk4::Box>()
             {
-                // Children: [Icon, Label, CloseButton]
                 let mut child = hbox.first_child();
                 let mut idx = 0;
                 while let Some(widget) = child {
@@ -666,16 +619,14 @@ impl TabManager {
             }
         }
 
-        // Reorient/reorder the action widget (toggle + add) so the add
-        // button stays reachable even when a vertical tab column is too
-        // narrow to host both buttons side-by-side.
+        // Keeps the add button reachable when a vertical tab column is too narrow for both.
         self.update_action_box_layout(collapsed);
 
         self.notebook.set_show_tabs(true);
     }
 
-    /// Vertical+collapsed: stack `[add, toggle]` so the `+` button isn't
-    /// hidden by the narrow column. Otherwise: horizontal `[toggle, add]`.
+    /// Vertical+collapsed: stack `[add, toggle]` so the `+` isn't hidden by the narrow column.
+    /// Otherwise horizontal `[toggle, add]`.
     fn update_action_box_layout(&self, collapsed: bool) {
         let Some(action) = self.notebook.action_widget(gtk4::PackType::End) else {
             return;
@@ -684,9 +635,8 @@ impl TabManager {
             return;
         };
 
-        // Identify the two buttons by widget name (set in setup_tab_actions).
-        // Walking siblings instead of indexing because reorder_child_after
-        // changes positions on each call.
+        // Find the two buttons by widget name (set in setup_tab_actions); walk siblings because
+        // reorder_child_after changes positions on each call.
         let mut toggle: Option<gtk4::Widget> = None;
         let mut add: Option<gtk4::Widget> = None;
         let mut child = hbox.first_child();
@@ -719,25 +669,18 @@ impl TabManager {
         add.set_visible(true);
 
         if stacked {
-            // [add, toggle] — `+` sits above the toggle button.
             hbox.reorder_child_after(&toggle, Some(&add));
         } else {
-            // [toggle, add] — original horizontal layout.
             hbox.reorder_child_after(&add, Some(&toggle));
         }
     }
 
-    // -- Tab rename --
-
-    /// Rename a tab by panel ID. Returns true if found.
     pub fn rename_tab(&self, panel_id: &str, title: &str) -> bool {
-        // Find the tab containing this panel
         let tabs = self.tabs.borrow();
         for (idx, tab) in tabs.iter().enumerate() {
             let mut panels = Vec::new();
             tab.root.borrow().collect_panels(&mut panels);
             if panels.iter().any(|p| p.id() == panel_id) {
-                // Update the notebook tab label text
                 if let Some(tab_label) = self.notebook.tab_label(&tab.page)
                     && let Some(icon) = tab_label.first_child()
                     && let Some(label_widget) = icon.next_sibling()
@@ -745,7 +688,6 @@ impl TabManager {
                 {
                     label.set_text(title);
                 }
-                // Store custom title
                 self.custom_titles
                     .borrow_mut()
                     .insert(panel_id.to_string(), title.to_string());
@@ -791,15 +733,12 @@ impl TabManager {
         self.cockpit_css
             .load_from_string(&crate::cockpit_panel::build_cockpit_css(&theme));
 
-        // Apply collapsed config if user hasn't manually toggled
         if !*self.user_toggled.borrow() {
             *self.tab_bar_collapsed.borrow_mut() = config.tabs.collapsed;
             self.apply_collapsed_state(config.tabs.collapsed);
         } else {
-            // Position may have flipped between vertical and horizontal
-            // even if collapsed state didn't change — re-lay out the
-            // action widget so a manually-collapsed user keeps the add
-            // button visible (stacked) on left/right tabs.
+            // Position may flip between vertical and horizontal without the collapsed state
+            // changing; re-lay out so a manually-collapsed user keeps the add button visible.
             self.update_action_box_layout(*self.tab_bar_collapsed.borrow());
         }
 
@@ -814,7 +753,6 @@ impl TabManager {
         }
     }
 
-    /// Navigate focus between split panes
     pub fn focus_direction(&self, direction: FocusDirection) {
         let focused = self.focused.borrow().clone();
         let Some(focused_panel) = focused else { return };
@@ -830,7 +768,6 @@ impl TabManager {
             return;
         }
 
-        // Simple: cycle through panels in order based on direction
         let current_idx = panels
             .iter()
             .position(|p| Rc::ptr_eq(p, &focused_panel))
@@ -852,7 +789,7 @@ impl TabManager {
         next_panel.grab_focus();
     }
 
-    /// The terminal panel ids of the tab on screen — every split of it. What the native comux
+    /// The terminal panel ids of the tab on screen, every split of it; what the native comux
     /// sidebar serves (decisions #169).
     pub fn visible_terminal_ids(&self) -> Vec<String> {
         let Some(cur) = self.current_tab() else {
@@ -871,7 +808,6 @@ impl TabManager {
             .collect()
     }
 
-    /// Return info for all panels across all tabs
     pub fn all_panels_info(&self) -> Vec<serde_json::Value> {
         let tabs = self.tabs.borrow();
         let focused = self.focused.borrow().clone();
@@ -899,7 +835,6 @@ impl TabManager {
         result
     }
 
-    /// Return detailed info for a panel by ID
     pub fn panel_info_by_id(&self, id: &str) -> Option<serde_json::Value> {
         let tabs = self.tabs.borrow();
         let focused = self.focused.borrow().clone();
@@ -941,19 +876,15 @@ impl TabManager {
         None
     }
 
-    /// Find a panel by ID
-    /// Profile a new browser pane is born into. `webview.open` has no pane to
-    /// be judged against, so the gate judges it against this.
+    /// Profile a new browser pane is born into; `webview.open` has no pane to be judged
+    /// against, so the gate judges it against this.
     pub fn default_browser_profile(&self) -> String {
         self.config.borrow().browser.profile.clone()
     }
 
-    /// Is ANY webview pane in `profile` currently protected?
-    ///
-    /// Protection freezes the PROFILE, not the pane (decision #100): a
-    /// concurrent pane on the same data store is another window onto the same
-    /// cookies, so refusing reads on only the protected pane would leave a
-    /// sibling automation pane reading the same authenticated session.
+    /// Is ANY webview pane in `profile` currently protected? Protection freezes the PROFILE, not
+    /// the pane (decision #100): a sibling pane on the same data store is another window onto the
+    /// same authenticated session.
     pub fn any_protected_webview_in_profile(&self, profile: &str) -> bool {
         use copad_core::browser::TabMode;
         let tabs = self.tabs.borrow();
@@ -986,7 +917,6 @@ impl TabManager {
         None
     }
 
-    /// Find the first terminal panel across all tabs.
     pub fn find_first_terminal(&self) -> Option<Rc<PanelVariant>> {
         let tabs = self.tabs.borrow();
         for tab in tabs.iter() {
@@ -1001,7 +931,6 @@ impl TabManager {
         None
     }
 
-    /// Return extended tab info
     pub fn tab_info(&self) -> serde_json::Value {
         let tabs = self.tabs.borrow();
         let current = self.notebook.current_page();
@@ -1024,8 +953,6 @@ impl TabManager {
             "tabs": tab_list,
         })
     }
-
-    // -- Private helpers --
 
     fn create_panel(
         self: &Rc<Self>,
@@ -1062,7 +989,6 @@ impl TabManager {
             crate::url_click::install(&term.terminal, window);
         }
 
-        // Hook terminal output events
         if let Some(term) = panel.as_terminal() {
             let bus = self.event_bus.clone();
             let panel_id = term.id.clone();
@@ -1079,7 +1005,6 @@ impl TabManager {
                 );
             });
 
-            // Hook title change events
             let bus = self.event_bus.clone();
             let panel_id = term.id.clone();
             term.terminal.connect_window_title_changed(move |term| {
@@ -1099,7 +1024,6 @@ impl TabManager {
                 );
             });
 
-            // Hook CWD change events (OSC 7)
             let bus = self.event_bus.clone();
             let panel_id = term.id.clone();
             let last_cwd = term.last_cwd.clone();
@@ -1121,9 +1045,8 @@ impl TabManager {
                     );
                 });
 
-            // Shell integration via termprop-changed (VTE ≥0.78)
-            // VTE replaced shell-precmd/preexec signals with termprops.
-            // Use detailed signal connections to subscribe to specific termprops.
+            // Shell integration via termprop-changed (VTE >= 0.78), which replaced the
+            // shell-precmd/preexec signals; subscribe to specific termprops by detail.
             {
                 let bus = self.event_bus.clone();
                 let panel_id = term.id.clone();
@@ -1160,16 +1083,14 @@ impl TabManager {
     fn create_webview_panel(self: &Rc<Self>, url: &str) -> Rc<PanelVariant> {
         let config = self.config.borrow();
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
-        // Read from the same place `default_browser_profile` does. A pane born
-        // into one profile while the gate judged `webview.open` against another
-        // would break "protection freezes the profile" the moment a non-default
-        // profile exists.
+        // Read from the same place as `default_browser_profile`; a pane born into a different
+        // profile than the gate judged `webview.open` against would break "protection freezes
+        // the profile" once a non-default profile exists.
         let profile = config.browser.profile.clone();
         drop(config);
         let webview_panel = WebViewPanel::new(url, &theme, profile);
         let panel = Rc::new(PanelVariant::WebView(webview_panel));
 
-        // Hook webview events
         if let Some(wv) = panel.as_webview() {
             let bus = self.event_bus.clone();
             let panel_id = wv.id.clone();
@@ -1274,7 +1195,6 @@ impl TabManager {
             }
         });
 
-        // Attach focus controller to the inner focusable widget
         match &**panel {
             PanelVariant::Terminal(term) => {
                 term.terminal.add_controller(controller);
@@ -1304,10 +1224,8 @@ impl TabManager {
             if let Some(panel) = panels.iter().find(|p| p.widget() == panel_widget) {
                 let panel_id = panel.id().to_string();
 
-                // Notify first — consumers (ContextService, trigger
-                // engine) need the event even when the pane stays
-                // visible. Matches the macOS path, which broadcasts
-                // before deciding whether to close.
+                // Notify first: consumers (ContextService, trigger engine) need the event even
+                // when the pane stays visible; matches the macOS path.
                 broadcast(
                     bus,
                     &Event::new(
@@ -1410,12 +1328,9 @@ impl TabManager {
             ),
             PanelVariant::WebView(_) => ("web-browser-symbolic".to_string(), "WebView".to_string()),
             PanelVariant::Plugin(pp) => {
-                // `resolve_by_name` honors the same duplicate-winner rule
-                // as daemon dispatch and `plugin.open`, so the tab icon
-                // and label match the manifest those paths actually run.
-                // Title fallback chain: panel-specific title → plugin's
-                // top-level title → plugin name (so even a malformed
-                // manifest produces something readable, not just "Plugin").
+                // `resolve_by_name` honors the same duplicate-winner rule as daemon dispatch and
+                // `plugin.open`. Title fallback: panel title -> plugin title -> plugin name, so a
+                // malformed manifest still reads sensibly.
                 let resolved = copad_core::plugin::resolve_by_name(&self.plugins, &pp.plugin_name);
                 let panel_def = resolved
                     .and_then(|p| p.manifest.panels.iter().find(|pd| pd.name == pp.panel_name));
@@ -1454,18 +1369,15 @@ impl TabManager {
         close_btn.add_css_class("copad-tab-close");
         close_btn.set_tooltip_text(Some("Close tab"));
 
-        // Order: [Icon, Label, CloseButton]
         hbox.append(&icon);
         hbox.append(&label);
         hbox.append(&close_btn);
 
-        // If currently collapsed, hide label and close button
         if *self.tab_bar_collapsed.borrow() {
             label.set_visible(false);
             close_btn.set_visible(false);
         }
 
-        // Hook title updates based on panel type (suppressed when custom title is set)
         let panel_id_for_title = panel.id().to_string();
         match &**panel {
             PanelVariant::Terminal(term) => {
@@ -1496,15 +1408,10 @@ impl TabManager {
                         }
                     });
             }
-            PanelVariant::Plugin(_) => {
-                // Plugin panels have a static title set at creation
-            }
-            PanelVariant::Cockpit(_) => {
-                // Static "Agents" title, same as plugin panels
-            }
+            PanelVariant::Plugin(_) => {}
+            PanelVariant::Cockpit(_) => {}
         }
 
-        // Double-click to rename tab
         {
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
@@ -1518,7 +1425,6 @@ impl TabManager {
                 }
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
 
-                // Replace label with an entry for inline editing
                 let parent = label_clone.parent().unwrap();
                 let hbox = parent.downcast_ref::<gtk4::Box>().unwrap();
                 let current_text = label_clone.text().to_string();
@@ -1560,7 +1466,6 @@ impl TabManager {
                     }
                 });
 
-                // Also handle focus-out (cancel/accept)
                 let label_for_focus = label_clone.clone();
                 let focus_ctrl = gtk4::EventControllerFocus::new();
                 let entry_for_focus = entry.clone();
@@ -1590,7 +1495,6 @@ impl TabManager {
             let idx = idx as usize;
             eprintln!("[copad] close: removing tab {idx}");
 
-            // Collect panel id before removing
             let panel_id = {
                 let tabs_ref = tabs.borrow();
                 if let Some(tab) = tabs_ref.get(idx) {
@@ -1616,8 +1520,8 @@ impl TabManager {
                 ),
             );
 
-            // Handle last-tab-close: spawn new default tab is not possible here
-            // (no window ref), so close the window via the notebook's toplevel
+            // Closing the window via the notebook's toplevel: no window ref here to spawn a
+            // default tab.
             if tabs.borrow().is_empty() {
                 if let Some(root) = nb.root()
                     && let Some(window) = root.downcast_ref::<gtk4::Window>()
@@ -1627,7 +1531,6 @@ impl TabManager {
                 return;
             }
 
-            // Update focus
             if let Some(new_page) = nb.current_page() {
                 let tabs_ref = tabs.borrow();
                 if let Some(tab) = tabs_ref.get(new_page as usize) {
@@ -1644,24 +1547,18 @@ impl TabManager {
         hbox
     }
 
-    // -- Session persistence --
-
-    /// Build a `Session` snapshot from the current tab/split tree.
-    /// WebView/Plugin panels are elided (terminal-only v1). A branch
-    /// whose only surviving subtree is a single child is collapsed.
+    /// Build a `Session` snapshot from the current tab/split tree. WebView/Plugin panels are
+    /// elided; a branch left with one surviving child is collapsed.
     pub fn snapshot_session(&self) -> crate::session::Session {
         use crate::session::{PaneContent, Session, SplitOrientation, SplitSnap, TabSnap};
 
         fn build_snap(node: &crate::split::SplitNode) -> Option<SplitSnap> {
             match node {
                 crate::split::SplitNode::Leaf { panel } => {
-                    // v3: only terminal leaves persist their cwd. Webview /
-                    // plugin / cockpit panels are still elided here — full
-                    // Linux typed-pane persistence is a follow-up slice.
+                    // Only terminal leaves persist (with their cwd); other panels are elided.
                     panel.as_terminal().map(|t| SplitSnap::Leaf {
-                        // current_cwd() falls back to /proc/<pid>/cwd
-                        // for shells that don't emit OSC 7. last_cwd
-                        // alone would miss `cd` updates in those shells.
+                        // current_cwd() falls back to /proc/<pid>/cwd for shells without OSC 7;
+                        // last_cwd alone would miss their `cd`s.
                         content: PaneContent::Terminal {
                             cwd: t.current_cwd(),
                         },
@@ -1680,8 +1577,6 @@ impl TabManager {
                                 gtk4::Orientation::Vertical => SplitOrientation::Vertical,
                                 _ => SplitOrientation::Horizontal,
                             };
-                            // v3 stores a normalized divider ratio (not pixels):
-                            // position / allocated extent along the split axis.
                             let total = match paned.orientation() {
                                 gtk4::Orientation::Vertical => paned.height(),
                                 _ => paned.width(),
@@ -1713,18 +1608,14 @@ impl TabManager {
         for (idx, tab) in tabs_borrow.iter().enumerate() {
             let root = tab.root.borrow();
             let Some(snap) = build_snap(&root) else {
-                // All panels in this tab were non-terminal; skip.
                 continue;
             };
-            // The notebook index counts elided tabs too; map it onto
-            // the surviving (terminal-only) tab list so restore picks
-            // the right page.
+            // The notebook index counts elided tabs too; map it onto the surviving tab list.
             if idx == active_idx {
                 current_tab = tab_snaps.len();
             } else if idx < active_idx {
-                // Active tab might be elided itself — if we cross past
-                // it without setting current_tab, the closest surviving
-                // tab before it is the next-best fallback.
+                // The active tab may itself be elided; the closest surviving tab before it is
+                // the fallback.
                 current_tab = tab_snaps.len();
             }
             let title = {
@@ -1747,9 +1638,7 @@ impl TabManager {
         }
     }
 
-    /// Build tabs+splits to mirror `session`. Returns `Ok(())` on
-    /// success; on any error the caller should fall back to default
-    /// single-tab creation.
+    /// Build tabs+splits to mirror `session`; on error the caller falls back to a default tab.
     pub fn restore_session(
         self: &Rc<Self>,
         window: &gtk4::ApplicationWindow,
@@ -1768,8 +1657,6 @@ impl TabManager {
             .current_tab
             .min(self.tabs.borrow().len().saturating_sub(1));
         self.notebook.set_current_page(Some(clamped as u32));
-        // Anchor focus to the first leaf of the active tab. Restoring
-        // exact focused-pane within a split is a v2 polish.
         if let Some(tab) = self.tabs.borrow().get(clamped) {
             let mut panels = Vec::new();
             tab.root.borrow().collect_panels(&mut panels);
@@ -1789,9 +1676,8 @@ impl TabManager {
     ) {
         use crate::session::SplitSnap;
         match snap {
-            // A leaf's panel is already created by its parent (a terminal seeded
-            // with the leftmost cwd). Non-terminal leaves fall back to that
-            // terminal for now — full typed-pane restore is a follow-up slice.
+            // A leaf's panel is already created by its parent (a terminal seeded with the
+            // leftmost cwd); non-terminal leaves fall back to that terminal.
             SplitSnap::Leaf { .. } => {}
             SplitSnap::Branch {
                 orientation,
@@ -1824,12 +1710,9 @@ pub enum FocusDirection {
     Prev,
 }
 
-/// Run a `[keybindings]` value. `spawn:` shells out; `action:` dispatches a
-/// copad method. Mirrors the macOS `Keybindings.dispatch` split.
-///
-/// An unprefixed value keeps working as a bare shell command — macOS warns and
-/// skips, but Linux has always treated it as `spawn:`, and silently breaking
-/// every existing config to match macOS would be the wrong trade.
+/// Run a `[keybindings]` value. `spawn:` shells out; `action:` dispatches a copad method.
+/// An unprefixed value stays a bare shell command (macOS warns and skips; Linux has always
+/// treated it as `spawn:`).
 fn run_binding(command: &str, dispatch_tx: &std::sync::mpsc::Sender<SocketCommand>) {
     match command.strip_prefix("action:") {
         Some(tail) => dispatch_binding_action(tail, dispatch_tx),
@@ -1837,14 +1720,12 @@ fn run_binding(command: &str, dispatch_tx: &std::sync::mpsc::Sender<SocketComman
     }
 }
 
-/// `action:<method> [k=v ...]` — parses macOS's `invokeAction` grammar and
-/// routes through `dispatch_tx`, i.e. the same channel the command palette uses.
-/// That reaches BOTH the ActionRegistry and the legacy socket arms, matching
-/// what macOS gets from `tryDispatchOrFallback`'s registry-then-fallback.
+/// `action:<method> [k=v ...]`: parses macOS's `invokeAction` grammar and routes through
+/// `dispatch_tx` (the command palette's channel), reaching both the ActionRegistry and the
+/// legacy socket arms.
 ///
-/// Values are always strings, as on macOS: `index=0` arrives as `"0"`. That
-/// makes `action:tab.switch index=0` fail its `as_u64` parse — noted in the docs
-/// rather than papered over with a guess about which keys are numeric.
+/// Values are always strings, as on macOS, so `action:tab.switch index=0` fails its `as_u64`
+/// parse (noted in the docs).
 fn dispatch_binding_action(tail: &str, dispatch_tx: &std::sync::mpsc::Sender<SocketCommand>) {
     let mut parts = tail.split_whitespace();
     let Some(method) = parts.next() else {
@@ -1857,7 +1738,6 @@ fn dispatch_binding_action(tail: &str, dispatch_tx: &std::sync::mpsc::Sender<Soc
             Some((k, v)) => {
                 params.insert(k.to_string(), serde_json::Value::String(v.to_string()));
             }
-            // Same as macOS: skip a malformed pair rather than abort the action.
             None => {
                 eprintln!("[copad] keybinding action {method}: ignoring malformed param {kv:?}")
             }
@@ -1879,14 +1759,12 @@ fn dispatch_binding_action(tail: &str, dispatch_tx: &std::sync::mpsc::Sender<Soc
         return;
     }
 
-    // Surface failures the way macOS's completion callback does. Dropping the
-    // receiver instead would leave a typo'd method silently dead — the exact bug
-    // this whole prefix exists to fix. Dispatch is async (the GTK timer drains
-    // the queue), so wait off the main thread; the timeout keeps a handler that
-    // never replies from leaking the thread.
+    // Surface failures as macOS's completion callback does: dropping the receiver would leave a
+    // typo'd method silently dead. Dispatch is async (the GTK timer drains the queue), so wait
+    // off the main thread; the timeout keeps a never-replying handler from leaking the thread.
     let method = method.to_string();
-    std::thread::spawn(move || {
-        match reply_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+    std::thread::spawn(
+        move || match reply_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(response) => {
                 if let Some(err) = response.error {
                     eprintln!(
@@ -1898,10 +1776,9 @@ fn dispatch_binding_action(tail: &str, dispatch_tx: &std::sync::mpsc::Sender<Soc
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 eprintln!("[copad] keybinding action {method}: no response within 5s")
             }
-            // Handler dropped the responder without replying (fire-and-forget arms).
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-        }
-    });
+        },
+    );
 }
 
 fn spawn_command(command: &str) {
@@ -1942,8 +1819,8 @@ fn check_custom_keybinding(
         return false;
     };
 
-    // When shift is held, GDK gives us the shifted keyval (e.g. braceright instead of bracketright).
-    // Also resolve the unshifted key from the hardware keycode for matching.
+    // With shift held GDK gives the shifted keyval (braceright for bracketright); also resolve
+    // the unshifted key from the hardware keycode for matching.
     let unshifted_name = if shift {
         gdk::Display::default().and_then(|d| {
             let entries = d.map_keycode(keycode);
@@ -1987,7 +1864,6 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
             return glib::Propagation::Proceed;
         };
 
-        // Check custom keybindings first (from config)
         if check_custom_keybinding(&mgr, keyval, keycode, modifier) {
             return glib::Propagation::Stop;
         }
@@ -1999,79 +1875,63 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
         let panel = mgr.active_panel();
         let is_terminal = panel.as_ref().is_some_and(|p| p.as_terminal().is_some());
 
-        // Only intercept Ctrl+Shift — all Ctrl-only keys pass through to terminal/webview
         if !ctrl_shift {
             return glib::Propagation::Proceed;
         }
 
         match keyval {
-            // Ctrl+Shift+B: toggle tab bar visibility
             gdk::Key::B => {
                 mgr.toggle_tab_bar();
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+F: toggle search (terminal only)
             gdk::Key::F if is_terminal => {
                 if let Some(term) = panel.as_ref().and_then(|p| p.as_terminal()) {
                     term.search_bar.toggle(&term.terminal);
                 }
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+C: copy (terminal)
             gdk::Key::C if is_terminal => {
                 if let Some(term) = panel.as_ref().and_then(|p| p.as_terminal()) {
                     term.terminal.copy_clipboard_format(vte4::Format::Text);
                 }
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+V: paste (terminal)
             gdk::Key::V if is_terminal => {
                 if let Some(term) = panel.as_ref().and_then(|p| p.as_terminal()) {
                     term.terminal.paste_clipboard();
                 }
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+T: new tab
             gdk::Key::T => {
                 mgr.add_tab(&win);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+U: new web tab. macOS pairs this with New Tab as
-            // Cmd+T / Cmd+Shift+T, which Linux can't mirror — Ctrl-only chords
-            // are reserved for the terminal child, so Ctrl+Shift+T is already
-            // New Tab and there is no shifted slot left. Parity here is
-            // capability-level, not chord-level. `U` for URL.
+            // Ctrl+Shift+U: new web tab. macOS uses Cmd+T / Cmd+Shift+T, which Linux can't mirror
+            // (Ctrl-only chords belong to the terminal child, and Ctrl+Shift+T is New Tab).
             gdk::Key::U => {
                 mgr.add_webview_tab("about:blank", &win);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+W: close focused panel (unsplit or close tab)
             gdk::Key::W => {
                 mgr.close_focused(&win);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+E: split horizontal
             gdk::Key::E => {
                 mgr.split_focused(gtk4::Orientation::Horizontal, &win);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+O: split vertical
             gdk::Key::O => {
                 mgr.split_focused(gtk4::Orientation::Vertical, &win);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+N / Ctrl+Shift+Right: next pane
             gdk::Key::N | gdk::Key::Right => {
                 mgr.focus_direction(FocusDirection::Next);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+Left: prev pane
             gdk::Key::Left => {
                 mgr.focus_direction(FocusDirection::Prev);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+P: command palette (was prev-pane; Ctrl+Shift+Left
-            // keeps that role)
             gdk::Key::P => {
                 crate::command_palette::open(&win, &mgr.actions, &mgr.dispatch_tx, &mgr);
                 glib::Propagation::Stop
@@ -2091,7 +1951,6 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
                 crate::comux_panel::toggle_graph_global("agent");
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+Tab: next tab
             gdk::Key::ISO_Left_Tab => {
                 let nb = &mgr.notebook;
                 if nb.n_pages() > 1 {
@@ -2101,7 +1960,6 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
                 }
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+1-9: switch to tab N
             k @ (gdk::Key::exclam
             | gdk::Key::at
             | gdk::Key::numbersign
@@ -2140,13 +1998,11 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     action_box.add_css_class("copad-tab-actions");
     action_box.set_halign(gtk4::Align::Start);
 
-    // Toggle button (collapse/expand tab bar)
     let toggle_btn = gtk4::Button::from_icon_name("sidebar-show-symbolic");
     toggle_btn.add_css_class("flat");
     toggle_btn.add_css_class("copad-action-btn");
     toggle_btn.set_tooltip_text(Some("Toggle tab bar (Ctrl+Shift+B)"));
-    // Names let `update_action_box_layout` identify the two buttons
-    // back from the action widget after GTK adopts the box.
+    // Names let `update_action_box_layout` find the two buttons again.
     toggle_btn.set_widget_name("copad-tab-toggle");
 
     let mgr = manager.clone();
@@ -2154,7 +2010,6 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
         mgr.toggle_tab_bar();
     });
 
-    // Add button with popover for terminal/webview choice
     let add_btn = gtk4::MenuButton::new();
     add_btn.set_icon_name("list-add-symbolic");
     add_btn.add_css_class("flat");
@@ -2166,7 +2021,6 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     let pop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     pop_box.add_css_class("copad-add-menu");
 
-    // Helper: create a row with [TypeIcon TypeLabel] [Tab] [SplitH] [SplitV]
     let make_row =
         |icon: &str, label_text: &str| -> (gtk4::Box, gtk4::Button, gtk4::Button, gtk4::Button) {
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -2218,8 +2072,7 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     remote_btn.set_child(Some(&remote_box));
     pop_box.append(&remote_btn);
 
-    // Plugin entries — keep only the winner per duplicate name so the
-    // picker matches what daemon dispatch / `plugin.open` would resolve.
+    // Keep only the winner per duplicate name, as daemon dispatch / `plugin.open` resolve.
     let mut seen_names = std::collections::HashSet::new();
     let plugin_winners: Vec<_> = manager
         .plugins
@@ -2278,7 +2131,6 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
         crate::comux_panel::prompt_open_remote(&mgr, &win);
     });
 
-    // Terminal placements
     let mgr = manager.clone();
     let win = window.clone();
     let pop = popover.clone();
@@ -2303,7 +2155,6 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
         mgr.split_focused(gtk4::Orientation::Vertical, &win);
     });
 
-    // Browser placements
     let mgr = manager.clone();
     let win = window.clone();
     let pop = popover.clone();
@@ -2335,10 +2186,6 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
         .notebook
         .set_action_widget(&action_box, gtk4::PackType::End);
 
-    // Apply orientation/order for the current (vertical, collapsed) combo.
-    // For vertical+collapsed the column is too narrow to fit both buttons
-    // side-by-side, so we stack them with the add button on top of the
-    // toggle button. Keeps both reachable in collapsed mode.
     manager.update_action_box_layout(*manager.tab_bar_collapsed.borrow());
 }
 

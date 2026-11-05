@@ -25,7 +25,6 @@ pub struct ImageLayers {
 #[derive(Default)]
 struct State {
     shown: Option<Published>,
-    /// Cairo copies of the shown images, by image key.
     surfaces: HashMap<u64, cairo::ImageSurface>,
 }
 
@@ -66,7 +65,6 @@ pub fn attach(
             }
         }
     };
-    // VTE parsed a marker: show the publication it stands for.
     {
         let (state, shared, redraw) = (state.clone(), shared.clone(), redraw.clone());
         terminal.connect_notify_local(Some("current-file-uri"), move |t, _| {
@@ -89,7 +87,6 @@ pub fn attach(
             }
         });
     }
-    // Scrolling back moves the images with the text.
     if let Some(adj) = terminal.vadjustment() {
         let (state, redraw) = (state.clone(), redraw.clone());
         adj.connect_value_changed(move |_| {
@@ -106,7 +103,6 @@ pub fn attach(
     layers
 }
 
-/// How many rows VTE is scrolled back from the live screen.
 fn scrolled_back(terminal: &Terminal) -> f64 {
     terminal.vadjustment().map_or(0.0, |a| {
         (a.upper() - a.page_size() - a.value()).max(0.0).round()
@@ -126,8 +122,6 @@ fn draw(terminal: &Terminal, st: &mut State, cr: &cairo::Context, below: bool) {
     #[allow(deprecated)]
     let pad = terminal.style_context().padding();
     let (px, py) = (pad.left() as f64, pad.top() as f64);
-    // Published rows count from the top of the shadow's history; the view starts that many
-    // rows down, less what VTE is scrolled back.
     let top = shown.history as f64 - scrolled_back(terminal);
     let rows = terminal.row_count() as f64;
     for run in shown.runs.iter().filter(|r| (r.z < 0) == below) {
@@ -161,7 +155,6 @@ fn draw(terminal: &Terminal, st: &mut State, cr: &cairo::Context, below: bool) {
         if uw <= 0.0 || uh <= 0.0 {
             continue;
         }
-        // Where the whole image would land for this slice to fall on `dest`.
         let (fw, fh) = (dest.2 / uw, dest.3 / uh);
         let (fx, fy) = (
             dest.0 - run.uv[0] as f64 * fw,
@@ -180,7 +173,6 @@ fn draw(terminal: &Terminal, st: &mut State, cr: &cairo::Context, below: bool) {
     }
 }
 
-/// Premultiplied RGBA → cairo's ARGB32 (native-endian, so BGRA in memory on little-endian).
 fn to_surface(image: &alacritty_terminal::term::cell::GraphicImage) -> Option<cairo::ImageSurface> {
     let (w, h) = (image.width as i32, image.height as i32);
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).ok()?;

@@ -20,13 +20,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAX_MISSES: u32 = 2;
 
-/// Allowed keys for the per-GUI env subset that a registered client
-/// may publish via `gui.register`'s `gui_env` field. Forwarded into
-/// `system.spawn` children so triggers can reach the user's
-/// compositor / Wayland session (`hyprctl`, `notify-send`, etc.). The
-/// list is intentionally small and reviewed at the daemon boundary —
-/// without this filter a malicious GUI could leak `LD_PRELOAD`,
-/// `PATH`, or session secrets into spawned children.
+/// Allowed keys for the per-GUI env a client publishes via `gui.register`'s `gui_env`,
+/// forwarded into `system.spawn` children so triggers reach the compositor / Wayland session.
+/// Kept small: unfiltered, a malicious GUI could leak `LD_PRELOAD`, `PATH` or secrets into
+/// children.
 pub const GUI_ENV_ALLOWED_KEYS: &[&str] = &[
     "HYPRLAND_INSTANCE_SIGNATURE",
     "DISPLAY",
@@ -37,10 +34,8 @@ pub const GUI_ENV_ALLOWED_KEYS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
 ];
 
-/// Apply [`GUI_ENV_ALLOWED_KEYS`] filtering at the daemon trust
-/// boundary. Called from `handle_gui_register` on every register
-/// payload — GUI-side filtering alone (the client could be a mock)
-/// is not enough.
+/// Applied at the daemon trust boundary on every `gui.register`: GUI-side filtering alone is
+/// not enough (the client could be a mock).
 pub fn filter_gui_env(raw: &Value) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Some(obj) = raw.as_object() else {
@@ -74,46 +69,34 @@ pub fn method_capability(method: &str) -> Option<&'static str> {
     match method {
         "tab.new" | "tab.close" | "tab.list" | "tab.info" | "tab.rename" | "tab.switch"
         | "tabs.toggle_bar" | "claude.start" => Some("tab"),
-        // Focus movement rides the pane-geometry capability rather than a new
-        // `pane` one: both are pane-scoped, and `split` is already in the GUI's
-        // advertised CAPABILITIES, so this needs no handshake change.
-        // `panel.focus` joins them: it is the same act addressed by id instead of
-        // by direction.
+        // Focus movement rides the pane-geometry capability: `split` is already in the GUI's
+        // advertised CAPABILITIES, so no handshake change. `panel.focus` is the same act by id.
         "split.horizontal" | "split.vertical" | "pane.focus_next" | "pane.focus_prev"
         | "panel.focus" => Some("split"),
         "terminal.read" | "terminal.state" | "terminal.exec" | "terminal.feed"
         | "terminal.history" | "terminal.context" => Some("terminal"),
         m if m.starts_with("webview.") => Some("webview"),
-        // `browser.*` rides the `webview` capability rather than getting one of
-        // its own. The split between the two namespaces is naming, not a
-        // boundary (the boundary is `TabMode`, checked in
-        // `copad_core::browser::authorize`) — `browser.secret.*` is served by
-        // the same webview subsystem, in the same GUI process, behind the same
-        // gate. A separate capability would need both GUIs to advertise it, and
-        // a GUI that had not yet been updated would answer `unknown_method` for
-        // a method it in fact implements.
+        // `browser.*` rides `webview`: the namespaces split by naming, not boundary (that is
+        // `TabMode`, checked in `copad_core::browser::authorize`). A separate capability would
+        // need both GUIs to advertise it, and an un-updated GUI would answer `unknown_method`
+        // for a method it implements.
         m if m.starts_with("browser.") => Some("webview"),
         m if m.starts_with("background.") => Some("background"),
         "statusbar.show" | "statusbar.hide" | "statusbar.toggle" => Some("statusbar"),
-        // Both open a GUI-owned panel; `agent.ui` is the capability the cockpit
-        // belongs to, and every GUI that advertises it can render one.
+        // Both open a GUI-owned panel; the cockpit belongs to `agent.ui`.
         "agent.approve" | "cockpit.open" => Some("agent.ui"),
         "plugin.open" => Some("plugin.open"),
         "session.list" | "session.info" => Some("session"),
-        // Phase 22.2 — project + workflow surfaces live GUI-side because
-        // workflow.run dispatches `claude.start` in-process (needs TabManager
-        // + GTK window). project.* + workflow.list/get are also GUI-routed
-        // for proximity to the registries that hold the data.
+        // workflow.run dispatches `claude.start` in-process (needs TabManager and the GTK
+        // window), so project.* and workflow.list/get are GUI-routed too.
         m if m.starts_with("project.") => Some("project"),
         m if m.starts_with("workflow.") => Some("workflow"),
         _ => None,
     }
 }
 
-/// Some GUI methods legitimately take more than the default 5s — slow
-/// WebView ops in particular. The supervisor's action_timeout is 120s
-/// upstream, so we match that for any method that can transitively trigger
-/// a plugin RPC or a heavy WebView call.
+/// Slow methods (WebView ops especially) need more than the default 5s. Matches the supervisor's
+/// 120s action_timeout for anything that can trigger a plugin RPC or heavy WebView call.
 pub fn method_invoke_timeout(method: &str) -> Duration {
     if method.starts_with("webview.") || method.starts_with("browser.") || method == "claude.start"
     {
@@ -127,14 +110,11 @@ pub struct GuiClient {
     pub client_id: String,
     pub capabilities: HashSet<String>,
     pub want_primary: bool,
-    /// Daemon-filtered subset of the GUI's process env, forwarded by
-    /// the trigger sink into `system.spawn` children. Filtered via
-    /// [`filter_gui_env`] at registration — the daemon never trusts
-    /// the raw GUI input.
+    /// Filtered via [`filter_gui_env`] at registration; the daemon never trusts raw GUI input.
     pub gui_env: HashMap<String, String>,
     writer_tx: SyncSender<String>,
-    /// `None` post-unregister — a stale `Arc<GuiClient>` held across a
-    /// disconnect cannot insert a pending entry nobody will resolve.
+    /// `None` after unregister, so a stale `Arc<GuiClient>` cannot insert a pending entry nobody
+    /// will resolve.
     pending: Mutex<Option<HashMap<String, Sender<Response>>>>,
     /// Lets `fail_all_pending` shutdown(Both) the daemon side, so both
     /// readers EOF and the GUI's reconnect_loop fires.
@@ -143,9 +123,6 @@ pub struct GuiClient {
 }
 
 impl GuiClient {
-    /// Sends an Invoke and blocks until the GUI replies with a matching
-    /// Response, or `timeout` elapses. Returns `gui_disconnected`
-    /// immediately if the client has already been unregistered.
     pub fn invoke(&self, method: &str, params: Value, timeout: Duration) -> Response {
         let invoke_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = channel::<Response>();
@@ -216,11 +193,10 @@ impl GuiClient {
         }
     }
 
-    /// Drains pending Invokes with `err`, marks the client disconnected
-    /// (subsequent `invoke` fail-fast), and tears down the socket.
+    /// Drains pending Invokes with `err`, marks the client disconnected, and tears down the socket.
     pub fn fail_all_pending(&self, err: ResponseError) {
-        // Stop forwarder BEFORE shutdown — otherwise it can push more
-        // lines into writer_tx that nothing will ever read.
+        // Stop the forwarder BEFORE shutdown, or it can push lines into writer_tx that nothing
+        // will read.
         self.forwarder_stop.store(true, Ordering::SeqCst);
         let drained = self.pending.lock().unwrap().take();
         if let Some(map) = drained {
@@ -242,8 +218,8 @@ impl GuiClient {
 #[derive(Default)]
 pub struct GuiRegistry {
     clients: Mutex<HashMap<String, Arc<GuiClient>>>,
-    /// Registration order, newest last. Primary promotion picks the most
-    /// recent `want_primary=true` entry per spec.
+    /// Registration order, newest last. Primary promotion picks the most recent
+    /// `want_primary=true` entry.
     order: Mutex<Vec<String>>,
     primary: Mutex<Option<String>>,
 }
@@ -253,8 +229,8 @@ impl GuiRegistry {
         Arc::new(Self::default())
     }
 
-    /// Returns `(client_id, is_primary)`. Lock order: clients → order →
-    /// primary (same as `unregister`/`route`; reversing deadlocks).
+    /// Returns `(client_id, is_primary)`. Lock order: clients -> order -> primary (same as
+    /// `unregister`/`route`; reversing deadlocks).
     pub fn register(
         self: &Arc<Self>,
         capabilities: HashSet<String>,
@@ -264,8 +240,6 @@ impl GuiRegistry {
         shutdown_handle: Option<UnixStream>,
     ) -> (String, bool) {
         let client_id = uuid::Uuid::new_v4().to_string();
-        // Snapshot before `capabilities` moves into the client — avoids
-        // re-locking just to format the log line.
         let caps_summary = {
             let mut v: Vec<&str> = capabilities.iter().map(String::as_str).collect();
             v.sort();
@@ -313,7 +287,7 @@ impl GuiRegistry {
     }
 
     pub fn unregister(&self, client_id: &str) {
-        // Lock order: clients → order → primary, same as `register`.
+        // Lock order: clients -> order -> primary, as in `register`.
         let mut clients = self.clients.lock().unwrap();
         let mut order = self.order.lock().unwrap();
         let mut primary = self.primary.lock().unwrap();
@@ -338,7 +312,7 @@ impl GuiRegistry {
         }
     }
 
-    /// Lock order: clients → primary (same direction as `register`).
+    /// Lock order: clients -> primary, as in `register`.
     pub fn route(
         &self,
         method: &str,
@@ -367,10 +341,8 @@ impl GuiRegistry {
         self.clients.lock().unwrap().get(client_id).cloned()
     }
 
-    /// Returns the primary GUI's filtered env subset, or `None` if no
-    /// primary is currently registered (headless mode). Lock order
-    /// `clients → primary` mirrors `route()` to avoid deadlocking
-    /// against any caller that holds clients first.
+    /// `None` when no primary is registered (headless). Lock order `clients -> primary`, as in
+    /// `route()`.
     pub fn primary_gui_env(&self) -> Option<HashMap<String, String>> {
         let clients = self.clients.lock().unwrap();
         let primary = self.primary.lock().unwrap().clone();
@@ -378,13 +350,10 @@ impl GuiRegistry {
         clients.get(&primary_id).map(|c| c.gui_env.clone())
     }
 
-    /// Drains the daemon `EventBus` into the GUI's writer channel as
-    /// wire `Event` lines (protocol § auto-subscribe-all).
+    /// Drains the daemon `EventBus` into the GUI's writer channel as wire `Event` lines.
     ///
-    /// MUST be called only after the `gui.register` ack has been queued
-    /// on `writer_tx`. Calling earlier races the first event past the
-    /// GUI's `await_register_ack`, which reads the first line as a
-    /// `Response`.
+    /// MUST be called only after the `gui.register` ack is queued on `writer_tx`: an earlier
+    /// event would reach the GUI's `await_register_ack` as its first line, read as a `Response`.
     pub fn start_event_forwarder(&self, client_id: &str, bus: Arc<EventBus>) {
         let Some(client) = self.get(client_id) else {
             return;
@@ -413,24 +382,17 @@ fn forwarder_loop(
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
             RecvOutcome::Event(ev) => {
-                // Echo prevention: an event whose bridge_id is already
-                // set was lifted off the GUI→daemon `_bus.publish`
-                // ingest. Re-bridging it back to the originating GUI
-                // would form a loop. Stage C will use the symmetric
-                // skip on the GUI side.
+                // Echo prevention: an event with `bridge_id` was lifted off the GUI's
+                // `_bus.publish` ingest; re-bridging it to the origin would loop.
                 if ev.bridge_id.is_some() {
                     continue;
                 }
                 let Some(client) = weak_client.upgrade() else {
                     return;
                 };
-                // Both `source` and `origin` MUST round-trip. The trigger
-                // engine's preflight-promotion gates on `source`
-                // (`copad.action` for completion-stamped events) and the
-                // `[security] accept_external` gate on `origin`. Without
-                // origin propagation a daemon-side `External` tag (set at
-                // `events.publish` ingest) silently downgrades to `Internal`
-                // on the GUI bus.
+                // `source` and `origin` MUST round-trip: preflight promotion gates on `source`,
+                // `[security] accept_external` on `origin`. Dropping origin would downgrade a
+                // daemon-side `External` tag to `Internal` on the GUI bus.
                 let wire = WireEvent::new(ev.kind, ev.payload)
                     .with_source(ev.source)
                     .with_origin(ev.origin);
@@ -444,9 +406,8 @@ fn forwarder_loop(
                 use std::sync::mpsc::TrySendError;
                 match client.writer_tx.try_send(line) {
                     Ok(_) => {}
-                    // Drop on Full to keep the stop-flag check alive;
-                    // heartbeat on the same channel will tear down the
-                    // wedged GUI.
+                    // Drop on Full to keep the stop-flag check alive; the heartbeat on the same
+                    // channel tears down a wedged GUI.
                     Err(TrySendError::Full(_)) => {
                         log::debug!("event forwarder: writer_tx full, dropping event");
                     }
@@ -509,18 +470,12 @@ mod tests {
         assert_eq!(method_capability("webview.click"), Some("webview"));
         assert_eq!(method_capability("terminal.exec"), Some("terminal"));
         assert_eq!(method_capability("claude.start"), Some("tab"));
-        // The agent cockpit is daemon-routable, so a trigger or an explicit
-        // --socket <daemon> call reaches the primary GUI instead of 404ing.
         assert_eq!(method_capability("cockpit.open"), Some("agent.ui"));
-        // Capabilities Linux had but never exposed over RPC — a human could
-        // switch tabs / move pane focus, an agent could not.
         assert_eq!(method_capability("tab.switch"), Some("tab"));
         assert_eq!(method_capability("pane.focus_next"), Some("split"));
         assert_eq!(method_capability("pane.focus_prev"), Some("split"));
-        // The notification-jump target (#115). Without a capability the daemon
-        // treats it as daemon-owned by omission, so a daemon-routed call answers
-        // `unknown_method` for a method BOTH GUIs implement — and nothing
-        // reserves the name against a plugin's `provides[]`.
+        // Without a capability the daemon treats it as daemon-owned and answers `unknown_method`
+        // for a method both GUIs implement, and nothing reserves the name against a plugin.
         assert_eq!(method_capability("panel.focus"), Some("split"));
         assert_eq!(method_capability("webview.state"), Some("webview"));
         assert_eq!(method_capability("system.ping"), None);
@@ -529,12 +484,8 @@ mod tests {
 
     #[test]
     fn the_browser_namespace_routes_to_the_gui_like_webview_does() {
-        // `browser.secret.*` is implemented in the GUI process behind the same
-        // `copad_core::browser::authorize` gate as `webview.*`. Without this the
-        // daemon treats it as daemon-owned by omission, and a `coctl secret`
-        // call answers `unknown_method` for a method the GUI implements — which
-        // is exactly the "is it a typo or is it not built?" ambiguity the
-        // Browser Workbench registers methods to remove.
+        // `browser.secret.*` lives in the GUI behind the same authorize gate as `webview.*`;
+        // without a capability the daemon would answer `unknown_method` for it.
         assert_eq!(method_capability("browser.secret.list"), Some("webview"));
         assert_eq!(method_capability("browser.secret.fill"), Some("webview"));
         assert_eq!(method_capability("browser.secret.save"), Some("webview"));
@@ -543,8 +494,6 @@ mod tests {
 
     #[test]
     fn browser_methods_get_the_long_webview_timeout() {
-        // A credential fill rebuilds a web view and waits on a keychain; the 5s
-        // default would time out a call that was going to succeed.
         assert!(method_invoke_timeout("browser.secret.fill") > Duration::from_secs(5));
         assert_eq!(
             method_invoke_timeout("browser.secret.fill"),
@@ -554,7 +503,6 @@ mod tests {
 
     #[test]
     fn plugin_dot_name_dot_cmd_is_daemon_owned() {
-        // Daemon hosts plugin manifest commands directly; no GUI routing.
         assert_eq!(method_capability("plugin.echo.greet"), None);
         assert_eq!(method_capability("plugin.todo.add"), None);
         // Single-dot `plugin.open` and `plugin.list` are unaffected.
@@ -722,12 +670,10 @@ mod tests {
         let (id2, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx2, None);
         let (tx3, _rx3) = sync_channel::<String>(64);
         let (id3, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx3, None);
-        // Drop the original primary (id1). Most-recent (id3) should win,
-        // not id2 (the second-oldest).
+        // Dropping id1 promotes the most recent (id3), not id2.
         reg.unregister(&id1);
         let routed = reg.route("tab.list", None).expect("primary transferred");
         assert_eq!(routed.client_id, id3);
-        // Drop the new primary too — id2 should become primary now.
         reg.unregister(&id3);
         let routed = reg
             .route("tab.list", None)
@@ -748,9 +694,7 @@ mod tests {
 
     #[test]
     fn heartbeat_unregisters_after_consecutive_misses() {
-        // Tight-cadence override so the test runs in under a second.
-        // writer_rx is dropped immediately, so every invoke fails fast
-        // with gui_disconnected — counts as a heartbeat miss.
+        // Tight cadence; the dropped writer_rx makes every invoke fail, counting as a miss.
         let reg = GuiRegistry::new();
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
         drop(writer_rx);
@@ -784,9 +728,8 @@ mod tests {
 
     #[test]
     fn invoke_after_unregister_returns_disconnect_fast() {
-        // Race we're closing: route() hands out an Arc<GuiClient>, then
-        // unregister fires, then the caller still tries to invoke. Must
-        // surface gui_disconnected, not wait for the full timeout.
+        // route() hands out an Arc<GuiClient>, unregister fires, then the caller invokes: must
+        // surface gui_disconnected, not wait out the timeout.
         let reg = GuiRegistry::new();
         let (writer_tx, _writer_rx) = sync_channel::<String>(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
@@ -809,13 +752,10 @@ mod tests {
         let (writer_tx, _writer_rx) = sync_channel(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         let client = reg.get(&cid).unwrap();
-        // Issue a pending Invoke from a worker, unregister, expect it to
-        // surface gui_disconnected.
         let client_clone = client.clone();
         let handle = std::thread::spawn(move || {
             client_clone.invoke("tab.list", json!({}), Duration::from_secs(5))
         });
-        // Brief wait so the pending entry exists before we unregister.
         std::thread::sleep(Duration::from_millis(30));
         reg.unregister(&cid);
         let resp = handle.join().unwrap();
@@ -825,15 +765,11 @@ mod tests {
 
     #[test]
     fn event_forwarder_writes_bus_events_to_writer() {
-        // Publish a bus event AFTER starting the forwarder; assert the
-        // GUI's writer_tx receives a wire `Event` line with matching kind
-        // + payload.
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         reg.start_event_forwarder(&cid, bus.clone());
-        // Give the forwarder a tick to enter recv_timeout.
         thread::sleep(Duration::from_millis(50));
         bus.publish(copad_core::event_bus::Event::new(
             "todo.create.completed",
@@ -850,16 +786,11 @@ mod tests {
 
     #[test]
     fn invoke_fast_fails_when_writer_buffer_full() {
-        // Buffer 1, no consumer (writer_rx dropped) → first send fills
-        // the buffer with the new-pending Invoke line, second send
-        // returns Full → invoke must return immediately with
-        // gui_disconnected (not block the heartbeat path).
         let reg = GuiRegistry::new();
         let (writer_tx, writer_rx) = sync_channel::<String>(1);
         drop(writer_rx);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         let client = reg.get(&cid).unwrap();
-        // First call hits the dropped-receiver path (Disconnected).
         let start = std::time::Instant::now();
         let resp = client.invoke("tab.list", json!({}), Duration::from_secs(5));
         assert!(!resp.ok);
@@ -873,21 +804,17 @@ mod tests {
 
     #[test]
     fn event_forwarder_skips_bridged_events() {
-        // Events whose `bridge_id` is set were ingested via the
-        // daemon's `_bus.publish` from the GUI side; the daemon→GUI
-        // forwarder must not echo them back to the originating GUI.
+        // Events with `bridge_id` came from the GUI's `_bus.publish`; echoing them back would loop.
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         reg.start_event_forwarder(&cid, bus.clone());
         thread::sleep(Duration::from_millis(50));
-        // Publish a BRIDGED event — should be skipped.
         bus.publish_bridged(
             copad_core::event_bus::Event::new("bridged.kind", "src", json!({})),
             42,
         );
-        // Publish a NON-bridged event — should flow through.
         bus.publish(copad_core::event_bus::Event::new(
             "native.kind",
             "src",
@@ -898,7 +825,6 @@ mod tests {
             .expect("forwarder should deliver the native event");
         let parsed: WireEvent = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed.event_type, "native.kind");
-        // Allow one more tick; the bridged event must NOT arrive.
         match writer_rx.recv_timeout(Duration::from_millis(200)) {
             Err(_) => {}
             Ok(extra) => {
@@ -910,8 +836,7 @@ mod tests {
 
     #[test]
     fn event_forwarder_stops_on_unregister() {
-        // After unregister, no more events flow even if the bus keeps
-        // publishing. (forwarder_stop flag flipped by fail_all_pending.)
+        // After unregister no more events flow (`forwarder_stop` is flipped by fail_all_pending).
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
@@ -923,21 +848,16 @@ mod tests {
             "test",
             json!({}),
         ));
-        // Drain the pre-unregister event.
         writer_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("first event delivered");
         reg.unregister(&cid);
-        // Give the forwarder time to observe the stop flag (one
-        // recv_timeout tick is ≤200ms).
         thread::sleep(Duration::from_millis(300));
         bus.publish(copad_core::event_bus::Event::new(
             "after.unreg",
             "test",
             json!({}),
         ));
-        // Either Disconnected (writer Receiver dropped) or Timeout —
-        // never Ok with an "after.unreg" line.
         if let Ok(line) = writer_rx.recv_timeout(Duration::from_millis(300)) {
             let parsed: WireEvent = serde_json::from_str(&line).unwrap();
             assert_ne!(

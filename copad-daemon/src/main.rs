@@ -1,6 +1,3 @@
-//! `copadd` binary entry. Hosts the daemon-side `ActionRegistry`
-//! (builtins + plugins via `ServiceSupervisor`) and the GUI registry.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,35 +28,24 @@ use copad_daemon::trigger_pump::PumpState;
 use copad_daemon::trigger_sink::TRIGGER_ONLY_RESERVED_METHODS;
 use serde_json::json;
 
-/// `plugin.<name>.<cmd>` inherits the supervisor's 120s action_timeout;
-/// the inner timeout is below that so the watchdog's kill+reap path
-/// always wins the race over the registry's outer 120s recv_timeout.
+/// Below the supervisor's 120s action_timeout so the watchdog's kill+reap wins the race.
 const PLUGIN_CMD_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Statusbar modules tick at 10s default. Generous-but-bounded so a
-/// runaway module can't pile up across ticks.
+/// Statusbar modules tick every 10s by default; bounded so a runaway module can't pile up.
 const MODULE_RUN_TIMEOUT: Duration = Duration::from_secs(8);
 
 const ENV_E2E_ACTIONS: &str = "COPADD_E2E_TEST_ACTIONS";
 const ENV_POOL_WORKERS: &str = "COPADD_POOL_WORKERS";
 const ENV_POOL_QUEUE: &str = "COPADD_POOL_QUEUE";
-/// Daemon-side TriggerEngine dispatch. Stages B+C delivered the
-/// atomic cut-over so a registered GUI gracefully releases its own
-/// in-process engine when the daemon advertises `host_triggers=true`
-/// in the `gui.register` ack — no risk of double-dispatch on the
-/// shared trigger set. Default flipped to ON when slice 1 of the
-/// `claude` harness loop landed (decisions.md #39): with no
-/// `COPADD_HOST_TRIGGERS` set, the daemon dispatches; set it to
-/// `0`/`false`/`no` to disable and let the GUI engine stay
-/// authoritative (only useful for the standalone-GUI path).
+/// Daemon-side TriggerEngine dispatch (decisions.md #39). Default ON: a registered GUI releases
+/// its own in-process engine when the `gui.register` ack advertises `host_triggers=true`, so
+/// there is no double-dispatch. Set `0`/`false`/`no` to keep the GUI engine authoritative
+/// (standalone-GUI path).
 const ENV_HOST_TRIGGERS: &str = "COPADD_HOST_TRIGGERS";
 
 const PUMP_TICK: Duration = Duration::from_millis(50);
 
-/// Daemon config file mtime poll interval. Two seconds is a fair
-/// trade-off: faster than user perception for trigger reloads, but
-/// slow enough that we don't churn the syscall table when nobody is
-/// editing.
+/// Config mtime poll interval.
 const WATCHER_TICK: Duration = Duration::from_secs(2);
 
 fn print_help() {
@@ -82,11 +68,8 @@ ENVIRONMENT:
 }
 
 fn main() -> ExitCode {
-    // Short-circuit read-only flags BEFORE env_logger init / socket bind.
-    // Without this, `copadd --version` invoked while a daemon is running
-    // would fail with "socket already bound" from `prepare_socket_path`
-    // (decisions.md #40 notes auto-start happens behind the user's back —
-    // a second invocation for `--version` is the normal way to check it).
+    // Handle read-only flags BEFORE env_logger init / socket bind: `copadd --version` against a
+    // running daemon would otherwise fail with "socket already bound" (decisions.md #40).
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("copadd {}", env!("CARGO_PKG_VERSION"));
@@ -136,34 +119,25 @@ fn main() -> ExitCode {
     if env_flag_enabled(ENV_E2E_ACTIONS) {
         register_e2e_actions(&actions);
     }
-    // Phase 22.6 — runledger write-through subscriber + events.replay action.
-    // (Phase 24.7, decision #51: the goal / mission / agent-registry / approval /
-    // pipeline registries and the goal-tick + approval-sweeper threads were
-    // removed — orchestration is now the pilot goal-queue plugin over csd.)
     let runledger_stop = Arc::new(AtomicBool::new(false));
     let _runledger_thread =
         register_runledger_actions(&actions, &event_bus, runledger_stop.clone());
     let _ = runledger_stop;
 
-    // GuiRegistry is built before the trigger sink so both share the
-    // same registry instance — the sink's fallthrough worker resolves
-    // a registered primary GUI via `gui.route(action, None)`.
+    // Built before the trigger sink so both share it: the sink's fallthrough worker resolves the
+    // primary GUI via `gui.route(action, None)`.
     let gui = GuiRegistry::new();
     let context = Arc::new(ContextService::new());
     let (triggers_cfg, initial_mtime) = load_triggers_config();
     let cached_triggers = Arc::new(Mutex::new(triggers_cfg.clone()));
     let engine = build_trigger_engine(&actions, &gui, &context, &event_bus, &triggers_cfg);
-    // Daily GitHub-release update check → `update.available` bus event + a native
-    // toast when a newer version ships (the update path for install.sh users).
-    // Runs regardless of trigger hosting; `COPAD_UPDATE_CHECK=0` disables it.
+    // Daily release check; runs regardless of trigger hosting. `COPAD_UPDATE_CHECK=0` disables.
     copad_daemon::update_check::spawn(
         event_bus.clone(),
         copad_core::notifier::platform_notifier().map(Arc::from),
     );
-    // PumpState — and the bus subscriptions it owns — only exists when
-    // the daemon is dispatch-authoritative. With host_triggers=false
-    // the engine holds the trigger set internally but no receivers are
-    // created, so daemon bus traffic does not accumulate.
+    // Only exists when dispatch-authoritative; with host_triggers=false no receivers are created,
+    // so bus traffic does not accumulate.
     let pump_state: Option<Arc<Mutex<PumpState>>> = if host_triggers {
         Some(build_pump_state(&event_bus, &triggers_cfg))
     } else {
@@ -179,8 +153,7 @@ fn main() -> ExitCode {
         if host_triggers { "ON" } else { "OFF" }
     );
 
-    // Bind before activating plugins so a bind failure can't orphan
-    // eagerly-spawned children.
+    // Bind before activating plugins so a bind failure can't orphan eagerly spawned children.
     let listener = match socket::bind_listener(&socket_path) {
         Ok(l) => l,
         Err(e) => {
@@ -189,12 +162,9 @@ fn main() -> ExitCode {
         }
     };
 
-    // macOS-only: kill any plugin process groups still alive from a
-    // prior daemon run that exited without `shutdown_all` (panic /
-    // SIGKILL). No-op on Linux, where PDEATHSIG already cleaned them
-    // up at parent death. Runs BEFORE the supervisor spawns its own
-    // plugins so we don't accidentally kill a freshly-spawned child
-    // that recycled an old pid.
+    // macOS-only: kill plugin process groups left by a prior daemon that exited without
+    // `shutdown_all` (panic/SIGKILL); Linux relies on PDEATHSIG. Runs BEFORE the supervisor
+    // spawns plugins so a recycled pid isn't killed.
     #[cfg(target_os = "macos")]
     copad_daemon::service_supervisor::sweep_orphan_pids();
 
@@ -211,11 +181,8 @@ fn main() -> ExitCode {
         )
     });
 
-    // Cron scheduler: daemon-only. When `host_triggers=false` the
-    // GUI owns trigger dispatch and a daemon-side cron firer would
-    // double-fire (or — worse — fire actions the GUI doesn't know
-    // about). Skip the scheduler entirely in that mode and log so
-    // the operator notices their cron triggers won't fire.
+    // Daemon-only. With host_triggers=false the GUI owns dispatch and a daemon cron firer would
+    // double-fire; skipped and logged so the operator knows cron triggers won't fire.
     let (cron_scheduler, cron_thread) = if host_triggers {
         let sched = Arc::new(CronScheduler::new(engine.clone(), context.clone()));
         sched.reload(&cached_triggers.lock().unwrap());
@@ -231,15 +198,10 @@ fn main() -> ExitCode {
         (None, None)
     };
 
-    // Config-file watcher runs unconditionally — daemon's own engine
-    // tracks `[[triggers]]` edits even with no GUI attached (headless
-    // case). When `host_triggers=false`, the watcher updates engine
-    // state without touching bus subscriptions (no PumpState exists);
-    // when `=true`, it follows the GUI's hot-reload ordering
-    // (set_triggers → pump_all → reconcile). `initial_mtime` was
-    // captured during `load_triggers_config()` so an edit landing in
-    // the window between main()'s load and the watcher's first tick
-    // is detected on that first tick.
+    // Runs unconditionally so the engine tracks `[[triggers]]` edits even headless. With
+    // host_triggers=false it updates the engine only (no PumpState); with true it follows the
+    // GUI's hot-reload order (set_triggers -> pump_all -> reconcile). `initial_mtime` comes from
+    // `load_triggers_config()` so an edit before the first tick is caught.
     let watcher_stop = Arc::new(AtomicBool::new(false));
     let watcher_thread = spawn_config_watcher(
         engine.clone(),
@@ -283,12 +245,10 @@ fn main() -> ExitCode {
         log::error!("cron scheduler thread panicked: {panic:?}");
     }
 
-    // Arc::drop does not call shutdown_all; we must invoke it explicitly
-    // for cooperative plugin shutdown before unlinking the socket.
+    // Arc::drop does not call shutdown_all; run it before unlinking the socket.
     log::info!("shutting down supervised plugins");
     supervisor_guard.shutdown_all();
-    // Explicit pool shutdown breaks any registry↔handler↔supervisor Arc
-    // cycle that would otherwise prevent the pool's Drop from running.
+    // Explicit shutdown breaks any registry/handler/supervisor Arc cycle that would block Drop.
     pool.shutdown();
 
     socket::cleanup_socket(&socket_path);
@@ -296,10 +256,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Returns the loaded triggers AND the mtime sampled at load time.
-/// The watcher seeds its baseline from this mtime so an edit landing
-/// between main()'s load and the watcher's first tick is detected on
-/// that first tick rather than ignored until the next edit.
+/// Also returns the mtime sampled at load; the watcher seeds its baseline from it so an edit
+/// before its first tick is detected.
 fn load_triggers_config() -> (Vec<Trigger>, Option<std::time::SystemTime>) {
     let path = CopadConfig::config_path();
     let mtime = std::fs::metadata(&path)
@@ -314,10 +272,8 @@ fn load_triggers_config() -> (Vec<Trigger>, Option<std::time::SystemTime>) {
     }
 }
 
-/// Build the engine + register `context.snapshot`. Does NOT create
-/// the PumpState — that's deferred to host-triggers-on mode so we
-/// don't accumulate unbounded trigger subscriptions with no pump
-/// thread to drain them.
+/// Builds the engine and registers `context.snapshot`. Does NOT create the PumpState: that waits
+/// for host-triggers-on mode, so subscriptions don't accumulate with no pump to drain them.
 fn build_trigger_engine(
     actions: &Arc<ActionRegistry>,
     gui: &Arc<GuiRegistry>,
@@ -377,12 +333,9 @@ fn build_trigger_engine(
             ctx_for_presence_get.presence().as_str().to_string(),
         ))
     });
-    // `event.history` mirrors the GUI's registration. Both processes
-    // host their own EventBus (bridge-forwarded events land on both),
-    // so a daemon-routed `coctl recent` returns the daemon's view
-    // and a GUI-routed call returns the GUI's; for plugin events the
-    // two are largely interchangeable. Registered silent so its own
-    // `.completed` doesn't inflate the next call's result.
+    // `event.history` mirrors the GUI's registration; each process hosts its own EventBus, so a
+    // daemon-routed `coctl recent` returns the daemon's view. Silent so its own `.completed`
+    // doesn't inflate the next call's result.
     let bus_for_history = event_bus.clone();
     actions.register_silent("event.history", move |params| {
         if let Some(v) = params.get("since_ms")
@@ -425,15 +378,10 @@ fn build_trigger_engine(
     engine
 }
 
-/// `notify.show` — desktop toast. Registered as `blocking_silent` so
-/// the ~10 ms `notify-send` subprocess runs on the action thread pool
-/// instead of stalling the trigger pump, and so its own `.completed`
-/// event doesn't fan-out (the toast IS the user signal). The same
-/// registration also runs on the GUI's in-process registry — see
-/// `copad-linux/src/window.rs` — so triggers fire regardless of
-/// whether the daemon hosts the engine or the GUI's `LiveTriggerSink`
-/// path resolves the action. `notifier` is plumbed as an arg so tests
-/// can inject a `NoopNotifier` without spawning real subprocesses.
+/// `notify.show` — desktop toast. `blocking_silent` so the `notify-send` subprocess runs on the
+/// action pool, not the trigger pump, and its `.completed` event doesn't fan out. Also registered
+/// on the GUI's in-process registry (`copad-linux/src/window.rs`). `notifier` is an argument so
+/// tests can inject a `NoopNotifier`.
 fn register_notify_show(
     actions: &Arc<copad_core::action_registry::ActionRegistry>,
     notifier: Option<Arc<dyn copad_core::notifier::Notifier>>,
@@ -472,9 +420,7 @@ fn register_notify_show(
                 }
             },
             None => {
-                // Platform has no concrete Notifier yet (only Linux and
-                // macOS are wired). Drop the toast with a debug-level
-                // log; downstream chains don't need to fail.
+                // No Notifier on this platform (only Linux and macOS are wired); drop the toast.
                 log::debug!("notify.show: no Notifier for this platform; dropping");
                 Ok(serde_json::json!({ "shown": false, "reason": "no_notifier" }))
             }
@@ -482,9 +428,6 @@ fn register_notify_show(
     });
 }
 
-/// Build + reconcile PumpState. Only call this when the daemon is
-/// host_triggers-enabled; the pump thread that drains the
-/// subscriptions is spawned alongside.
 fn build_pump_state(
     event_bus: &Arc<copad_core::event_bus::EventBus>,
     triggers_cfg: &[Trigger],
@@ -553,10 +496,8 @@ fn config_watcher_loop(
     stop: Arc<AtomicBool>,
     path: &Path,
 ) {
-    // Seed from the mtime sampled at the time of the initial config
-    // load, NOT from a fresh sample on watcher startup. The latter
-    // would silently swallow any edit that landed between main()'s
-    // load and the watcher entering this function.
+    // Seed from the mtime of the initial config load, NOT a fresh sample here: that would
+    // swallow an edit landing between main()'s load and this function.
     let mut last_mtime = initial_mtime;
     while !stop.load(Ordering::SeqCst) {
         thread::sleep(WATCHER_TICK);
@@ -582,17 +523,11 @@ fn config_watcher_loop(
     }
 }
 
-/// Hot-reload contract:
-/// - Always: `engine.set_triggers(new)` + refresh cached_triggers.
-/// - When `pump_state` is `Some` (host_triggers=true): mirror the
-///   GUI's `watch_config` ordering — `pump_all` on OLD subscribers
-///   to flush pending events, then `reconcile_triggers`. Skipping
-///   `pump_all` would discard pending events the new trigger set
-///   would have matched during a pattern-narrowing reload.
-/// - When `pump_state` is `None` (host_triggers=false): bus
-///   subscriptions don't exist at all — nothing to reconcile and
-///   nothing to flush. The engine's internal trigger list is the
-///   only thing that updates.
+/// Hot-reload contract: always `engine.set_triggers(new)` and refresh cached_triggers. With
+/// `pump_state` (host_triggers=true), mirror the GUI's `watch_config` ordering: `pump_all` on the
+/// OLD subscribers first, then `reconcile_triggers`; skipping `pump_all` would discard pending
+/// events the new set would match after a pattern-narrowing reload. Without it there are no bus
+/// subscriptions, so only the engine's trigger list updates.
 #[allow(clippy::too_many_arguments)]
 fn apply_reloaded_triggers(
     engine: &Arc<TriggerEngine>,
@@ -624,8 +559,7 @@ fn build_pool() -> Arc<ThreadPool> {
         .map(|n| n.get().saturating_mul(2))
         .unwrap_or(8)
         .clamp(4, 16);
-    // Clamp env overrides to a sane band so a typo (e.g. `WORKERS=10000`)
-    // can't OS-exhaust the daemon on startup.
+    // Clamp env overrides so a typo (e.g. `WORKERS=10000`) can't exhaust the OS.
     let workers = env_usize(ENV_POOL_WORKERS)
         .unwrap_or(default_workers)
         .clamp(1, 256);
@@ -649,8 +583,6 @@ fn env_usize(var: &str) -> Option<usize> {
     }
 }
 
-/// Phase 22.6 — Runledger subscriber + replay action. Spawns a thread
-/// that drains a bus subscription into the monthly JSONL ledger.
 fn register_runledger_actions(
     actions: &Arc<ActionRegistry>,
     bus: &Arc<copad_core::event_bus::EventBus>,
@@ -719,11 +651,9 @@ fn register_plugin_commands(
     socket_path: &Path,
 ) {
     let socket_str = socket_path.to_string_lossy().into_owned();
-    // Iterate only the WINNING entry per unique plugin name (sorted
-    // slice → resolve_by_name returns the last-by-dir entry). Without
-    // this dedup, a losing duplicate with a command name the winner
-    // does NOT have would leak into the dispatch table; only collisions
-    // on the same `<name>.<cmd>` method get HashMap-overwritten.
+    // Only the WINNING entry per plugin name (sorted slice, `resolve_by_name` returns the
+    // last-by-dir): a losing duplicate with a command the winner lacks would otherwise leak into
+    // the dispatch table.
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let winners: Vec<&LoadedPlugin> = plugins
         .iter()
@@ -733,9 +663,7 @@ fn register_plugin_commands(
     for plugin in winners.iter() {
         let plugin_name = plugin.manifest.plugin.name.clone();
         for cmd in &plugin.manifest.commands {
-            // A dot in the command name would create a 4+ segment
-            // method that breaks `plugin.<name>.<cmd>` parsing for
-            // downstream consumers (the trigger engine, the CLI).
+            // A dot would make a 4+ segment method that breaks `plugin.<name>.<cmd>` parsing.
             if cmd.name.contains('.') {
                 log::warn!(
                     "plugin {} command `{}` contains a dot; skipping registration",
@@ -772,8 +700,7 @@ fn register_plugin_commands(
             .get("module")
             .and_then(|v| v.as_str())
             .ok_or_else(|| invalid_params("missing 'module' field"))?;
-        // `resolve_by_name` picks the sorted-last (winner) entry,
-        // matching `register_plugin_commands`' winners-only set.
+        // `resolve_by_name` picks the sorted-last winner, matching `register_plugin_commands`.
         let plugin = copad_core::plugin::resolve_by_name(&plugins_for_module, plugin_name)
             .ok_or_else(|| ResponseError {
                 code: "not_found".into(),
@@ -819,9 +746,6 @@ fn run_plugin_shell(
     spawn_plugin_shell(dir, exec, stdin_payload.as_bytes(), &env, timeout)
 }
 
-/// Mirrors the legacy GUI handler's contract: JSON stdout is returned
-/// verbatim; otherwise wrap the trimmed text under `{ "output": ... }`
-/// so the caller always receives a JSON object.
 fn parse_plugin_stdout(out: copad_daemon::plugin_exec::ShellOutput) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(&out.stdout)
         .unwrap_or_else(|_| json!({ "output": out.stdout.trim() }))
@@ -882,8 +806,7 @@ fn register_builtins(
     });
     actions.register("theme.list", |_| {
         let themes: Vec<&str> = copad_core::theme::Theme::list().to_vec();
-        // `current` is GUI-state (per-window). Daemon reports null; GUI
-        // resolves its own current theme through GUI-owned routing later.
+        // `current` is per-window GUI state; the daemon reports null.
         Ok(json!({ "themes": themes, "current": serde_json::Value::Null }))
     });
     let plugins_for_list = plugins.clone();
@@ -923,8 +846,6 @@ fn register_builtins(
     });
 }
 
-/// Accepts `1`, `true`, `yes` (case-insensitive). Everything else,
-/// including `0` / `false` / empty / unset, disables.
 fn env_flag_enabled(var: &str) -> bool {
     match std::env::var(var) {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
@@ -932,17 +853,12 @@ fn env_flag_enabled(var: &str) -> bool {
     }
 }
 
-/// Mirror of `env_flag_enabled` for flags whose default is ON.
-/// `None` (env unset) = enabled; `Some("0" | "false" | "no" | "")`
-/// (case-insensitive, trimmed) = disabled; every other value is
-/// treated as enabled. We bias enable-on-garbage so a typo doesn't
-/// silently turn the feature off — opt-out has to be intentional.
+/// Like `env_flag_enabled` for flags whose default is ON. `None` (unset) and unrecognised values
+/// are enabled; only `0`/`false`/`no`/empty (case-insensitive, trimmed) disable, so a typo does
+/// not silently turn the feature off.
 ///
-/// Takes a pre-extracted optional value rather than the env var name
-/// itself so tests can exercise the parser without mutating the
-/// process-global environment (cargo runs tests in parallel; concurrent
-/// `set_var`/`remove_var` is unsound on glibc per the `env` module's
-/// safety contract — codex C1 round 1).
+/// Takes the value rather than the var name so tests need not mutate the process environment
+/// (concurrent `set_var`/`remove_var` is unsound on glibc under parallel cargo tests).
 fn env_flag_default_on(value: Option<&str>) -> bool {
     match value {
         Some(v) => !matches!(
@@ -953,17 +869,13 @@ fn env_flag_default_on(value: Option<&str>) -> bool {
     }
 }
 
-/// `manifest.plugin.name` is the dispatch key for `plugin.<name>.<cmd>`
-/// and statusbar `_module.run`. Sort the once-discovered list so two
-/// daemons on the same machine register the same set in the same order
-/// (deterministic last-write-wins on duplicates). Warns about dupes so
-/// the user can fix the manifest.
+/// `manifest.plugin.name` is the dispatch key for `plugin.<name>.<cmd>` and `_module.run`. The
+/// list is sorted so two daemons register the same set in the same order (deterministic
+/// last-write-wins). Warns about duplicates.
 pub fn discover_and_sort_plugins() -> Arc<Vec<copad_core::plugin::LoadedPlugin>> {
     let plugins = copad_core::plugin::discover_sorted_plugins();
-    // After sort: equal names are adjacent and ordered by dir.
-    // `register_blocking` does last-write-wins on HashMap insertion,
-    // so the entry registered LAST (largest dir) is the active one.
-    // `copad_core::plugin::resolve_by_name` picks the same winner.
+    // After sort, equal names are adjacent and ordered by dir. `register_blocking` is
+    // last-write-wins, so the largest dir is active; `resolve_by_name` picks the same winner.
     let mut prev: Option<&str> = None;
     for p in &plugins {
         let name = p.manifest.plugin.name.as_str();
@@ -1068,9 +980,6 @@ mod tests {
 
     #[test]
     fn apply_reloaded_triggers_without_pump_only_updates_engine() {
-        // host_triggers=false path — no PumpState exists, so the
-        // engine's internal trigger list updates but no bus
-        // subscriptions are touched (and none should accumulate).
         let (bus, engine, _pump, ctx) = mk_pump_bundle();
         let cached = Arc::new(Mutex::new(Vec::<Trigger>::new()));
         apply_reloaded_triggers(
@@ -1097,7 +1006,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("config.toml");
-        // Initial: empty triggers
         std::fs::write(&path, "").expect("write initial");
 
         let (bus, engine, _pump, ctx) = mk_pump_bundle();
@@ -1127,9 +1035,7 @@ mod tests {
             );
         });
 
-        // Sleep past the first tick, then rewrite with a trigger. The
-        // 2s WATCHER_TICK makes this a 5s test — slow but adequate for
-        // verifying the poll loop end-to-end.
+        // The 2s WATCHER_TICK makes this a slow end-to-end check of the poll loop.
         thread::sleep(Duration::from_millis(2500));
         std::fs::write(
             &path,
@@ -1153,7 +1059,6 @@ event_kind = "panel.focused"
         assert_eq!(cached.lock().unwrap().len(), 1);
 
         stop.store(true, Ordering::SeqCst);
-        // join with a generous timeout via a polling check
         for _ in 0..30 {
             if handle.is_finished() {
                 break;
@@ -1164,8 +1069,6 @@ event_kind = "panel.focused"
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }
-
-    // ---- notify.show registration ----
 
     fn fresh_registry() -> Arc<copad_core::action_registry::ActionRegistry> {
         Arc::new(copad_core::action_registry::ActionRegistry::new())
@@ -1212,10 +1115,6 @@ event_kind = "panel.focused"
 
     #[test]
     fn notify_show_invokes_notifier_with_defaults() {
-        // Blocking action returns `{"queued": true}` synchronously; the
-        // handler runs on the action thread pool. Use try_dispatch with
-        // a blocking callback so the test can read the captured side
-        // effect deterministically.
         let actions = fresh_registry();
         let notifier = Arc::new(copad_core::notifier::NoopNotifier::default());
         register_notify_show(&actions, Some(notifier.clone()));
@@ -1281,11 +1180,8 @@ event_kind = "panel.focused"
 
     #[test]
     fn notify_show_runs_on_blocking_pool_and_does_not_fan_out_completion() {
-        // Regression guard: blocking-silent means the subprocess runs
-        // on the action thread pool (not the calling thread) AND no
-        // `<action>.completed` event spams the bus. Build a registry
-        // with a completion bus + subscribe to `notify.show.completed`
-        // before invoking.
+        // Blocking-silent: the subprocess runs on the action pool and no `<action>.completed`
+        // event reaches the bus.
         let bus = Arc::new(copad_core::event_bus::EventBus::new());
         let actions =
             Arc::new(copad_core::action_registry::ActionRegistry::with_completion_bus(bus.clone()));
@@ -1306,10 +1202,7 @@ event_kind = "panel.focused"
         rx.recv_timeout(Duration::from_secs(2))
             .expect("handler ran")
             .expect("handler returned Ok");
-        // notifier was called…
         assert_eq!(notifier.captured.lock().unwrap().len(), 1);
-        // …but completion event did NOT fan out. Sleep a beat in case
-        // the bus tx is asynchronous, then assert no event arrived.
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             matches!(
@@ -1319,12 +1212,6 @@ event_kind = "panel.focused"
             "silent action must not publish .completed"
         );
     }
-
-    // ---- env_flag_default_on ----
-    // Pure parser: takes a pre-extracted `Option<&str>` (caller resolves
-    // `env::var`). No environment mutation in tests; safe under
-    // parallel cargo execution. See the function doc-comment for the
-    // codex C1 round 1 context that drove this shape.
 
     #[test]
     fn env_flag_default_on_when_unset() {
@@ -1340,8 +1227,6 @@ event_kind = "panel.focused"
 
     #[test]
     fn env_flag_default_on_treats_garbage_as_enabled() {
-        // Bias toward enabled-on-typo so a misspelled "fasle" or
-        // "tru" doesn't silently turn off harness triggers.
         for v in ["1", "true", "yes", "on", "tru", "fasle", "garbage"] {
             assert!(env_flag_default_on(Some(v)), "value {v:?} should enable");
         }

@@ -1,32 +1,19 @@
-//! Service plugin supervisor.
+//! Service plugin supervisor: owns lifecycle (spawn, init handshake, restart on crash) of
+//! long-running newline-JSON stdio plugins, forwards bus events they `subscribe` to, and
+//! registers their `provides` actions in the shared `ActionRegistry`.
 //!
-//! A service plugin is a long-running subprocess that speaks newline-JSON
-//! over stdio. This module owns the lifecycle (spawn, init handshake,
-//! restart on crash), wires bidirectional RPC, forwards bus events the
-//! service `subscribes` to, and registers `provides` actions through the
-//! shared `ActionRegistry`.
+//! Conflict resolution: before any spawn, manifests are walked in lexical order of
+//! `[plugin].name`; the first plugin to claim an action name wins and later ones skip that
+//! entry only. The pre-spawn analysis must stay accurate or this is invalid.
 //!
-//! Conflict resolution. Before any process is spawned, every enabled
-//! plugin's manifest is walked in lexical order of `[plugin].name`. The
-//! first plugin to claim an action name wins; later plugins quietly skip
-//! that one entry while keeping their other registrations. This makes the
-//! global ownership table stable across runs and independent of spawn
-//! ordering / filesystem mtime.
+//! Init validation applies the same asymmetric rule to `provides` and `subscribes`: the served
+//! set is the runtime/manifest intersection. Runtime subset of manifest is degraded mode
+//! (manifest-only actions stay registered and return `service_degraded`); runtime superset warns
+//! and drops the extras.
 //!
-//! Init validation. The runtime `initialize` reply is checked against the
-//! manifest with the same asymmetric rule applied to BOTH `provides` and
-//! `subscribes`: the served set is always the runtime∩manifest intersection.
-//! Runtime ⊂ manifest is degraded mode — manifest-only actions stay
-//! registered and return `service_degraded` on invoke. Runtime ⊃ manifest
-//! warns and drops the extras. The pre-spawn analysis must stay accurate
-//! or the conflict resolution above is invalid.
-//!
-//! Threading. Each running service owns three OS threads: a writer that
-//! drains the outgoing channel into child stdin, a reader that parses
-//! child stdout and dispatches, and a stderr-tail thread that logs. One
-//! additional forwarder thread per `subscribes` pattern bridges the bus
-//! into the outgoing channel. All blocking happens off the GTK main
-//! thread.
+//! Threading: each running service has a writer thread (outgoing channel to child stdin), a
+//! reader thread (parses child stdout and dispatches), and a stderr-tail thread, plus one
+//! forwarder thread per `subscribes` pattern. Nothing blocks the GTK main thread.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -46,14 +33,12 @@ use copad_core::notifier::{Level, Notifier};
 use copad_core::plugin::{Activation, LoadedPlugin, PluginServiceDef, RestartPolicy};
 use copad_core::protocol::{Request, Response, ResponseError};
 
-/// Announced to plugins in the `initialize` request. Plugins decide whether
-/// to accept; rejecting (e.g. with `protocol_mismatch`) makes init fail and
-/// the supervisor kills the child. Bump on backwards-incompatible RPC changes.
+/// Announced in the `initialize` request; a plugin rejecting it (e.g. `protocol_mismatch`) fails
+/// init and the supervisor kills the child. Bump on backwards-incompatible RPC changes.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Single global action-reply timeout. Sized to accommodate long-running
-/// LLM completions (10-90s).
+/// Single global action-reply timeout, sized for long LLM completions (10-90s).
 const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PENDING_BUFFER: usize = 64;
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -62,16 +47,9 @@ const BACKOFF_CAP: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 #[allow(dead_code)] // fields are surfaced via Debug output for diagnostics
 enum ServiceState {
-    /// Service is not running. Spawning is the responsibility of whichever
-    /// activation rule fires next (`onStartup`, `onAction:`, `onEvent:`).
     Stopped,
-    /// Process spawned and `initialize` request sent; awaiting reply.
     Starting { started_at: Instant },
-    /// Init complete. The negotiated runtime capability set is the
-    /// intersection of manifest + reply (subset rule).
     Running { service_version: String },
-    /// Init timed out, the binary couldn't be spawned, or the protocol
-    /// version was rejected. Stays here unless an activation re-arms it.
     Failed,
 }
 
@@ -116,32 +94,23 @@ struct ServiceHandle {
     service_name: String,
     plugin_dir: PathBuf,
     spec: PluginServiceDef,
-    /// Post-conflict-resolution manifest set. Runtime init reply checked
-    /// against this (subset OK, superset rejected); see module preamble.
+    /// Post-conflict-resolution manifest set; the runtime init reply is checked against it.
     approved_provides: Vec<String>,
     approved_subscribes: Vec<String>,
     state: Mutex<ServiceState>,
-    /// Set when a process is alive. Sender goes to writer thread.
     outgoing: Mutex<Option<Sender<OutgoingFrame>>>,
-    /// Pending requests copad has sent to the service, awaiting reply.
-    /// Keyed by request id.
     pending_responses: Mutex<HashMap<String, Sender<Response>>>,
-    /// Action invocations buffered while state is `Starting`. Drained in
-    /// FIFO order on the transition to `Running`.
     pending_invocations: Mutex<VecDeque<PendingInvocation>>,
-    /// Negotiated runtime action set (`None` until first successful init).
-    /// `invoke_remote` gates dispatch on this so manifest-approved actions
-    /// the runtime omitted return `service_degraded` instead of vanishing.
-    /// Cleared on exit so restart re-establishes via a fresh handshake.
+    /// Negotiated runtime action set (`None` until first init). `invoke_remote` gates on it so
+    /// manifest-approved actions the runtime omitted return `service_degraded`. Cleared on exit.
     runtime_provides: Mutex<Option<HashSet<String>>>,
-    /// Set while the child is alive. The init-timeout path SIGKILLs via
-    /// this since stdin-EOF cooperation can't be assumed.
+    /// Set while the child is alive; the init-timeout path SIGKILLs via it since stdin-EOF
+    /// cooperation can't be assumed.
     child_pid: Mutex<Option<u32>>,
     next_id: AtomicU64,
     backoff: Mutex<BackoffState>,
-    /// Per-init subscribe-forwarder bookkeeping. Without cooperative
-    /// teardown via `handle_exit`, restarts would leak one forwarder
-    /// thread + bus subscription per `subscribes` pattern.
+    /// Without cooperative teardown via `handle_exit`, restarts leak one forwarder thread and
+    /// bus subscription per `subscribes` pattern.
     forwarder_stop: Arc<AtomicBool>,
     forwarder_handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
@@ -185,15 +154,11 @@ pub struct ProvideConflict {
 /// `(plugin_name, service_name) → approved action names`.
 pub type ApprovedProvides = HashMap<(String, String), Vec<String>>;
 
-/// Resolve action-name conflicts deterministically: walks plugins in lexical
-/// order of `[plugin].name` BEFORE any process is spawned, so spawn order,
-/// mtimes, and filesystem layout don't influence which plugin wins.
+/// Resolves action-name conflicts deterministically: plugins are walked in lexical order of
+/// `[plugin].name` BEFORE any spawn, independent of spawn order and mtimes.
 pub fn resolve_provides(plugins: &[LoadedPlugin]) -> (ApprovedProvides, Vec<ProvideConflict>) {
-    // Sort by `[plugin].name` then by `dir` as a stable tiebreaker.
-    // The loader doesn't reject duplicate manifest names; without the
-    // secondary key, ordering would depend on filesystem enumeration
-    // (differs across runs/machines). Duplicates surface as separate
-    // warnings so the user notices.
+    // Sorted by name then `dir`: the loader doesn't reject duplicate manifest names, and
+    // without the tiebreak ordering would depend on filesystem enumeration.
     let mut ordered: Vec<&LoadedPlugin> = plugins.iter().collect();
     ordered.sort_by(|a, b| {
         a.manifest
@@ -231,11 +196,7 @@ pub fn resolve_provides(plugins: &[LoadedPlugin]) -> (ApprovedProvides, Vec<Prov
                         take.push(action.clone());
                     }
                     Some(winner) if winner == pname => {
-                        // Same plugin declared the action in multiple
-                        // services. Treat as already-taken; the first
-                        // service to declare it wins within the plugin.
-                        // (Service order within a manifest is the user's
-                        // choice — we don't try to be smarter than that.)
+                        // Same plugin declared it in several services: the first service wins.
                     }
                     Some(winner) => {
                         let entry =
@@ -268,39 +229,28 @@ pub struct ServiceSupervisor {
     registry: Arc<ActionRegistry>,
     services: Mutex<Vec<Arc<ServiceHandle>>>,
     copad_version: String,
-    /// Bound daemon socket path. Injected into every service plugin
-    /// child as `COPAD_SOCKET=<path>` so plugins that need raw
-    /// daemon-socket access (the path that goes through `dispatch()`
-    /// → `GuiRegistry` for GUI-owned methods like `terminal.read`)
-    /// can connect without rediscovery. Standard service-plugin RPC
-    /// (stdin/stdout) does not require this — it's purely for the
-    /// long-running listener pattern (web-bridge, future ntfy bridge,
-    /// prometheus exporter, …).
+    /// Injected into every service plugin child as `COPAD_SOCKET=<path>` for plugins that need
+    /// raw daemon-socket access (web-bridge and other long-running listeners). Standard stdio
+    /// RPC doesn't need it.
     socket_path: PathBuf,
     init_timeout: Duration,
     action_timeout: Duration,
     on_event_rules: Vec<(String, Arc<ServiceHandle>)>,
     shutting_down: AtomicBool,
-    /// All spawns route here so every `fork()` happens on the same OS
-    /// thread; that makes `PR_SET_PDEATHSIG(SIGTERM)` fire on real daemon
-    /// death rather than per-spawn worker exit. `None` post-shutdown.
+    /// All spawns route here so every `fork()` happens on one OS thread; that makes
+    /// `PR_SET_PDEATHSIG(SIGTERM)` fire on real daemon death, not per-spawn worker exit. `None`
+    /// after shutdown.
     spawner_tx: Mutex<Option<Sender<SpawnRequest>>>,
     spawner_thread: Mutex<Option<JoinHandle<()>>>,
-    /// Bound on concurrent in-flight waiters for `dispatch_invocation`.
-    /// Pre-Phase 9.5: each invocation `thread::spawn`'d an unbounded
-    /// waiter. Now admission goes through a counter (atomic) — saturation
-    /// returns `overloaded` immediately without sending the invoke to the
-    /// service. NOT a queueing pool: every admitted waiter spawns a thread
-    /// instantly, so the daemon never buffers a response behind a
-    /// not-yet-picked-up job. Counter-bounded `thread::spawn` is the
-    /// right primitive here because waiters spend their lifetime blocked
-    /// on `recv_timeout` — pool worker reuse would just add scheduling
-    /// latency without saving real work.
+    /// Bound on concurrent `dispatch_invocation` waiters. Saturation returns `overloaded`
+    /// without sending the invoke. Not a queueing pool: every admitted waiter spawns a thread
+    /// at once so no response buffers behind an unstarted job, and waiters just block on
+    /// `recv_timeout`, so pool reuse would only add latency.
     waiter_active: Arc<AtomicUsize>,
     waiter_max: usize,
-    /// Desktop toast surface for `plugin.config_error` events — the daemon owns toast capability,
-    /// so a misconfigured plugin gets default-on visibility with zero user trigger config. `None`
-    /// on platforms without a notifier impl (the event still publishes to the bus).
+    /// Desktop toast surface for `plugin.config_error` events, so a misconfigured plugin is
+    /// visible with no user trigger config. `None` without a notifier impl (the event still
+    /// publishes).
     notifier: Option<Arc<dyn Notifier>>,
     /// Service names already toasted for a config error this run, so a plugin restart loop or a
     /// repeated emission can't spam the user with the same misconfiguration toast.
@@ -316,33 +266,18 @@ impl ServiceSupervisor {
         extra_reserved: &[&str],
         socket_path: PathBuf,
     ) -> Arc<Self> {
-        // Snapshot the registry AND any additional reserved names BEFORE
-        // walking the manifests. Two sources are needed because action
-        // dispatch is currently bimodal:
-        //
-        //   1. Built-ins migrated into `ActionRegistry` (e.g.
-        //      `system.ping`, `system.log`, `context.snapshot`) —
-        //      `ActionRegistry::register` would overwrite them silently.
-        //   2. Legacy match-arm commands in `socket::dispatch`
-        //      (`tab.*`, `terminal.*`, `webview.*`, …) — these aren't
-        //      in the registry, but the dispatcher checks the registry
-        //      first, so a plugin that claimed `tab.new` would shadow
-        //      the legacy handler.
-        //
-        // `extra_reserved` carries the legacy list (see
-        // `socket::LEGACY_DISPATCH_METHODS`) so the supervisor protects
-        // both. As more commands migrate into the registry, the
-        // legacy list shrinks and this dual-source pattern fades.
+        // Snapshot the registry AND the extra reserved names BEFORE walking manifests. Two
+        // sources are needed: built-ins in `ActionRegistry` (`register` would overwrite them
+        // silently) and legacy match-arm commands in `socket::dispatch` (`tab.*`, `terminal.*`,
+        // `webview.*`), which the registry-first dispatcher would let a plugin shadow.
+        // `extra_reserved` carries `socket::LEGACY_DISPATCH_METHODS`.
         let mut reserved: HashSet<String> = registry.names().into_iter().collect();
         for name in extra_reserved {
             reserved.insert((*name).to_string());
         }
-        // Existing `[[commands]]` plugins surface as `plugin.<name>.<cmd>`
-        // through a wildcard match arm in `socket::dispatch`. Those
-        // names aren't in the registry either, but registry-first
-        // dispatch would let a service plugin claim them and shadow the
-        // shell-command handler. Reserve every discovered command's
-        // socket name so the `[[services]]` rollout stays additive
+        // `[[commands]]` plugins surface as `plugin.<name>.<cmd>` through a wildcard arm in
+        // `socket::dispatch`. They aren't in the registry, but registry-first dispatch would let
+        // a service plugin shadow them, so reserve every discovered command's socket name
         // (docs/service-plugins.md D7).
         for plugin in plugins {
             for cmd in &plugin.manifest.commands {
@@ -371,11 +306,8 @@ impl ServiceSupervisor {
                     .get(&(pname.clone(), svc.name.clone()))
                     .cloned()
                     .unwrap_or_default();
-                // Strip out any actions reserved by built-ins. A plugin
-                // that lists a reserved name in `provides` keeps its
-                // other declarations; the conflicting one is dropped
-                // with a clear warning so the user can rename if it
-                // was intentional.
+                // Drop actions reserved by built-ins; the plugin keeps its other declarations and
+                // a warning names the dropped one.
                 let approved_provides: Vec<String> = raw_approved
                     .into_iter()
                     .filter(|action| {
@@ -437,9 +369,8 @@ impl ServiceSupervisor {
             config_error_notified: Mutex::new(HashSet::new()),
         });
 
-        // Spawner must be alive before any onEvent / onStartup activation
-        // below sends a SpawnRequest. `Weak<Self>` so the spawner doesn't
-        // keep the supervisor alive past `shutdown_all`'s join.
+        // Must be alive before any onEvent / onStartup activation below sends a SpawnRequest.
+        // `Weak<Self>` so the spawner doesn't keep the supervisor alive past `shutdown_all`'s join.
         let (spawner_tx, spawner_rx) = channel::<SpawnRequest>();
         let sup_weak = Arc::downgrade(&supervisor);
         let spawner_thread = thread::Builder::new()
@@ -449,27 +380,17 @@ impl ServiceSupervisor {
         *supervisor.spawner_tx.lock().unwrap() = Some(spawner_tx);
         *supervisor.spawner_thread.lock().unwrap() = Some(spawner_thread);
 
-        // Register approved actions in the global registry. Each handler
-        // captures an Arc<ServiceHandle> + Arc<Self> and routes through
-        // the supervisor regardless of the service's current state. The
-        // action name is captured per-registration so the remote call
-        // carries the correct method even though every handler shares
-        // the same closure shape.
+        // Each handler routes through the supervisor regardless of service state; the action
+        // name is captured per registration so the remote call carries the right method.
         let services_snapshot = supervisor.services.lock().unwrap().clone();
         for handle in &services_snapshot {
             for action_name in handle.approved_provides.clone() {
                 let svc = handle.clone();
                 let sup = supervisor.clone();
                 let captured_name = action_name.clone();
-                // `register_blocking`: invoke_remote can park the
-                // calling thread for up to the action timeout
-                // (DEFAULT_ACTION_TIMEOUT — currently 120s for LLM
-                // completions; see the constant at the top of this
-                // file) waiting on a stdio reply from the plugin
-                // subprocess. Marking the entry blocking lets
-                // `ActionRegistry::try_dispatch` route this onto a
-                // worker thread so the GTK main loop and trigger
-                // pump don't stall while the plugin computes.
+                // `register_blocking`: invoke_remote can park the caller up to
+                // DEFAULT_ACTION_TIMEOUT waiting on the plugin; blocking routes it to a worker so
+                // the GTK main loop and trigger pump don't stall.
                 supervisor
                     .registry
                     .register_blocking(action_name, move |params| {
@@ -478,22 +399,10 @@ impl ServiceSupervisor {
             }
         }
 
-        // Wire `onEvent:` activations as PURE SPAWN TRIGGERS, matching
-        // the documented contract that `event.dispatch` is driven by
-        // `subscribes` (not by activation). Each onEvent thread blocks
-        // on bus matches and triggers `start_service` if the service is
-        // currently `Stopped` or `Failed`; the event itself is NOT
-        // forwarded via this path.
-        //
-        // The very first event that activates the service is dropped
-        // from delivery: post-init `subscribes` forwarders subscribe
-        // AFTER init completes, so an event that arrived during init is
-        // gone by the time they exist. Workaround: declare the glob in
-        // both `provides` and `subscribes`.
-        //
-        // `Failed` is included alongside `Stopped` so init failures
-        // don't permanently inert an event-activated service (lifecycle
-        // contract: activation re-arms `Failed`).
+        // `onEvent:` activations are PURE SPAWN TRIGGERS: each thread blocks on bus matches and
+        // calls `start_service` if the service is `Stopped` or `Failed` (init failures must not
+        // inert an event-activated service); the event itself is NOT forwarded. The event that
+        // activates the service is lost, since `subscribes` forwarders subscribe after init.
         for (glob, handle) in &supervisor.on_event_rules {
             let rx = supervisor.bus.subscribe_unbounded(glob.clone());
             let sup = supervisor.clone();
@@ -511,7 +420,6 @@ impl ServiceSupervisor {
             });
         }
 
-        // Eager-start services with `onStartup` activation.
         for handle in &services_snapshot {
             if matches!(handle.spec.activation, Activation::OnStartup) {
                 supervisor.spawn_service_async(handle.clone());
@@ -532,8 +440,6 @@ impl ServiceSupervisor {
     }
 
     fn start_service(self: &Arc<Self>, handle: &Arc<ServiceHandle>) -> Result<(), ResponseError> {
-        // Atomically claim the right to spawn. Any other thread (a
-        // concurrent activation or restart) sees `Starting` and bails.
         {
             let mut state = handle.state.lock().unwrap();
             match *state {
@@ -548,13 +454,9 @@ impl ServiceSupervisor {
         let result = self.start_service_inner(handle);
         if let Err(ref err) = result {
             *handle.state.lock().unwrap() = ServiceState::Failed;
-            // Closing the outgoing channel triggers the writer thread
-            // to drop child stdin, which gives the child EOF and lets
-            // the wait thread observe a clean exit. Without this, a
-            // child that ignores its stdin sits around forever.
+            // Closing the outgoing channel makes the writer drop child stdin so the child sees
+            // EOF; otherwise a child that ignores stdin sits around forever.
             *handle.outgoing.lock().unwrap() = None;
-            // Drain any pending invocations with the error so callers
-            // unblock instead of timing out.
             let mut buf = handle.pending_invocations.lock().unwrap();
             while let Some(p) = buf.pop_front() {
                 let _ = p.reply.send(Err(err.clone()));
@@ -581,16 +483,13 @@ impl ServiceSupervisor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // pdeathsig only fires correctly because every fork happens on
-        // the long-lived `copad-spawner` thread (set up in `new`).
-        // macOS has no equivalent — `shutdown_all` is the only path
-        // there, plus the orphan-sweep at next launch that uses the
-        // pid file written below.
+        // pdeathsig is only correct because every fork happens on the long-lived
+        // `copad-spawner` thread (see `new`). macOS has no equivalent; it relies on
+        // `shutdown_all` and the next-launch orphan sweep using the pid file below.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: pre_exec runs post-fork in the child. `prctl` and
-            // `getppid` are async-signal-safe; no allocs / locks.
+            // SAFETY: pre_exec runs post-fork; `prctl` and `getppid` are async-signal-safe.
             unsafe {
                 cmd.pre_exec(|| {
                     let rc = libc::prctl(
@@ -603,8 +502,7 @@ impl ServiceSupervisor {
                     if rc != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    // Closes fork→prctl TOCTOU: parent died in the
-                    // window and we got reparented to init.
+                    // Closes the fork->prctl TOCTOU: parent died and we were reparented to init.
                     if libc::getppid() == 1 {
                         libc::_exit(129);
                     }
@@ -612,17 +510,13 @@ impl ServiceSupervisor {
                 });
             }
         }
-        // macOS: no PDEATHSIG. Put the child in its own process group
-        // (pgid == child pid) so `shutdown_all` can `killpg` the
-        // entire group, reaching plugin grandchildren too. Combined
-        // with the post-spawn pid-file write + `sweep_orphan_pids`
-        // at startup, SIGKILL of the daemon stops leaking orphan
-        // plugin processes between sessions.
+        // macOS has no PDEATHSIG: own process group (pgid == child pid) so `shutdown_all` can
+        // `killpg` the group including grandchildren; plus the pid file and `sweep_orphan_pids`
+        // at startup so a SIGKILL'd daemon doesn't leak plugins.
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: `setpgid` is async-signal-safe and only mutates
-            // the calling (post-fork, pre-exec) process's pgid.
+            // SAFETY: `setpgid` is async-signal-safe and only touches the post-fork pgid.
             unsafe {
                 cmd.pre_exec(|| {
                     if libc::setpgid(0, 0) != 0 {
@@ -644,14 +538,9 @@ impl ServiceSupervisor {
 
         let pid = child.id();
         *handle.child_pid.lock().unwrap() = Some(pid);
-        // macOS-only: write the pid (== pgid post `setpgid(0,0)`) to
-        // a per-service file under the state dir. `sweep_orphan_pids`
-        // at next launch reads these to find and kill plugin process
-        // groups left behind by a SIGKILL'd or panicked daemon. Linux
-        // doesn't need this — PDEATHSIG already covers the parent-died
-        // case. Best-effort: a write failure logs but doesn't abort
-        // the spawn, since the only downside is a one-time orphan on
-        // an out-of-band daemon death.
+        // macOS-only: pid (== pgid after `setpgid(0,0)`) goes to a per-service file so
+        // `sweep_orphan_pids` can kill groups left by a SIGKILL'd or panicked daemon. Linux has
+        // PDEATHSIG. Best-effort: a failed write only risks a one-time orphan.
         #[cfg(target_os = "macos")]
         write_pid_file(&handle.plugin_name, &handle.service_name, pid);
 
@@ -671,17 +560,12 @@ impl ServiceSupervisor {
         let (out_tx, out_rx) = channel::<OutgoingFrame>();
         *handle.outgoing.lock().unwrap() = Some(out_tx.clone());
 
-        // Writer thread.
         spawn_writer(handle.fq_name(), stdin, out_rx);
 
-        // Reader thread: dispatches frames to the supervisor.
         spawn_reader(self.clone(), handle.clone(), stdout);
 
-        // Stderr tail.
         spawn_stderr_tail(handle.fq_name(), stderr);
 
-        // Process-wait thread: notifies supervisor on exit so it can
-        // restart per policy.
         let sup_for_wait = self.clone();
         let handle_for_wait = handle.clone();
         thread::spawn(move || {
@@ -689,9 +573,6 @@ impl ServiceSupervisor {
             sup_for_wait.handle_exit(handle_for_wait, status);
         });
 
-        // Send `initialize` request and block here for the reply (we're
-        // already off the GTK main thread — `start_service` is always
-        // called from a worker via `spawn_service_async`).
         let req_id = handle.next_request_id();
         let req = Request::new(
             req_id.clone(),
@@ -713,19 +594,11 @@ impl ServiceSupervisor {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
                 handle.pending_responses.lock().unwrap().remove(&req_id);
-                // Best-effort SIGKILL so a plugin that ignores its stdin
-                // doesn't accumulate as an orphaned process across
-                // restart attempts. The wait thread will pick up the
-                // exit and run `handle_exit` cleanly afterwards.
-                // macOS: also SIGKILL the whole pgroup + remove pid
-                // file so grandchildren of a misbehaving init don't
-                // survive and the next-launch sweep stays clean.
+                // Best-effort SIGKILL so a plugin ignoring its stdin doesn't linger across
+                // restarts; the wait thread then runs `handle_exit`. macOS also kills the pgroup
+                // and removes the pid file so grandchildren and the next-launch sweep stay clean.
                 kill_service_group(pid, &handle.plugin_name, &handle.service_name);
-                // `service_unavailable` matches the documented protocol
-                // error code (docs/service-plugins.md "During Starting,
-                // requests for the service are buffered… If the service
-                // doesn't initialize within a timeout, pending invokes
-                // return ResponseError { code: 'service_unavailable' }").
+                // `service_unavailable` is the documented protocol code (docs/service-plugins.md).
                 return Err(ResponseError {
                     code: "service_unavailable".into(),
                     message: format!(
@@ -768,7 +641,6 @@ impl ServiceSupervisor {
         let runtime_provides = string_array(&result, "provides");
         let runtime_subscribes = string_array(&result, "subscribes");
 
-        // Asymmetric validation, applied identically to both fields.
         let manifest_provides: HashSet<&str> = handle
             .approved_provides
             .iter()
@@ -805,28 +677,20 @@ impl ServiceSupervisor {
             }
         }
 
-        // Send `initialized` notification.
         handle.send(OutgoingFrame::Notification {
             method: "initialized".into(),
             params: json!({}),
         })?;
 
-        // Atomic Starting→Running transition. We hold the state lock
-        // for the entire transition and re-check that we're still
-        // `Starting` because the wait thread may have observed an exit
-        // mid-init and already flipped the state to `Stopped`. Setting
-        // `runtime_provides` and `state` under the same critical
-        // section (and against the same lock order `handle_exit` uses)
-        // means a concurrent exit can't half-clear the next instance's
-        // state. Subset rule: invocations for manifest-approved actions
-        // the runtime didn't claim now return `service_degraded` from
-        // `invoke_remote` instead of being silently sent to a service
-        // that won't handle them.
+        // Atomic Starting->Running. Re-check `Starting` under the state lock, since the wait
+        // thread may have seen an exit mid-init and set `Stopped`. Setting `runtime_provides`
+        // and `state` in one critical section, in `handle_exit`'s lock order, stops a
+        // concurrent exit half-clearing the next instance. Manifest-approved actions the runtime
+        // didn't claim then return `service_degraded` from `invoke_remote`.
         {
             let mut state_g = handle.state.lock().unwrap();
             if !matches!(*state_g, ServiceState::Starting { .. }) {
-                // Wait thread saw the child exit while we were still
-                // in init. Roll back: don't transition to Running.
+                // The wait thread saw the child exit mid-init: roll back.
                 return Err(ResponseError {
                     code: "service_unavailable".into(),
                     message: format!("service {} exited during init", handle.fq_name()),
@@ -845,16 +709,10 @@ impl ServiceSupervisor {
             accepted_subscribes
         );
 
-        // Forwarder threads bridge bus events into the outgoing channel
-        // for kinds the runtime actually accepted. They exit on:
-        //   1. The shared `forwarder_stop` flag flipping true
-        //      (handle_exit's cooperative teardown).
-        //   2. The bus dropping the subscriber (RecvOutcome::Disconnected),
-        //      e.g. on a global supervisor shutdown.
-        //   3. The writer channel rejecting a send (out_rx dropped).
-        // Reset the stop flag for this fresh instance and clear any
-        // stale JoinHandles left over from a previous run that
-        // crashed before handle_exit could join them.
+        // Forwarders bridge bus events for accepted kinds into the outgoing channel. They exit
+        // when `forwarder_stop` flips (handle_exit), the bus drops the subscriber, or the writer
+        // channel rejects a send. Reset the stop flag for this instance and clear stale
+        // JoinHandles from a run that crashed before handle_exit could join them.
         handle
             .forwarder_stop
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -901,7 +759,6 @@ impl ServiceSupervisor {
             handle.forwarder_handles.lock().unwrap().push(join);
         }
 
-        // Drain buffered invocations now that the service is Running.
         let mut buf = handle.pending_invocations.lock().unwrap();
         while let Some(p) = buf.pop_front() {
             if Instant::now() >= p.deadline {
@@ -922,46 +779,32 @@ impl ServiceSupervisor {
         handle: Arc<ServiceHandle>,
         status: std::io::Result<std::process::ExitStatus>,
     ) {
-        // Hold state lock for the entire cleanup so a concurrent
-        // `start_service` can't observe a partly-cleaned instance and
-        // race a replacement. Lock order is state → outgoing → child_pid
-        // → runtime_provides; `start_service_inner` follows the same
-        // order at the Running transition, so no deadlock.
+        // Under the state lock so a concurrent `start_service` can't see a half-cleaned instance.
+        // Lock order state -> outgoing -> child_pid -> runtime_provides, same as the Running
+        // transition in `start_service_inner`.
         let prev_state = {
             let mut state_g = handle.state.lock().unwrap();
             let prev = std::mem::replace(&mut *state_g, ServiceState::Stopped);
             *handle.outgoing.lock().unwrap() = None;
             *handle.child_pid.lock().unwrap() = None;
-            // Clear the negotiated set so a restart re-establishes through
-            // a fresh handshake; until then `invoke_remote` returns to
-            // the pre-init buffering behavior for manifest-approved
-            // actions.
+            // Cleared so a restart re-handshakes; until then `invoke_remote` buffers
+            // manifest-approved actions as pre-init.
             *handle.runtime_provides.lock().unwrap() = None;
             prev
         };
 
-        // Tear down per-instance forwarder threads BEFORE we drop the
-        // state lock so the JoinHandles can't be observed by the next
-        // `start_service` call. Without this, every successful init
-        // accumulates one forwarder thread + one bus subscription per
-        // `subscribes` pattern, which over a crash-loop scenario
-        // grows unbounded. Cooperative shutdown via the shared
-        // `forwarder_stop` flag — each forwarder polls every 200ms
-        // (worst-case shutdown latency).
+        // Tear down the forwarders, or every init leaks a forwarder thread and bus subscription
+        // per `subscribes` pattern, unbounded in a crash loop. Cooperative via `forwarder_stop`;
+        // each forwarder polls every 200ms.
         handle
             .forwarder_stop
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let joins: Vec<thread::JoinHandle<()>> =
             std::mem::take(&mut *handle.forwarder_handles.lock().unwrap());
         for j in joins {
-            // Wait briefly for graceful exit; if the forwarder is
-            // somehow stuck we'd rather leak it (next start will
-            // overwrite the JoinHandles list anyway) than block
-            // handle_exit forever.
             let _ = j.join();
         }
 
-        // Fail any pending responses.
         let pending: Vec<Sender<Response>> = handle
             .pending_responses
             .lock()
@@ -980,10 +823,8 @@ impl ServiceSupervisor {
         let exited_cleanly = matches!(&status, Ok(s) if s.success());
         let was_running = matches!(prev_state, ServiceState::Running { .. });
 
-        // Once shutdown_all has been called, ALL services should stay
-        // dead — even ones with `restart=always`, even ones that
-        // crashed in response to the `shutdown` notification. Without
-        // this gate a fast-restarting service can outlive the GUI.
+        // After shutdown_all, ALL services stay dead, even `restart=always` ones that crashed on
+        // the `shutdown` notification; otherwise a fast-restarting service outlives the GUI.
         let should_restart = if self.shutting_down.load(Ordering::SeqCst) {
             false
         } else {
@@ -1009,35 +850,25 @@ impl ServiceSupervisor {
         let delay = handle.backoff.lock().unwrap().next_delay();
         let sup = self.clone();
         let h = handle.clone();
-        // Backoff sleep lives on this transient thread; the actual fork
-        // must go through `spawn_service_async` so pdeathsig binds to
-        // the long-lived spawner thread, not us.
+        // The backoff sleep lives on this transient thread; the fork must go through
+        // `spawn_service_async` so pdeathsig binds to the long-lived spawner thread.
         thread::spawn(move || {
             thread::sleep(delay);
             sup.spawn_service_async(h);
         });
     }
 
-    /// Action-registry entry point: blocks the caller until the service
-    /// replies or `self.action_timeout` elapses.
     fn invoke_remote(
         self: &Arc<Self>,
         handle: &Arc<ServiceHandle>,
         action_name: &str,
         params: Value,
     ) -> ActionResult {
-        // Subset enforcement. Once init has negotiated the runtime
-        // action set, manifest-approved actions the runtime didn't
-        // claim must NOT be dispatched (the documented "degraded mode"
-        // contract). Pre-init the set is None and we still buffer +
-        // spawn — at that point the manifest is the best information
-        // we have.
-        //
-        // We snapshot `runtime_provides` into a local before touching
-        // any other lock so this method never holds two locks at once.
-        // That keeps `invoke_remote` lock-order-safe with respect to
-        // `start_service_inner` and `handle_exit`, both of which take
-        // state → runtime_provides nested.
+        // Once init has negotiated the runtime action set, manifest-approved actions the
+        // runtime didn't claim must NOT be dispatched (degraded mode). Pre-init the set is None
+        // and we still buffer and spawn. `runtime_provides` is snapshotted before touching any
+        // other lock so this never holds two, staying lock-order-safe against
+        // `start_service_inner` and `handle_exit` (state -> runtime_provides).
         let provides_snapshot: Option<HashSet<String>> =
             handle.runtime_provides.lock().unwrap().clone();
         if let Some(set) = provides_snapshot.as_ref()
@@ -1061,18 +892,10 @@ impl ServiceSupervisor {
             deadline,
         };
 
-        // Decide on routing under a single state lock to avoid TOCTOU.
-        //
-        //   Running   → dispatch immediately.
-        //   Starting  → buffer; the worker that's already starting
-        //               drains the buffer after init.
-        //   Stopped/  → only an `onAction:<glob>` activation that
-        //   Failed     matches `action_name` may trigger spawn. For
-        //               `onStartup`/`onEvent` services in this state,
-        //               the activation rule did not fire — actions
-        //               must not resurrect them — and `restart=never`
-        //               services are intentionally inert. We return
-        //               `service_unavailable` per the protocol.
+        // Route under a single state lock to avoid TOCTOU. Running: dispatch. Starting: buffer
+        // for the starting worker to drain. Stopped/Failed: only a matching `onAction:<glob>`
+        // may spawn; `onStartup`/`onEvent` services must not be resurrected by actions and
+        // `restart=never` services are inert, so return `service_unavailable`.
         let need_spawn = {
             let state = handle.state.lock().unwrap();
             match &*state {
@@ -1095,9 +918,8 @@ impl ServiceSupervisor {
                 ServiceState::Stopped | ServiceState::Failed => {
                     match &handle.spec.activation {
                         Activation::OnAction(glob) if pattern_matches(glob, action_name) => {
-                            // Action matches the activation glob —
-                            // permitted to spawn. Buffer the invocation
-                            // so the worker drains it after init.
+                            // Matches the activation glob: may spawn. Buffer the invocation so
+                            // the worker drains it after init.
                             let mut buf = handle.pending_invocations.lock().unwrap();
                             if buf.len() >= MAX_PENDING_BUFFER {
                                 return Err(ResponseError {
@@ -1112,10 +934,8 @@ impl ServiceSupervisor {
                             true
                         }
                         _ => {
-                            // onStartup / onEvent / mismatched onAction —
-                            // actions cannot trigger spawn. Return the
-                            // documented protocol error rather than
-                            // silently incurring a side effect.
+                            // onStartup / onEvent / mismatched onAction: actions cannot trigger
+                            // spawn; return the protocol error.
                             return Err(ResponseError {
                                 code: "service_unavailable".into(),
                                 message: format!(
@@ -1149,20 +969,14 @@ impl ServiceSupervisor {
         }
     }
 
-    /// Send the buffered invocation to the running service. The reader
-    /// thread will fulfill `pending.reply` when the response arrives.
     fn dispatch_invocation(
         self: &Arc<Self>,
         handle: Arc<ServiceHandle>,
         pending: PendingInvocation,
     ) {
-        // Counter admission: every admitted waiter spawns its own thread
-        // immediately, so there's no buffered "queued but not running"
-        // state where a service response could land into a parked
-        // `resp_rx` faster than the waiter thread is up to receive it.
-        // Pre-fix this was unbounded `thread::spawn` per invoke; the
-        // counter caps growth without introducing the buffering hazard
-        // that ThreadPool's queue would.
+        // Counter admission: each admitted waiter spawns its thread immediately, so no response
+        // can land in a parked `resp_rx` before a waiter exists (a ThreadPool queue would
+        // introduce that hazard).
         let cur = self.waiter_active.fetch_add(1, Ordering::SeqCst);
         if cur >= self.waiter_max {
             self.waiter_active.fetch_sub(1, Ordering::SeqCst);
@@ -1186,9 +1000,7 @@ impl ServiceSupervisor {
             .unwrap()
             .insert(req_id.clone(), resp_tx);
 
-        // Send the invoke synchronously on the caller's thread. Admission
-        // is reserved (permit held by `_permit`), so saturation cannot
-        // race the send.
+        // Sent on the caller's thread; the permit is held, so saturation can't race the send.
         let invoke_request = Request::new(
             req_id.clone(),
             "action.invoke",
@@ -1203,13 +1015,10 @@ impl ServiceSupervisor {
             return; // permit drops, slot released
         }
 
-        // Spawn the waiter thread. Permit moves into the thread; counter
-        // decrements on thread exit (success, timeout, or panic). Clone
-        // `reply` so we can wake the caller from the caller's own thread
-        // if `thread::Builder::spawn` itself fails (e.g. system thread
-        // limit). Without the fallback, the service might still run the
-        // action but the caller would wait the full `action_timeout`
-        // before hearing back, possibly retrying and double-firing.
+        // The permit moves into the thread; the counter decrements on exit (success, timeout or
+        // panic). `reply` is cloned so the caller can be woken from its own thread if
+        // `thread::Builder::spawn` fails (e.g. thread limit); otherwise it would wait the full
+        // `action_timeout` and might retry, double-firing the action.
         let reply = pending.reply;
         let reply_fallback = reply.clone();
         let timeout = self.action_timeout;
@@ -1249,11 +1058,8 @@ impl ServiceSupervisor {
                 let _ = reply.send(outcome);
             })
         {
-            // Closure was consumed (and so was the permit → slot
-            // released). The pending_responses entry stays in case the
-            // service replies anyway (reader logs an "unknown id" warn
-            // on receipt). Wake the caller immediately rather than
-            // letting it block on reply_rx for action_timeout.
+            // The closure (and permit) was consumed: drop the pending_responses entry and wake the
+            // caller now instead of letting it wait out action_timeout.
             spawn_handle
                 .pending_responses
                 .lock()
@@ -1266,7 +1072,6 @@ impl ServiceSupervisor {
         }
     }
 
-    /// Called by the reader thread when the service produces a frame.
     fn handle_inbound(self: &Arc<Self>, handle: &Arc<ServiceHandle>, frame: InboundFrame) {
         match frame {
             InboundFrame::Response(resp) => {
@@ -1288,11 +1093,8 @@ impl ServiceSupervisor {
     }
 
     fn handle_service_request(self: &Arc<Self>, handle: &Arc<ServiceHandle>, req: Request) {
-        // Run on a worker thread so the reader stays free. A registered
-        // action handler may itself call back into a service action,
-        // which would block here on a response that the same reader is
-        // responsible for delivering — classic deadlock if we kept
-        // executing inline.
+        // Run on a worker so the reader stays free: an action handler may call back into a
+        // service action and would otherwise block on a response this same reader must deliver.
         let sup = self.clone();
         let handle = handle.clone();
         thread::spawn(move || {
@@ -1353,9 +1155,9 @@ impl ServiceSupervisor {
                     }
                 };
                 let payload = params.get("payload").cloned().unwrap_or(Value::Null);
-                // Misconfiguration is the most common silent onboarding failure (a plugin keeps
-                // running with empty credentials). Toast it by default — the bus event still
-                // composes with user triggers, but visibility no longer depends on opt-in config.
+                // Misconfiguration is the commonest silent onboarding failure (the plugin keeps
+                // running with empty credentials), so toast by default; the bus event still
+                // composes with user triggers.
                 if kind == "plugin.config_error" {
                     notify_config_error(
                         self.notifier.as_deref(),
@@ -1389,18 +1191,16 @@ impl ServiceSupervisor {
         self.services.lock().unwrap().len()
     }
 
-    /// Idempotent. Stages: set `shutting_down`, send JSON `shutdown`,
-    /// 200ms grace, drain+join spawner (pdeathsig SIGTERM), 200ms
-    /// SIGTERM-handler grace, SIGKILL sweep.
+    /// Idempotent. Stages: set `shutting_down`, send JSON `shutdown`, 200ms grace, drain+join
+    /// spawner (pdeathsig SIGTERM), 200ms SIGTERM-handler grace, SIGKILL sweep.
     ///
-    /// Worst-case latency ~5.4s if the spawner is mid-`start_service`
-    /// (init_timeout 5s blocks join); typical ~400ms.
+    /// Worst case ~5.4s if the spawner is mid-`start_service` (init_timeout 5s blocks join);
+    /// typical ~400ms.
     pub fn shutdown_all(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
 
-        // Cooperative shutdown must precede the spawner join: joining
-        // triggers pdeathsig SIGTERM on every still-running plugin, and
-        // we want them to receive the JSON `shutdown` first.
+        // Cooperative shutdown must precede the spawner join: joining fires pdeathsig SIGTERM on
+        // running plugins, and they should get the JSON `shutdown` first.
 
         let services = self.services.lock().unwrap().clone();
         for handle in &services {
@@ -1416,9 +1216,7 @@ impl ServiceSupervisor {
 
         thread::sleep(Duration::from_millis(200));
 
-        // Drop sender + join spawner. join() can block up to
-        // init_timeout (5s) if the spawner is mid-`start_service`;
-        // see fn doc-comment for worst-case latency.
+        // join() can block up to init_timeout (5s) if the spawner is mid-`start_service`.
         {
             let mut tx_guard = self.spawner_tx.lock().unwrap();
             *tx_guard = None;
@@ -1429,10 +1227,8 @@ impl ServiceSupervisor {
             eprintln!("[copad] spawner thread join failed: {e:?}");
         }
 
-        // SIGTERM-handler grace — joining the spawner just fired
-        // pdeathsig SIGTERM on every Linux survivor. On macOS we
-        // explicitly killpg(SIGTERM) here, then 200ms wait, then
-        // SIGKILL the leader (or whole group on macOS) below.
+        // SIGTERM-handler grace: joining the spawner fired pdeathsig SIGTERM on Linux survivors;
+        // on macOS we killpg(SIGTERM) explicitly, wait 200ms, then SIGKILL below.
         #[cfg(target_os = "macos")]
         {
             for handle in &services {
@@ -1458,9 +1254,7 @@ fn pid_files_dir() -> std::path::PathBuf {
 
 #[cfg(target_os = "macos")]
 fn pid_file_path(plugin: &str, service: &str) -> std::path::PathBuf {
-    // `<plugin>.<service>.pid`. service is typically `main`; the
-    // filename is intentionally flat (no subdirs) to keep the sweep
-    // a single readdir.
+    // `<plugin>.<service>.pid`, flat (no subdirs) so the sweep is a single readdir.
     pid_files_dir().join(format!("{plugin}.{service}.pid"))
 }
 
@@ -1492,28 +1286,23 @@ fn remove_pid_file(plugin: &str, service: &str) {
 
 #[cfg(target_os = "macos")]
 fn killpg_signal(pid: u32, sig: libc::c_int) {
-    // SAFETY: `killpg` only requires a pgid and signal; we passed
-    // `setpgid(0, 0)` post-fork so child pid == pgid. Signal goes to
-    // every process in the group including plugin grandchildren.
+    // SAFETY: `killpg` needs a pgid and signal; `setpgid(0, 0)` post-fork made child pid == pgid,
+    // so this reaches plugin grandchildren too.
     unsafe {
         libc::killpg(pid as libc::pid_t, sig);
     }
 }
 
-/// macOS-only: at supervisor startup, walk the pid-files dir and
-/// kill any process group whose pid file references a still-living
-/// pgid. A live orphan here is by definition NOT owned by us (we
-/// haven't started spawning yet), so it must be a leftover from a
-/// SIGKILL'd or panicked prior daemon run — safe to terminate.
-/// Files are removed regardless of whether the pgid was alive.
+/// macOS-only: at startup, kill any process group whose pid file names a still-living pgid.
+/// Nothing is spawned yet, so a live one is a leftover from a SIGKILL'd or panicked prior daemon.
+/// Files are removed regardless.
 #[cfg(target_os = "macos")]
 pub fn sweep_orphan_pids() {
     sweep_orphan_pids_in(&pid_files_dir());
 }
 
-/// Inner implementation that takes an explicit dir — `sweep_orphan_pids`
-/// is the production caller. Lifted out so tests can isolate via a
-/// per-test temp dir without racing on `env::set_var("HOME", ...)`.
+/// Takes an explicit dir so tests can isolate with a temp dir instead of racing on
+/// `env::set_var("HOME", ...)`.
 #[cfg(target_os = "macos")]
 fn sweep_orphan_pids_in(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1532,12 +1321,9 @@ fn sweep_orphan_pids_in(dir: &std::path::Path) {
             let _ = std::fs::remove_file(&path);
             continue;
         };
-        // Defensive: a malformed file containing `0` (or a negative)
-        // would otherwise turn `kill(-pid, 0)` into `kill(0, 0)`,
-        // which targets the DAEMON'S OWN process group, and the
-        // followup `killpg(0, SIGTERM)` would actually signal us.
-        // Treat any non-positive pid as garbage, remove the file,
-        // and move on.
+        // A `0` or negative pid would turn `kill(-pid, 0)` into `kill(0, 0)`, targeting the
+        // DAEMON'S OWN process group, and the follow-up `killpg(0, SIGTERM)` would signal us.
+        // Treat it as garbage and remove the file.
         if pid <= 0 {
             log::warn!(
                 "[copad] orphan pid file {} contains non-positive pid {pid}; removing",
@@ -1546,10 +1332,8 @@ fn sweep_orphan_pids_in(dir: &std::path::Path) {
             let _ = std::fs::remove_file(&path);
             continue;
         }
-        // `kill(-pgid, 0)` returns 0 if the group has any live
-        // member, -1 otherwise. We negate `pid` to address the
-        // pgid since `setpgid(0, 0)` made pid == pgid for the
-        // plugin's leader.
+        // `kill(-pgid, 0)` returns 0 if the group has a live member; negate because
+        // `setpgid(0, 0)` made pid == pgid for the plugin's leader.
         let alive = unsafe { libc::kill(-pid, 0) } == 0;
         if alive {
             log::warn!(
@@ -1559,8 +1343,7 @@ fn sweep_orphan_pids_in(dir: &std::path::Path) {
             unsafe {
                 libc::killpg(pid, libc::SIGTERM);
             }
-            // Short grace then force-kill — orphans don't get to
-            // negotiate. 200ms matches `shutdown_all`'s rhythm.
+            // Short grace then force-kill; 200ms matches `shutdown_all`.
             std::thread::sleep(Duration::from_millis(200));
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
@@ -1617,8 +1400,8 @@ fn notify_config_error(
     );
 }
 
-/// Drop guard for the `waiter_active` counter — released when the
-/// waiter thread exits (regardless of success / timeout / panic).
+/// Drop guard for the `waiter_active` counter, released when the waiter thread exits (success,
+/// timeout or panic).
 struct WaiterPermit(Arc<AtomicUsize>);
 
 impl WaiterPermit {
@@ -1633,10 +1416,9 @@ impl Drop for WaiterPermit {
     }
 }
 
-/// Receives `SpawnRequest`s, brings services up via `start_service`.
-/// Lives until `shutdown_all` drops the Sender. The post-`start_service`
-/// `shutting_down` re-check kills any newborn child that shutdown raced
-/// past — without it the pid sweep would miss it.
+/// Receives `SpawnRequest`s and brings services up via `start_service`; lives until
+/// `shutdown_all` drops the Sender. The post-`start_service` `shutting_down` re-check kills a
+/// newborn child that shutdown raced past, which the pid sweep would miss.
 fn spawner_loop(sup: Weak<ServiceSupervisor>, rx: Receiver<SpawnRequest>) {
     while let Ok(handle) = rx.recv() {
         let Some(sup) = sup.upgrade() else {
@@ -1760,35 +1542,21 @@ fn spawn_stderr_tail(label: String, stderr: std::process::ChildStderr) {
     });
 }
 
-/// Best-effort SIGKILL by raw PID — `Child` has been moved into the wait
-/// thread, so we can't `kill()` it directly. Return value is ignored;
-/// "process already exited" is the most common failure and is the goal anyway,
-/// but PID reuse means a successful syscall is also not a strict guarantee
+/// Best-effort SIGKILL by raw PID (`Child` was moved into the wait thread). The result is
+/// ignored: "already exited" is the common failure, and PID reuse means success is not proof
 /// the right process was hit.
 fn kill_child(pid: u32) {
-    // Safety: `libc::kill` accepts a PID + signal. The PID came from
-    // `Child::id()` and was ours when first recorded; PID reuse after
-    // wait+respawn could in theory aim at an unrelated process, but
-    // SIGKILL on PID 0 / negative is the only foot-gun the syscall has,
-    // and we never pass those values. Return ignored (see outer doc).
+    // Safety: the PID came from `Child::id()`. Reuse after wait+respawn could in theory hit an
+    // unrelated process; we never pass 0 or negative values, the syscall's only foot-gun.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
 }
 
-/// Symmetric kill+cleanup for a single plugin service.
-/// - macOS: `killpg(SIGKILL)` to catch grandchildren in the same
-///   pgroup the spawn-time `setpgid(0,0)` established, then the
-///   per-service pid file is removed so the next-launch
-///   `sweep_orphan_pids` doesn't see a stale (dead-pgid) entry that
-///   takes a startup tick to GC anyway.
-/// - Linux: just `kill_child` — PDEATHSIG handles grandchildren
-///   transitively at parent exit, and no pid file was ever written.
-///
-/// Used by every macOS init-failure and shutdown-race path so the
-/// cleanup is consistent. The normal `shutdown_all` flow does the
-/// SIGTERM grace + SIGKILL + remove_pid_file inline (mirrors this
-/// helper but interleaves a 200ms wait between SIGTERM and SIGKILL).
+/// Kill and clean up one plugin service. macOS: `killpg(SIGKILL)` reaches grandchildren in the
+/// pgroup from the spawn-time `setpgid(0,0)`, then the pid file is removed. Linux: just
+/// `kill_child`, since PDEATHSIG covers grandchildren and no pid file exists. `shutdown_all`
+/// does the same inline with a 200ms SIGTERM grace in between.
 fn kill_service_group(pid: u32, _plugin: &str, _service: &str) {
     #[cfg(target_os = "macos")]
     {
@@ -1807,8 +1575,7 @@ fn resolve_exec(plugin_dir: &Path, exec: &str) -> PathBuf {
     if candidate.exists() {
         return candidate;
     }
-    // Fall back to PATH lookup by passing through; Command::new will use
-    // the bare name if it can't find it in plugin_dir.
+    // Pass the bare name through; Command::new falls back to PATH lookup.
     path
 }
 
@@ -1841,7 +1608,6 @@ mod tests {
             "remediation": "set COPAD_SLACK_BOT_TOKEN",
         });
         notify_config_error(Some(&notifier), &seen, &payload);
-        // Same service again (e.g. a restart re-emits) must not toast twice.
         notify_config_error(Some(&notifier), &seen, &payload);
 
         let captured = notifier.captured.lock().unwrap();
@@ -1883,8 +1649,6 @@ mod tests {
 
     #[test]
     fn config_error_without_notifier_still_dedupes() {
-        // Headless (no platform notifier): the call must not panic and must record the dedup so
-        // behavior matches the desktop path.
         let seen = Mutex::new(HashSet::new());
         let payload = json!({ "service": "calendar", "message": "missing creds" });
         notify_config_error(None, &seen, &payload);
@@ -1926,7 +1690,6 @@ mod tests {
         let a = mk_plugin("alpha", vec![mk_service("main", &["kb.search"])]);
         let b = mk_plugin("bravo", vec![mk_service("main", &["kb.search", "kb.read"])]);
         let (approved, conflicts) = resolve_provides(&[b.clone(), a.clone()]);
-        // alpha sorts first → wins kb.search; bravo keeps kb.read.
         assert_eq!(
             approved.get(&("alpha".into(), "main".into())),
             Some(&vec!["kb.search".into()])
@@ -2047,7 +1810,6 @@ mod tests {
     fn supervisor_skips_provides_that_collide_with_built_ins() {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
-        // Pre-register a built-in that the plugin tries to override.
         registry.register("system.ping", |_| Ok(json!({"status": "core"})));
 
         let plugin = mk_plugin(
@@ -2062,7 +1824,6 @@ mod tests {
             &[],
             PathBuf::from("/tmp/copadd-test-placeholder.sock"),
         );
-        // Built-in is untouched; plugin's other action still registers.
         assert_eq!(
             registry.invoke("system.ping", json!({})).unwrap(),
             json!({"status": "core"})
@@ -2076,7 +1837,6 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
 
-        // An existing `[[commands]]` plugin claiming `plugin.hello.greet`.
         let cmds_plugin = LoadedPlugin {
             manifest: PluginManifest {
                 plugin: PluginMeta {
@@ -2096,7 +1856,6 @@ mod tests {
             },
             dir: PathBuf::from("/tmp"),
         };
-        // A rogue service plugin trying to shadow `plugin.hello.greet`.
         let rogue = mk_plugin(
             "rogue",
             vec![mk_service("main", &["plugin.hello.greet", "rogue.do"])],
@@ -2110,10 +1869,8 @@ mod tests {
             &[],
             PathBuf::from("/tmp/copadd-test-placeholder.sock"),
         );
-        // The shell-command name stays unclaimed in the registry so
-        // `socket::dispatch` falls through to `handle_plugin_command`.
+        // Stays unclaimed so `socket::dispatch` falls through to `handle_plugin_command`.
         assert!(!registry.has("plugin.hello.greet"));
-        // Non-conflicting plugin action still registers.
         assert!(registry.has("rogue.do"));
     }
 
@@ -2122,9 +1879,8 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
         let plugin = mk_plugin("rogue", vec![mk_service("main", &["tab.new", "rogue.do"])]);
-        // `tab.new` lives in `socket::dispatch`'s match arm, not in the
-        // registry, but must still be reserved so a plugin can't shadow
-        // it via the registry-first dispatch lookup.
+        // `tab.new` lives in `socket::dispatch`'s match arm, not the registry, but must be
+        // reserved against registry-first dispatch shadowing.
         let _sup = ServiceSupervisor::new(
             bus,
             registry.clone(),
@@ -2139,15 +1895,10 @@ mod tests {
 
     #[test]
     fn supervisor_skips_system_spawn_provides_via_trigger_only_reserved() {
-        // Trust-boundary regression guard for WR-2: `system.spawn` is
-        // a trigger-only intercept (LiveTriggerSink). It MUST stay
-        // unreachable through the registry, otherwise `coctl call
-        // system.spawn` from any process holding COPAD_SOCKET would
-        // get arbitrary process exec. A malicious or buggy plugin
-        // declaring `provides = ["system.spawn"]` would defeat that
-        // unless the supervisor reserves the name. The `extra_reserved`
-        // arg is what window.rs threads `TRIGGER_ONLY_RESERVED_METHODS`
-        // through.
+        // Trust boundary: `system.spawn` is a trigger-only intercept and must stay unreachable
+        // through the registry, or `coctl call system.spawn` from any process holding
+        // COPAD_SOCKET could exec arbitrary processes. `extra_reserved` is how window.rs threads
+        // `TRIGGER_ONLY_RESERVED_METHODS` through.
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
         let plugin = mk_plugin(
@@ -2194,11 +1945,8 @@ mod tests {
             PathBuf::from("/tmp/copadd-test-placeholder.sock"),
         );
         let svc = sup.services.lock().unwrap()[0].clone();
-        // onAction services don't auto-spawn at boot; state should be
-        // Stopped, but be defensive against future changes.
         wait_for_stopped_or_failed(&svc);
-        // kb.read is approved by manifest but does NOT match the
-        // activation glob — must refuse to spawn.
+        // kb.read is manifest-approved but doesn't match the activation glob: must not spawn.
         let err = sup
             .invoke_remote(&svc, "kb.read", json!({}))
             .expect_err("kb.read should be gated by onAction:kb.search");
@@ -2206,9 +1954,7 @@ mod tests {
     }
 
     fn wait_for_stopped_or_failed(svc: &Arc<ServiceHandle>) {
-        // The boot-time spawn worker for `onStartup` services briefly
-        // flips state to `Starting` before discovering the exec is
-        // bogus and settling at `Failed`. Poll instead of racing.
+        // `onStartup` workers briefly flip to `Starting` before settling at `Failed`; poll.
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if matches!(
@@ -2278,7 +2024,6 @@ mod tests {
             PathBuf::from("/tmp/copadd-test-placeholder.sock"),
         );
         let svc = sup.services.lock().unwrap()[0].clone();
-        // onEvent never auto-spawns at boot, but be defensive.
         wait_for_stopped_or_failed(&svc);
         let err = sup
             .invoke_remote(&svc, "slack.draft_reply", json!({}))
@@ -2310,12 +2055,9 @@ mod tests {
             &[],
             PathBuf::from("/tmp/copadd-test-placeholder.sock"),
         );
-        // Both manifest-approved actions are registered.
         assert!(registry.has("kb.search"));
         assert!(registry.has("kb.read"));
 
-        // Simulate a successful init that announced ONLY kb.read at
-        // runtime — the degraded-mode case the doc describes.
         let svc = sup.services.lock().unwrap()[0].clone();
         *svc.runtime_provides.lock().unwrap() = Some(["kb.read".to_string()].into_iter().collect());
 
@@ -2330,9 +2072,6 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(5));
         {
             let _p = WaiterPermit::new(counter.clone());
-            // Mimic the dispatch_invocation increment (caller bumped to 6
-            // before constructing the permit; permit's role is to undo
-            // exactly one increment on drop).
         }
         assert_eq!(counter.load(Ordering::SeqCst), 4);
     }
@@ -2346,20 +2085,16 @@ mod tests {
             panic!("simulated worker panic");
         }));
         assert!(result.is_err());
-        // Drop fired on unwind → decrement happened.
         assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn env_waiter_max_falls_back_to_default_on_invalid() {
-        // Default path (env not set).
         let n = env_waiter_max("__COPADD_WAITER_MAX_NOT_SET_AAA", 64);
         assert_eq!(n, 64);
-        // Filter rejects 0 — would otherwise allow zero concurrency.
         unsafe { std::env::set_var("__COPADD_WAITER_MAX_TEST_ZERO", "0") };
         let n = env_waiter_max("__COPADD_WAITER_MAX_TEST_ZERO", 64);
         assert_eq!(n, 64);
-        // Valid override.
         unsafe { std::env::set_var("__COPADD_WAITER_MAX_TEST_OK", "12") };
         let n = env_waiter_max("__COPADD_WAITER_MAX_TEST_OK", 64);
         assert_eq!(n, 12);
@@ -2378,13 +2113,9 @@ mod tests {
         }
     }
 
-    /// macOS-only: dead-pgid + malformed-content + non-.pid branches.
-    /// Live-orphan kill path is covered by
-    /// `sweep_kills_live_orphan_pgid` below.
     #[cfg(target_os = "macos")]
     #[test]
     fn sweep_removes_pid_file_for_dead_pgid_and_malformed() {
-        // Use a temp HOME so the sweep walks an isolated dir.
         let tmp = std::env::temp_dir().join(format!(
             "copad-sweep-test-{}-{}",
             std::process::id(),
@@ -2396,14 +2127,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let pids_dir = tmp.join("plugin-pids");
         std::fs::create_dir_all(&pids_dir).unwrap();
-        // Dead pgid: 999999 — almost certainly not assigned, kill(0)
-        // returns ESRCH, sweep removes file.
+        // 999999 is almost certainly unassigned: kill(0) returns ESRCH and the file is removed.
         let dead_path = pids_dir.join("ghost.main.pid");
         std::fs::write(&dead_path, "999999").unwrap();
-        // Malformed: non-numeric content, sweep removes file silently.
         let bad_path = pids_dir.join("malformed.main.pid");
         std::fs::write(&bad_path, "not-a-pid").unwrap();
-        // Non-pid extension: sweep ignores entirely (left behind).
         let leave_path = pids_dir.join("README.txt");
         std::fs::write(&leave_path, "doc").unwrap();
 
@@ -2413,10 +2141,8 @@ mod tests {
         assert!(!bad_path.exists(), "malformed pid file should be removed");
         assert!(leave_path.exists(), "non-.pid file should be ignored");
 
-        // C1 defense: pid file containing 0 or a negative pid must
-        // not turn the sweep into a `killpg(0, SIGTERM)` self-signal.
-        // The file is removed and the daemon process group is left
-        // untouched.
+        // A pid file containing 0 or a negative pid must not become a `killpg(0, SIGTERM)`
+        // self-signal; the file is removed and the daemon's group left alone.
         let zero_path = pids_dir.join("zero.main.pid");
         std::fs::write(&zero_path, "0").unwrap();
         let neg_path = pids_dir.join("neg.main.pid");
@@ -2434,11 +2160,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// macOS-only: spawn a real `sleep` child in its own process
-    /// group, write its pid to a pid file, run sweep, assert the
-    /// child was killed and the file was removed. Covers the
-    /// `kill(-pgid, 0) == 0` branch — the one that actually matters
-    /// for orphan cleanup after a SIGKILL'd daemon.
+    /// macOS-only: a real `sleep` child in its own process group with a pid file must be killed
+    /// and the file removed (the `kill(-pgid, 0) == 0` branch).
     #[cfg(target_os = "macos")]
     #[test]
     fn sweep_kills_live_orphan_pgid() {
@@ -2457,8 +2180,7 @@ mod tests {
         let pids_dir = tmp.join("plugin-pids");
         std::fs::create_dir_all(&pids_dir).unwrap();
 
-        // Spawn `sleep 60` in its own pgroup so the sweep's
-        // `kill(-pgid, ...)` targets a real, isolated process.
+        // Own pgroup so the sweep's `kill(-pgid, ...)` hits a real, isolated process.
         let mut cmd = Command::new("sleep");
         cmd.arg("60");
         unsafe {
@@ -2472,7 +2194,6 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         let pid = child.id() as i32;
 
-        // Wait a beat for the pgid to settle.
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
             unsafe { libc::kill(-pid, 0) },
@@ -2485,17 +2206,13 @@ mod tests {
 
         super::sweep_orphan_pids_in(&pids_dir);
 
-        // 200ms grace (per sweep impl) + small buffer for SIGKILL to
-        // land + the child to be reaped.
+        // 200ms sweep grace plus a buffer for SIGKILL and reaping.
         std::thread::sleep(Duration::from_millis(400));
-        // After sweep + SIGKILL, the pgroup should be dead.
         let still_alive = unsafe { libc::kill(-pid, 0) } == 0;
         assert!(!still_alive, "post-sweep: orphan pgroup should be killed");
         assert!(!pid_file.exists(), "pid file should be removed after sweep");
 
-        // Reap the zombie via Child::wait so the Child handle's
-        // lifetime is clean (satisfies clippy::zombie_processes and
-        // gives us a reaped status to inspect).
+        // Reap so the Child handle is clean (clippy::zombie_processes).
         let _ = child.wait();
 
         let _ = std::fs::remove_dir_all(&tmp);
