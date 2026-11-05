@@ -1,17 +1,5 @@
-//! `coctl jira` — ergonomic wrapper over the `jira.*` action surface.
-//!
-//! Maps clap subcommands onto actions exposed by `copad-plugin-jira`:
-//!
-//! | CLI                                       | Action                  |
-//! |-------------------------------------------|-------------------------|
-//! | `jira mine [--status S] [--project P]`    | `jira.list_my_tickets`  |
-//! | `jira ticket <key>`                       | `jira.get_ticket`       |
-//! | `jira transition <key> <status>`          | `jira.transition`       |
-//! | `jira comment <key> <text>`               | `jira.add_comment`      |
-//! | `jira auth-status`                        | `jira.auth_status`      |
-//!
-//! Every subcommand renders a focused human view by default and the
-//! raw action payload under `--json`. No new IPC, no plugin-side work.
+//! `coctl jira` — wrapper over the `jira.*` actions. Each subcommand renders a focused human view,
+//! or the raw action payload under `--json`.
 
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -148,8 +136,6 @@ fn render_mine(v: &Value) {
 }
 
 fn render_ticket(v: &Value) {
-    // The action returns the verbatim Jira issue payload; pluck the
-    // most useful fields out and dump the rest after.
     let key = v.get("key").and_then(Value::as_str).unwrap_or("?");
     let fields = v.get("fields");
     let summary = fields
@@ -188,11 +174,9 @@ fn render_ticket(v: &Value) {
     }
 }
 
-/// Pull the first paragraph of an ADF (Atlassian Document Format) body
-/// as plain text. The plugin itself owns full ADF rendering for trigger
-/// interpolation; the CLI keeps a tiny inline reader because pulling
-/// `copad-plugin-jira` as a dep just for one render path would invert
-/// the crate ownership.
+/// First paragraph of an ADF (Atlassian Document Format) body as plain text. The CLI keeps a tiny
+/// reader here because depending on `copad-plugin-jira` for one render path would invert the crate
+/// ownership.
 fn adf_first_paragraph(content: &Value) -> String {
     let Some(arr) = content.as_array() else {
         return String::new();

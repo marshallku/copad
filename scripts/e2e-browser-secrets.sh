@@ -1,35 +1,25 @@
 #!/usr/bin/env bash
-# e2e for the credential boundary (work unit B5, macOS).
-#
-# The claims, in the order they matter:
-#   1. A password is refused on an UNPROTECTED tab. On such a page the value was
-#      already readable through `query`/`execute_js`, so "saving it securely"
-#      afterwards would be theatre.
-#   2. Entering protected mode rebuilds the tab: any script the agent installed
-#      into the old document is gone.
-#   3. While protected, every value-returning command against the pane is
-#      REFUSED — including `execute_js`, which is what makes the boundary real.
-#   4. A save reads the password natively; it is never an RPC parameter. In a
-#      DEV build the keychain write cannot complete (see below), so what is
-#      asserted here is that it degrades to `secret_backend_unavailable`
-#      promptly rather than hanging — which is the failure that actually
-#      happened, and froze the whole GUI, before the call was bounded.
+# e2e for the credential boundary (macOS). Claims, in order of importance:
+#   1. A password is refused on an UNPROTECTED tab: its value is already readable through
+#      `query`/`execute_js`, so "saving it securely" would be theatre.
+#   2. Entering protected mode rebuilds the tab: scripts the agent installed are gone.
+#   3. While protected, every value-returning command against the pane is REFUSED, including
+#      `execute_js`, which is what makes the boundary real.
+#   4. A save reads the password natively; it is never an RPC parameter. In a DEV build the
+#      keychain write cannot complete (below), so this asserts it degrades promptly to
+#      `secret_backend_unavailable` instead of hanging, which once froze the whole GUI.
 #   5. `browser.secret.list` returns metadata with no secret-bearing field.
-#   6. A fill against an unknown credential is refused, and no error path
-#      carries a secret.
+#   6. A fill against an unknown credential is refused, and no error path carries a secret.
 #   7. The secret appears in no file copad wrote.
 #   8. None of it takes the frontmost app or the cursor.
 #
-# WHAT THIS CANNOT COVER IN A DEV BUILD. A locally self-signed bundle has no
-# team identifier, so the data-protection keychain refuses it
-# (`errSecMissingEntitlement`), and adding `keychain-access-groups` anyway gets
-# the process AMFI-killed on launch — both measured. The pre-unified
-# `SecKeychain*` fallback then blocks on an access prompt. So a SUCCESSFUL
-# round-trip (save → fill → the password lands in the page) is only reachable
-# from a Developer ID signed build, and is queued in
-# docs/pending-linux-verification.md rather than silently claimed here.
+# NOT COVERABLE IN A DEV BUILD: a locally self-signed bundle has no team identifier, so the
+# data-protection keychain refuses it (`errSecMissingEntitlement`), adding
+# `keychain-access-groups` gets the process AMFI-killed, and the legacy `SecKeychain*`
+# fallback blocks on an access prompt. A successful save -> fill round-trip needs a
+# Developer ID signed build and is queued in docs/pending-linux-verification.md.
 #
-# Login page served locally so the password is one we chose and can grep for.
+# The login page is served locally so the password is one we chose and can grep for.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,21 +35,17 @@ cleanup() {
     [ -n "${SERVER_PID:-}" ] && kill -9 "$SERVER_PID" 2>/dev/null
     [ -n "${WWW:-}" ] && rm -rf "$WWW"
     [ -n "${TMPHOME:-}" ] && rm -rf "$TMPHOME"
-    # The keychain is REAL and shared, so a leftover test credential would
-    # outlive the temp home everything else lives in. Scoped to the exact test
-    # ACCOUNT, never just the service: deleting by service alone would remove a
-    # real credential the user had saved, even on a run where this test stored
-    # nothing.
+    # The keychain is REAL and shared, so a leftover test credential would outlive the temp
+    # home. Delete by the exact test ACCOUNT, never the service alone, which would remove a
+    # real credential the user saved.
     if [ -n "${CRED_ID:-}" ]; then
         security delete-generic-password \
             -s com.marshall.copad.browser -a "$CRED_ID" >/dev/null 2>&1 || true
     fi
 }
-# Cleanup runs on EXIT only. `trap cleanup EXIT INT TERM` looks equivalent and is
-# not: bash runs a signal handler and then RESUMES the script, so the cleanup
-# would delete the temp $HOME the very next command reads from and the run would
-# carry on asserting against wiped state. INT/TERM therefore just `exit` with the
-# conventional status, which fires the EXIT trap exactly once (codex C1).
+# EXIT only: with `trap cleanup EXIT INT TERM` bash runs the handler and then RESUMES the
+# script, deleting the temp $HOME the next command reads. INT/TERM just `exit`, which fires
+# the EXIT trap once.
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -109,10 +95,8 @@ BASE_FRONT=$(front); BASE_MOUSE=$(mouse)
 
 COPAD_SOCKET="$SOCK" "$COCTL" webview open "$BASE/login.html" --mode tab >/dev/null 2>&1
 sleep 3
-# Build the params in python via a heredoc: interpolating a quoted secret into
-# a shell-built JSON string produced a document that would not parse, and
-# escaping quotes through `python3 -c` inside single quotes broke the script
-# itself.
+# Build the params in python via a heredoc: interpolating a quoted secret into a shell-built
+# JSON string does not parse, and escaping quotes through `python3 -c` broke the script.
 type_password() {
     local params
     params=$(python3 - "$SECRET" <<'PY'
@@ -200,9 +184,8 @@ else
 fi
 
 echo "[5/8] the credential index is metadata with no secret-bearing field"
-# Seed the index directly when the keychain could not — the index is core's
-# file and needs no keychain, so the SHAPE of what an agent may read is still
-# fully testable.
+# Seed the index directly when the keychain could not: the index needs no keychain, so the
+# shape of what an agent may read is still testable.
 if [ -z "$CRED_ID" ]; then
     CRED_ID="127.0.0.1/e2e"
     python3 - "$TMPHOME/Library/Application Support/copad/browser/credentials.json" "$CRED_ID" <<'PY'

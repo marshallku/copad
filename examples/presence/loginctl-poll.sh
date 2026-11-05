@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Presence detection via systemd-logind's IdleHint, polled.
-#
-# Works on any systemd-managed session regardless of desktop
-# environment — logind tracks per-session IdleHint based on the
-# graphical layer's report (most DEs flip it on lockscreen / DPMS
-# off). Polling is the dumb-but-portable path; a D-Bus subscription
-# is the upgrade if this gets too jittery for you.
+# Presence detection via systemd-logind's IdleHint, polled. Works on any systemd-managed session;
+# most DEs flip IdleHint on lockscreen / DPMS off.
 #
 # Drop on PATH, run as a systemd --user service:
 #
@@ -24,7 +19,7 @@
 #
 # Then `systemctl --user enable --now copad-presence-loginctl`.
 #
-# Threshold knob: POLL_SECS. Tune for jitter vs latency.
+# Knob: POLL_SECS.
 
 set -euo pipefail
 
@@ -33,8 +28,7 @@ COCTL="${COCTL:-coctl}"
 
 session_id="${XDG_SESSION_ID:-}"
 if [ -z "$session_id" ]; then
-  # Fall back to the user's first graphical session if XDG_SESSION_ID
-  # isn't in the unit's env (it usually IS for --user units).
+  # Fall back to the user's first graphical session when XDG_SESSION_ID is not in the unit's env.
   # loginctl list-sessions columns are: SESSION UID USER SEAT TTY
   session_id="$(loginctl list-sessions --no-legend \
     | awk -v user="$USER" '$3 == user && $4 == "seat0" {print $1; exit}')"

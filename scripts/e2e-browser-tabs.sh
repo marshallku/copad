@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
-# e2e for the browser tab strip (work unit B3, macOS).
-#
-# The claims:
-#   1. `webview.tab.new` opens a tab in the BACKGROUND by default — an agent
-#      must never yank the visible page out from under the user.
-#   2. A background tab can be screenshotted without raising or focusing it.
-#      This is the claim the B3 spike unblocked: `takeSnapshot` renders a web
-#      view that is in no window at all.
-#   3. Every page-level method takes a `tab_id`, so a background tab can be
-#      driven without selecting it.
+# e2e for the browser tab strip (macOS):
+#   1. `webview.tab.new` opens a tab in the BACKGROUND by default; an agent must never yank
+#      the visible page from under the user.
+#   2. A background tab can be screenshotted without raising or focusing it (`takeSnapshot`
+#      renders a web view that is in no window).
+#   3. Every page-level method takes a `tab_id`, so a background tab is driven unselected.
 #   4. list / select / move / close behave, and closing the last tab is refused.
-#   5. All of the above changes neither the frontmost app nor the cursor.
+#   5. None of the above changes the frontmost app or the cursor.
 #   6. Multiple tabs survive a restart, each keeping its own stable id.
 #
-# Pages come from a local throwaway HTTP server: the tabs must be visually
-# distinguishable for the screenshot check, and the run must not depend on the
-# network. Isolated by $HOME so it cannot touch the user's session.
+# Pages come from a local throwaway HTTP server (distinguishable tabs for the screenshot
+# check, no network). Isolated by $HOME so it cannot touch the user's session.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,11 +26,9 @@ cleanup() {
     [ -n "${WWW:-}" ] && rm -rf "$WWW"
     [ -n "${TMPHOME:-}" ] && rm -rf "$TMPHOME"
 }
-# Cleanup runs on EXIT only. `trap cleanup EXIT INT TERM` looks equivalent and is
-# not: bash runs a signal handler and then RESUMES the script, so the cleanup
-# would delete the temp $HOME the very next command reads from and the run would
-# carry on asserting against wiped state. INT/TERM therefore just `exit` with the
-# conventional status, which fires the EXIT trap exactly once (codex C1).
+# EXIT only: with `trap cleanup EXIT INT TERM` bash runs the handler and then RESUMES the
+# script, deleting the temp $HOME the next command reads. INT/TERM just `exit`, which fires
+# the EXIT trap once.
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -131,7 +124,6 @@ raw = sys.argv[1]
 if not raw:
     print("no image"); raise SystemExit
 data = base64.b64decode(raw)
-# Decode the PNG far enough to sample pixels, without a dependency.
 pos, w, h, idat, bitdepth, ctype = 8, 0, 0, b"", 0, 0
 while pos < len(data):
     ln = struct.unpack(">I", data[pos:pos+4])[0]
@@ -165,7 +157,6 @@ for _ in range(h):
             pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
             line[i] = (line[i] + pr) & 255
     rows.append(bytes(line)); prev = line
-# Sample the middle.
 y = h // 2; x = w // 2
 r, g, bch = rows[y][x*4], rows[y][x*4+1], rows[y][x*4+2]
 print(f"{w}x{h} rgb=({r},{g},{bch}) " + ("BLUE" if bch > 200 and r < 80 else ("RED" if r > 200 and bch < 80 else "OTHER")))

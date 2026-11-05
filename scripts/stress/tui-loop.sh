@@ -55,7 +55,6 @@ run_tui htop
 run_tui btop
 run_tui lazygit
 
-# nvim — open a large generated buffer with treesitter-able content.
 if command -v nvim >/dev/null 2>&1; then
     BUF=$(mktemp -t nvim-stress.XXXXXX)
     seq 1 20000 | awk '{printf "%6d  the quick brown fox jumps over the lazy dog %d\n", $1, $1*$1}' > "$BUF"
@@ -70,7 +69,6 @@ if command -v nvim >/dev/null 2>&1; then
     rm -f "$BUF"
 fi
 
-# tmux — only test if not already inside one.
 if command -v tmux >/dev/null 2>&1 && [ -z "${TMUX:-}" ]; then
     echo "=== tmux 3-way split (${DURATION}s) ==="
     sleep 1

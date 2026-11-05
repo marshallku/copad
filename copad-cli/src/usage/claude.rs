@@ -1,11 +1,9 @@
 //! Scan `~/.claude/projects/<slug>/<uuid>.jsonl` for token usage.
 //!
-//! CRITICAL: Claude Code writes the SAME assistant `message.id` on multiple
-//! JSONL lines (streaming/rewrite snapshots — observed up to 5–7×, always with
-//! the identical final usage). Naive line-summing overstated output tokens by
-//! ~2.75× on a real transcript. So we DEDUPE by `message.id`, keeping the
-//! snapshot with the largest token total (the final, complete one). Only after
-//! dedup do we window-filter and sum.
+//! Claude Code writes the SAME assistant `message.id` on several JSONL lines (streaming/rewrite
+//! snapshots, up to 5-7x, with identical final usage); summing lines overstated output tokens
+//! ~2.75x. So records are deduped by `message.id`, keeping the snapshot with the largest total,
+//! before the window filter and the sum.
 
 use super::model::{RawUsage, Record, Tool, Warnings};
 use chrono::{DateTime, Local};
@@ -14,7 +12,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
 
-/// A parsed assistant usage line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeLine {
     /// `message.id`; `None` only if Claude ever omits it (kept un-deduped).
@@ -24,10 +21,9 @@ pub struct ClaudeLine {
     pub usage: RawUsage,
 }
 
-/// A usage field: absent/null → `Some(0)` (a legitimately omitted category);
-/// present and a valid `u64` → `Some(n)`; present but the WRONG type (string,
-/// float, negative) → `None`, which rejects the whole record as malformed
-/// rather than silently miscounting it as zero (codex R3/C2).
+/// A usage field: absent/null is `Some(0)` (an omitted category); a valid `u64` is `Some(n)`; the
+/// wrong type (string, float, negative) is `None`, rejecting the whole record as malformed rather
+/// than miscounting it as zero.
 fn uget(v: &Value, k: &str) -> Option<u64> {
     match v.get(k) {
         None | Some(Value::Null) => Some(0),
@@ -35,9 +31,6 @@ fn uget(v: &Value, k: &str) -> Option<u64> {
     }
 }
 
-/// `Ok(None)` = valid JSON but not a usage-bearing assistant line (skip, no
-/// warning). `Err(())` = malformed JSON or unparseable timestamp (counts as a
-/// skipped line so format drift surfaces instead of reading as zero usage).
 pub fn parse_claude_line(line: &str) -> Result<Option<ClaudeLine>, ()> {
     let v: Value = serde_json::from_str(line).map_err(|_| ())?;
     if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
@@ -49,8 +42,7 @@ pub fn parse_claude_line(line: &str) -> Result<Option<ClaudeLine>, ()> {
     let Some(usage_v) = msg.get("usage") else {
         return Ok(None);
     };
-    // `usage` present but not an object (e.g. `"usage":"invalid"`) is format
-    // drift — reject as malformed rather than reading every field as absent/0.
+    // A non-object `usage` is format drift: reject rather than read every field as 0.
     if !usage_v.is_object() {
         return Err(());
     }
@@ -81,19 +73,16 @@ pub fn parse_claude_line(line: &str) -> Result<Option<ClaudeLine>, ()> {
     }))
 }
 
-/// Recursively collect `*.jsonl` under `dir`. Claude nests SUBAGENT transcripts
-/// at `<project>/<session>/subagents/agent-*.jsonl` (not just top-level session
-/// files) — a depth-1 scan silently dropped them and undercounted usage, so we
-/// walk the whole tree (mirrors codex's `collect_rollouts`).
+/// Recursively collect `*.jsonl` under `dir`. Subagent transcripts live at
+/// `<project>/<session>/subagents/agent-*.jsonl`; a depth-1 scan undercounts them.
 fn collect_jsonl(dir: &Path, out: &mut Vec<std::path::PathBuf>, warns: &mut Warnings) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         warns.unreadable_files += 1;
         return;
     };
     for e in rd.flatten() {
-        // `file_type()` from the dir entry does NOT follow symlinks, so a
-        // symlinked directory is treated as a leaf — no infinite recursion on a
-        // symlink cycle (codex R5/I1).
+        // A dir entry's `file_type()` does not follow symlinks, so a symlinked directory is a
+        // leaf and a symlink cycle cannot recurse forever.
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
         if ft.is_dir() {
@@ -104,8 +93,6 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<std::path::PathBuf>, warns: &mut Warn
     }
 }
 
-/// Walk `root` (`~/.claude/projects`) recursively, dedup by `message.id`, keep
-/// records at or after `since`. Returns the surviving records plus warnings.
 pub fn scan(root: &Path, since: Option<DateTime<Local>>) -> (Vec<Record>, Warnings) {
     let mut dedup: HashMap<String, (DateTime<Local>, String, RawUsage)> = HashMap::new();
     let mut warns = Warnings::default();
@@ -115,20 +102,15 @@ pub fn scan(root: &Path, since: Option<DateTime<Local>>) -> (Vec<Record>, Warnin
     let mut files = Vec::new();
     collect_jsonl(root, &mut files, &mut warns);
     for fp in files {
-        // mtime prune: a file untouched since the window start cannot hold
-        // in-window records, so skip the whole read (status-line speed).
         if let Some(cut) = since_sys
             && let Ok(mt) = fp.metadata().and_then(|m| m.modified())
             && mt < cut
         {
             continue;
         }
-        // Read as BYTES + lossy-decode per line: an active file whose last line
-        // is a concurrent append truncated mid-multibyte-UTF-8-char would make
-        // `read_to_string` reject the WHOLE file (dropping every valid record) —
-        // fatal here since the user's transcripts contain multibyte text. Lossy
-        // decoding turns only the truncated tail into U+FFFD, so its JSON parse
-        // fails (skip+warn) while all complete lines still count.
+        // Read bytes and decode lossily per line: an active file whose last line is a concurrent
+        // append cut mid-UTF-8-char would make `read_to_string` reject the whole file. Lossy
+        // decoding only breaks the truncated tail (skipped with a warning).
         let Ok(bytes) = std::fs::read(&fp) else {
             warns.unreadable_files += 1;
             continue;
@@ -193,22 +175,18 @@ mod tests {
         assert_eq!(parsed.id.as_deref(), Some("msg_1"));
         assert_eq!(parsed.usage.output, 100);
         assert_eq!(parsed.usage.cache_read, 5);
-        // a user line is valid JSON but carries no usage
         assert!(parse_claude_line(r#"{"type":"user"}"#).unwrap().is_none());
-        // malformed → Err
         assert!(parse_claude_line("{not json").is_err());
-        // present-but-wrong-type usage field → rejected as malformed, not
-        // silently zeroed (codex R3/C2)
+        // wrong-type usage field is rejected, not silently zeroed
         let bad = r#"{"type":"assistant","timestamp":"2026-07-20T12:00:00.000Z","message":{"id":"m","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":"oops"}}}"#;
         assert!(parse_claude_line(bad).is_err());
-        // `usage` present but not an object → malformed, not silently ignored
         let bad_container = r#"{"type":"assistant","timestamp":"2026-07-20T12:00:00.000Z","message":{"id":"m","model":"claude-opus-4-8","usage":"invalid"}}"#;
         assert!(parse_claude_line(bad_container).is_err());
     }
 
     #[test]
     fn scan_dedupes_repeated_message_id() {
-        // The C1 regression: same message.id written 3× must count ONCE.
+        // the same message.id written 3x counts once
         let dir = tempfile::tempdir().unwrap();
         let proj = dir.path().join("proj-a");
         std::fs::create_dir(&proj).unwrap();
@@ -223,7 +201,6 @@ mod tests {
 
         let (records, warns) = scan(dir.path(), None);
         let total_output: u64 = records.iter().map(|r| r.usage.output).sum();
-        // 500 (deduped, not 1500) + 200 = 700
         assert_eq!(total_output, 700);
         assert_eq!(records.len(), 2);
         assert!(warns.is_empty());
@@ -241,7 +218,6 @@ mod tests {
             assistant_line("m1", "2026-07-20T12:00:00.000Z", 10)
         )
         .unwrap();
-        // simulate an active file with a truncated trailing line
         write!(f, r#"{{"type":"assistant","messag"#).unwrap();
         drop(f);
         let (records, warns) = scan(dir.path(), None);
@@ -251,8 +227,7 @@ mod tests {
 
     #[test]
     fn scan_preserves_valid_lines_when_tail_is_truncated_multibyte() {
-        // An active file whose final line is a concurrent append cut mid-
-        // multibyte-char must NOT lose its valid preceding records.
+        // A final line cut mid-multibyte-char must not lose the valid records before it.
         let dir = tempfile::tempdir().unwrap();
         let proj = dir.path().join("proj-utf8");
         std::fs::create_dir(&proj).unwrap();
@@ -272,7 +247,6 @@ mod tests {
 
     #[test]
     fn scan_recurses_into_nested_subagent_dirs() {
-        // Claude nests subagent transcripts at <project>/<session>/subagents/.
         let dir = tempfile::tempdir().unwrap();
         let proj = dir.path().join("proj-c");
         let nested = proj.join("session-1/subagents");
@@ -295,7 +269,6 @@ mod tests {
 
         let (records, _) = scan(dir.path(), None);
         let total: u64 = records.iter().map(|r| r.usage.output).sum();
-        // both the top-level (100) and the nested subagent (40) counted
         assert_eq!(records.len(), 2);
         assert_eq!(total, 140);
     }

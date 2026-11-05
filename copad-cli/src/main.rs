@@ -12,7 +12,6 @@ use commands::{AgentCommand, BackgroundCommand, Cli, Command, EventCommand, Upda
 fn main() {
     let cli = Cli::parse();
 
-    // Handle update commands locally (no socket needed)
     if let Command::Update(cmd) = &cli.command {
         match cmd {
             UpdateCommand::Check => update::check_update(),
@@ -21,9 +20,8 @@ fn main() {
         return;
     }
 
-    // `usage` and `agent status` are LOCAL readouts — they parse transcript
-    // files / shell out to `tmx`, never the daemon socket — so they work over
-    // SSH and inside a tmux status bar. Dispatch before any socket resolution.
+    // `usage` and `agent status` are local readouts (transcripts, `tmx`), never the daemon socket,
+    // so they work over SSH; dispatch before any socket resolution.
     if let Command::Usage(args) = &cli.command {
         std::process::exit(usage::run(args, cli.json));
     }
@@ -31,9 +29,8 @@ fn main() {
         std::process::exit(agent_status::run(*oneline, cli.json));
     }
 
-    // `background cache` rebuilds the wallpaper list from a directory — pure
-    // config-read + filesystem work, so it must not require a running GUI
-    // (you populate the list BEFORE copad has anything to rotate).
+    // Pure config-read + filesystem work: the list is populated before copad has anything to
+    // rotate, so no running GUI may be required.
     if let Command::Background(BackgroundCommand::Cache {
         path,
         output,
@@ -50,12 +47,9 @@ fn main() {
         ));
     }
 
-    // `coctl event publish` bypasses the generic `discover_socket`
-    // (which prefers GUI per-instance sockets) and connects directly
-    // to the daemon — `events.publish` is daemon-only. Done BEFORE
-    // `socket_path` resolution so an invalid JSON payload fails
-    // without ever touching a socket (the generic resolver probes
-    // COPAD_SOCKET + discover_socket as a side effect).
+    // Connects straight to the daemon (`events.publish` is daemon-only) instead of the generic
+    // `discover_socket`, which prefers GUI sockets. Runs before `socket_path` resolution so an
+    // invalid JSON payload fails without probing sockets.
     if let Command::Event(EventCommand::Publish {
         kind,
         payload,
@@ -76,7 +70,6 @@ fn main() {
         eprintln!("[coctl] using socket: {socket_path}");
     }
 
-    // Event subscribe is a long-lived streaming connection
     if matches!(&cli.command, Command::Event(EventCommand::Subscribe)) {
         match client::subscribe(&socket_path) {
             Ok(()) => {}
@@ -88,9 +81,8 @@ fn main() {
         return;
     }
 
-    // Phase 19.1: per-plugin ergonomic wrappers own their dispatch
-    // (preflight id resolution + custom human renderer), bypassing
-    // the generic `cli.method() / cli.params()` path.
+    // Per-plugin wrappers own their dispatch (id preflight, custom renderer), bypassing the
+    // generic `cli.method() / cli.params()` path.
     if let Command::Todo(cmd) = &cli.command {
         std::process::exit(plugin_cmds::todo::dispatch(cmd, &socket_path, cli.json));
     }
@@ -115,11 +107,8 @@ fn main() {
     if let Command::Recent(args) = &cli.command {
         std::process::exit(plugin_cmds::recent::dispatch(args, &socket_path, cli.json));
     }
-    // Phase 19.2 context aggregator. Bypass to the new dispatcher
-    // unless the user is explicitly asking for the raw legacy shape
-    // (`--json` without `--full`) — that path stays on the generic
-    // `cli.method() / cli.params()` flow so any script piping the
-    // bare snapshot keeps working.
+    // `--json` without `--full` stays on the generic path so scripts piping the raw
+    // `context.snapshot` keep working.
     if let Command::Context { full } = &cli.command
         && (!cli.json || *full)
     {
@@ -150,17 +139,10 @@ fn main() {
     }
 }
 
-/// Three-tier discovery in strict preference order:
-/// 1. **Hardened GUI sockets** under `<runtime_dir>/gui-{PID}.sock` —
-///    parent dir verified owner-only.
-/// 2. **Legacy GUI sockets** under `/tmp/copad-{PID}.sock` — kept so
-///    a still-running pre-5b.4 copad stays addressable.
-/// 3. **Daemon well-known path** `<runtime_dir>/socket` — last resort.
-///
-/// Within each tier, newest mtime wins. The tier boundary is HARD: a
-/// freshly-touched legacy socket cannot preempt a hardened one. This
-/// matters because tier 2's parent (`/tmp`) is world-writable while
-/// tier 1's is owner-only.
+/// Three tiers in strict preference order: hardened GUI sockets (`<runtime_dir>/gui-{PID}.sock`,
+/// parent dir verified owner-only), legacy GUI sockets (`/tmp/copad-{PID}.sock`), then the daemon
+/// path `<runtime_dir>/socket`. Within a tier the newest mtime wins; a tier boundary is hard,
+/// because `/tmp` is world-writable and a fresh legacy socket must not preempt a hardened one.
 fn discover_socket() -> Option<String> {
     let runtime_dir = copad_core::paths::runtime_dir();
     let trusted = copad_core::paths::is_trusted_dir(&runtime_dir);
@@ -212,11 +194,8 @@ fn best_connectable_with_prefix(
 }
 
 fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool, quiet: bool) -> i32 {
-    // Schema checks run BEFORE socket resolution so `--quiet` doesn't
-    // mask caller bugs: a hook script publishing `foo.completed` (a
-    // reserved suffix the daemon would reject) must surface as exit 1
-    // even when copadd is down, otherwise the hook author never sees
-    // that their publish call can never succeed.
+    // Schema checks run before socket resolution so `--quiet` cannot mask caller bugs: a hook
+    // publishing a reserved `.completed` kind must exit 1 even when copadd is down.
     if kind.is_empty() {
         eprintln!("Error [invalid_params]: kind must not be empty");
         return 1;
@@ -261,10 +240,8 @@ fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool, quiet: bool) 
                 }
                 0
             } else if let Some(err) = response.error {
-                // Schema errors from the daemon (e.g. reserved-kind
-                // rejection) still surface even under --quiet: the
-                // hook author wrote a publish call that can't ever
-                // succeed and the silent path would hide that forever.
+                // Daemon schema errors surface even under --quiet: that publish can never
+                // succeed and the silent path would hide it forever.
                 eprintln!("Error [{}]: {}", err.code, err.message);
                 1
             } else {

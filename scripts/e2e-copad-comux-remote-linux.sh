@@ -24,7 +24,6 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL: $*"; exit 1; }
 
-# --- throwaway sshd + client config ------------------------------------------------------
 ssh-keygen -q -t ed25519 -N '' -f "$W/hostkey"
 ssh-keygen -q -t ed25519 -N '' -f "$W/client" -C copad-e2e
 cp "$W/client.pub" "$W/authorized_keys"
@@ -56,7 +55,6 @@ chmod +x "$W/sshwrap"
 sleep 1
 "$W/sshwrap" e2e-remote true || fail "the throwaway sshd does not accept the test key"
 
-# --- the "remote" comux (isolated) -------------------------------------------------------
 RENV="COPAD_MUX_SOCK=$W/s COPAD_MUX_STATE=$W/st.json COPAD_MUX_NOTIFY=0 COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1"
 export COPAD_MUX_SOCK=$W/s
 unset COPAD_MUX_PANE COPAD_MUX COPAD_SOCKET COPAD_PANEL_ID
@@ -71,7 +69,6 @@ print(json.dumps(json.loads(f.readline())["topics"]["clients"]["data"]))
 PY
 }
 
-# --- copad-linux, headless, with the ssh wrapper and NO local comux ----------------------
 gtk4-broadwayd :19 >"$W/broadway.log" 2>&1 & BPID=$!
 sleep 1
 # The local comux socket points nowhere: everything copad shows must come over SSH.

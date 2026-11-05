@@ -2,7 +2,6 @@ import CopadCore
 import Foundation
 import TOMLKit
 
-/// Policy for OSC 52 clipboard writes from the PTY.
 /// Policy for OSC 52 clipboard writes from the PTY, applied via `drainClipboardRequests`.
 ///
 /// Default `allow`, as in ghostty/kitty/wezterm/alacritty. `deny` silently breaks tools that copy

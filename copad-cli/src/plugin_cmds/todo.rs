@@ -1,48 +1,14 @@
-//! `coctl todo` — ergonomic wrapper over the `todo.*` action surface.
+//! `coctl todo` — wrapper over the `todo.*` actions.
 //!
-//! Maps clap subcommands onto the existing actions exposed by
-//! `copad-plugin-todo`:
-//!
-//! | CLI                                 | Action            |
-//! |-------------------------------------|-------------------|
-//! | `todo create <title> [--workspace …]` | `todo.create`     |
-//! | `todo list [--status …]`              | `todo.list`       |
-//! | `todo update <id> [flags…]`           | `todo.update`     |
-//! | `todo loop <id> [--copy]`             | `todo.render_loop_prompt` |
-//! | `todo set <id> --status <s>`          | `todo.set_status` |
-//! | `todo done <id>`                      | `todo.set_status` (status=done) |
-//! | `todo doing <id>`                     | `todo.set_status` (status=in_progress) |
-//! | `todo block <id>`                     | `todo.set_status` (status=blocked) |
-//! | `todo start <id>`                     | `todo.start`      |
-//! | `todo delete <id>`                    | `todo.delete`     |
-//!
-//! ## ID prefix resolution
-//!
-//! Every command that takes an `<id>` accepts a unique prefix in lieu
-//! of the full `T-<datetime>-<seq>` identifier. We preflight a
-//! `todo.list` call, find the unique matching id, and substitute it
-//! before dispatch. If zero or many ids match, we error out with the
-//! candidates so the user can disambiguate. The roundtrip is cheap on
-//! a local socket and saves the user from having to look up the full
-//! id from the panel for routine actions.
-//!
-//! ## Workspace defaulting
-//!
-//! `--workspace` defaults to `COPAD_TODO_DEFAULT_WORKSPACE` env var if
-//! set, else `"default"`. Cwd-derived workspace resolution is a
-//! Phase 19.X follow-up (needs `git.resolve_workspace` lifted into a
-//! copad-internal action) — until then, users on multiple workspaces
-//! pass `--workspace` explicitly. The plugin itself defaults to
-//! `default` if the field is omitted from `todo.create`, so omitting
-//! the flag here is also fine for the common case.
+//! Every `<id>` accepts a unique prefix: a preflight `todo.list` resolves it and errors with the
+//! candidates when zero or several match. `--workspace` defaults to
+//! `COPAD_TODO_DEFAULT_WORKSPACE`, else the plugin's own default.
 
 use clap::Subcommand;
 use serde_json::{Value, json};
 
 use crate::client;
 
-/// Pretty status icon for a `todo.list` row. Matches the panel's
-/// "Doing" column label (`in_progress` → `~`).
 fn status_icon(status: &str) -> &'static str {
     match status {
         "open" => "[ ]",
@@ -219,7 +185,6 @@ pub enum TodoCommand {
     },
 }
 
-/// Returns process exit code for `main.rs` to propagate.
 pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
     match cmd {
         TodoCommand::Create {
@@ -235,8 +200,6 @@ pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
                 "title": title,
                 "priority": priority,
             });
-            // Workspace resolution: explicit flag > env var > plugin default.
-            // Cwd-derived workspace is a Phase 19.X follow-up.
             if let Some(ws) = workspace {
                 params["workspace"] = json!(ws);
             } else if let Ok(ws) = std::env::var("COPAD_TODO_DEFAULT_WORKSPACE") {
@@ -260,10 +223,6 @@ pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
                 params["tags"] = json!(parts);
             }
             call_and_render(socket_path, "todo.create", params, json_out, |v| {
-                // Response shape: `{id, workspace, todo}` (full Todo
-                // payload nested under `todo`). Render the id +
-                // workspace; the rest is fetchable via `todo list` /
-                // `todo show` (19.2).
                 let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
                 let ws = v.get("workspace").and_then(Value::as_str).unwrap_or("?");
                 println!("created {id} (ws={ws})");
@@ -354,12 +313,8 @@ pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
                 Ok(r) => r,
                 Err(code) => return code,
             };
-            // `--append-subtask` is wired straight through to the action's
-            // `append_subtask` param so the read-modify-write happens inside
-            // the action handler — no client-side preflight that would widen
-            // the race window. clap's `conflicts_with` already rejects
-            // simultaneous `--body` + `--append-subtask`; the action also
-            // rejects the combination as a defense-in-depth.
+            // Passed straight to the action so the read-modify-write happens in the handler; a
+            // client-side preflight would widen the race window.
             let mut params = json!({ "id": r.id, "workspace": r.workspace });
             if let Some(t) = title {
                 params["title"] = json!(t);
@@ -448,10 +403,7 @@ pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
     }
 }
 
-/// Best-effort clipboard pipe. Prefers `wl-copy` when `WAYLAND_DISPLAY`
-/// is set, else `xclip -selection clipboard` when `DISPLAY` is set,
-/// else returns false so the caller can fall back to stdout. Stdin pipe
-/// failure (tool not on PATH, write error) also reports false.
+/// Prefers `wl-copy` on Wayland, else `xclip` on X11; false when neither works.
 fn pipe_to_clipboard(text: &str) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -493,13 +445,6 @@ fn pipe_to_clipboard(text: &str) -> bool {
     false
 }
 
-/// `todo show` — fan out from one resolved id:
-/// - `linked_kb[]` → `kb.read` per entry (best-effort; per-entry errors
-///   are swallowed and aggregated). Preview in human mode, full content
-///   under `--json`.
-/// - `linked_jira` rendered as keys (no `jira.get_ticket` fan-out yet).
-/// - `linked_slack` rendered as permalinks (no cheap body-fetch).
-/// - Timeline omitted — there's no socket-callable history surface yet.
 fn show(
     socket_path: &str,
     id_or_prefix: &str,
@@ -510,12 +455,6 @@ fn show(
         Ok(r) => r,
         Err(code) => return code,
     };
-    // Re-fetch the full todo from the resolved id. The preflight in
-    // `resolve_id` already pulled `todo.list`, but it discards
-    // everything except `id` and `workspace`; doing one more list
-    // (filtered by workspace) is cheaper than threading the full
-    // object through and doesn't depend on `resolve_id`'s internal
-    // shape.
     let todo = match find_todo(socket_path, &r.id, &r.workspace) {
         Ok(t) => t,
         Err(code) => return code,
@@ -537,11 +476,7 @@ fn show(
         let kb_json: Vec<Value> = kb_entries
             .iter()
             .map(|(id, res)| match res {
-                // Pass through the full kb.read payload (content +
-                // frontmatter + path + whatever else the plugin
-                // adds in future) so scripts piping
-                // `--json` get the same data as a direct
-                // `coctl call kb.read` would.
+                // Pass the full kb.read payload through so `--json` matches `coctl call kb.read`.
                 Ok(v) => {
                     let mut obj = serde_json::Map::new();
                     obj.insert("id".into(), Value::String(id.clone()));
@@ -597,8 +532,6 @@ fn find_todo(socket_path: &str, id: &str, workspace: &str) -> Result<Value, i32>
         })
 }
 
-/// Like `call_and_render` but doesn't print/exit on failure — `show`
-/// aggregates per-entry errors and renders them together.
 fn call_one(socket_path: &str, method: &str, params: Value) -> Result<Value, (String, String)> {
     let resp = client::send_command(socket_path, method, params)
         .map_err(|e| ("transport_error".to_string(), e.to_string()))?;
@@ -644,18 +577,12 @@ fn render_show(todo: &Value, kb_entries: &[KbEntry]) {
     if let Some(jira) = todo.get("linked_jira").and_then(Value::as_str)
         && !jira.is_empty()
     {
-        // jira.get_ticket fan-out lands once Phase 16 ships; until
-        // then we just surface the key.
         println!("  jira {jira}");
     }
     if let Some(slack) = todo.get("linked_slack").and_then(Value::as_array)
         && !slack.is_empty()
     {
-        // `linked_slack` is `Vec<Value>` per the todo schema —
-        // entries can be permalink strings OR structured objects
-        // (e.g. `{team, channel, ts}` matching the slack.reaction
-        // payload shape). Render strings verbatim; flatten objects
-        // to `key=value` pairs; fall back to JSON for anything else.
+        // `linked_slack` entries are permalink strings or objects; objects print as key=value.
         println!("  slack");
         for s in slack {
             match s {
@@ -697,9 +624,6 @@ fn render_show(todo: &Value, kb_entries: &[KbEntry]) {
             match res {
                 Ok(v) => {
                     let content = v.get("content").and_then(Value::as_str).unwrap_or("");
-                    // Strip frontmatter for the preview — the user
-                    // came here for body content, not metadata they
-                    // already see in the kb file itself.
                     let preview = strip_frontmatter(content);
                     println!("  {kb_id}");
                     let mut shown = 0;
@@ -710,7 +634,6 @@ fn render_show(todo: &Value, kb_entries: &[KbEntry]) {
                         }
                         let trimmed = line.trim_end();
                         if trimmed.is_empty() && shown == 0 {
-                            // Skip leading blank lines after frontmatter
                             continue;
                         }
                         println!("    {trimmed}");
@@ -725,8 +648,6 @@ fn render_show(todo: &Value, kb_entries: &[KbEntry]) {
     }
 }
 
-/// Strip a leading `---\n...\n---\n` YAML frontmatter block. Returns
-/// the input unchanged if no frontmatter is present.
 fn strip_frontmatter(content: &str) -> &str {
     if !content.starts_with("---\n") && !content.starts_with("---\r\n") {
         return content;
@@ -782,7 +703,6 @@ fn render_list(v: &Value, hide_done: bool) {
         println!("(no todos)");
         return;
     }
-    // Column widths — id is the only one with significant variance.
     let id_w = todos
         .iter()
         .filter_map(|t| t.get("id").and_then(Value::as_str))
@@ -831,21 +751,15 @@ fn render_list(v: &Value, hide_done: bool) {
     }
 }
 
-/// Pairs id with its actual workspace — actions default `workspace`
-/// to the plugin's configured default, so a non-default-workspace
-/// todo 404s without this.
+/// Actions default `workspace` to the plugin default, so a todo in another workspace 404s without
+/// its real one.
 struct ResolvedTodo {
     id: String,
     workspace: String,
 }
 
-/// Resolves `<id>` (full or prefix) → `ResolvedTodo`. Strategy:
-/// exact-match first across visible workspaces; on zero matches, fall
-/// back to prefix-match. Either set ambiguous (>1) forces the user to
-/// pass `--workspace <ws>` — we never silently pick whichever workspace
-/// the listing enumerated first, which would mutate the wrong todo.
-/// `workspace_filter` scopes the preflight when the user already knows
-/// which workspace to target.
+/// Exact match first, then prefix. An ambiguous set requires `--workspace`; picking the first
+/// listed workspace would mutate the wrong todo.
 fn resolve_id(
     socket_path: &str,
     prefix: &str,

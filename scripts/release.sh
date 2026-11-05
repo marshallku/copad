@@ -45,7 +45,6 @@ DEFAULT_BRANCH="master"
 die() { echo "release: $*" >&2; exit 1; }
 
 usage() {
-    # Print the header block (lines starting with "# ") as help text.
     # `sed -E` for the optional-space strip: BSD sed's BRE has no `\?`, so the
     # portable-looking `s/^# \?//` left every `#` in place on macOS.
     sed -n '2,/^set -euo/p' "$0" | grep -E '^#( |$)' | sed -E 's/^# ?//'
@@ -70,7 +69,6 @@ for arg in "$@"; do
     esac
 done
 
-# Everything runs from the repo root so the awk/git paths are unambiguous.
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
 cd "$ROOT"
 
@@ -78,8 +76,7 @@ read_workspace_version() {
     awk -F'"' '/^\[workspace.package\]/{s=1;next} s&&/^version[[:space:]]*=/{print $2;exit}' "$1"
 }
 
-# The branch + clean-tree guards run BEFORE the version is resolved: failing
-# them after making the user pick a bump would waste the prompt.
+# Guards run before the version is resolved so a failure does not waste the bump prompt.
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "$DEFAULT_BRANCH" ] || die "on branch '$BRANCH', not '$DEFAULT_BRANCH' — release from $DEFAULT_BRANCH (or edit DEFAULT_BRANCH)"
 
@@ -88,13 +85,8 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 CURRENT="$(read_workspace_version Cargo.toml)"
 [ -n "$CURRENT" ] || die "could not read [workspace.package] version from Cargo.toml"
 
-# --- Resolve the target version --------------------------------------------
-
-# Next version for a bump level. A prerelease/build suffix is dropped, and a
-# `patch` bump off a PRERELEASE releases it (1.0.5-rc.1 -> 1.0.5) rather than
-# skipping to 1.0.6 — that is what semver ordering means. Build metadata does
-# NOT count: it carries no precedence, so 1.0.5+build must still patch to
-# 1.0.6, not back to a 1.0.5 that ranks equal to what's already released.
+# A `patch` bump off a PRERELEASE releases it (1.0.5-rc.1 -> 1.0.5). Build metadata carries
+# no precedence, so 1.0.5+build still patches to 1.0.6.
 bump() {
     local core rest pre major minor patch
     core="${CURRENT%%[-+]*}"
@@ -115,14 +107,9 @@ bump() {
     printf '%s.%s.%s\n' "$major" "$minor" "$patch"
 }
 
-# Present the three bumps and let the user choose. Rows are
-# "<level> <version> <what it means>"; only the second field is consumed, so
-# the description is free to change.
 pick_level() {
-    # `choice`/`line` are initialized, not just declared: a bare `local x` is
-    # UNSET, and under `set -u` bash 5 aborts on `$x` when a picker exits
-    # without choosing (Ctrl-D out of `select`). bash 3.2 tolerates it, so this
-    # only bites on a modern bash.
+    # Initialized, not just declared: a bare `local x` is unset, and under `set -u` bash 5
+    # aborts on `$x` when the picker exits without choosing (Ctrl-D out of `select`).
     local rows prompt typed PS3 choice="" line=""
     rows="$(printf '%s\n' \
         "patch   $(bump patch)   backwards-compatible fixes" \
@@ -135,8 +122,6 @@ pick_level() {
         choice="$(printf '%s\n' "$rows" | fzf --height=~8 --reverse --no-multi \
             --header="$prompt" --prompt='bump> ')" || true
     else
-        # `select` writes its menu + PS3 to stderr and reads stdin, so the
-        # picker never pollutes the captured stdout.
         echo "$prompt" >&2
         PS3="choice> "
         select line in $(printf '%s\n' "$rows" | awk '{print $1}'); do
@@ -164,21 +149,15 @@ elif [ -z "$VERSION" ]; then
     [ -n "$VERSION" ] || die "no version chosen — aborted"
 fi
 
-# Tolerate a leading `v` (the tag carries it; the Cargo.toml version does not).
 VERSION="${VERSION#v}"
 
-# Validate against the official SemVer grammar. Hand-rolling a loose `[0-9.]+`
-# would let a bad version reach Cargo.toml and — since the cargo-update sync is
-# non-fatal — get committed, tagged, and pushed only for CI's build to reject
-# it. So match SemVer precisely: X.Y.Z with no leading zeros in the numeric
-# core; an optional prerelease (`-…`) whose dot-separated identifiers are each a
-# non-leading-zero number OR contain a non-digit (so `1.2.3-rc.1` / `-0` pass but
-# `-01` / `-.` do not — the latter is what cargo itself rejects); an optional
-# build section (`+…`) whose identifiers are any non-empty alnum/hyphen run
-# (leading zeros ARE allowed in build metadata per spec). This is the shape
-# release.yml derives from GITHUB_REF_NAME.
+# Match the SemVer grammar exactly (this is also the shape release.yml derives from
+# GITHUB_REF_NAME): a loose pattern would let a bad version reach Cargo.toml, get committed,
+# tagged and pushed, and then fail in CI. Prerelease identifiers are non-leading-zero
+# numbers or contain a non-digit (`-rc.1`, `-0` pass; `-01` fails, as cargo rejects it);
+# build identifiers may have leading zeros.
 SEMVER_CORE='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-PRE_ID='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'   # numeric (no leading 0) or alphanumeric
+PRE_ID='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
 SEMVER_PRE="(-${PRE_ID}(\\.${PRE_ID})*)?"
 SEMVER_BUILD='(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
 if ! printf '%s' "$VERSION" | grep -qE "^${SEMVER_CORE}${SEMVER_PRE}${SEMVER_BUILD}$"; then
@@ -187,18 +166,14 @@ fi
 TAG="v${VERSION}"
 
 run() {
-    # Echo the command; execute it unless --dry-run.
     echo "  + $*"
     [ "$DRY_RUN" -eq 1 ] || "$@"
 }
 
-# --- Preflight guards (branch + clean tree already checked above) -----------
-
 git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1 \
     && die "tag ${TAG} already exists locally — bump to a new version"
 
-# Fetch so the ahead/behind and remote-tag checks see the truth. Non-fatal
-# offline (you might be cutting a release to push later), just a warning.
+# Non-fatal offline: a release can be cut now and pushed later.
 if ! git fetch --quiet --tags origin 2>/dev/null; then
     echo "release: warning — could not fetch origin (offline?); skipping remote up-to-date + remote-tag checks"
 else
@@ -213,14 +188,11 @@ fi
 echo "release: ${CURRENT} -> ${VERSION}  (tag ${TAG}, branch ${BRANCH})"
 [ "$DRY_RUN" -eq 1 ] && echo "release: --dry-run — no files written, no commit, no tag, no push"
 
-# --- Bump the workspace version --------------------------------------------
-
 if [ "$CURRENT" = "$VERSION" ]; then
     echo "release: Cargo.toml already at ${VERSION}; skipping the version-bump commit"
     BUMPED=0
 else
-    # Rewrite ONLY the `version = "..."` line inside the [workspace.package]
-    # section (anchored so a dependency's `version = ` is never touched).
+    # Anchored to [workspace.package] so a dependency's `version = ` is never touched.
     TMP="$(mktemp)"
     awk -v v="$VERSION" '
         /^\[/ { in_wp = ($0 == "[workspace.package]") }
@@ -238,9 +210,7 @@ else
     fi
     BUMPED=1
 
-    # Keep Cargo.lock's workspace-member versions in step so the release commit
-    # is internally consistent (CI builds without --locked, but a matching lock
-    # avoids a confusing post-checkout diff). Non-fatal if cargo is unavailable.
+    # Keep Cargo.lock's workspace versions in step with the release commit. Non-fatal.
     if command -v cargo >/dev/null 2>&1; then
         run cargo update --workspace --quiet || echo "release: warning — 'cargo update --workspace' failed; Cargo.lock may lag (harmless, CI regenerates)"
     else
@@ -251,13 +221,9 @@ else
     run git commit -m "chore(release): v${VERSION}"
 fi
 
-# --- Tag + push -------------------------------------------------------------
-
 run git tag -a "${TAG}" -m "Release ${TAG}"
-# Push the branch and the tag in ONE atomic transaction: either both refs land
-# or neither does. Two separate pushes could leave the version-bump commit on
-# origin without its tag (no release fires), and the leftover LOCAL tag would
-# then block a clean re-run. `--atomic` needs a modern remote (GitHub supports it).
+# One atomic push: separate pushes could leave the bump commit on origin without its tag,
+# and the leftover local tag would block a re-run. Needs a remote with `--atomic`.
 run git push --atomic origin "${BRANCH}" "${TAG}"
 
 if [ "$DRY_RUN" -eq 1 ]; then

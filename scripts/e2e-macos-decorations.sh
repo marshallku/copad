@@ -128,7 +128,6 @@ PASS=metal
 launch
 decorations
 
-# Focus reports.
 cat >"$W/focus.py" <<'PY'
 import os, select, sys, termios, tty, time
 fd = os.open("/dev/tty", os.O_RDWR)

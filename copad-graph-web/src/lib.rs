@@ -6,7 +6,6 @@
 //! WebKitGTK. The iOS app, which links no Rust, bundles the four files and does the same two
 //! substitutions in Swift (`GraphPage.swift`); keep the markers in step.
 
-/// Where the stylesheet goes in `graph.html`.
 pub const CSS_MARKER: &str = "/*COPAD_GRAPH_CSS*/";
 /// Where the scripts go in `graph.html` (model first: the page script uses it).
 pub const JS_MARKER: &str = "//COPAD_GRAPH_JS";
@@ -16,7 +15,6 @@ pub const CSS: &str = include_str!("../web/graph.css");
 pub const MODEL_JS: &str = include_str!("../web/model.js");
 pub const GRAPH_JS: &str = include_str!("../web/graph.js");
 
-/// The whole page.
 pub fn page() -> String {
     HTML.replacen(CSS_MARKER, CSS, 1)
         .replacen(JS_MARKER, &format!("{MODEL_JS}\n{GRAPH_JS}"), 1)

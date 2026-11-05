@@ -91,7 +91,6 @@ fn the_yazi_probe_is_answered_and_shared_memory_is_refused() {
             "\x1b_Gi=32;ENOTSUPPORTED:only direct transmission (t=d)\x1b\\".to_string(),
         ]
     );
-    // A query stores nothing.
     assert_eq!(rig.images(), 0);
 }
 
@@ -197,7 +196,6 @@ fn placing_at_the_bottom_scrolls_and_text_carries_the_image_into_history() {
     assert_eq!(rig.cursor(), (3, 1));
     rig.feed(b"\r\n\n\n");
     assert!(!rig.at(-1, 0).is_empty(), "scrolled into history");
-    // Writing over an image cell drops its fragment.
     rig.feed(b"\x1b[1;1Hx");
     assert!(rig.at(0, 0).is_empty());
 }
@@ -280,7 +278,6 @@ fn quota_evicts_unreferenced_images_first_then_refuses() {
     assert!(!g.images.contains_key(&1) && g.images.contains_key(&2) && g.images.contains_key(&3));
     assert_eq!(g.live_bytes(), size * 2);
     drop(g);
-    // Bigger than the whole quota: refused.
     rig.apc("a=t,i=5,f=24,s=20,v=30", &rgb(20, 30));
     assert_eq!(
         rig.replies(),
@@ -452,7 +449,6 @@ fn effects_describe_the_scroll_the_cursor_and_the_linefeed() {
     assert_eq!(e.scrolled, 2);
     assert_eq!(e.cursor, Some(Point::new(Line(3), Column(0))));
     assert!(e.linefeed);
-    // C=1 moves nothing.
     let e = g.lock().unwrap().handle(&mut rig.term, b"Ga=p,i=1,q=2,C=1");
     assert_eq!(e, Effects::default());
 }

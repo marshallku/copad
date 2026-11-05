@@ -1,18 +1,14 @@
 name: Homebrew tap
 
-# Publishes the released macOS/Linux artifacts to the Homebrew tap
-# (marshallku/homebrew-copad): the `copad` cask (GUI + coctl + copadd + plugins)
-# and the standalone `comux` formula.
+# Publishes the released artifacts to the Homebrew tap (marshallku/homebrew-copad): the
+# `copad` cask (GUI + coctl + copadd + plugins) and the standalone `comux` formula.
 #
-# Called by release.yml after the GitHub Release is published, and dispatchable
-# on its own to backfill / re-render the tap for an existing tag without cutting
-# a new release:
+# Called by release.yml after the Release is published; also dispatchable to re-render the
+# tap for an existing tag:
 #
 #     gh workflow run homebrew.yml -f version=v1.0.5
 #
-# The cask/formula bodies are NOT maintained in the tap — they are rendered from
-# dist/homebrew/*.rb.tmpl in this repo so the packaging lives next to the release
-# workflow that produces the artifacts it points at.
+# The bodies are rendered from dist/homebrew/*.rb.tmpl, not maintained in the tap.
 
 on:
   workflow_call:
@@ -34,11 +30,9 @@ env:
 jobs:
   update-tap:
     name: Render + push cask/formula
-    # macOS runner on purpose: the signing verification below uses codesign /
-    # stapler on the actual published bytes. That check is what lets the cask
-    # drop its old "macOS 26 (Tahoe) is unsupported" preflight — brew users must
-    # never be handed an ad-hoc-signed build, whose copadd + plugin binaries
-    # Tahoe's App Verification deletes on first launchd spawn.
+    # macOS runner: the signing verification below runs codesign / stapler on the published
+    # bytes. Brew users must never get an ad-hoc-signed build, whose copadd and plugin
+    # binaries Tahoe's App Verification deletes on first launchd spawn.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,11 +52,9 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           ls -l assets
 
-      # Gate the tap update on the published artifacts actually carrying the
-      # owner's Developer ID signature + a stapled notarization ticket. The
-      # release job falls back to ad-hoc signing whenever a signing secret is
-      # missing or the cert fails to import (deliberately — so forks still
-      # build), and that fallback must not reach Homebrew users.
+      # Gate the tap update on the published artifacts carrying a Developer ID signature and
+      # a stapled notarization ticket: release.yml falls back to ad-hoc signing when a signing
+      # secret is missing (so forks build), and that must not reach Homebrew users.
       - name: Verify Developer ID signature + notarization
         run: |
           set -euo pipefail

@@ -32,12 +32,8 @@ SCRIPT_NAME="${0##*/}"
 
 # Sentinel grammar:
 #   # COPAD_HOOK_PUBLISH: <kind> [<json-payload>]
-#
-# `<kind>` is the bus event kind (e.g. `claude.commit_blocked`).
-# `<json-payload>` is optional; when omitted, `{}` is used. When
-# present, it's a literal JSON string passed verbatim to `coctl event
-# publish`; shell-style `${VAR}` expansions inside it are expanded by
-# the hook script at run-time (we DO NOT escape `${`).
+# `<json-payload>` is optional (`{}` when omitted) and passed verbatim to `coctl event
+# publish`, so `${VAR}` in it expands in the hook script at run time (`${` is not escaped).
 SENTINEL_START='# COPAD_HOOK_PUBLISH:'
 SENTINEL_END='# COPAD_HOOK_PUBLISH_END'
 
@@ -50,19 +46,12 @@ usage() {
 
 log() { printf '[%s] %s\n' "$SCRIPT_NAME" "$*" >&2; }
 
-# Detect whether a hook file has at least one sentinel.
 file_has_sentinel() {
     grep -qF -- "$SENTINEL_START" "$1"
 }
 
-# Process one file. Modes:
-#   install   — for each unpaired sentinel, insert the publish line
-#               + END marker on the next two lines.
-#   uninstall — for each paired sentinel, remove every line strictly
-#               between sentinel and END plus the END marker itself.
-#               The sentinel stays in place so a subsequent install
-#               re-inserts the pair.
-#   dry-run   — like install but writes to stdout instead of the file.
+# uninstall keeps the sentinel line so a later install re-inserts the pair; dry-run writes
+# to stdout instead of the file.
 process_file() {
     local mode="$1"
     local file="$2"
@@ -85,7 +74,7 @@ process_file() {
             # Sentinel can be at any column (e.g. inside an indented
             # case branch). `index()` finds where the marker starts;
             # we slice from there + length(marker) to capture the
-            # body. Codex C1 round 4.
+            # body.
             marker_pos = index(sentinel_line, start_marker)
             if (marker_pos == 0) {
                 print "internal: emit_publish called on non-sentinel line: " sentinel_line > "/dev/stderr"
@@ -131,8 +120,8 @@ process_file() {
                 # first the inserted `\` would get doubled by the
                 # second pass. Bash inside `"..."` collapses `\\` →
                 # `\` and `\"` → `"`, so the emitted text round-
-                # trips to the literal user payload. Codex C1
-                # round 5: without the `\` escape, `\\tmp` in JSON
+                # trips to the literal user payload. Without the
+                # `\` escape, `\\tmp` in JSON
                 # arrived at coctl as `\tmp`.
                 escaped_payload = payload
                 gsub(/\\/, "\\\\\\\\", escaped_payload)
@@ -225,39 +214,19 @@ process_file() {
         return 0
     fi
 
-    # Atomic move if content changed. Preserve file mode portably —
-    # GNU `chmod --reference` is Linux-only, so we read the mode via
-    # `stat` with both GNU (`-c`) and BSD/macOS (`-f`) flag styles.
-    # `mktemp` creates 0600 by default; without restoring the mode the
-    # patched hook would lose its executable bit on macOS. Codex C1
-    # round 2.
+    # Preserve the file mode: mktemp creates 0600, so a patched hook would lose its
+    # executable bit on macOS. GNU `chmod --reference` is Linux-only, hence both stat styles.
     if ! diff -q "$file" "$tmp" > /dev/null 2>&1; then
-        # `stat -L` follows symlinks before reading mode. Without
-        # `-L`, a file-symlink path returns the symlink mode itself
-        # (typically 0777), and the temp file would be chmodded
-        # world-writable before replacing the real target. Codex C2
-        # round 10. The double-flag-style fallback keeps macOS BSD
-        # `stat` portable.
+        # `stat -L`: without it a symlink reports its own mode (0777) and the temp file
+        # would be chmodded world-writable before replacing the real target.
         local mode
         mode=$(stat -L -c '%a' "$file" 2>/dev/null || stat -L -f '%OLp' "$file" 2>/dev/null || true)
         if [[ -n "$mode" ]]; then
             chmod "$mode" "$tmp"
         fi
-        # Symlink-safe writeback. `find -L` walks through symlinked
-        # directories AND surfaces symlinked files inside them; a
-        # naked `mv "$tmp" "$file"` against a symlink would replace
-        # the link with a regular file, breaking dotfiles tools
-        # (e.g. stow) that symlink individual hook files. Resolve
-        # to the canonical target first so the write lands on the
-        # actual file the symlink points at. Codex C1 round 9-10.
-        # Canonical resolution must be ABSOLUTE — a plain `readlink`
-        # returns the symlink content verbatim, which for a
-        # relative target like `../foo` would resolve against the
-        # current process cwd instead of the symlink directory.
-        # Strategy: prefer `realpath` (POSIX-ish, on all modern
-        # systems we ship to including macOS), fall back to
-        # `readlink -f` (GNU), then bail. Both produce absolute
-        # paths.
+        # Write through symlinks (stow-style dotfiles): a plain `mv` would replace the link
+        # with a regular file. Resolve to an ABSOLUTE path (realpath, else `readlink -f`); a
+        # relative symlink target would otherwise resolve against the cwd.
         local target="$file"
         if [[ -L "$file" ]]; then
             if command -v realpath >/dev/null 2>&1; then
@@ -284,41 +253,29 @@ process_file() {
     fi
 }
 
-# Scan a directory for *.sh files containing the sentinel and process
-# them. Skips non-directories silently (so the default scan tolerates
-# missing ~/.claude/scripts). `find -L` follows symlinks because
-# users commonly link `~/.claude/{hooks,scripts}` from their dotfiles
-# repo; without `-L`, the find returns empty against a symlinked dir.
+# `find -L`: users link ~/.claude/{hooks,scripts} from their dotfiles, and without it find
+# returns nothing against a symlinked dir. A missing dir is skipped silently.
 scan_dir() {
     local mode="$1"
     local dir="$2"
     [[ -d "$dir" ]] || return 0
-    # `find -L` resolves the dir symlink itself + `*.sh` symlinks
-    # inside. `-type f` matches both regular files and symlinks to
-    # regular files because `-L` resolves the symlink before -type.
-    # Use -print0 / read -d for filenames with spaces.
     while IFS= read -r -d '' file; do
         process_file "$mode" "$file"
     done < <(find -L "$dir" -maxdepth 1 -type f -name '*.sh' -print0)
 }
 
-# --self-test runs a deterministic suite in a tmpdir; never touches the
-# real ~/.claude. Returns non-zero on any failure.
+# --self-test runs in a tmpdir and never touches the real ~/.claude.
 run_self_test() {
     local tmp
     tmp=$(mktemp -d /tmp/install-claude-hooks-test.XXXXXX)
-    # `${tmp:-}` so the trap survives `set -u` after the function
-    # returns and `tmp` falls out of local scope.
+    # `${tmp:-}` keeps the trap safe under `set -u` once `tmp` is out of scope.
     trap 'rm -rf "${tmp:-}"' EXIT
 
     local failed=0
-    # Helpers — declared at function scope, not nested-`local` (bash
-    # rejects `local fn() {}`; the function symbol lives at outer scope
-    # anyway, which is fine for a self-test run.
+    # Not `local`: bash cannot declare a function local.
     _selftest_pass() { printf '  ok %s\n' "$1"; }
     _selftest_fail() { printf '  FAIL %s: %s\n' "$1" "$2" >&2; failed=1; }
 
-    # Test 1: install adds publish line + END after sentinel.
     cat > "$tmp/test1.sh" <<'EOF'
 #!/bin/sh
 echo "before"
@@ -333,7 +290,6 @@ EOF
         _selftest_fail "test1" "missing publish/end after install: $(cat "$tmp/test1.sh")"
     fi
 
-    # Test 2: idempotent — second install is a no-op.
     cp "$tmp/test1.sh" "$tmp/test1.before"
     process_file install "$tmp/test1.sh"
     if cmp -s "$tmp/test1.before" "$tmp/test1.sh"; then
@@ -342,8 +298,6 @@ EOF
         _selftest_fail "test2" "second install changed file (see diff -u $tmp/test1.before $tmp/test1.sh)"
     fi
 
-    # Test 3: uninstall removes publish line, keeps both markers absent
-    # (or leaves the sentinel for re-install).
     process_file uninstall "$tmp/test1.sh"
     if grep -qF "$SENTINEL_START" "$tmp/test1.sh" \
         && ! grep -qF 'coctl event publish claude.commit_blocked' "$tmp/test1.sh" \
@@ -353,7 +307,6 @@ EOF
         _selftest_fail "test3" "uninstall left bad state: $(cat "$tmp/test1.sh")"
     fi
 
-    # Test 4: empty payload defaults to {}.
     cat > "$tmp/test4.sh" <<'EOF'
 #!/bin/sh
 # COPAD_HOOK_PUBLISH: claude.simple_event
@@ -365,7 +318,6 @@ EOF
         _selftest_fail "test4" "payload default wrong: $(cat "$tmp/test4.sh")"
     fi
 
-    # Test 5: no sentinel → no change.
     cat > "$tmp/test5.sh" <<'EOF'
 #!/bin/sh
 echo "no markers here"
@@ -379,8 +331,6 @@ EOF
         _selftest_fail "test5" "file changed without sentinel"
     fi
 
-    # Test 6: multiple sentinels in one file (e.g. pre-commit-gate with
-    # several deny paths). Both get patched independently.
     cat > "$tmp/test6.sh" <<'EOF'
 #!/bin/sh
 if cond1; then
@@ -393,14 +343,11 @@ echo "denied 2"
 fi
 EOF
     process_file install "$tmp/test6.sh"
-    # Count actual publish lines (grep on the `coctl event publish` prefix
-    # avoids the false-positive of matching the user's sentinel-comment
-    # `reason` token too).
+    # Count by the `coctl event publish` prefix; the sentinel comment also contains `reason`.
     local publish_count
     publish_count=$(grep -cF 'coctl event publish' "$tmp/test6.sh" || true)
     local end_count
     end_count=$(grep -cF "$SENTINEL_END" "$tmp/test6.sh" || true)
-    # Verify each publish carries the right reason.
     local cond1_pub
     cond1_pub=$(grep -cE 'coctl event publish.*reason.*cond1' "$tmp/test6.sh" || true)
     local cond2_pub
@@ -411,7 +358,6 @@ EOF
         _selftest_fail "test6" "expected 2 publish + 2 END + 1-each-reason, got publish=$publish_count end=$end_count cond1=$cond1_pub cond2=$cond2_pub"
     fi
 
-    # Test 7: dry-run never writes.
     cat > "$tmp/test7.sh" <<'EOF'
 #!/bin/sh
 # COPAD_HOOK_PUBLISH: claude.dryrun
@@ -424,32 +370,24 @@ EOF
         _selftest_fail "test7" "dry-run modified file"
     fi
 
-    # Test 9 (codex C1 round 1 regression): user writes natural JSON
-    # in the sentinel; the patcher escapes embedded `"` so the
-    # emitted bash double-quoted payload parses correctly.
+    # Regression: embedded `"` in natural JSON must be escaped so the emitted double-quoted
+    # payload parses.
     cat > "$tmp/test9.sh" <<'EOF'
 #!/bin/sh
 R=hello
 # COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"$R"}
 EOF
     process_file install "$tmp/test9.sh"
-    # The emitted line should contain `\"reason\":\"$R\"` (escaped),
-    # NOT a literal `"reason":"$R"` which would shell-parse into
-    # broken JSON tokens.
     if grep -qE 'coctl event publish claude.commit_blocked --quiet "\{\\"reason\\":\\"\$R\\"\}"' "$tmp/test9.sh"; then
         _selftest_pass "double-quote payload is escaped for bash"
     else
         _selftest_fail "test9" "payload not escaped: $(grep coctl "$tmp/test9.sh")"
     fi
-    # Execute the patched script with `coctl` shimmed to a function
-    # that echoes the payload it receives — proves the bash-level
-    # quoting is correct end-to-end. `command -v coctl` succeeds
-    # because the function is in scope; the function then prints the
-    # 4th argv (`<kind> --quiet "<payload>"` → payload at $3).
+    # Run the patched script with `coctl` shimmed to echo its payload, proving the bash-level
+    # quoting end to end.
     local payload_observed
     payload_observed=$(
         coctl() {
-            # $1=event, $2=publish, $3=<kind>, $4=--quiet, $5=<payload>
             printf '%s\n' "$5"
         }
         export -f coctl 2>/dev/null || true
@@ -464,7 +402,7 @@ EOS
         _selftest_fail "test9-exec" "expected '{\"reason\":\"hello\"}', got '$payload_observed'"
     fi
 
-    # Test 11 (codex C2 round 2 docs path): `$(...)` command
+    # Test 11 (docs path): `$(...)` command
     # substitution in the sentinel survives quote-escape so the
     # docs-recommended `jq -n` recipe works. The patcher escapes `"`
     # uniformly, which inside bash double-quoted context becomes
@@ -487,18 +425,14 @@ coctl() { printf '%s\n' "\$5"; }
 $(cat "$tmp/test11.sh")
 EOS
     )
-    # Just assert the command substitution executed (output starts
-    # with `{` and contains `unsafe`).
     if [[ "$payload_observed" == *'unsafe'* && "$payload_observed" == \{* ]]; then
         _selftest_pass "command substitution \$(...) survives patcher escape"
     else
         _selftest_fail "test11" "command substitution broke: '$payload_observed'"
     fi
 
-    # Test 13 (codex C1 round 5 regression): JSON with literal
-    # backslash (`\\`) round-trips intact. Without the `\` escape,
-    # bash collapsed `\\` to `\` and the wrong path landed at the
-    # action handler.
+    # Regression: a literal backslash in the JSON must survive; without the `\` escape bash
+    # collapses `\\` to `\`.
     cat > "$tmp/test13.sh" <<'EOF'
 #!/bin/sh
 # COPAD_HOOK_PUBLISH: claude.path_event {"path":"C:\\tmp\\file"}
@@ -521,7 +455,7 @@ EOS
         _selftest_fail "test13" "expected double-backslash preserved, got: $payload_observed"
     fi
 
-    # Test 14 (codex C1 round 9 regression): file-level symlinks
+    # Test 14 (regression): file-level symlinks
     # are preserved — the patch lands on the target file, not on
     # the symlink itself. Dotfiles tools (stow) commonly symlink
     # individual hook files, and a naked `mv` would replace the
@@ -542,7 +476,7 @@ EOF
         _selftest_fail "test14" "symlink replaced or target unmodified: link=$(stat -c '%F' "$tmp/link-hooks/hook.sh" 2>/dev/null) real-content=$(grep -c coctl "$tmp/real-hooks/hook.sh")"
     fi
 
-    # Test 15 (codex C1 round 10 regression): RELATIVE symlink with
+    # Test 15 (regression): RELATIVE symlink with
     # the patcher run from an unrelated cwd. Plain `readlink` returns
     # the relative target unchanged; if `mv` interprets that
     # relative to its own cwd, it writes to the wrong place. The
@@ -563,7 +497,7 @@ EOF
         _selftest_fail "test15" "relative symlink mishandled (link=$(stat -c '%F' "$tmp/rellink/hook.sh" 2>/dev/null) real-content=$(grep -c coctl "$tmp/relreal/hook.sh"))"
     fi
 
-    # Test 16 (codex C2 round 10 regression): mode is read from the
+    # Test 16 (regression): mode is read from the
     # symlink TARGET, not the symlink itself. A symlink is typically
     # 0777; reading the symlink mode and copying it to the temp
     # file would chmod the underlying target world-writable.
@@ -582,7 +516,7 @@ EOF
         _selftest_fail "test16" "expected mode 640, got $final_mode"
     fi
 
-    # Test 12 (codex C1 round 4 regression): sentinel inside an
+    # Test 12 (regression): sentinel inside an
     # indented case branch (the documented placement in
     # docs/harness-hooks.md § codex-review.sh). The parser must use
     # the index of `# COPAD_HOOK_PUBLISH:` within the line, not the
@@ -605,7 +539,7 @@ EOF
         _selftest_fail "test12" "indented sentinel slice misaligned: $(grep coctl "$tmp/test12.sh" || echo NONE)"
     fi
 
-    # Test 10 (codex C1 round 2 regression): patched file keeps its
+    # Test 10 (regression): patched file keeps its
     # original mode. GNU `chmod --reference` is Linux-only; on macOS
     # the mktemp 0600 mode would otherwise leak into the patched
     # hook and drop the executable bit. We read the original mode

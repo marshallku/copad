@@ -1,14 +1,9 @@
-//! `coctl agent status` — a thin, LOCAL passthrough to `tmx agents --json`.
+//! `coctl agent status`: a local passthrough to `tmx agents --json`, so a tmux `status-right` can
+//! show live agent state. `tmx` owns the Claude/Codex process classification.
 //!
-//! `tmx` (≥1.1) is the ecosystem's source of truth for Claude/Codex process
-//! classification (process-tree walk, zombie filtering, attention queue) — the
-//! web-bridge already shells out to it rather than re-deriving. We do the same
-//! so a tmux `status-right` can show live agent state next to `coctl usage`.
-//!
-//! The subprocess is TIME-BOUNDED (codex review C3): a wedged `tmx`/tmux must
-//! never hang a 15s-cadence status-line call, so we kill it past a short budget
-//! and degrade to an empty/"unavailable" readout (exit 0 — a status bar widget
-//! should never error out the bar).
+//! The subprocess is time-bounded: a wedged `tmx`/tmux must never hang a status-line call, so it
+//! is killed past a short budget and the readout degrades to "unavailable" (exit 0; a status bar
+//! widget must not error out the bar).
 
 use serde::Deserialize;
 use std::io::Read;
@@ -36,16 +31,12 @@ struct Agent {
     repo_name: String,
 }
 
-/// Run `tmx agents --json`, bounded by `TMX_TIMEOUT`. `None` = not installed,
-/// timed out, or empty output (all handled as "unavailable" by the caller).
+/// Run `tmx agents --json`, bounded by `TMX_TIMEOUT`. `None` = not installed, timed out, or
+/// empty output.
 ///
-/// The MAIN thread's wait is bounded by `rx.recv_timeout` — never by a thread
-/// `join()`. A separate reader drains stdout concurrently (so a full pipe can't
-/// wedge `tmx` before exit) and is DETACHED: if a lingering descendant keeps
-/// the stdout write-end open past `tmx`'s own exit/kill, the reader may block,
-/// but we never wait on it, so the status bar can't hang (codex R3/C1). On
-/// timeout we kill+reap `tmx`; the orphaned reader unblocks when the pipe
-/// finally closes, or exits with the process.
+/// The main thread waits on `rx.recv_timeout`, never on a thread `join()`. A detached reader
+/// drains stdout concurrently (a full pipe would wedge `tmx`); if a lingering descendant keeps the
+/// pipe open past `tmx`'s exit or kill, only the reader blocks, never the status bar.
 fn run_tmx(timeout: Duration) -> Option<String> {
     let mut child = Command::new("tmx")
         .args(["agents", "--json"])
@@ -64,8 +55,7 @@ fn run_tmx(timeout: Duration) -> Option<String> {
 
     match rx.recv_timeout(timeout) {
         Ok(s) => {
-            // Full stdout received (EOF) → tmx is done. Validity is decided by
-            // the caller's JSON parse, so exit status isn't consulted.
+            // EOF means tmx is done; validity is decided by the caller's JSON parse.
             reap_detached(child);
             (!s.trim().is_empty()).then_some(s)
         }
@@ -76,10 +66,8 @@ fn run_tmx(timeout: Duration) -> Option<String> {
     }
 }
 
-/// Kill `child` and reap it on a THROWAWAY thread, so the caller returns within
-/// its `recv_timeout` bound even if the process lingers after SIGKILL (e.g.
-/// wedged in uninterruptible I/O). Only the detached thread ever blocks on
-/// `wait()` — never the status-bar path (codex R5/C1).
+/// Kill `child` and reap it on a throwaway thread, so the caller still returns within its
+/// `recv_timeout` bound if the process lingers after SIGKILL (e.g. uninterruptible I/O).
 fn reap_detached(mut child: std::process::Child) {
     let _ = child.kill();
     std::thread::spawn(move || {
@@ -87,8 +75,7 @@ fn reap_detached(mut child: std::process::Child) {
     });
 }
 
-/// The supervision-relevant agents: Claude/Codex only (shell/other rows exist
-/// in the snapshot but aren't "agents" for a status readout — codex I1).
+/// Claude/Codex only; shell/other rows in the snapshot are not agents for a status readout.
 fn is_agent(a: &Agent) -> bool {
     a.kind == "claude" || a.kind == "codex"
 }
@@ -117,11 +104,9 @@ fn repo_label(a: &Agent) -> String {
     sanitize(&raw)
 }
 
-/// Normalize `tmx`'s status vocabulary (`working` / `awaiting-decision` /
-/// `ready` / `idle`, and whatever it grows next) into the three states a
-/// status bar cares about. Substring-matched so a renamed variant
-/// (`waiting-for-input`, `active`, …) still lands in the right bucket instead
-/// of silently counting as idle.
+/// Normalize `tmx`'s status vocabulary into the three states a status bar cares about.
+/// Substring-matched so a renamed variant (`waiting-for-input`, `active`, ...) still lands in the
+/// right bucket instead of counting as idle.
 #[derive(PartialEq)]
 enum Class {
     Busy,
@@ -131,8 +116,8 @@ enum Class {
 
 fn classify(status: &str) -> Class {
     let s = status.to_ascii_lowercase();
-    // `background` is tmx's status for a LIVE codex background job (kind codex,
-    // pane null) — active work, so it must bucket Busy, not Idle.
+    // `background` is tmx's status for a live codex background job (kind codex, pane null):
+    // active work, so Busy.
     if s.contains("work")
         || s == "busy"
         || s.contains("active")
@@ -172,10 +157,8 @@ fn oneline(agents: &[Agent]) -> String {
         segs.push(format!("⏸{waiting} waiting"));
     }
     if segs.is_empty() {
-        // Everything idle — a repo list here is just noise on the bar.
         return format!("{} idle", agents.len());
     }
-    // List only the repos with something actually happening (busy/attention).
     let mut repos: Vec<String> = Vec::new();
     for a in agents {
         if classify(&a.status) == Class::Idle {
@@ -195,8 +178,7 @@ fn human(agents: &[Agent]) -> String {
     }
     let mut out = String::new();
     for a in agents {
-        // Status column sized for tmx's longest current label
-        // ("awaiting-decision" = 17 chars).
+        // Sized for tmx's longest label ("awaiting-decision" = 17 chars).
         out.push_str(&format!(
             "{:<7} {:<18} {}\n",
             a.kind,
@@ -208,9 +190,8 @@ fn human(agents: &[Agent]) -> String {
 }
 
 pub fn run(oneline_mode: bool, json: bool) -> i32 {
-    // A parse failure is treated as "unavailable" (not empty) and noted on
-    // stderr, so tmx format drift surfaces instead of reading as "no agents"
-    // (codex I2).
+    // A parse failure counts as "unavailable" (not empty) and is noted on stderr, so tmx format
+    // drift does not read as "no agents".
     let (available, agents): (bool, Vec<Agent>) = match run_tmx(TMX_TIMEOUT) {
         Some(s) => match serde_json::from_str::<Snapshot>(&s) {
             Ok(snap) => (true, snap.agents.into_iter().filter(is_agent).collect()),
@@ -246,7 +227,6 @@ pub fn run(oneline_mode: bool, json: bool) -> i32 {
     }
 
     if !available {
-        // Don't error a status bar; note it on stderr and print nothing/empty.
         eprintln!("coctl agent status: tmx unavailable (not installed, errored, or timed out)");
         if oneline_mode {
             println!("—");
@@ -281,9 +261,7 @@ mod tests {
         assert!(classify("awaiting-decision") == Class::Attention);
         assert!(classify("ready") == Class::Idle);
         assert!(classify("idle") == Class::Idle);
-        // a live codex background job is active, not idle
         assert!(classify("background") == Class::Busy);
-        // future-proofing: unseen-but-related labels still bucket correctly
         assert!(classify("active") == Class::Busy);
         assert!(classify("waiting-for-input") == Class::Attention);
     }
@@ -335,7 +313,6 @@ mod tests {
         let label = repo_label(&a);
         assert!(!label.contains('\n'));
         assert!(!label.contains('\t'));
-        // and the oneline stays single-line
         assert!(!oneline(std::slice::from_ref(&a)).contains('\n'));
     }
 

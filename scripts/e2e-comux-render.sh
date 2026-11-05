@@ -71,7 +71,6 @@ for f in "${FILES[@]}" "$NFD"; do echo two >>"$f"; done
 echo new >untracked.txt
 cd "$REPO"
 
-# ---- one scenario: a mux.toml, a fresh server, a fresh client -----------------------------------
 scenario() {
     local name="$1" toml="$2"
     printf '%s\n' "$toml" >"$W/cfg/copad/mux.toml"
@@ -141,8 +140,8 @@ for p in ps:
             FAILS=$((FAILS + 1))
         fi
     }
-    # 4 s is past the default silent repaint (3 s), which re-emits every cell: this is where a row
-    # used to shift sideways.
+    # 4 s is past the default silent repaint (3 s), which re-emits every cell: a row shifting
+    # sideways shows up here.
     settle() { sleep 4; }
     shot() {
         SHOT="$1"

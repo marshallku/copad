@@ -164,7 +164,6 @@ pub fn apply_update(version: Option<String>) {
         let target = dest.join(name);
         let tmp_target = dest.join(format!(".{name}.new"));
 
-        // Read source binary into memory
         let mut src_file = match fs::File::open(&src) {
             Ok(f) => f,
             Err(e) => {
@@ -179,7 +178,6 @@ pub fn apply_update(version: Option<String>) {
             std::process::exit(1);
         }
 
-        // Write to temp file then atomic rename
         if let Err(e) = fs::write(&tmp_target, &contents) {
             eprintln!("Failed to write {name}: {e}");
             std::process::exit(1);

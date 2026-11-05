@@ -13,8 +13,6 @@ fn ev(key: Key, m: u8) -> KeyEvent<'static> {
     }
 }
 
-/// A US-layout text key the way a GUI hands it over: the unshifted character, its shifted
-/// one, and the text it types (none under Ctrl/Alt).
 fn us(c: char, m: u8) -> KeyEvent<'static> {
     let shifted = match c {
         'a'..='z' => c.to_ascii_uppercase(),
@@ -56,8 +54,6 @@ fn with(mut e: KeyEvent<'static>, action: Action) -> KeyEvent<'static> {
     e.action = action;
     e
 }
-
-// ---- legacy (the spec's "Legacy text keys" and "C0 controls" tables) ----
 
 #[test]
 fn legacy_text_key_table() {
@@ -140,8 +136,6 @@ fn legacy_functional_keys() {
     assert_eq!(k(Key::Kp(Kp::Up), 0), "\x1b[A");
 }
 
-// ---- disambiguate (flag 1) ----
-
 #[test]
 fn disambiguate_reports_what_legacy_cannot() {
     let k = |key, m| s(&ev(key, m), DISAMBIGUATE);
@@ -160,7 +154,6 @@ fn disambiguate_reports_what_legacy_cannot() {
     assert_eq!(s(&us('a', ALT), DISAMBIGUATE), "\x1b[97;3u");
     assert_eq!(s(&us('a', CTRL | SHIFT), DISAMBIGUATE), "\x1b[97;6u");
     assert_eq!(s(&us(' ', CTRL), DISAMBIGUATE), "\x1b[32;5u");
-    // Text stays text.
     assert_eq!(encode(&us('a', 0), DISAMBIGUATE, false), Encoded::Text);
     assert_eq!(encode(&us('a', SHIFT), DISAMBIGUATE, false), Encoded::Text);
     // Functional keys keep their CSI forms, never SS3.
@@ -217,8 +210,6 @@ fn modifier_keys_only_with_all_keys() {
     assert_eq!(s(&ev(Key::CapsLock, CAPS_LOCK), ALL_KEYS), "\x1b[57358;65u");
 }
 
-// ---- event types (flag 2) ----
-
 #[test]
 fn event_types() {
     let f = DISAMBIGUATE | EVENT_TYPES;
@@ -255,8 +246,6 @@ fn event_types() {
     );
 }
 
-// ---- alternate keys (flag 4) ----
-
 #[test]
 fn alternate_keys() {
     let f = DISAMBIGUATE | ALTERNATE_KEYS;
@@ -279,8 +268,6 @@ fn alternate_keys() {
     // non-US layout falls back to the US key.
     assert_eq!(bytes(&ru, 0), b"\x03");
 }
-
-// ---- report all keys (flag 8) and associated text (flag 16) ----
 
 #[test]
 fn all_keys_and_text() {
@@ -308,8 +295,6 @@ fn control_characters_are_not_text() {
     c.text = "\x03";
     assert_eq!(s(&c, DISAMBIGUATE), "\x1b[99;5u");
 }
-
-// ---- the tracker ----
 
 fn feed(t: &mut Tracker, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let (mut out, mut replies) = (Vec::new(), Vec::new());

@@ -42,18 +42,12 @@ cask "copad" do
   # symlinking HOMEBREW_PREFIX/bin/comux would collide at install time. Cask
   # users who want the multiplexer run `brew install marshallku/copad/comux`.
 
-  # No Tahoe preflight guard: since the release CI gained Developer ID signing +
-  # notarization (every Mach-O signed with a hardened runtime and secure
-  # timestamp, Copad.app notarized and stapled), macOS 26's App Verification no
-  # longer deletes copadd / the plugin binaries on first launchd spawn. The
-  # guard that used to `odie` here was the ad-hoc-signing era's fail-fast.
+  # No Tahoe preflight guard: every Mach-O is Developer-ID signed and Copad.app notarized,
+  # so macOS 26 does not delete copadd or the plugin binaries on first launchd spawn.
 
   postflight do
     require "fileutils"
 
-    # PluginSupervisor (copad-daemon) discovers plugins at startup from
-    # ~/Library/Application Support/copad/plugins/<name>/. Mirror that
-    # layout from the staged tarball.
     plugins_dst = File.expand_path("~/Library/Application Support/copad/plugins")
     FileUtils.mkdir_p(plugins_dst)
     Dir.glob("#{staged_path}/plugins/*").each do |src|
@@ -62,33 +56,24 @@ cask "copad" do
       dst = File.join(plugins_dst, File.basename(src))
       FileUtils.rm_r(dst) if File.exist?(dst)
       FileUtils.cp_r(src, dst)
-      # Strip the com.apple.quarantine xattr from copied plugin binaries.
-      # brew Cask's `app` + `binary` stanzas auto-strip quarantine, but
-      # plugin binaries get copied here via postflight Ruby — Cask has no
-      # idea they exist, so quarantine is preserved on extraction. The
-      # binaries are Developer-ID-signed, but a quarantined signed binary
-      # still gets a Gatekeeper prompt the supervisor cannot answer, so
-      # strip it recursively (manifests + assets are inert data).
+      # Strip com.apple.quarantine from the copied plugin binaries: Cask only strips it from
+      # `app`/`binary` artifacts, and a quarantined binary triggers a Gatekeeper prompt the
+      # supervisor cannot answer.
       system("/usr/bin/xattr", "-dr", "com.apple.quarantine", dst,
              out: File::NULL, err: File::NULL)
     end
 
-    # Shell hooks for live-cwd reporting (sourced from user's rc file).
     hooks_dst = File.expand_path("~/.config/copad/shell-hooks")
     FileUtils.mkdir_p(hooks_dst)
     Dir.glob("#{staged_path}/shell-hooks/copad-cwd.*").each do |src|
       FileUtils.cp(src, File.join(hooks_dst, File.basename(src)))
     end
 
-    # LaunchAgent. ProgramArguments runs copadd through the copadd-launch.sh
-    # wrapper the release tarball ships — NOT the binary directly. The wrapper
-    # is what sources ~/.config/copad/secrets.env (mode 600, so plugin bearer
-    # tokens like COPAD_WEB_BRIDGE_TOKEN never sit in this world-readable
-    # plist), puts the Homebrew bin dirs on the launchd-minimal PATH (plugins
-    # shell out to tmux/git), and defaults LANG to UTF-8 (without it tmux
-    # rewrites its format separators and the web-bridge pane list comes back
-    # empty). install.sh and scripts/install-macos.sh both wire it this way;
-    # a cask that ran the bare binary would silently ship a degraded daemon.
+    # ProgramArguments runs copadd through the copadd-launch.sh wrapper, not the binary: the
+    # wrapper sources ~/.config/copad/secrets.env (mode 600, keeping tokens out of this
+    # readable plist), adds the Homebrew bin dirs to launchd's minimal PATH (plugins shell
+    # out to tmux/git), and defaults LANG to UTF-8 (otherwise tmux rewrites its format
+    # separators and the web-bridge pane list comes back empty).
     config_dir = File.expand_path("~/.config/copad")
     FileUtils.mkdir_p(config_dir)
 
@@ -117,24 +102,21 @@ cask "copad" do
     # and a KeepAlive agent that execs the wrong copy restarts forever.
     File.write(File.join(config_dir, "copadd.path"), "#{HOMEBREW_PREFIX}/bin/copadd\n")
 
-    # `~` is not expanded by launchd, so every path below is absolute. XML-escape
-    # them: a home directory containing & or < would otherwise produce a plist
-    # launchd refuses to parse.
+    # launchd does not expand `~`, so paths are absolute and XML-escaped (a home directory
+    # with & or < would otherwise make the plist unparseable).
     xml = ->(s) { s.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;") }
     program_args =
       if File.exist?(wrapper_dst)
         "    <string>/bin/sh</string>\n    <string>#{xml.call(wrapper_dst)}</string>"
       else
-        # Defensive: an artifact without the wrapper still gets a working
-        # daemon (minus secrets/PATH) rather than a plist pointing at a
-        # missing script, which launchd would respawn in a tight loop.
+        # Fall back to the bare binary rather than a plist pointing at a missing script,
+        # which launchd would respawn in a tight loop.
         opoo "copadd-launch.sh missing from the release tarball — the LaunchAgent " \
              "will run copadd directly, so ~/.config/copad/secrets.env is not applied."
         "    <string>#{xml.call("#{HOMEBREW_PREFIX}/bin/copadd")}</string>"
       end
 
-    # Write the plist fresh each install so a HOMEBREW_PREFIX change
-    # (Intel → arm64 reinstall, custom prefix) is reflected.
+    # Rewritten each install so a HOMEBREW_PREFIX change is reflected.
     plist_dst = File.expand_path("~/Library/LaunchAgents/com.marshall.copad.daemon.plist")
     plist_body = <<~PLIST
       <?xml version="1.0" encoding="UTF-8"?>
@@ -168,39 +150,25 @@ cask "copad" do
     FileUtils.mkdir_p(File.dirname(plist_dst))
     File.write(plist_dst, plist_body)
 
-    # Bootstrap the LaunchAgent immediately so copadd is running before the
-    # user launches Copad.app. Without this the daemon would only come up at
-    # next login — and AutoSpawn (the GUI's fallback) only searches inherited
-    # PATH + ~/.cargo/bin + /opt/homebrew/bin; a Finder launch on a fresh
-    # install where copadd lives only in HOMEBREW_PREFIX/bin still works
-    # because of the /opt/homebrew/bin fallback added for brew users, but
-    # bootstrapping here means the daemon is up *before* the GUI ever asks,
-    # which keeps the status bar / plugins / triggers responsive from first
-    # launch. `bootout` first makes this idempotent on reinstall.
+    # Bootstrap now so copadd is up before the GUI first asks (AutoSpawn's PATH search is
+    # only a fallback). `bootout` first makes reinstall idempotent.
     domain = "gui/#{Process.uid}"
     label = "com.marshall.copad.daemon"
     system("/bin/launchctl", "bootout", "#{domain}/#{label}", out: File::NULL, err: File::NULL)
-    # `bootstrap` failure is rare but possible (e.g., a stale plist at the
-    # same label that bootout did not clean). Warn but do not fail the
-    # cask install — copadd will still come up at next login, and the user
-    # can `launchctl load` it manually now. Hard-failing here would block
-    # `brew install` on an edge case the user can fix in 5 seconds.
+    # Warn rather than fail: a hard failure would block `brew install` on an edge case (e.g.
+    # a stale plist at the same label); copadd still starts at next login.
     unless system("/bin/launchctl", "bootstrap", domain, plist_dst)
       opoo "launchctl bootstrap failed for #{label} — " \
            "run `launchctl load #{plist_dst}` manually, or it will start at next login."
     end
   end
 
-  # `launchctl:` boots the daemon out, which also tears down its running
-  # instance — no separate `signal:` needed for copadd. `quit:` sends an
-  # Apple Event to the GUI app via its bundle id. `delete:` removes the
-  # plist we wrote in postflight, since brew only tracks artifacts declared
-  # in the cask DSL itself.
+  # `launchctl:` boots the daemon out, tearing down its running instance, so no `signal:` is
+  # needed. `delete:` removes the plist written in postflight, which brew does not track.
   uninstall launchctl: "com.marshall.copad.daemon",
             quit:      "com.marshall.copad",
             delete:    "~/Library/LaunchAgents/com.marshall.copad.daemon.plist"
 
-  # `zap` runs only on `brew uninstall --zap copad` — destroys user state.
   zap trash: [
     "~/.config/copad",
     "~/Library/Application Support/copad",

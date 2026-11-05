@@ -1,18 +1,13 @@
-//! The kitty keyboard negotiation, read off a program's output.
+//! The kitty keyboard negotiation, read off a program's output, for a widget that lacks the protocol (VTE).
 //!
-//! For a terminal widget that does not implement the protocol (VTE): every byte the program
-//! writes passes through [`Tracker::feed`], which takes out the four negotiation sequences
-//! (`CSI > flags u` push, `CSI < n u` pop, `CSI = flags ; mode u` set, `CSI ? u` query),
-//! keeps the per-screen flag stacks, answers the query, and hands everything else on byte for
-//! byte. It also follows the two modes the key encoder needs: DECCKM and which screen is up.
+//! [`Tracker::feed`] strips the four negotiation sequences (push, pop, set, query), keeps per-screen flag
+//! stacks, answers the query, and passes everything else through byte for byte. It also follows DECCKM and
+//! which screen is up.
 //!
-//! The parser follows the DEC/ECMA-48 state machine VTE itself uses, so it agrees with the
-//! widget on where a sequence starts and ends: ESC in any state starts a new escape (so ESC
-//! ends a string, and `ESC \` is ST), CAN and SUB cancel, OSC ends at BEL or ST, while DCS, SOS,
-//! PM and APC end only at ST — a BEL inside them is data. Nothing inside a string is ever
-//! interpreted.
+//! The parser follows the DEC/ECMA-48 state machine VTE uses so both agree on where a sequence ends: ESC starts
+//! a new escape in any state, CAN and SUB cancel, OSC ends at BEL or ST, DCS/SOS/PM/APC end only at ST (a BEL
+//! inside is data), and nothing inside a string is interpreted.
 
-/// The most flag entries a screen's stack keeps; a push onto a full stack evicts the oldest.
 const STACK_CAP: usize = 16;
 /// A CSI longer than this is no negotiation sequence; it is passed through as it arrives.
 const CSI_CAP: usize = 64;
@@ -23,14 +18,11 @@ enum State {
     /// Saw 0xC2 in ground: the next byte may make it a C1 control in UTF-8 form.
     GroundC2,
     Esc,
-    /// `ESC` + intermediates, until the final byte.
     EscIntermediate,
-    /// A CSI being held back until its final byte decides whether it is ours.
     Csi,
     /// A CSI known not to be ours (too long), passed through until its final byte.
     CsiPassthrough,
     Osc,
-    /// DCS / SOS / PM / APC: ends only at ST.
     String,
     /// Saw 0xC2 inside a string: 0x9C makes it the C1 ST.
     StringC2 {
@@ -41,7 +33,6 @@ enum State {
 #[derive(Debug, Clone)]
 pub struct Tracker {
     state: State,
-    /// The held-back bytes of the sequence being read (ESC, or a whole CSI).
     held: Vec<u8>,
     /// The flag stacks of the screen that is up and of the other one.
     active: Vec<u8>,
@@ -68,7 +59,6 @@ impl Tracker {
         }
     }
 
-    /// The flags in force on the screen that is up.
     pub fn flags(&self) -> u8 {
         self.active.last().copied().unwrap_or(0)
     }
@@ -91,7 +81,6 @@ impl Tracker {
     }
 
     fn step(&mut self, b: u8, out: &mut Vec<u8>, replies: &mut Vec<u8>) {
-        // Anywhere: CAN / SUB abandon a sequence, ESC starts a new one.
         match b {
             0x18 | 0x1a => {
                 self.flush_held(out);
@@ -124,7 +113,6 @@ impl Tracker {
                 }
                 self.flush_held(out);
                 if b == 0xc2 {
-                    // Another lead byte: it may itself start a C1 control.
                     self.held.push(b);
                     return;
                 }
@@ -155,7 +143,6 @@ impl Tracker {
                     out.push(b);
                     self.state = State::EscIntermediate;
                 }
-                // A C0 control inside an escape is executed and the escape goes on.
                 0x00..=0x1f => out.push(b),
                 _ => {
                     self.flush_held(out);
@@ -221,11 +208,8 @@ impl Tracker {
         }
     }
 
-    /// A complete CSI is held in `self.held`: consume it if it is a negotiation sequence,
-    /// otherwise pass it on (noting the modes it sets).
     fn finish_csi(&mut self, out: &mut Vec<u8>, replies: &mut Vec<u8>) {
         let held = std::mem::take(&mut self.held);
-        // After `ESC [` or its C1 form `C2 9B`, both two bytes.
         let body = &held[2..];
         let (&fin, inner) = body.split_last().expect("a CSI ends in its final byte");
         let (prefix, params) = match inner.first() {
@@ -301,7 +285,6 @@ impl Tracker {
         }
     }
 
-    /// RIS (`ESC c`): back to the power-on state.
     fn reset(&mut self) {
         self.active.clear();
         self.inactive.clear();

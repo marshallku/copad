@@ -33,11 +33,9 @@ class Comux < Formula
   else
     depends_on arch: :x86_64
 
-    # The statically linked (musl) asset, not the glibc one. Homebrew on Linux
-    # runs on hosts whose glibc is frequently older than the release runner's
-    # (the glibc build needs 2.39+), and brew's own glibc formula does not help
-    # a prebuilt binary that the system loader resolves. The static build has no
-    # libc dependency at all, so it runs on every supported host.
+    # The static (musl) asset, not the glibc one: Homebrew on Linux often runs on hosts whose
+    # glibc is older than the release runner's (the glibc build needs 2.39+), and a prebuilt
+    # binary resolves libc through the system loader. The static build has no libc dependency.
     url "https://github.com/marshallku/copad/releases/download/v__VERSION__/comux-v__VERSION__-x86_64-linux-musl"
     sha256 "__SHA256_LINUX_MUSL__"
   end

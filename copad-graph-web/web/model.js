@@ -7,7 +7,6 @@
 "use strict";
 
 const GraphModel = (() => {
-    /** The kinds a step can have, and the colour role each is drawn in. */
     const KIND_ROLE = {
         prompt: "text",
         read: "blue",
@@ -23,7 +22,6 @@ const GraphModel = (() => {
 
     /** The most file nodes an agent view draws (the most touched win); the rest are counted. */
     const VIEW_FILES = 300;
-    /** Files per agent in the all-sessions view. */
     const ALL_FILES = 24;
 
     /** Shortest and longest a step plays, and the longest a whole replay runs. */
@@ -37,7 +35,6 @@ const GraphModel = (() => {
 
     const keyOf = (a) => `${a.token}|${a.conversation}|${a.gen}`;
 
-    /** A cache of one agent's graph: overview + every history page merged, by identity. */
     function emptyCache(agent) {
         return {
             key: keyOf(agent),
@@ -73,7 +70,6 @@ const GraphModel = (() => {
         return c;
     }
 
-    /** Fold a history page in. A page of another graph (gen) is ignored. */
     function mergePage(cache, page, before) {
         if (!cache || cache.key !== `${page.token}|${page.conversation}|${page.gen}`) return false;
         const had = cache.steps.size;
@@ -242,7 +238,6 @@ const GraphModel = (() => {
         return at;
     }
 
-    /** The index of the last step started at play time `t` (−1 before the first). */
     function stepAt(at, t) {
         let lo = 0;
         let hi = at.length - 1;
@@ -283,7 +278,6 @@ const GraphModel = (() => {
         return { present, lit, beams, spill, step: cur || null };
     }
 
-    /** A step as one line of text: what it did and to what. */
     function describe(step, files, subs) {
         if (!step) return "";
         const f = step.file != null ? files.get(step.file) : null;

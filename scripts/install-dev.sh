@@ -48,7 +48,7 @@ while [ "$#" -gt 0 ]; do
         --no-build)    DO_BUILD=false ; shift ;;
         --no-plugins)  DO_PLUGINS=false ; shift ;;
         --no-daemon)   DO_DAEMON=false ; shift ;;
-        --with-daemon) DO_DAEMON=true ; shift ;;       # explicit; default is on
+        --with-daemon) DO_DAEMON=true ; shift ;;
         --restart)     DO_RESTART=true ; shift ;;
         -h|--help)
             sed -n '2,/^set -euo/p' "$0" | grep -E '^# ' | sed 's/^# \?//'
@@ -88,11 +88,6 @@ done
 
 echo "==> installing copad + coctl + copadd + comux into $INSTALL_DIR"
 if [ -n "$SUDO" ]; then
-    # `install -m755` on existing files just rewrites; safe to repeat.
-    # copadd is the always-on daemon for trigger dispatch + plugin
-    # supervision; comux is the standalone agent-orchestration
-    # terminal multiplexer — bundling them here means a single install
-    # gives the user the full GUI + CLI + daemon + mux set.
     $SUDO install -Dm755 "$TARGET/copad" "$INSTALL_DIR/copad"
     $SUDO install -Dm755 "$TARGET/coctl" "$INSTALL_DIR/coctl"
     $SUDO install -Dm755 "$TARGET/copadd" "$INSTALL_DIR/copadd"
@@ -104,43 +99,30 @@ else
     install -Dm755 "$TARGET/copadd" "$INSTALL_DIR/copadd"
     install -Dm755 "$TARGET/comux" "$INSTALL_DIR/comux"
 fi
-# The multiplexer was renamed copad-mux → comux; remove a stale legacy binary so an
-# upgrade doesn't leave two commands pointing at different versions.
 if [ -e "$INSTALL_DIR/copad-mux" ]; then
     echo "==> removing legacy $INSTALL_DIR/copad-mux (renamed to comux)"
     $SUDO rm -f "$INSTALL_DIR/copad-mux"
 fi
 
 echo "==> installing desktop entry + hicolor icons into ${DESKTOP_DIR%/applications} / $ICON_BASE"
-# Desktop file basename matches the GTK app_id (com.marshall.copad)
-# so Wayland compositors can map the running window to this launcher
-# entry. Without that mapping, the WM falls back to a generic icon
-# and the StartupNotify cookie does not flow through.
+# Desktop file basename must match the GTK app_id (com.marshall.copad) so Wayland
+# compositors map the window to this launcher.
 $SUDO install -Dm644 \
     "$REPO_ROOT/copad-linux/com.marshall.copad.desktop" \
     "$DESKTOP_DIR/com.marshall.copad.desktop"
-# Cleanup: a pre-rename "copad.desktop" lingering at the same dest
-# would show up as a second, broken launcher entry.
+# A pre-rename copad.desktop at the same dest would show up as a second, broken launcher.
 $SUDO rm -f "$DESKTOP_DIR/copad.desktop"
 for size in 16 22 24 32 48 64 128 256 512; do
     $SUDO install -Dm644 \
         "$REPO_ROOT/copad-linux/icons/hicolor/${size}x${size}/apps/copad.png" \
         "$ICON_BASE/${size}x${size}/apps/copad.png"
 done
-# Refresh the icon cache so launchers pick up Icon=copad without a logout.
-# gtk-update-icon-cache is in libgtk-4 / gtk4 packages — present on any
-# system that already builds copad, so the missing-binary branch is rare.
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     $SUDO gtk-update-icon-cache -q -t "$ICON_BASE" || true
 fi
 
-# Sanity: user might have BOTH ~/.local/bin/copad and
-# /usr/local/bin/copad. PATH typically prefers /usr/local/bin, so
-# if they're out of sync the user gets the wrong one. We can't
-# auto-fix without making policy decisions about which copy to
-# trust, but we can flag the drift so the next "why isn't my fix
-# applied?" debug session is shorter. Concrete remedies the user
-# can pick from are listed in the warning.
+# Flag drift between the two copies: PATH typically prefers /usr/local/bin, so a stale one
+# silently shadows the fresh build.
 if [ -x "$HOME/.local/bin/copad" ] && [ -x "/usr/local/bin/copad" ]; then
     if ! cmp -s "$HOME/.local/bin/copad" "/usr/local/bin/copad"; then
         echo
@@ -161,9 +143,6 @@ if $DO_PLUGINS; then
     bash "$REPO_ROOT/scripts/install-plugins.sh"
 fi
 
-# Phase 22.2 — seed workflow YAMLs. Skip-if-exists so user edits are
-# preserved across re-installs. New examples (added in later commits)
-# land on the next install; existing ones are never overwritten.
 WORKFLOWS_SRC="$REPO_ROOT/examples/workflows"
 WORKFLOWS_DST="$HOME/.config/copad/workflows"
 if [ -d "$WORKFLOWS_SRC" ]; then
@@ -183,16 +162,9 @@ if [ -d "$WORKFLOWS_SRC" ]; then
     echo "==> seeded $seeded workflow yaml(s) to $WORKFLOWS_DST (skipped $skipped existing)"
 fi
 
-# Phase 22.1 / 22.3 context bridge (zsh). Linux gets live cwd from VTE
-# (OSC 7) for free, so unlike macOS no copad-cwd hook is needed here —
-# but the richer pane_context (git_remote / branch / tmux) AND the
-# `doc.opened` signal that drives the KB panel's active-note slot +
-# project scoping come ONLY from this prompt hook. Without it those two
-# features are silently inert (the panel's static slots still work).
-# Single source of truth at examples/shell/copad-context.zsh; copied to
-# ~/.config/copad/shell-hooks/ to match the macOS installer. The user
-# sources it from their rc (printed at the end). No-op outside copad PTY
-# children, so sourcing unconditionally is safe.
+# Linux gets cwd from VTE (OSC 7), but pane_context (git_remote / branch / tmux) and the
+# `doc.opened` signal behind the KB panel's active-note slot come only from this prompt
+# hook. No-op outside copad PTY children.
 CONTEXT_HOOK_SRC="$REPO_ROOT/examples/shell/copad-context.zsh"
 CONTEXT_HOOK_DST="$HOME/.config/copad/shell-hooks/copad-context.zsh"
 if [ -f "$CONTEXT_HOOK_SRC" ]; then
@@ -202,16 +174,8 @@ if [ -f "$CONTEXT_HOOK_SRC" ]; then
 fi
 
 if $DO_DAEMON; then
-    # `systemd --user` unit install. Without this, copadd never starts
-    # automatically — every reboot or new SSH session leaves the user
-    # with no daemon, and harness publishes silently no-op via the
-    # --quiet path. The block below copies the unit + does
-    # daemon-reload / enable / restart so the binary is picked up on
-    # both first install and subsequent re-installs (where the unit
-    # is already active and `enable --now` would no-op the start).
-    # On systems with `loginctl enable-linger <user>` set, the daemon
-    # also survives logout. See docs/harness-hooks.md "SSH + daemon
-    # lifecycle".
+    # Without the unit copadd never starts after a reboot or new SSH session. See
+    # docs/harness-hooks.md "SSH + daemon lifecycle".
     if command -v systemctl >/dev/null 2>&1; then
         UNIT_DST="$HOME/.config/systemd/user"
         UNIT_SRC="$REPO_ROOT/dist/systemd/copad-daemon.service"
@@ -220,33 +184,20 @@ if $DO_DAEMON; then
         else
             echo "==> installing systemd --user unit into $UNIT_DST"
             mkdir -p "$UNIT_DST"
-            # Rewrite COPADD_BIN_PATH to the actual install location.
-            # Bash 5.3+ defaults `patsub_replacement` ON, which makes
-            # unescaped `&` in `${var//pat/repl}` expand to the
-            # matched text — same hazard as sed/awk. Disable the
-            # shopt so the replacement is guaranteed literal. The
-            # shopt name was introduced in bash 5.3 so the unset
-            # error-no-ops on older bash. Codex C1 step 7 rounds 2-3.
+            # Disable patsub_replacement (default ON in bash 5.3+, where `&` in a replacement
+            # expands to the match); on older bash the unset is a harmless no-op.
             shopt -u patsub_replacement 2>/dev/null || true
             UNIT_TEXT=$(cat "$UNIT_SRC")
             UNIT_TEXT=${UNIT_TEXT//COPADD_BIN_PATH/$INSTALL_DIR/copadd}
             printf '%s\n' "$UNIT_TEXT" > "$UNIT_DST/copad-daemon.service"
             chmod 644 "$UNIT_DST/copad-daemon.service"
-            # daemon-reload picks up the unit. `enable` creates the
-            # WantedBy symlink so the unit starts on next user-session
-            # boot. `restart` covers BOTH the first-install case
-            # (restart of an inactive unit ≡ start) AND the re-install
-            # case where the binary changed and we need the running
-            # daemon to pick it up. `enable --now` would silently
-            # leave the old binary in place if the unit was already
-            # active. Codex C1 step 7 round 6.
+            # `restart`, not `enable --now`: on a re-install the unit is already active and
+            # `enable --now` would leave the old binary running.
             systemctl --user daemon-reload
             systemctl --user enable copad-daemon.service
             systemctl --user restart copad-daemon.service
             echo "    systemctl --user status copad-daemon  # to inspect"
             echo "    journalctl --user -u copad-daemon -f  # to tail logs"
-            # Linger reminder — not enabled automatically (per-user
-            # policy decision). Without it, daemon dies on last logout.
             if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q '^Linger=yes$'; then
                 echo
                 echo "note: linger is OFF for $USER — copadd will die on last logout."
@@ -262,17 +213,8 @@ if $DO_DAEMON; then
     fi
 fi
 
-# Nudge the user to source the context bridge hook if they haven't.
-# Without it the KB panel's "Active note" slot + project scoping stay
-# inert (doc.opened / pane.context_changed never fire — the symptom is
-# an always-empty "Active note" and no project pill, easily mistaken
-# for "that's just how it is"). Quiet once sourced so re-installs don't
-# nag. Mirrors the macOS installer's post-install instruction.
-#
-# grep returns exit 2 (error) when ANY path argument is missing, even
-# if the pattern matched in another file — and `-s` suppresses only the
-# message, not that code. So check each rc that actually exists rather
-# than passing the whole candidate list to one grep.
+# grep exits 2 when ANY path is missing even if another file matched (`-s` only silences
+# the message), so check each rc that exists instead of passing the whole list to one grep.
 if [ -f "$CONTEXT_HOOK_DST" ]; then
     NUDGE_NEEDED=true
     for rc in "$HOME/.zshrc" "$HOME/.zshenv"; do

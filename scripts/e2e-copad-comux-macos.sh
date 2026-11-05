@@ -120,7 +120,6 @@ done
 [[ -n "$claimed" ]] || fail "copad never claimed the comux client's sidebar: $(clients)"
 log "ok — copad found its tab's comux client by tag and claimed sidebar, status and overlays"
 
-# comux no longer draws its sidebar in that tab: the screen has no `spaces` header.
 # The claim lands before comux's next frame: give the pane a moment to redraw without it.
 for _ in $(seq 1 20); do
     SCREEN="$("$COCTL" --socket "$GUI" terminal read 2>/dev/null || true)"
@@ -131,7 +130,6 @@ grep -q "spaces" <<<"$SCREEN" && fail "the TUI sidebar is still drawn:
 $SCREEN"
 log "ok — the comux frame in the copad tab has no TUI sidebar"
 
-# The native panel is on screen with comux's sessions (the window's accessibility tree).
 ax() {
     osascript <<OSA 2>/dev/null
 tell application "System Events"
@@ -472,12 +470,10 @@ gwait 'd["page"]["steps"]' 35 60
 log "ok — the right panel shows the agent's 33 files, its Explore subagent and all 35 steps (paged)"
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/graph-agent.png" && log "screenshot: $W/graph-agent.png"
 TOPW="$(gq 'd["terminal_width"]')"
-# Live: a new step reaches the open panel.
 use g4 Write '{"file_path":"/repo/src/new.rs"}' 7; res g4 false 7
 gwait 'd["page"]["seq"]' 36 40
 gwait 'd["page"]["card"].startswith("Wrote /repo/src/new.rs") or d["page"]["card"]' True 20
 log "ok — a step appended to the transcript reached the panel live (#36 Wrote /repo/src/new.rs)"
-# All sessions, then closed: the terminal gets its width back.
 [[ "$(gq 'd["mode"]' '{"open":true,"mode":"all"}')" == all ]] || fail "mode all"
 gwait '(d["page"]["mode"], d["page"]["agents"])' "('all', 1)" 20
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/graph-all.png" && log "screenshot: $W/graph-all.png"
@@ -506,7 +502,6 @@ sleep 1
 log "ok — the notifications drop down under the top bar's bell: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result",d)["frame"])' "$W/notif.json")"
 kill "$APID" 2>/dev/null || true
 
-# Closing copad releases the claim: comux draws its own sidebar again for the next client.
 kill "$APP_PID"; APP_PID=""
 for _ in $(seq 1 40); do
     c="$(clients)"

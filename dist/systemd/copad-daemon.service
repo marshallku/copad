@@ -2,48 +2,35 @@
 Description=copad daemon (action registry, trigger engine, plugin supervisor)
 Documentation=https://github.com/marshallku/copad
 Documentation=file:%h/dev/copad/docs/harness-integration.md
-# Wait for the user session to be fully up so DBUS_SESSION_BUS_ADDRESS
-# resolves and XDG_RUNTIME_DIR is mounted. default.target is the
-# user-instance equivalent of multi-user.target.
+# Wait for the user session so DBUS_SESSION_BUS_ADDRESS resolves and XDG_RUNTIME_DIR is
+# mounted.
 After=default.target
 
 [Service]
 Type=simple
-# `COPADD_BIN_PATH` is rewritten by `scripts/install-dev.sh` at copy
-# time to match the install location (`--user` → ~/.local/bin/copadd,
-# `--system` → /usr/local/bin/copadd). Systemd does not expand `~`
-# or `$HOME` and has no specifier that picks between user vs system
-# install dirs, so sed substitution on the template is the simplest
-# way to keep one unit file in tree. Codex C1 step 7.
+# `COPADD_BIN_PATH` is rewritten at install time (scripts/install-dev.sh, install.sh) to the
+# install location: systemd expands neither `~` nor `$HOME` here and has no specifier that
+# picks between user and system install dirs.
 ExecStart=COPADD_BIN_PATH
 # Restart on crash but not on intentional `systemctl stop` (success).
 Restart=on-failure
-# 10s back-off lets the daemon settle if a transient cause (socket
-# path busy on rapid restart) is the trigger; tighter values risk
+# 10s back-off lets a transient cause (socket path busy on rapid restart) settle and avoids
 # tight restart loops on persistent config errors.
 RestartSec=10
 # Pump copadd info-level logs into the journal. Set RUST_LOG=debug
 # in `systemctl --user edit copad-daemon` to override per-deployment.
 Environment=RUST_LOG=info
-# Deterministic PATH for the daemon and everything it spawns. The
-# `systemd --user` instance otherwise inherits whatever the login
-# session happened to export, which is not guaranteed to include
-# `~/.local/bin` / `~/.cargo/bin`. The pilot plugin (Phase 24) shells
-# out to `csd`, which in turn spawns `claude` + `tmux`, so all three
-# must resolve from copadd's env, not just an interactive shell's.
-# `%h` expands to the user's home (systemd specifier).
+# Deterministic PATH: the `systemd --user` instance otherwise inherits whatever the login
+# session exported, which may lack ~/.local/bin and ~/.cargo/bin. The pilot plugin shells out
+# to `csd`, which spawns `claude` + `tmux`. `%h` is the user's home.
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-# Explicit csd binary for the pilot goal-queue plugin. Redundant with
-# PATH above, but pins the location so a PATH change can't silently
-# break dispatch. Override per-deployment via `systemctl --user edit`.
+# Pins the csd location so a PATH change cannot silently break dispatch. Override
+# per-deployment via `systemctl --user edit`.
 Environment=COPAD_PILOT_CSD_BIN=%h/.cargo/bin/csd
-# Limit runaway memory + thread pool damage. copadd's own thread
-# pool is bounded; this is a defense in depth against plugin
-# fork-bombs landing through the supervisor.
+# Defense in depth against plugin fork-bombs landing through the supervisor.
 LimitNOFILE=4096
 
 [Install]
-# user-instance equivalent of multi-user.target — `systemctl --user
-# enable copad-daemon` creates the WantedBy symlink under
+# `systemctl --user enable` creates the WantedBy symlink under
 # ~/.config/systemd/user/default.target.wants/.
 WantedBy=default.target

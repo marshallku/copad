@@ -1,15 +1,8 @@
 //! `coctl slack` — wrapper over `slack.*` actions.
 //!
-//! | CLI                                                  | Action                |
-//! |------------------------------------------------------|-----------------------|
-//! | `slack send <channel> <text> [--thread-ts]`          | `slack.post_message`  |
-//! | `slack get <channel> <ts>`                           | `slack.get_message`   |
-//! | `slack auth-status`                                  | `slack.auth_status`   |
-//!
-//! `auth-login` is deliberately NOT a subcommand here — Slack token
-//! capture goes through the plugin's own interactive `copad-plugin-
-//! slack auth` binary (env paste + keyring write). Wrapping it in
-//! coctl would invert the trust boundary.
+//! `auth-login` is deliberately not a subcommand: token capture goes through the plugin's own
+//! interactive `copad-plugin-slack auth` binary, and wrapping it in coctl would invert the trust
+//! boundary.
 
 use clap::Subcommand;
 use serde_json::{Value, json};

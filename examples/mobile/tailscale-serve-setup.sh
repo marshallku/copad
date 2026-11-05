@@ -9,13 +9,10 @@
 #   ./tailscale-serve-setup.sh              # print token + setup guidance
 #   ./tailscale-serve-setup.sh --serve      # also run `tailscale serve` (HTTPS)
 #
-# Why tailscale serve (not a raw bind): it gives HTTPS + a *.ts.net host = the
-# secure context iOS/Android require before a PWA may use a service worker or Web
-# Push, and it injects the Tailscale-User-Login identity header so the phone skips
-# HTTPS + a secure context, which the PWA needs for its service worker and Web Push.
-# It does NOT remove the bearer token: the identity-header auth path was removed because it
-# let any page a browser on an admitted device visited open a terminal. See
-# docs/mobile-access.md § Auth model.
+# Why tailscale serve (not a raw bind): HTTPS on a *.ts.net host is the secure context iOS/Android
+# require before a PWA may use a service worker or Web Push. It does NOT remove the bearer token:
+# the Tailscale-User-Login identity-header auth path was removed because it let any page a
+# browser on an admitted device visited open a terminal. See docs/mobile-access.md § Auth model.
 
 set -euo pipefail
 
@@ -34,8 +31,8 @@ echo
 
 case "$(uname)" in
 Linux)
-    # Paste-safe: `printf > file` instead of a nested heredoc (an indented
-    # heredoc terminator wouldn't terminate when the user pastes it).
+    # Paste-safe: `printf > file`, not a nested heredoc (an indented terminator would not end it
+    # when pasted).
     cat <<EOF
 2) Inject on Linux (systemd user drop-in), then reload — paste these lines:
      D=~/.config/systemd/user/copad-daemon.service.d
@@ -76,8 +73,8 @@ echo
 if [ "$DO_SERVE" = 1 ]; then
     command -v tailscale >/dev/null || { echo "tailscale not installed" >&2; exit 1; }
     echo "Running: tailscale serve --bg --https=443 http://127.0.0.1:$PORT"
-    # Writing a serve config is root-only unless the user holds the operator
-    # role. Say so instead of letting tailscale's bare "Access denied" land.
+    # Writing a serve config is root-only unless the user holds the operator role; say so instead
+    # of leaving tailscale's bare "Access denied".
     if ! tailscale serve --bg --https=443 "http://127.0.0.1:$PORT"; then
         echo >&2
         echo "serve failed (tailscale's own error is above)." >&2

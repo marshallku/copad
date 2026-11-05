@@ -1,12 +1,7 @@
-//! A blocking L0 subscriber: open a stream, hand every server message to a callback, send
-//! commands and claims. Shared by every Rust host (copad-linux, copad-ffi for macOS,
-//! web-bridge) so the handshake, the ping cadence and the "remote printed something before
-//! comux" diagnosis exist once.
-//!
-//! The transport is either the local unix socket or a spawned command whose stdin/stdout
-//! carry the stream — `ssh -T <dest> comux proxy --stdio` for a remote server. The command
-//! form keeps the last lines of its stderr so a failure (`Permission denied (publickey)`,
-//! `comux: command not found`) can be shown instead of a bare "disconnected".
+//! A blocking L0 subscriber over the local comux socket or a spawned command's stdin/stdout (`ssh -T <dest>
+//! comux proxy --stdio`). Shared by every Rust host so the handshake, ping cadence and the "remote printed
+//! something before comux" diagnosis exist once. The command form keeps its last stderr lines so a failure
+//! (`Permission denied (publickey)`) can be shown instead of a bare "disconnected".
 
 use crate::{PING_SECS, PROTO, PubMsg, SubMsg};
 use serde_json::Value;
@@ -19,12 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Where the comux server is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Endpoint {
-    /// A local comux socket.
     Socket(PathBuf),
-    /// A command bridging to one (`ssh -T host comux proxy --stdio`).
     Command { program: String, args: Vec<String> },
 }
 
@@ -62,14 +54,12 @@ impl Endpoint {
     }
 }
 
-/// The remote command string `Endpoint::ssh` runs. A login shell (`$SHELL -lc`) because the
-/// exec channel is non-interactive and would otherwise miss the PATH entries comux installs
-/// into; `exec` so the proxy is the process ssh talks to.
+/// A login shell (`$SHELL -lc`) because the non-interactive exec channel would miss the PATH entries comux
+/// installs into; `exec` so the proxy is the process ssh talks to.
 pub fn remote_proxy_command() -> String {
     remote_proxy_command_for("comux")
 }
 
-/// [`remote_proxy_command`] for a given remote comux command.
 pub fn remote_proxy_command_for(comux: &str) -> String {
     format!("exec \"${{SHELL:-/bin/sh}}\" -lc 'exec {comux} proxy --stdio'")
 }
@@ -92,8 +82,6 @@ pub fn default_socket() -> PathBuf {
         .join("sock")
 }
 
-/// An opened transport: reader, writer, the child to reap (command form), the socket to
-/// shut down (socket form), and the command's stderr tail.
 type Transport = (
     Box<dyn Read + Send>,
     Box<dyn Write + Send>,
@@ -102,15 +90,13 @@ type Transport = (
     Option<Arc<Mutex<VecDeque<String>>>>,
 );
 
-/// What the callback receives.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkEvent {
     Msg(PubMsg),
-    /// The stream ended; the string says why (for showing, not parsing).
+    /// Why the link closed, for showing, not parsing.
     Closed(String),
 }
 
-/// An open subscription. Dropping it closes the stream.
 pub struct Link {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     closed: Arc<AtomicBool>,
@@ -135,7 +121,6 @@ const CUT: Duration = if cfg!(test) {
     SILENCE
 };
 
-/// What tears the transport down; shared with the ping thread so a silent server can be cut.
 struct Closer {
     child: Mutex<Option<Child>>,
     shutdown: Option<UnixStream>,
@@ -159,9 +144,7 @@ impl Closer {
 }
 
 impl Link {
-    /// Connect, send `subscribe`, and start delivering messages to `on` from a reader
-    /// thread. `on` is called for every message in order, then once with
-    /// [`LinkEvent::Closed`].
+    /// `on` is called for every message in order, then once with [`LinkEvent::Closed`].
     pub fn open<F>(ep: &Endpoint, on: F) -> io::Result<Link>
     where
         F: FnMut(LinkEvent) + Send + 'static,
@@ -297,7 +280,6 @@ impl Link {
             finish(why);
         });
 
-        // Ping: keeps chrome claims alive and notices a dead peer from our side too.
         let pw = writer;
         let pclosed = closed;
         std::thread::spawn(move || {
@@ -333,7 +315,6 @@ impl Link {
         Ok(link)
     }
 
-    /// Send one message.
     pub fn send(&self, msg: &SubMsg) -> io::Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "link closed"));
@@ -378,7 +359,6 @@ fn write_line(w: &Mutex<Box<dyn Write + Send>>, msg: &SubMsg) -> io::Result<()> 
     w.flush()
 }
 
-/// Keep the last few stderr lines of a transport command for the close reason.
 fn spawn_stderr_tail(err: impl Read + Send + 'static, tail: Arc<Mutex<VecDeque<String>>>) {
     std::thread::spawn(move || {
         for line in BufReader::new(err).lines().map_while(Result::ok) {

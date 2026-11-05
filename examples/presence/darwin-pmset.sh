@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Presence detection on macOS, polling HIDIdleTime via ioreg.
-#
-# macOS doesn't expose a per-user "idle" hint as clean as logind's
-# IdleHint, but `ioreg -c IOHIDSystem` reports HIDIdleTime in
-# nanoseconds since the last keyboard/mouse event. We poll it.
+# Presence detection on macOS, polling HIDIdleTime (nanoseconds since the last keyboard/mouse
+# event) from `ioreg -c IOHIDSystem`.
 #
 # Run as a LaunchAgent. Drop a plist at
 # ~/Library/LaunchAgents/com.you.copad-presence.plist with:
@@ -27,8 +24,7 @@ COCTL="${COCTL:-coctl}"
 
 last=""
 while :; do
-  # HIDIdleTime is the first one ioreg lists for IOHIDSystem; it's
-  # nanoseconds. Convert to seconds with /1e9.
+  # HIDIdleTime is the first match for IOHIDSystem, in nanoseconds.
   idle_ns="$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF; exit}')"
   if [ -z "$idle_ns" ]; then
     sleep "$POLL_SECS"

@@ -1,9 +1,6 @@
-//! `graph`: the work graph — what each live agent has read, edited, searched and run, its
-//! subagents, and the order it did it in (decisions #204).
-//!
-//! The topic is a bounded OVERVIEW: per agent its counters, the newest files and steps, its
-//! subagents. The full history of one agent comes page by page from the `graph` command
-//! ([`GraphPage`]), which a host asks for when it shows that agent.
+//! `graph`: the work graph, what each live agent has read, edited, searched and run, its subagents, and
+//! the order (decisions #204). The topic is a bounded overview; one agent's full history comes page by page
+//! from the `graph` command ([`GraphPage`]).
 //!
 //! **Identity.** File and subagent ids are minted per conversation graph in discovery order and
 //! never reused; step `seq`s rise from 1. All three are scoped by `(conversation, gen)`: `gen`
@@ -13,7 +10,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The `graph` topic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Graph {
     pub agents: Vec<AgentGraph>,
@@ -22,15 +18,12 @@ pub struct Graph {
     pub omitted_agents: u32,
 }
 
-/// One live agent's graph, as the overview carries it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentGraph {
     /// The pane (`$COPAD_MUX_PANE`), the join key with the `agents` topic.
     pub token: String,
     pub tool: String,
-    /// The agent's conversation (Claude session id, Codex thread id).
     pub conversation: String,
-    /// The graph's generation (see the module docs).
     #[serde(rename = "gen")]
     pub generation: String,
     /// The directory the agent works in; `display` paths are relative to it.
@@ -48,7 +41,6 @@ pub struct AgentGraph {
     pub counts: GraphCounts,
     pub files: Vec<GraphFile>,
     pub subagents: Vec<GraphSub>,
-    /// The newest steps, oldest first.
     pub steps: Vec<GraphStep>,
     /// Steps still waiting for their result (newest, at most 32).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -86,7 +78,6 @@ pub struct GraphCounts {
     pub steps: u64,
 }
 
-/// A file (or directory a search ran in) the agent touched.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraphFile {
     pub id: u32,
@@ -108,7 +99,6 @@ pub struct GraphFile {
     pub last_ms: i64,
 }
 
-/// A subagent the agent spawned (Claude `Agent`/`Task`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraphSub {
     /// Never 0: 0 is the main agent.
@@ -130,36 +120,27 @@ pub struct GraphSub {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum StepKind {
-    /// The user asked something (a turn begins).
     #[default]
     Prompt,
     Read,
     Edit,
-    /// Created or overwrote a whole file.
     Write,
     Delete,
-    /// A grep/glob/listing; `file` is where it looked, when it said.
     Search,
-    /// A shell command.
     Run,
-    /// A web fetch or search.
     Web,
     /// Started a subagent (`file` empty; the subagent is the step's own).
     Spawn,
-    /// The turn ended (Codex `task_complete`).
     Done,
 }
 
-/// How a step ended.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
-    /// Its result has not arrived.
     Pending,
     #[default]
     Ok,
     Failed,
-    /// Its result was never matched (comux stopped waiting for it).
     Unknown,
 }
 
@@ -178,7 +159,6 @@ pub struct GraphStep {
     pub label: String,
     #[serde(default)]
     pub outcome: Outcome,
-    /// For a spawn: the subagent it started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned: Option<u32>,
 }
@@ -189,7 +169,6 @@ pub struct Settled {
     pub outcome: Outcome,
 }
 
-/// One page of an agent's history: the `graph` command's answer for a target.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GraphPage {
     pub token: String,
@@ -202,9 +181,7 @@ pub struct GraphPage {
     pub counts: GraphCounts,
     pub files: Vec<GraphFile>,
     pub subagents: Vec<GraphSub>,
-    /// Oldest first.
     pub steps: Vec<GraphStep>,
-    /// The oldest step comux keeps for this conversation.
     pub oldest_seq: u64,
     /// The first and last step of THIS page (0 when it is empty).
     pub page_first_seq: u64,
@@ -213,7 +190,6 @@ pub struct GraphPage {
     /// page reaches `oldest_seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_before: Option<u64>,
-    /// Steps dropped past the history cap (older than `oldest_seq`).
     #[serde(default, skip_serializing_if = "is_zero64")]
     pub dropped_before: u64,
 }

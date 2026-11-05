@@ -1,8 +1,7 @@
 # /verify — browser screenshot + vision analysis on a URL
 #
-# Project-agnostic (require_project: false). URL field carries both
-# pattern (^https?://) and max_length (500) — load-bearing per
-# codex-plan C6: invalid URLs were getting through in the bridge plan.
+# Project-agnostic (require_project: false). The URL field carries both a pattern (^https?://)
+# and max_length (500); both are load-bearing, since invalid URLs otherwise got through.
 id: verify
 name: /verify
 description: |

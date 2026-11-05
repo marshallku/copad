@@ -2,11 +2,9 @@
 # Standalone installer for `comux` — copad's terminal multiplexer — on its own,
 # WITHOUT the copad GUI app, the copadd daemon, or the plugins.
 #
-# comux is a self-contained single binary (pure Rust, no GTK / no daemon): a
-# tmux-style server/client multiplexer with splits, tabs, sessions, worktrees,
-# a sidebar, agent-status, and session persistence. It is distributed as its
-# own release asset so users who only want the multiplexer don't download the
-# whole terminal app. For the full copad, use install.sh instead.
+# comux is a self-contained single binary (pure Rust, no GTK, no daemon), distributed as its
+# own release asset so users who only want the multiplexer skip the terminal app. For the
+# full copad, use install.sh instead.
 #
 # Optional companion: the status-bar usage/limits readout shells out to `coctl
 # usage --limits --json`. Without coctl on PATH (or installed next to comux)
@@ -55,7 +53,6 @@ is_musl_libc() {
     [[ -e /lib/ld-musl-x86_64.so.1 ]]
 }
 
-# Map the running platform to the release asset name (raw binary per target).
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "${OS}:${ARCH}" in
@@ -91,7 +88,6 @@ else
     SUDO=""
 fi
 
-# Resolve the release tag.
 if [[ -n "${TARGET_VERSION}" ]]; then
     VERSION="${TARGET_VERSION}"
     API_URL="https://api.github.com/repos/${REPO}/releases/tags/${VERSION}"

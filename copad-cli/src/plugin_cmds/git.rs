@@ -1,38 +1,10 @@
-//! `coctl git` — ergonomic wrapper over the `git.*` action surface.
+//! `coctl git` — wrapper over the `git.*` actions.
 //!
-//! Maps clap subcommands onto the existing actions exposed by
-//! `copad-plugin-git`:
-//!
-//! | CLI                                            | Action                |
-//! |------------------------------------------------|-----------------------|
-//! | `git workspaces`                               | `git.list_workspaces` |
-//! | `git worktrees [--workspace W]`                | `git.list_worktrees`  |
-//! | `git wt add <branch> [--workspace] [--sanitize-jira]` | `git.worktree_add`    |
-//! | `git wt remove <path> [--force]`               | `git.worktree_remove` |
-//! | `git branch [--workspace W]`                   | `git.current_branch`  |
-//! | `git status [--workspace W] [--path P]`        | `git.status`          |
-//!
-//! ## Workspace defaulting
-//!
-//! Every subcommand that takes `--workspace` falls through:
-//! 1. Explicit `--workspace <name>` flag (highest precedence).
-//! 2. `COPAD_GIT_DEFAULT_WORKSPACE` env var.
-//! 3. Cwd-derived: preflight `git.list_workspaces`, then longest-prefix
-//!    match the cwd (canonicalized) against EITHER each workspace's
-//!    `path` OR its `worktree_root` (both canonicalized). The
-//!    worktree_root match is what makes `cd` into a created worktree
-//!    under `<repo>-worktrees/<branch>` resolve correctly.
-//! 4. If exactly one workspace is configured, use it.
-//! 5. Otherwise the CLI prints the candidate list to stderr and
-//!    returns exit 1. The plugin's own `require_workspace` returns
-//!    `not_found` without enumerating candidates, so the CLI does
-//!    the listing client-side — better UX than the bare error.
-//!
-//! Cwd-derive is the killer ergonomic — `cd` into a worktree, run
-//! `coctl git status`, get the right answer without typing
-//! `--workspace`. Implemented client-side via the preflight call;
-//! a future Phase 19.X copad-internal `resolve_workspace(cwd)` action
-//! could lift this, but until then the CLI does the lookup itself.
+//! Workspace defaulting for every `--workspace` flag: explicit flag, then
+//! `COPAD_GIT_DEFAULT_WORKSPACE`, then the cwd (canonicalized) longest-prefix matched against each
+//! workspace's `path` or `worktree_root`, then the only configured workspace. Otherwise the
+//! candidates are listed on stderr (exit 1), since the plugin's `require_workspace` returns a bare
+//! `not_found`.
 
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -165,9 +137,6 @@ pub fn dispatch(cmd: &GitCommand, socket_path: &str, json_out: bool) -> i32 {
             )
         }
         GitCommand::Status { workspace, path } => {
-            // git.status accepts EITHER workspace OR path, exclusive.
-            // Clap already enforces conflict; here we apply the
-            // resolve-fallback only if neither was given.
             let mut params = json!({});
             if let Some(p) = path {
                 params["path"] = json!(p);
@@ -183,10 +152,7 @@ pub fn dispatch(cmd: &GitCommand, socket_path: &str, json_out: bool) -> i32 {
     }
 }
 
-/// Defaulting chain: `--workspace` → env → cwd-derived (matched against
-/// either `path` or `worktree_root`) → single-config-entry → error.
-/// Enumerates candidates client-side because the plugin's own
-/// `require_workspace` returns bare `not_found` without a list.
+/// Chain: `--workspace`, env, cwd-derived, single configured entry, else error with candidates.
 fn resolve_workspace(socket_path: &str, explicit: Option<&str>) -> Result<String, i32> {
     if let Some(s) = explicit {
         return Ok(s.to_string());
@@ -196,9 +162,6 @@ fn resolve_workspace(socket_path: &str, explicit: Option<&str>) -> Result<String
     {
         return Ok(env_ws);
     }
-    // Preflight list_workspaces. If the call fails, surface the
-    // transport error — caller can pass `--workspace` explicitly to
-    // bypass the preflight entirely.
     let resp = match client::send_command(socket_path, "git.list_workspaces", json!({})) {
         Ok(r) => r,
         Err(e) => {
@@ -227,10 +190,6 @@ fn resolve_workspace(socket_path: &str, explicit: Option<&str>) -> Result<String
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     if arr.is_empty() {
-        // `git.list_workspaces` is the discovery surface — it
-        // surfaces `fatal_error` in-band even when no workspaces
-        // load. Don't paper over that with a generic "no workspaces
-        // configured" message; relay the plugin's diagnostic.
         if let Some(err) = fatal {
             eprintln!("Error: workspaces.toml has errors: {err}");
         } else {
@@ -238,18 +197,13 @@ fn resolve_workspace(socket_path: &str, explicit: Option<&str>) -> Result<String
         }
         return Err(1);
     }
-    // Canonicalize cwd once so symlinked entry into a workspace
-    // (e.g. user has `~/work/copad -> /home/marshall/dev/copad`) still
-    // matches the configured (canonical) workspace paths.
+    // Canonicalize so a symlinked entry into a workspace still matches the canonical config paths.
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.canonicalize().unwrap_or(p));
     if let Some(ref cwd) = cwd {
-        // Longest-prefix match. Workspaces have BOTH a primary `path`
-        // and a `worktree_root` (where created worktrees live, often
-        // a sibling of `path` like `<repo>-worktrees`). Match against
-        // either — `cd` into a worktree should resolve to its
-        // workspace just as well as `cd` into the primary checkout.
+        // Longest-prefix match against both `path` and `worktree_root`, so `cd` into a worktree
+        // resolves like the primary checkout.
         let mut best: Option<(usize, String)> = None;
         for w in &arr {
             let Some(name) = w.get("name").and_then(Value::as_str) else {
@@ -259,11 +213,8 @@ fn resolve_workspace(socket_path: &str, explicit: Option<&str>) -> Result<String
                 let Some(prefix) = w.get(field).and_then(Value::as_str) else {
                     continue;
                 };
-                // Canonicalize the prefix too (best-effort — a
-                // configured path that doesn't exist on disk falls
-                // back to the literal value). Without this the
-                // canonical cwd may not start_with a non-canonical
-                // prefix, defeating the symlink fix.
+                // Canonicalize the prefix too (literal if the path is missing); a canonical cwd
+                // would not start_with a non-canonical prefix.
                 let prefix_path = Path::new(prefix);
                 let canon = prefix_path
                     .canonicalize()
@@ -279,15 +230,11 @@ fn resolve_workspace(socket_path: &str, explicit: Option<&str>) -> Result<String
             return Ok(name);
         }
     }
-    // No cwd match — if exactly one workspace is configured, use it.
     if arr.len() == 1
         && let Some(name) = arr[0].get("name").and_then(Value::as_str)
     {
         return Ok(name.to_string());
     }
-    // Multiple workspaces, no cwd match — list candidates so the
-    // user can pass `--workspace <name>` knowingly. The plugin's
-    // own error wouldn't include the list.
     eprintln!(
         "Error: cannot resolve workspace (cwd doesn't match any configured `path` / `worktree_root`)."
     );

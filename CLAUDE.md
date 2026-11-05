@@ -113,6 +113,7 @@ git config core.hooksPath .githooks
 - Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/copad/wallpapers.txt` (macOS, falls back to Linux path). Default only — `[background] list` overrides it, and a directory `[background] image` (Linux) bypasses the list file entirely (decision #78)
 - Theme: configurable via `[theme] name` — 10 built-ins (catppuccin variants, dracula, nord, tokyo-night, gruvbox-dark, one-dark, solarized-dark), default `catppuccin-mocha`, hot-reloads
 - Dark theme forced via GTK settings
+- Comments carry only what the code cannot say: a workaround and what breaks without it, a constraint that makes code look removable, a trust boundary, a cross-file sync contract, a non-obvious constant. No restating the code, no narration or banners, no history or review-round references; context goes to `docs/` (decisions #206)
 
 ## Critical Implementation Details
 

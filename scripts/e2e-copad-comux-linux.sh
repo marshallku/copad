@@ -123,9 +123,9 @@ PY
   dirs | grep -q "browsed=.*/proj" || fail "the native browser never created a session in proj: $(dirs)"
   echo "ok — Ctrl-b C was a native GTK browser: descending into proj and creating there made the session"
 fi
-# The work graph (decisions #204): a (fake) claude agent's transcript, drawn in the right panel
-# (a WebKitGTK page: under Broadway it never draws a frame, and its state is a function of time
-# for exactly that reason).
+# The work graph (decisions #204): a (fake) claude agent's transcript, drawn in the right
+# panel. It is a WebKitGTK page that never draws a frame under Broadway, so its state is a
+# function of time.
 graph() {
   local p="${1:-}"; [[ -n "$p" ]] || p='{}'
   $COCTL --socket "$GUI" call comux.graph --params "$p" --json
@@ -184,7 +184,7 @@ TOPW="$(gq 'd["terminal_width"]')"
 WAS_SHOWN="$(gq 'd["shown"]')"
 [[ "$(gq 'd["shown"]' '{"open":false}')" == False ]] || fail "the panel should close"
 sleep 1
-# A closed revealer used to keep ~12 px beside the terminal.
+# A closed revealer must take no room beside the terminal.
 [[ "$(gq 'd["dock_width"]')" == 0 ]] || fail "the closed panel still takes room: $(graph)"
 if [[ "$WAS_SHOWN" == True ]]; then
   [[ "$(gq 'd["terminal_width"] > '"$TOPW")" == True ]] || fail "closing the panel should give the terminal its width back: $(graph)"

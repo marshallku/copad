@@ -1,29 +1,8 @@
-//! `coctl bookmark` — ergonomic wrapper over the `bookmark.*`
-//! action surface (Phase 19, BM-1).
+//! `coctl bookmark` — wrapper over the `bookmark.*` actions.
 //!
-//! Maps clap subcommands onto the existing actions exposed by
-//! `copad-plugin-bookmark`:
-//!
-//! | CLI                                          | Action            |
-//! |----------------------------------------------|-------------------|
-//! | `bookmark add <url> [--tags ...]`            | `bookmark.add`    |
-//! | `bookmark list [--status ...]`               | `bookmark.list`   |
-//! | `bookmark show <id|url>`                     | `bookmark.show`   |
-//! | `bookmark delete <id|url>`                   | `bookmark.delete` |
-//!
-//! ## ID resolution
-//!
-//! Every `<id>` arg accepts a prefix of the 8-char `urlhash8`
-//! identifier (≥ 1 hex char). When the prefix matches more than one
-//! bookmark we error out with the candidate list — same shape as
-//! `coctl todo`. Unlike todo, bookmarks have no workspace concept,
-//! so disambiguation is purely "use a longer prefix" or "pass the
-//! full URL".
-//!
-//! `<id>` is parsed locally as hex; if the user passes a URL where an
-//! id is expected (e.g. `bookmark show https://example.com/`), we
-//! detect the URL form and pass it as `{url: ...}` instead — the
-//! plugin canonicalizes and looks up by full hash.
+//! Every `<id>` accepts a prefix of the 8-char `urlhash8` identifier; an ambiguous prefix errors
+//! with the candidate list. A URL where an id is expected is detected and sent as `{url: ...}`;
+//! the plugin canonicalizes and looks it up by full hash.
 
 use clap::Subcommand;
 use serde_json::{Value, json};

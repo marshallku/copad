@@ -69,7 +69,6 @@ done
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-# ---- Shared: resolve the release tag + prepare a scratch dir --------------
 if [[ -n "${TARGET_VERSION}" ]]; then
     VERSION="${TARGET_VERSION}"
     API_URL="https://api.github.com/repos/${REPO}/releases/tags/${VERSION}"
@@ -89,8 +88,6 @@ fi
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT
 
-# download_asset <asset-name> — fetch a release asset into $TMPDIR and
-# extract it there. Leaves the extracted tree directly under $TMPDIR.
 download_asset() {
     local asset="$1"
     local url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
@@ -100,9 +97,6 @@ download_asset() {
     tar -xzf "${TMPDIR}/${asset}" -C "${TMPDIR}"
 }
 
-# ===========================================================================
-# Linux
-# ===========================================================================
 install_linux() {
     if [[ "${ARCH}" != "x86_64" ]]; then
         echo "Error: unsupported Linux architecture '${ARCH}'. Only x86_64 is supported."
@@ -124,11 +118,8 @@ install_linux() {
     echo "Installing copad ${VERSION} (Linux x86_64)..."
     download_asset "copad-${VERSION}-x86_64-linux.tar.gz"
 
-    # Pre-0.2 release tarballs shipped a "copad.desktop"; v0.2+ ship
-    # "com.marshall.copad.desktop" so the basename matches the app_id
-    # and Wayland compositors associate windows with the launcher. Detect
-    # whichever the tarball carries so this installer is forward- and
-    # backward-compatible.
+    # Pre-0.2 tarballs ship "copad.desktop"; v0.2+ ship "com.marshall.copad.desktop" (basename
+    # = app_id). Detect whichever the tarball carries.
     local DESKTOP_SRC="" DESKTOP_DEST_NAME=""
     for candidate in "com.marshall.copad.desktop" "copad.desktop"; do
         if [[ -f "${TMPDIR}/${candidate}" ]]; then
@@ -172,8 +163,6 @@ install_linux() {
         ${SUDO} gtk-update-icon-cache -q -t "${ICON_BASE}" || true
     fi
 
-    # Warn (don't fail) on missing GTK/VTE runtime libraries — copad needs
-    # them at runtime but they are the user's package manager's job.
     local missing=()
     pkg-config --exists gtk4 2>/dev/null || missing+=("gtk4")
     pkg-config --exists vte-2.91-gtk4 2>/dev/null || missing+=("vte4 (libvte-2.91-gtk4)")
@@ -184,18 +173,14 @@ install_linux() {
         echo "copad requires these libraries to run. Install them via your package manager."
     fi
 
-    # copadd systemd --user unit: start the daemon now + on login so Linux
-    # release users get the background daemon (update-check notifications,
-    # triggers, status bar), matching the from-source install-dev.sh path. The
-    # unit ships in the tarball under systemd/; COPADD_BIN_PATH is rewritten to
-    # the chosen install dir (systemd doesn't expand ~ or pick user/system dirs).
+    # copadd systemd --user unit, matching install-dev.sh. COPADD_BIN_PATH is rewritten to
+    # the install dir because systemd does not expand ~.
     if ${DO_DAEMON} && [[ -f "${TMPDIR}/copadd" && -f "${TMPDIR}/systemd/copad-daemon.service" ]]; then
         if command -v systemctl >/dev/null 2>&1; then
             local unit_dst="${HOME}/.config/systemd/user"
             echo "==> installing copadd systemd --user unit into ${unit_dst}"
             mkdir -p "${unit_dst}"
-            # Disable bash 5.3+ patsub_replacement so `&` in the replacement is
-            # literal (the path has none, but be safe — matches install-dev.sh).
+            # Disable patsub_replacement (bash 5.3+) so `&` in the replacement stays literal.
             shopt -u patsub_replacement 2>/dev/null || true
             local unit_text; unit_text="$(cat "${TMPDIR}/systemd/copad-daemon.service")"
             unit_text="${unit_text//COPADD_BIN_PATH/${INSTALL_DIR}/copadd}"
@@ -233,9 +218,6 @@ install_linux() {
     [[ -f "${TMPDIR}/copadd" ]] && echo "  copadd -> ${INSTALL_DIR}/copadd"
 }
 
-# ===========================================================================
-# macOS
-# ===========================================================================
 install_macos() {
     if [[ "${ARCH}" != "arm64" ]]; then
         echo "Error: unsupported macOS architecture '${ARCH}'. Release builds are"
@@ -265,24 +247,18 @@ install_macos() {
         exit 1
     fi
 
-    # Stop any running instance so we can replace the bundle's executable —
-    # macOS holds an exclusive lock on a running .app's exec.
+    # macOS holds an exclusive lock on a running .app's executable, so stop it before replacing.
     pkill -x Copad 2>/dev/null || true
     sleep 0.3
 
-    # 1. Install Copad.app. `ditto` preserves bundle structure/xattrs and is
-    #    the Apple-blessed way to copy an .app. Replace atomically-ish: the
-    #    running instance was just killed above.
+    # `ditto` preserves bundle structure and xattrs.
     echo "==> installing Copad.app to ${APP_DEST}"
     ${SUDO_APP} mkdir -p "${APP_DEST}"
     ${SUDO_APP} rm -rf "${APP_DEST}/Copad.app"
     ${SUDO_APP} ditto "${TMPDIR}/Copad.app" "${APP_DEST}/Copad.app"
-    # The bundle is ad-hoc signed (not notarized). Strip the quarantine
-    # xattr the download carried so Gatekeeper lets it launch without the
-    # right-click → Open dance. Only affects this locally-installed copy.
+    # Strip the download's quarantine xattr so the bundle launches without right-click -> Open.
     ${SUDO_APP} xattr -dr com.apple.quarantine "${APP_DEST}/Copad.app" 2>/dev/null || true
 
-    # 2. CLI binaries → BIN_DIR.
     echo "==> installing coctl / copadd / comux to ${BIN_DIR}"
     ${SUDO_APP} mkdir -p "${BIN_DIR}"
     for b in coctl copadd comux; do
@@ -298,14 +274,11 @@ install_macos() {
         printf '%s\n' "${BIN_DIR}/copadd" > "${HOME}/.config/copad/copadd.path"
     fi
 
-    # 3. Plugins → ~/Library/Application Support/copad/plugins/<name>/.
-    #    PluginSupervisor reads this at startup; each dir holds the binary
-    #    co-located with its plugin.toml so it wins over $PATH lookup.
+    # PluginSupervisor reads this at startup; the binary sits next to its plugin.toml so it
+    # wins over $PATH lookup.
     if [[ -d "${TMPDIR}/plugins" ]]; then
         echo "==> installing plugins to ${PLUGIN_DEST}"
         mkdir -p "${PLUGIN_DEST}"
-        # Copy each plugin dir individually so an existing install is
-        # refreshed in place rather than nested under a stray subdir.
         for pdir in "${TMPDIR}/plugins/"*/; do
             [[ -d "$pdir" ]] || continue
             local name; name="$(basename "$pdir")"
@@ -314,19 +287,14 @@ install_macos() {
         done
     fi
 
-    # 4. Live-cwd shell hooks (opt-in; user sources one from their rc file).
     if [[ -d "${TMPDIR}/shell-hooks" ]]; then
         mkdir -p "${SHELL_HOOK_DEST}"
         cp -f "${TMPDIR}/shell-hooks/"* "${SHELL_HOOK_DEST}/" 2>/dev/null || true
     fi
 
-    # 5. copadd LaunchAgent (best effort). The Swift app auto-spawns copadd
-    #    on launch, so this is only needed for the daemon to run at login
-    #    without the app open (background agent-turn notifications). Requires
-    #    the copadd-launch.sh wrapper the tarball ships alongside the plist.
-    #    Run in a subshell so a mid-setup failure under `set -e` (an
-    #    unwritable dir, a bad plist write) is contained there and NEVER
-    #    aborts the core install that already succeeded above.
+    # The app auto-spawns copadd, so the LaunchAgent only matters for running the daemon at
+    # login without the app open. Needs the copadd-launch.sh wrapper shipped with the plist.
+    # A subshell contains a `set -e` failure so it cannot abort the install that succeeded.
     ( install_macos_launchagent ) || \
         echo "note: copadd LaunchAgent setup did not complete (non-fatal) — the app still auto-starts copadd when open."
 
@@ -341,20 +309,15 @@ install_macos() {
     [[ -d "${TMPDIR}/plugins" ]] && echo "  plugins -> ${PLUGIN_DEST}/"
 }
 
-# LaunchAgent setup for copadd on macOS. Best effort: any failure prints a
-# note and returns 0 so the overall install still succeeds. Mirrors the
-# proven logic in scripts/install-macos.sh (HOME_PLACEHOLDER rewrite +
-# secrets.env minting), adapted to read the plist/wrapper from the tarball.
+# Best effort: any failure prints a note and returns 0 so the install still succeeds.
+# Mirrors scripts/install-macos.sh, reading the plist/wrapper from the tarball.
 install_macos_launchagent() {
     if ! ${DO_DAEMON}; then
-        # --no-daemon: tear down any LaunchAgent a prior install left, so an
-        # upgrade honors the opt-out. (The app itself still auto-spawns copadd
-        # when it's open — the LaunchAgent only governs login persistence.)
+        # --no-daemon: tear down a LaunchAgent a prior install left, so an upgrade honors it.
         launchctl bootout "gui/$UID/com.marshall.copad.daemon" 2>/dev/null || true
         rm -f "${HOME}/Library/LaunchAgents/com.marshall.copad.daemon.plist"
-        # Also stop a copadd the app auto-spawned (a detached process with no
-        # launchd label, so bootout doesn't reach it). It re-spawns next time the
-        # app launches — that path is inherent to Copad.app and documented.
+        # Also stop a copadd the app auto-spawned: it has no launchd label, so bootout misses
+        # it. It re-spawns when the app next launches.
         pkill -x copadd 2>/dev/null || true
         echo "note: --no-daemon — stopped copadd + removed the LaunchAgent (the app re-spawns it when opened)."
         return 0
@@ -393,9 +356,8 @@ install_macos_launchagent() {
         chmod 600 "$secrets_env" 2>/dev/null || true
     fi
 
-    # XML-escape $HOME then substitute HOME_PLACEHOLDER (launchd does not
-    # expand ~). Disable bash 5.3+ patsub_replacement first so `&` in the
-    # replacement text is treated literally, not as the matched substring.
+    # launchd does not expand ~, hence HOME_PLACEHOLDER. Disable patsub_replacement first so
+    # `&` in the replacement is literal.
     shopt -u patsub_replacement 2>/dev/null || true
     local home_esc="$HOME"
     home_esc=${home_esc//&/&amp;}
@@ -414,7 +376,6 @@ install_macos_launchagent() {
     fi
 }
 
-# warn_path <dir> — remind the user to add <dir> to PATH if it is not there.
 warn_path() {
     local dir="$1"
     if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${dir}"; then

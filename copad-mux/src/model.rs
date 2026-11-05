@@ -443,9 +443,6 @@ impl SplitTree {
     /// branch gets a share proportional to how many panes it lines up ALONG that branch's
     /// direction, so `a | (b | c)` becomes thirds and `a | (b / c)` halves. Returns whether
     /// any ratio moved.
-    /// tmux `select-layout -E`: each side of a branch gets a share proportional to how many panes
-    /// it lines up along that branch's direction, so `a | (b | c)` becomes thirds and
-    /// `a | (b / c)` halves.
     pub fn spread(&mut self) -> bool {
         match self {
             SplitTree::Leaf { .. } => false,

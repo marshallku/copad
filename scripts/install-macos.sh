@@ -48,15 +48,9 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Copad.app"
 
-# Re-sign a cargo-installed CLI with a fresh ad-hoc signature.
-#
-# `cargo install` ships the binary with the Rust/LLVM linker-signed ad-hoc
-# signature. On macOS 26 the kernel's Code Signing Monitor sometimes rejects
-# that linker signature at exec time — even though `codesign -v` passes on
-# disk — killing the process instantly with "SIGKILL (Code Signature
-# Invalid)" before main() runs (observed on comux). `codesign --force --sign -`
-# replaces it with a plain ad-hoc signature the kernel accepts, and is a no-op
-# for binaries that were already fine. Cheap insurance; apply to every CLI.
+# `cargo install` binaries carry a linker-signed ad-hoc signature that the macOS 26 Code
+# Signing Monitor can reject at exec time (SIGKILL "Code Signature Invalid", seen on comux)
+# even though `codesign -v` passes. A fresh ad-hoc signature avoids it.
 resign_cli() {
     local bin="$1"
     [ -e "$bin" ] || return 0
@@ -72,22 +66,6 @@ DO_PLUGINS=true
 DO_DAEMON=true
 DO_LAUNCH=false
 
-# macOS-buildable plugins. All first-party plugins now compile on macOS:
-# - PR 4 added git (no platform-specific deps).
-# - PR 5a added llm — proved `keyring` `apple-native` reaches Apple
-#   Keychain at runtime.
-# - PR 5b added calendar — validated the polling-daemon supervisor
-#   lifecycle on macOS (background poller publishing
-#   `calendar.event_imminent`). RPC actions still work without Google
-#   OAuth creds thanks to `Config::minimal()` fallback.
-# - kb / todo / bookmark formerly required Linux's `renameat2(RENAME_NOREPLACE)`;
-#   the shared `copad_core::fs_atomic` primitive now selects between
-#   `renameat2` (Linux) and `renamex_np(RENAME_EXCL)` (Darwin), so all
-#   three install and run on macOS.
-# - slack / discord install fine; full functionality needs user-supplied
-#   Slack `xoxb-` tokens / Discord bot tokens in Keychain (see plugin
-#   READMEs). Without creds the plugins return RPC errors gracefully
-#   rather than crashing the supervisor.
 MACOS_PLUGINS=(echo git llm calendar kb docs todo pomodoro bookmark slack discord jira claude pilot web-bridge)
 
 while [[ $# -gt 0 ]]; do
@@ -120,12 +98,8 @@ else
     SUDO_APP=""
 fi
 
-# 1. Build the macOS app via SwiftPM (release config).
-#    The Copad executable links libcopad_ffi.a from the Rust staticlib crate;
-#    SwiftPM cannot run cargo as a prebuild step from Package.swift, so we
-#    invoke cargo here first. swift build's linker phase then picks up the
-#    archive at $REPO_ROOT/target/release/libcopad_ffi.a via the
-#    -L../target/release flag baked into Package.swift.
+# SwiftPM cannot run cargo as a prebuild step, so build the Rust staticlibs first;
+# Package.swift links them via -L../target/release.
 if $DO_BUILD; then
     echo "==> cargo build --release -p copad-ffi -p copad-term (Rust staticlibs for Swift FFI)"
     (cd "$REPO_ROOT" && cargo build --release -p copad-ffi -p copad-term)
@@ -140,12 +114,10 @@ if [[ ! -x "$BUILT_BIN" ]]; then
     exit 1
 fi
 
-# 2. Stop any running instance so we can replace the bundle's executable.
+# Stop any running instance so the bundle's executable can be replaced.
 pkill -x Copad 2>/dev/null || true
 sleep 0.3
 
-# 3. Stage the bundle in a tmp dir so the install is atomic — the user
-#    never sees a half-written .app at $APP_DEST.
 STAGING_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGING_DIR"' EXIT
 STAGING="$STAGING_DIR/$APP_NAME"
@@ -155,11 +127,6 @@ RESOURCES="$CONTENTS/Resources"
 mkdir -p "$MACOS" "$RESOURCES"
 cp "$BUILT_BIN" "$MACOS/Copad"
 
-# Bundle icon. CFBundleIconFile expects the basename ("AppIcon") and
-# Finder/Dock/Launchpad pull pixels from Resources/AppIcon.icns. The
-# .icns is checked in (generated from assets/icons/copad.png — see
-# scripts/build-icons.sh) so swift build alone is enough to produce a
-# fully-iconed bundle.
 ICNS_SRC="$REPO_ROOT/copad-macos/Resources/AppIcon.icns"
 if [[ -f "$ICNS_SRC" ]]; then
     cp "$ICNS_SRC" "$RESOURCES/AppIcon.icns"
@@ -167,8 +134,7 @@ else
     echo "warn: $ICNS_SRC missing — bundle will fall back to the generic app icon" >&2
 fi
 
-# Info.plist — kept in sync with copad-macos/run.sh by hand. Two copies is
-# acceptable (Rule of Three); a third would mean extracting to a template.
+# Info.plist is kept in sync with copad-macos/run.sh by hand.
 cat > "$CONTENTS/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -200,29 +166,15 @@ cat > "$CONTENTS/Info.plist" <<'EOF'
 </plist>
 EOF
 
-# 4. Sign the staging bundle with a stable self-signed cert. Without
-#    this, swift's ad-hoc linker signature gives a fresh cdhash on every
-#    build, so macOS TCC treats each install as a different app and
-#    re-prompts for every permission grant. Signing at staging means
-#    --system installs don't need sudo for codesign.
+# Sign the staging bundle with the stable self-signed cert: swift's ad-hoc signature has a
+# fresh cdhash per build, so TCC would re-prompt for every permission after each install.
 "$REPO_ROOT/scripts/codesign-dev.sh" "$STAGING"
 
-# 5. Install — replace any prior bundle in one rename so a partially-failed
-#    install never leaves $APP_DEST in a broken state.
 echo "==> installing $APP_NAME to $APP_DEST"
 mkdir -p "$APP_DEST" 2>/dev/null || $SUDO_APP mkdir -p "$APP_DEST"
 $SUDO_APP rm -rf "$APP_DEST/$APP_NAME"
 $SUDO_APP mv "$STAGING" "$APP_DEST/$APP_NAME"
 
-# 6. Install coctl + copadd via cargo install (writes to ~/.cargo/bin).
-#    Same rationale as coctl: `cargo install <name>` fails (not on
-#    crates.io) and `cargo install --path .` fails (workspace virtual
-#    manifest), so we always pass `--path <crate-dir>`.
-#
-#    copadd is the background daemon (status bar, triggers, plugin
-#    runtime). The Swift app auto-spawns it on launch when missing, so
-#    a fresh install without copadd in PATH would warn-and-skip the
-#    status bar / plugin features.
 if $DO_COCTL; then
     echo "==> cargo install --path copad-cli (coctl → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-cli"
@@ -232,29 +184,21 @@ if $DO_COPADD; then
     echo "==> cargo install --path copad-daemon (copadd → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-daemon"
     resign_cli "$HOME/.cargo/bin/copadd"
-    # Pin the copadd path for the LaunchAgent wrapper (see copadd-launch.sh) so
-    # it launches THIS binary rather than a stale copy a prior release-installer
-    # (`install.sh`, which uses ~/.local/bin) may have left behind.
+    # Pin the path for the LaunchAgent wrapper (copadd-launch.sh) so it does not launch a
+    # stale ~/.local/bin copy left by install.sh.
     mkdir -p "$HOME/.config/copad"
     printf '%s\n' "$HOME/.cargo/bin/copadd" > "$HOME/.config/copad/copadd.path"
 fi
 if $DO_MUX; then
-    # comux: the standalone agent-orchestration terminal multiplexer
-    # (splits + sidebar + Ctrl-f popup + `comux ctl` control API). Same
-    # cargo-install rationale as coctl — not on crates.io, so install by path.
     echo "==> cargo install --path copad-mux (comux → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-mux"
     resign_cli "$HOME/.cargo/bin/comux"
-    # Renamed copad-mux → comux; drop a stale legacy binary from a prior install.
+    # Drop the pre-rename copad-mux binary so an upgrade leaves only comux.
     [ -e "$HOME/.cargo/bin/copad-mux" ] && rm -f "$HOME/.cargo/bin/copad-mux"
 fi
 
-# 7. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
-#    ~/Library/Application Support/copad/plugins/<name>/ at startup; we
-#    cargo-build the binary and copy the manifest. Manifest's
-#    `services.exec` is resolved against the plugin dir first, so we drop
-#    the binary alongside plugin.toml so the supervisor finds it without
-#    a $PATH dance.
+# Manifest `services.exec` resolves against the plugin dir first, so the binary goes next
+# to plugin.toml and needs no PATH.
 PLUGIN_DEST="$HOME/Library/Application Support/copad/plugins"
 if $DO_PLUGINS; then
     mkdir -p "$PLUGIN_DEST"
@@ -276,26 +220,17 @@ if $DO_PLUGINS; then
 
         plugin_dir="$PLUGIN_DEST/$name"
         mkdir -p "$plugin_dir"
-        # Copy every loose file next to plugin.toml (manifest + panel.html
-        # if any) so panel-bearing plugins land complete. Cargo.toml lives
-        # in the same dir but is build-time only — exclude it.
         find "$REPO_ROOT/plugins/$name" -maxdepth 1 -type f ! -name 'Cargo.toml' \
             -exec cp -f {} "$plugin_dir/" \;
-        # Copy (don't symlink) the binary so a `git clean` of target/ doesn't
-        # silently break the install. Cheap — these binaries are small.
+        # Copy, not symlink, so a `git clean` of target/ doesn't silently break the install.
         cp -f "$bin_src" "$plugin_dir/$crate"
         chmod 755 "$plugin_dir/$crate"
         echo "ok    plugin $name → $plugin_dir/"
     done
 fi
 
-# 8. Install the LaunchAgent plist so copadd auto-starts at login
-#    (and `KeepAlive=true` restarts it on crash). The plist template
-#    in dist/launchd/ uses HOME_PLACEHOLDER tokens because launchd
-#    does not expand `~` — we rewrite them with the user's actual
-#    HOME during install. `launchctl bootstrap` is the modern
-#    replacement for `launchctl load`; we `bootout` first to make
-#    this idempotent across re-runs.
+# launchd does not expand `~`, so the HOME_PLACEHOLDER tokens in the plist template are
+# rewritten; `bootout` first keeps re-runs idempotent.
 if $DO_DAEMON; then
     if command -v launchctl >/dev/null 2>&1 && $DO_COPADD; then
         PLIST_SRC="$REPO_ROOT/dist/launchd/com.marshall.copad.daemon.plist"
@@ -306,13 +241,9 @@ if $DO_DAEMON; then
             echo "==> installing LaunchAgent plist into $PLIST_DST"
             mkdir -p "$(dirname "$PLIST_DST")"
 
-            # Install the copadd launch wrapper + mint the operator secrets
-            # file it sources. The plist runs `/bin/sh <wrapper>`, and the
-            # wrapper sources ~/.config/copad/secrets.env (mode 600) before
-            # exec'ing copadd — so plugin bearer tokens reach copadd's env
-            # (and its plugins) without living in the 644 plist. The token is
-            # minted ONCE and preserved across reinstalls, so a phone that
-            # already paired keeps working after an upgrade.
+            # The wrapper sources secrets.env (mode 600) before exec'ing copadd, keeping
+            # plugin tokens out of the 644 plist. The token is minted once so a paired phone
+            # survives upgrades.
             WRAP_SRC="$REPO_ROOT/dist/launchd/copadd-launch.sh"
             WRAP_DST="$HOME/.config/copad/copadd-launch.sh"
             SECRETS_ENV="$HOME/.config/copad/secrets.env"
@@ -324,9 +255,8 @@ if $DO_DAEMON; then
                 echo "warn: $WRAP_SRC missing — copadd will run without secrets sourcing" >&2
             fi
             if [[ ! -f "$SECRETS_ENV" ]]; then
-                # Generate + validate the token BEFORE writing so an openssl
-                # failure never leaves an empty token file behind (which would
-                # then be "preserved" forever on later reinstalls).
+                # Validate before writing: a failed openssl must not leave an empty token file
+                # that later reinstalls would preserve forever.
                 WB_TOKEN=$(openssl rand -hex 24 2>/dev/null || true)
                 if [[ -z "$WB_TOKEN" ]]; then
                     echo "warn: openssl rand failed — no web-bridge token minted; add COPAD_WEB_BRIDGE_TOKEN=<≥32 chars> to $SECRETS_ENV manually" >&2
@@ -336,25 +266,13 @@ if $DO_DAEMON; then
                     echo "    minted web-bridge token → $SECRETS_ENV (600). View with: cat $SECRETS_ENV"
                 fi
             else
-                # Re-assert 600 even when preserving — an existing file created
-                # with looser perms would otherwise keep the token exposed.
+                # Re-assert 600: a pre-existing looser file would keep the token exposed.
                 chmod 600 "$SECRETS_ENV"
                 echo "    preserving existing $SECRETS_ENV (web-bridge token kept; perms reasserted 600)"
             fi
-            # XML-escape `$HOME` then drop it into the plist. Two
-            # bash-version pitfalls compound here:
-            # 1. Bash 5.3+ defaults `patsub_replacement` ON, which
-            #    expands `&` in `${var//pat/repl}` replacements to
-            #    the matched substring. That breaks BOTH the
-            #    escape passes below (`&amp;`/`&lt;`/`&gt;` all
-            #    contain `&`) AND the final HOME_PLACEHOLDER
-            #    substitution. Disable it FIRST so every later
-            #    substitution treats `repl` as literal text.
-            #    Codex C1 step 7 rounds 2-3 + round 5.
-            # 2. plist `<string>...</string>` is XML — raw `&`/`<`
-            #    breaks plistlib. Order escapes so the `&` we
-            #    inject for `&amp;` is not re-escaped by later
-            #    passes. Codex C1 step 7 round 4.
+            # Bash 5.3+ enables patsub_replacement, which expands `&` in the replacement and
+            # breaks both the XML escapes and the HOME_PLACEHOLDER substitution; disable it
+            # first. Escape `&` before `<` and `>` so the injected `&amp;` is not re-escaped.
             shopt -u patsub_replacement 2>/dev/null || true
             HOME_ESC=$HOME
             HOME_ESC=${HOME_ESC//&/&amp;}
@@ -378,11 +296,8 @@ if $DO_DAEMON; then
     fi
 fi
 
-# Shell hooks for live-cwd reporting. macOS alacritty backend can't
-# capture OSC 7 (no vte handler) and proc_pidinfo is EPERM under
-# hardened runtime; the in-shell hook calls `coctl call
-# panel.report_cwd` on every chpwd instead. Files land under
-# ~/.config/copad/shell-hooks/; users source one from their rc file.
+# The alacritty backend cannot capture OSC 7 and proc_pidinfo is EPERM under hardened
+# runtime, so an in-shell hook calls `coctl call panel.report_cwd` on every chpwd.
 SHELL_HOOK_SRC="$REPO_ROOT/copad-macos/shell-hooks"
 SHELL_HOOK_DEST="$HOME/.config/copad/shell-hooks"
 if [[ -d "$SHELL_HOOK_SRC" ]]; then
@@ -393,12 +308,7 @@ if [[ -d "$SHELL_HOOK_SRC" ]]; then
     done
 fi
 
-# Phase 22.1 context bridge (zsh). Single source of truth at
-# examples/shell/copad-context.zsh — same script Linux uses. macOS
-# zsh ≥ 5.0 ships `zmodload zsh/datetime` natively, so no platform
-# fork is needed. Sourcing is opt-in: the dossier panel (Phase 22.2)
-# is the eventual consumer, and the script is a no-op outside copad
-# PTY children regardless.
+# Context bridge (zsh): same script Linux uses; a no-op outside copad PTY children.
 CONTEXT_HOOK_SRC="$REPO_ROOT/examples/shell/copad-context.zsh"
 if [[ -f "$CONTEXT_HOOK_SRC" ]]; then
     mkdir -p "$SHELL_HOOK_DEST"

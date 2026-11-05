@@ -1,13 +1,5 @@
-//! `coctl recent` — recent bus events snapshot.
-//!
-//! Wraps the `event.history` socket action (Phase 19.X event ring
-//! buffer in `copad-core::event_bus`). Two filters:
-//! - `--since 2h` (or `30m`, `1d`, or raw seconds) → `since_ms` cutoff
-//! - `--kind jira.*` → event-kind glob
-//!
-//! Default human renderer: `<HH:MM:SS>  <kind>  <one-line payload>`.
-//! `--json` dumps the raw action payload (matches the wire shape used
-//! by `event.subscribe`).
+//! `coctl recent` — recent bus events via the `event.history` action. Filters: `--since`
+//! (`2h`, `30m`, `1d` or raw seconds) and `--kind` (glob). `--json` dumps the raw action payload.
 
 use clap::Args;
 use serde_json::{Value, json};
@@ -77,11 +69,7 @@ fn render_events(v: &Value) {
 }
 
 fn format_clock(ts_ms: u64) -> String {
-    // Just the HH:MM:SS of the local time. Lighter than pulling a date
-    // formatter; consumer of full timestamp uses --json.
     let secs = (ts_ms / 1000) as i64;
-    // Local-tz offset via libc-free approach: chrono is already a CLI
-    // dep, reuse it.
     let dt = chrono::DateTime::<chrono::Local>::from(
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64),
     );
@@ -104,10 +92,8 @@ fn payload_preview(payload: &Value) -> String {
         .map(|(k, v)| format!("{k}={}", short_value(v, 40)))
         .collect();
     let s = parts.join(" ");
-    // Truncate by char count, not byte count — `String::truncate` is
-    // a byte index and panics on a non-char-boundary cut, which
-    // happens whenever the 120th byte lands inside a multibyte
-    // UTF-8 sequence (e.g. Korean / Japanese / emoji payloads).
+    // Truncate by char count: `String::truncate` takes a byte index and panics inside a multibyte
+    // char.
     if s.chars().count() > MAX_LEN {
         let truncated: String = s.chars().take(MAX_LEN).collect();
         format!("{truncated}…")
@@ -117,13 +103,8 @@ fn payload_preview(payload: &Value) -> String {
 }
 
 fn short_value(v: &Value, max: usize) -> String {
-    // `serde_json::to_string` JSON-escapes every variant uniformly,
-    // including control bytes inside strings (`` rather than
-    // a literal ESC). Without this, an event payload that captured
-    // raw ANSI/OSC bytes (e.g. an OSC 11 `set background color`)
-    // would print verbatim and reconfigure the host terminal — a
-    // user-visible bug that turned the entire terminal background
-    // black during `coctl recent`.
+    // `to_string` JSON-escapes control bytes, so a payload holding raw ANSI/OSC bytes (e.g. OSC 11
+    // set-background) cannot reconfigure the host terminal when printed.
     let raw = serde_json::to_string(v).unwrap_or_default();
     if raw.chars().count() > max {
         let truncated: String = raw.chars().take(max).collect();
@@ -197,10 +178,8 @@ mod tests {
 
     #[test]
     fn payload_preview_escapes_ansi_control_bytes() {
-        // Regression: raw `\x1b]11;rgb:0/0/0\x1b\\` in a payload
-        // string reached stdout and reconfigured VTE's background.
-        // The renderer must JSON-escape control bytes so the terminal
-        // sees the literal sequence, not the active control code.
+        // Raw `\x1b]11;rgb:0/0/0\x1b\\` in a payload reached stdout and reconfigured VTE's
+        // background; control bytes must be JSON-escaped.
         let v = json!({"msg": "\u{1b}]11;rgb:0/0/0\u{1b}\\"});
         let rendered = payload_preview(&v);
         assert!(
@@ -215,10 +194,7 @@ mod tests {
 
     #[test]
     fn payload_preview_does_not_panic_on_multibyte_boundary() {
-        // Codex C2 round 1: byte-index truncate panics if the 120th
-        // byte lands inside a multibyte UTF-8 char. Construct a value
-        // that fills the buffer with Korean text and assert we get a
-        // non-panicking, ellipsis-terminated rendering.
+        // Byte-index truncation would panic when the 120th byte lands inside a multibyte char.
         let body = "한글".repeat(100); // 600 bytes, 200 chars
         let v = json!({ "body": body });
         let s = payload_preview(&v);

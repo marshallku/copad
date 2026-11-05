@@ -29,8 +29,6 @@
     const summary = $("summary");
     const empty = $("empty");
 
-    // ---- the bridge -----------------------------------------------------------------------
-
     /** Every message carries the host's epoch (`setHost`), so the host can drop one that was
      * queued for a connection it has since left. */
     const post = (message) => {
@@ -40,11 +38,8 @@
         else if (window.parent !== window) window.parent.postMessage({ comuxGraph: message }, "*");
     };
 
-    // ---- state ----------------------------------------------------------------------------
-
     let topic = { agents: [] };
     let agentsInfo = [];
-    /** token → the merged cache of that agent's graph. */
     const caches = new Map();
     let mode = "agent";
     let selected = null;
@@ -62,7 +57,6 @@
     let size = { w: 1, h: 1, dpr: 1 };
 
     let steps = [];
-    /** `steps` as the cursor was last placed in. */
     let prevSteps = [];
     let at = [];
     let cursor = -1;
@@ -83,8 +77,6 @@
     let historyUnsupported = false;
     let resets = 0;
 
-    // ---- colours --------------------------------------------------------------------------
-
     const roles = {
         base: "#1e1e2e", text: "#cdd6f4", subtext: "#bac2de", dim: "#a6adc8", rule: "#585b70", hover: "#45475a",
         accent: "#89b4fa", mauve: "#cba6f7", peach: "#fab387", green: "#a6e3a1", yellow: "#f9e2af", blue: "#89b4fa", red: "#f38ba8",
@@ -101,8 +93,6 @@
         return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${a})`;
     }
 
-    // ---- data in --------------------------------------------------------------------------
-
     function setData(data) {
         topic = (data && data.graph) || { agents: [] };
         agentsInfo = (data && data.agents) || agentsInfo;
@@ -113,7 +103,6 @@
             const before = caches.get(a.token);
             const c = M.mergeOverview(before, a);
             caches.set(a.token, c);
-            // New steps since the last value: they play as they arrive.
             const key = c.key;
             const prev = lastSeqByKey.get(key);
             const newest = (a.steps || []).reduce((m, s) => Math.max(m, s.seq), 0);
@@ -240,8 +229,6 @@
         picker.hidden = mode !== "agent" || want.length === 0;
     }
 
-    // ---- view -----------------------------------------------------------------------------
-
     function titleOf(token) {
         const a = agentsInfo.find((x) => x.token === token);
         return a ? a.title || a.tool : (caches.get(token) || {}).tool;
@@ -335,8 +322,6 @@
             if (!viewTouched) fit();
         }
     }
-
-    // ---- layout ---------------------------------------------------------------------------
 
     const CHARGE = { agent: -700, space: -600, sub: -320, dir: -110, file: -70 };
     const REST = { spawn: 110, root: 80, tree: 40, touch: 80 };
@@ -440,8 +425,6 @@
         transform = { k: Math.max(k, 0.25), x: size.w / 2 - ((minX + maxX) / 2) * Math.max(k, 0.25), y: size.h / 2 - ((minY + maxY) / 2) * Math.max(k, 0.25) };
     }
 
-    // ---- timeline -------------------------------------------------------------------------
-
     function setCursor(index, fromUser) {
         cursor = Math.max(-1, Math.min(index, steps.length - 1));
         cursorSince = performance.now();
@@ -523,8 +506,6 @@
         setCursor(i, true);
     }
 
-    // ---- drawing --------------------------------------------------------------------------
-
     function resize() {
         const r = stage.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
@@ -565,7 +546,6 @@
         ctx.save();
         ctx.translate(transform.x, transform.y);
         ctx.scale(transform.k, transform.k);
-        // Links.
         for (const l of view.links) {
             const a = points.get(l.source);
             const b = points.get(l.target);
@@ -579,7 +559,6 @@
             ctx.stroke();
         }
         ctx.setLineDash([]);
-        // Beams: the current step's, and live arrivals'.
         const beam = (from, to, kind, progress) => {
             if (!from || !to) return;
             const x = from.x + (to.x - from.x) * progress;
@@ -611,7 +590,6 @@
                 if (since < M.BEAM) beam(points.get(fl.from), points.get(id), fl.kind, since / M.BEAM);
             }
         }
-        // Nodes.
         const labels = [];
         ctx.font = `${fontSize}px ${font}`;
         ctx.textAlign = "center";
@@ -721,8 +699,6 @@
         return liveLit.size > 0 || (f && (now - cursorSince < M.FLARE)) || pendingFiles.size > 0 || view.nodes.some((n) => n.kind === "sub" && n.status === "running");
     }
 
-    // ---- the loop -------------------------------------------------------------------------
-
     let scheduled = false;
     let dragging = null;
 
@@ -763,8 +739,6 @@
         const animating = draw(now);
         if (alpha > 0 || playing || animating || dragging) kick();
     }
-
-    // ---- interaction ----------------------------------------------------------------------
 
     function nodeAt(clientX, clientY) {
         const r = canvas.getBoundingClientRect();
@@ -899,7 +873,6 @@
         else if (n.kind === "agent" && mode === "agent" && selected) post({ type: "jump", token: selected });
         else if (n.kind === "file" && mode === "agent") {
             selectedFile = selectedFile === n.file ? null : n.file;
-            // Jump the cursor to this file's latest step.
             if (selectedFile !== null) {
                 for (let i = steps.length - 1; i >= 0; i--) {
                     if (steps[i].file === selectedFile) {
@@ -1090,7 +1063,6 @@
         },
     };
 
-    // A parent frame (the web client) drives it the same way.
     window.addEventListener("message", (e) => {
         const m = e.data && e.data.comuxGraphCall;
         if (!m || typeof window.comuxGraph[m.fn] !== "function" || m.fn === "state" || m.fn === "render") return;

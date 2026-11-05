@@ -1,16 +1,13 @@
 //! Scan `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` for token usage.
 //!
-//! Each `event_msg`/`token_count` record carries BOTH `total_token_usage`
-//! (cumulative — summing it across a session would explode) and
-//! `last_token_usage` (the per-turn DELTA). We sum the DELTAS, mirroring the
-//! Claude per-turn model.
+//! Each `event_msg`/`token_count` record carries `total_token_usage` (cumulative; summing it would
+//! explode) and `last_token_usage` (the per-turn delta). Only the deltas are summed.
 //!
-//! `last_token_usage.input_tokens` is the FULL input including the cached
-//! portion, so we subtract `cached_input_tokens` into `cache_read` (codex has
-//! no separate cache-write meter). `output_tokens` already INCLUDES
-//! `reasoning_output_tokens` (verified: input+output == total), so reasoning is
-//! never added again. The model id (`gpt-5.6-sol`, …) comes from an earlier
-//! session-config line's `payload.model`; we carry the most recent one forward.
+//! `last_token_usage.input_tokens` includes the cached portion, so `cached_input_tokens` is moved
+//! into `cache_read` (codex has no cache-write meter). `output_tokens` already includes
+//! `reasoning_output_tokens` (input+output == total), so reasoning is never added again. The model
+//! id comes from an earlier session-config line's `payload.model`; the latest one is carried
+//! forward.
 
 use super::model::{RawUsage, Record, Tool, Warnings};
 use chrono::{DateTime, Local};
@@ -20,19 +17,16 @@ use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexLine {
-    /// A session-config line declaring the model.
     Model(String),
-    /// A per-turn token delta.
     Tokens {
         ts: DateTime<Local>,
         usage: RawUsage,
     },
-    /// Anything else (ignored, no warning).
     Other,
 }
 
-/// Absent/null → `Some(0)`; valid `u64` → `Some(n)`; present-but-wrong-type →
-/// `None` (rejects the record as malformed instead of miscounting; codex R3/C2).
+/// Absent/null is `Some(0)`; a valid `u64` is `Some(n)`; the wrong type is `None` (rejects the
+/// record as malformed instead of miscounting).
 fn uget(v: &Value, k: &str) -> Option<u64> {
     match v.get(k) {
         None | Some(Value::Null) => Some(0),
@@ -40,14 +34,12 @@ fn uget(v: &Value, k: &str) -> Option<u64> {
     }
 }
 
-/// `Err(())` = malformed JSON (counts as a skipped line).
 pub fn parse_codex_line(line: &str) -> Result<CodexLine, ()> {
     let v: Value = serde_json::from_str(line).map_err(|_| ())?;
     let Some(payload) = v.get("payload") else {
         return Ok(CodexLine::Other);
     };
 
-    // A session-config line carries the model id directly on the payload.
     if let Some(m) = payload.get("model").and_then(|m| m.as_str()) {
         return Ok(CodexLine::Model(m.to_string()));
     }
@@ -56,7 +48,6 @@ pub fn parse_codex_line(line: &str) -> Result<CodexLine, ()> {
         let Some(last) = payload.get("info").and_then(|i| i.get("last_token_usage")) else {
             return Ok(CodexLine::Other);
         };
-        // present but not an object → format drift, not a zero-usage turn.
         if !last.is_object() {
             return Err(());
         }
@@ -88,8 +79,8 @@ fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>, warns: &mut Warnings) {
         return;
     };
     for e in rd.flatten() {
-        // `file_type()` doesn't follow symlinks → no infinite recursion on a
-        // symlinked-directory cycle (codex R5/I1).
+        // A dir entry's `file_type()` does not follow symlinks: no infinite recursion on a
+        // symlinked-directory cycle.
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
         if ft.is_dir() {
@@ -105,9 +96,7 @@ fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>, warns: &mut Warnings) {
     }
 }
 
-/// Walk `root` (`~/.codex/sessions`) recursively, summing per-turn deltas at or
-/// after `since`. Consecutive exact-duplicate token lines are collapsed as a
-/// cheap guard against any append-log double-write.
+/// Walk `root` (`~/.codex/sessions`) recursively, summing per-turn deltas at or after `since`.
 pub fn scan(root: &Path, since: Option<DateTime<Local>>) -> (Vec<Record>, Warnings) {
     let mut warns = Warnings::default();
     let mut files = Vec::new();
@@ -122,8 +111,8 @@ pub fn scan(root: &Path, since: Option<DateTime<Local>>) -> (Vec<Record>, Warnin
         {
             continue;
         }
-        // Read as bytes + lossy-decode per line so a concurrent append truncated
-        // mid-multibyte-UTF-8-char can't reject the whole file (see claude.rs).
+        // Bytes plus lossy per-line decoding, so a concurrent append cut mid-UTF-8-char cannot
+        // reject the whole file (see claude.rs).
         let Ok(bytes) = std::fs::read(&fp) else {
             warns.unreadable_files += 1;
             continue;
@@ -137,11 +126,9 @@ pub fn scan(root: &Path, since: Option<DateTime<Local>>) -> (Vec<Record>, Warnin
             match parse_codex_line(&line) {
                 Ok(CodexLine::Model(m)) => model = m,
                 Ok(CodexLine::Tokens { ts, usage }) => {
-                    // Each token_count event is one turn's delta — sum them all.
-                    // (No dup-suppression: codex is an append-only event log with
-                    // one token_count per turn; a heuristic keyed on
-                    // timestamp+usage would wrongly drop two distinct turns that
-                    // happened to bill identically in the same millisecond.)
+                    // No dup-suppression: one token_count per turn in an append-only log, and a
+                    // timestamp+usage heuristic would drop two distinct turns that billed
+                    // identically in the same millisecond.
                     if let Some(s) = since
                         && ts < s
                     {
@@ -175,7 +162,6 @@ mod tests {
 
     #[test]
     fn parse_maps_cached_and_never_double_counts_reasoning() {
-        // input 18842 (incl 9984 cached), output 199 (incl 33 reasoning).
         let line = token_line("2026-07-20T03:42:29.059Z", 18842, 9984, 199, 33);
         let CodexLine::Tokens { usage, .. } = parse_codex_line(&line).unwrap() else {
             panic!("expected Tokens");
@@ -195,10 +181,8 @@ mod tests {
             CodexLine::Other
         );
         assert!(parse_codex_line("{bad").is_err());
-        // present-but-wrong-type token field → malformed, not zeroed (R3/C2)
         let bad = r#"{"timestamp":"2026-07-20T12:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":"x","output_tokens":5}}}}"#;
         assert!(parse_codex_line(bad).is_err());
-        // last_token_usage present but not an object → malformed, not zero-usage
         let bad_container = r#"{"timestamp":"2026-07-20T12:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":"nope"}}}"#;
         assert!(parse_codex_line(bad_container).is_err());
     }
@@ -210,8 +194,7 @@ mod tests {
         std::fs::create_dir_all(&day).unwrap();
         let mut f = std::fs::File::create(day.join("rollout-x.jsonl")).unwrap();
         writeln!(f, r#"{{"payload":{{"model":"gpt-5.6-sol"}}}}"#).unwrap();
-        // Every token_count is a real per-turn delta — all three are summed,
-        // even two that bill identically (no speculative dup-suppression).
+        // Every token_count is a real delta: all three are summed, even two that bill identically.
         writeln!(
             f,
             "{}",
@@ -237,7 +220,6 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert!(records.iter().all(|r| r.model == "gpt-5.6-sol"));
         let total: u64 = records.iter().map(|r| r.usage.total()).sum();
-        // (100+20) + (100+20) + (50+5) = 295
         assert_eq!(total, 295);
     }
 }

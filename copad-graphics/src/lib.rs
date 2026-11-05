@@ -6,10 +6,8 @@
 //! here. The parser hands us each complete APC string in stream order (the vendored vte patch), so
 //! a placement inside a synchronized update still lands where the cursor is at that point.
 //!
-//! Deliberate limits: direct (`t=d`) transmission only — no file, temp-file or shared-memory reads,
-//! so a program can never make the terminal open a path; no animation; no Unicode placeholders.
-//! Writing text over an image cell removes that cell's fragment (kitty keeps images independent of
-//! text).
+//! Deliberate limits: direct (`t=d`) transmission only, so a program can never make the terminal open a
+//! path; no animation. Writing text over an image cell removes that cell's fragment.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -28,13 +26,10 @@ use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 /// Decoded bytes a terminal may hold across store, cells, scrollback and snapshots (kitty's own
 /// default storage limit).
 pub const QUOTA_BYTES: usize = 320 << 20;
-/// Largest single decoded image.
 pub const MAX_IMAGE_BYTES: usize = 100 << 20;
-/// Largest width or height.
 pub const MAX_DIMENSION: u32 = 10_000;
 /// Fragments one cell keeps; a further one pushes out the lowest-stacked.
 pub const MAX_PER_CELL: usize = 4;
-/// Live placements a terminal tracks before it refuses new ones.
 pub const MAX_PLACEMENTS: usize = 16_384;
 
 /// Used to size placements while the host has not reported its cell size yet.
@@ -64,7 +59,6 @@ pub struct Shared {
 }
 
 impl Shared {
-    /// The cell size images are laid out against (a fallback until the host reports one).
     pub fn cell(&self) -> (u32, u32) {
         let (w, h) = (
             self.cell_width.load(Ordering::Relaxed),
@@ -80,9 +74,7 @@ impl Shared {
 
 struct Stored {
     image: Arc<GraphicImage>,
-    /// The `I=` image number it was sent with, 0 if none.
     number: u32,
-    /// Last use, for eviction order.
     used: u64,
 }
 
@@ -93,7 +85,6 @@ struct Pending {
     error: Option<&'static str>,
 }
 
-/// A virtual placement (`U=1`): where Unicode placeholder cells (U+10EEEE) find their image.
 #[derive(Clone)]
 pub struct Virtual {
     pub image: Arc<GraphicImage>,
@@ -106,7 +97,6 @@ pub struct Virtual {
 /// [`collect`] (placeholders are text in the grid, so they are resolved when drawing).
 pub type Virtuals = Arc<std::sync::Mutex<HashMap<(u32, u32), Virtual>>>;
 
-/// The placeholder character of kitty's Unicode placeholders.
 pub const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// kitty's row/column diacritics (gen/rowcolumn-diacritics.txt): the n-th means n.
@@ -414,11 +404,9 @@ const DIACRITICS: [char; 297] = [
 /// second terminal (copad-linux's relay feeds VTE) replays these there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Effects {
-    /// Lines the scroll region was scrolled up before placing (`Handler::scroll_up`).
     pub scrolled: usize,
     /// Where the placement left the cursor, BEFORE `linefeed`.
     pub cursor: Option<Point>,
-    /// The placement ended with a linefeed (the cursor ran past the last column).
     pub linefeed: bool,
 }
 
@@ -437,9 +425,7 @@ pub struct Graphics {
     /// `(image id, client placement id)` → internal placement, for the ones the client named.
     named: HashMap<(u32, u32), u64>,
     pending: Option<Pending>,
-    /// Filled by `put` while a command runs; returned by `handle`.
     effects: Effects,
-    /// Bumped by every change to what is drawn (placement, delete, eviction).
     revision: u64,
     virtuals: Virtuals,
 }
@@ -539,7 +525,6 @@ fn parse(control: &[u8]) -> Result<Cmd, &'static str> {
     Ok(cmd)
 }
 
-/// Bytes per pixel of a raw format, `None` for PNG.
 fn raw_bpp(format: u32) -> Result<Option<usize>, &'static str> {
     match format {
         24 => Ok(Some(3)),
@@ -563,7 +548,6 @@ fn check_dimensions(width: u32, height: u32) -> Result<usize, &'static str> {
     Ok(bytes)
 }
 
-/// The most transmitted (pre-decompression) bytes a command may accumulate.
 fn transmission_cap(cmd: &Cmd) -> Result<usize, &'static str> {
     match raw_bpp(cmd.format)? {
         Some(bpp) if !cmd.compressed => {
@@ -574,7 +558,6 @@ fn transmission_cap(cmd: &Cmd) -> Result<usize, &'static str> {
     }
 }
 
-/// Decode a finished transmission to premultiplied RGBA8.
 fn decode(cmd: &Cmd, data: Vec<u8>) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let bpp = raw_bpp(cmd.format)?;
     let data = if cmd.compressed {
@@ -667,12 +650,10 @@ fn premultiply(rgba: &mut [u8]) {
     }
 }
 
-/// Every line of a grid, history included.
 fn all_lines<T>(grid: &Grid<T>) -> std::ops::Range<i32> {
     -(grid.history_size() as i32)..grid.screen_lines() as i32
 }
 
-/// Remove matching fragments everywhere in `grid`; returns the placements touched.
 fn strip(grid: &mut Grid<Cell>, mut matches: impl FnMut(&GraphicCell) -> bool) -> HashSet<u64> {
     let mut touched = HashSet::new();
     let columns = grid.columns();
@@ -695,7 +676,6 @@ fn strip(grid: &mut Grid<Cell>, mut matches: impl FnMut(&GraphicCell) -> bool) -
     touched
 }
 
-/// Whether any cell of either screen buffer still shows image `key`.
 fn shows<L>(term: &mut Term<L>, key: u64) -> bool {
     term.grids_mut().into_iter().any(|grid| {
         all_lines(grid).any(|line| {
@@ -709,7 +689,6 @@ fn shows<L>(term: &mut Term<L>, key: u64) -> bool {
     })
 }
 
-/// Placements with a fragment on the visible screen that `matches` (cell point, fragment).
 fn visible_placements<L>(
     term: &Term<L>,
     mut matches: impl FnMut(Point, &GraphicCell) -> bool,
@@ -749,7 +728,6 @@ impl Graphics {
         }
     }
 
-    /// The virtual placements, for [`collect`].
     pub fn virtuals(&self) -> Virtuals {
         self.virtuals.clone()
     }
@@ -769,22 +747,18 @@ impl Graphics {
         self.quota = bytes;
     }
 
-    /// Changes with every placement, delete or eviction: a host polls it to know when to redraw.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Images are stored or still shown somewhere.
     pub fn has_images(&self) -> bool {
         !self.images.is_empty() || self.live_bytes() > 0
     }
 
-    /// Decoded image bytes still alive anywhere (store, cells, snapshots).
     pub fn live_bytes(&self) -> usize {
         self.live_bytes.load(Ordering::Relaxed)
     }
 
-    /// One APC string from the parser; returns what it did to the cursor and scroll region.
     pub fn handle<L: EventListener>(&mut self, term: &mut Term<L>, data: &[u8]) -> Effects {
         self.effects = Effects::default();
         self.dispatch(term, data);
@@ -910,7 +884,6 @@ impl Graphics {
             self.live_bytes.clone(),
         ));
         if self.images.contains_key(&id) {
-            // Retransmitting an id replaces the image and drops what showed the old one.
             self.remove_placements(term, |g| g.image_id == id);
             self.drop_virtuals(|v| v == id);
         }
@@ -945,7 +918,6 @@ impl Graphics {
         }
     }
 
-    /// Free enough of the quota for `needed` more bytes, or say why not.
     fn make_room<L: EventListener>(
         &mut self,
         term: &mut Term<L>,
@@ -998,7 +970,6 @@ impl Graphics {
         }
     }
 
-    /// Remove every fragment `matches` in the current grid (history included).
     fn remove_placements<L: EventListener>(
         &mut self,
         term: &mut Term<L>,
@@ -1014,7 +985,6 @@ impl Graphics {
         }
     }
 
-    /// Rebuild the live set from what the grids actually hold.
     fn prune_live<L: EventListener>(&mut self, term: &mut Term<L>) {
         let mut seen = HashSet::new();
         for grid in term.grids_mut() {
@@ -1030,7 +1000,6 @@ impl Graphics {
         self.named.retain(|_, p| seen.contains(p));
     }
 
-    /// Display an already transmitted image at the cursor (`a=p`, and the place half of `a=T`).
     fn put<L: EventListener>(
         &mut self,
         term: &mut Term<L>,
@@ -1296,7 +1265,6 @@ impl Graphics {
                 self.drop_virtuals(|v| v >= lo && v <= hi);
                 self.remove_placements(term, |g| g.image_id >= lo && g.image_id <= hi);
             }
-            // Animation frames (f/F) and anything unknown: nothing to delete.
             _ => {}
         }
         if free {
@@ -1312,7 +1280,6 @@ impl Graphics {
         }
     }
 
-    /// Answer a command — only when it named an image (kitty's rule), and as `q=` allows.
     fn respond(&mut self, cmd: &Cmd, result: Result<u32, &'static str>) {
         if cmd.id == 0 && cmd.number == 0 {
             return;
@@ -1398,7 +1365,6 @@ fn dest_rect(
     [left, top, right, bottom]
 }
 
-/// One image run on one viewport row, in draw order (`#[repr(C)]`: handed to the renderer).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CopadGraphic {
@@ -1407,7 +1373,6 @@ pub struct CopadGraphic {
     /// `[left, top, right, bottom]` in the image, 0..=1.
     pub uv: [f32; 4],
     pub z: i32,
-    /// Index into the snapshot's images.
     pub image: u32,
 }
 
@@ -1420,7 +1385,6 @@ pub struct Placeholders<'a> {
     pub cell: (u32, u32),
 }
 
-/// Runs being built: fragments that continue each other on a row merge into one.
 struct Runs {
     runs: Vec<((i32, u32, u64), usize, CopadGraphic)>,
     images: Vec<Arc<GraphicImage>>,
@@ -1482,7 +1446,6 @@ impl Runs {
     }
 }
 
-/// A placeholder cell's image id and placement id, from its colours.
 fn placeholder_ids(cell: &Cell) -> Option<(u32, u32)> {
     let id = |c: alacritty_terminal::vte::ansi::Color| match c {
         alacritty_terminal::vte::ansi::Color::Spec(rgb) => {

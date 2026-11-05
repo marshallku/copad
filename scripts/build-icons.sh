@@ -9,11 +9,8 @@
 #   copad-linux/icons/hicolor/<size>x<size>/apps/copad.png   for size ∈ {16,22,24,32,48,64,128,256,512}
 #   copad-macos/Resources/AppIcon.icns                        — multi-res .icns (PNG-encoded entries)
 #
-# Run this whenever the master PNG changes, then commit the regenerated
-# files. -strip kills all ancillary chunks. Source PNG is a colorful
-# raster (coffee mug + terminal prompt); palette quantization would
-# visibly band the brown gradients, so we keep full truecolor with
-# alpha and rely on PNG filter/compression for size.
+# Run this whenever the master PNG changes, then commit the regenerated files. Full
+# truecolor + alpha is kept: palette quantization would visibly band the brown gradients.
 #
 # Requires: ImageMagick 7 (`magick`), Python 3 (for the .icns assembly
 # — ImageMagick's icns coder writes a single-image .icns, which Finder

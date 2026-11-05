@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end verification of the daemon ↔ GUI socket link.
+# End-to-end verification of the daemon <-> GUI socket link.
 #
-# Runs copadd against an isolated socket path, then exercises:
-#   1. register handshake
-#   2. heartbeat survival
-#   3. daemon restart → GUI re-register
-#   4. frozen GUI → heartbeat-miss unregister
-#
-# A small Python mock client (stdlib only) stands in for copad-linux so the
-# script doesn't need GTK / a display. Real copad GUI verification is a
-# manual step listed at the bottom.
+# Runs copadd against an isolated socket path, with a stdlib-only Python mock client standing
+# in for copad-linux so no GTK or display is needed. Each `step N` below is one scenario.
 
 set -euo pipefail
 
@@ -21,12 +14,9 @@ COCTL="$REPO/target/debug/coctl"
 [[ -x "$COCTL" ]] || { echo "build first: cargo build -p copad-cli"; exit 2; }
 
 WORK="$(mktemp -d -t copad-e2e.XXXXXX)"
-# Step 12's marker path is interpolated into both a TOML string and
-# a `/bin/sh -c` command. Use a STRICT allowlist (alphanumerics +
-# `._/-`) so no shell metacharacter (`;`, `&`, backtick, `>`, `|`,
-# newline, quote, dollar, etc.) and no TOML-corrupting char (`"`,
-# `\`) can sneak in via a maliciously-set TMPDIR. Default /tmp is
-# always safe.
+# Step 12's marker path is interpolated into a TOML string and a `/bin/sh -c` command, so
+# allow only [A-Za-z0-9._/-]: no shell metacharacter or TOML-corrupting char can sneak in
+# via a hostile TMPDIR.
 if ! printf '%s' "$WORK" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
     echo "Refusing to run: WORK path '$WORK' contains characters outside [A-Za-z0-9._/-]. Set TMPDIR to a plain ASCII path." >&2
     exit 2
@@ -37,21 +27,17 @@ SOCKET="$WORK/copadd.sock"
 
 export COPAD_SOCKET="$SOCKET"
 export RUST_LOG="${RUST_LOG:-info}"
-# Tiny pool + test-only action so step 6 can force saturation.
+# Tiny pool + test-only actions so step 7 can force saturation.
 export COPADD_POOL_WORKERS=2
 export COPADD_POOL_QUEUE=2
 export COPADD_E2E_TEST_ACTIONS=1
-# Isolate plugin discovery: daemon is the sole plugin host since Step
-# 5b, so without this it would spawn every plugin from the user's real
-# ~/.config/copad/plugins/ during the test.
+# The daemon is the sole plugin host; isolate discovery so it does not spawn every plugin
+# from the user's real ~/.config/copad/plugins/.
 mkdir -p "$WORK/xdg-config/copad/plugins"
 export XDG_CONFIG_HOME="$WORK/xdg-config"
 
-# Stub plugin for Step 8 (plugin.<name>.<cmd> + _module.run dispatch).
-# No [[services]] entries so the supervisor doesn't try to spawn a
-# non-existent binary. `hello` command emits JSON so the dispatcher's
-# "parse stdout as JSON" path is exercised; `clock` module emits a
-# fixed string so the test can assert exact stdout.
+# Stub plugin for step 8. No [[services]], so the supervisor spawns nothing; `hello` emits
+# JSON (dispatcher parses stdout) and the `clock` module a fixed string for exact assertion.
 STUB_DIR="$WORK/xdg-config/copad/plugins/e2e-stub"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/plugin.toml" <<'TOML'
@@ -105,15 +91,13 @@ wait_for() {
     return 1
 }
 
-# Waits until grep counts at least N matches — survives the "first entry
-# already there" trap that plain wait_for falls into.
+# Wait for at least N matches; plain wait_for returns on an already-present first entry.
 wait_for_count() {
     local pattern=$1 file=$2 min_count=$3 timeout_s=${4:-10}
     local deadline=$(( SECONDS + timeout_s ))
     while (( SECONDS < deadline )); do
         local n
-        # `grep -c` exits 1 on zero matches; under set -e the `n=$(...)`
-        # form would abort the whole script. Force n=0 explicitly.
+        # `grep -c` exits 1 on zero matches, which would abort under set -e.
         n=$(grep -cE "$pattern" "$file" 2>/dev/null) || n=0
         (( n >= min_count )) && return 0
         sleep 0.2
@@ -223,8 +207,7 @@ client_1=$(grep -oE 'gui registered: client_id=[^ ]+' "$DAEMON_LOG" | tail -n1 |
 pass "register OK; primary client_id=${client_1:0:8}…"
 
 step 3 "heartbeat survival (25s)"
-# Snapshot the unregister count so we measure the window, not the
-# accumulated log. (`grep -c` exits 1 on zero matches; force 0 under set -e.)
+# Snapshot the count so only this window is measured.
 misses_before=$(grep -cE 'consecutive misses' "$DAEMON_LOG" 2>/dev/null) || misses_before=0
 sleep 25
 misses_after=$(grep -cE 'consecutive misses' "$DAEMON_LOG" 2>/dev/null) || misses_after=0
@@ -250,11 +233,9 @@ client_2=$(grep -oE 'gui registered: client_id=[^ ]+' "$DAEMON_LOG" | tail -n1 |
 pass "re-registered; new client_id=${client_2:0:8}…"
 
 step 5 "event bridge — completion forwarded to GUI"
-# Fire a plain (non-GUI) connection that invokes __test.slow_blocking;
-# the daemon's ActionRegistry publishes `<action>.completed` on its bus
-# after the handler returns. The mock GUI (still registered from step 4)
-# must observe that wire Event via the auto-subscribe-all forwarder —
-# this is the chained-trigger preservation contract for Step 5b.
+# A plain (non-GUI) connection invokes __test.slow_blocking; the registry publishes
+# `<action>.completed` and the still-registered mock GUI must see it via the auto-subscribe-all
+# forwarder (chained-trigger preservation).
 python3 - "$SOCKET" >/dev/null 2>&1 <<'PY'
 import json, socket, sys, uuid
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -285,11 +266,8 @@ kill -KILL "$GUI_PID" 2>/dev/null || true
 GUI_PID=""
 
 step 7 "pool saturation → overloaded"
-# Daemon's per-connection handler dispatches synchronously (recv_timeout
-# 120s), so concurrency comes from concurrent connections, not concurrent
-# requests on one socket. Fire N independent connections and assert ≥ 6
-# bounce back as overloaded.
-# Pool capacity = workers(2) + queue(2) = 4 in flight max.
+# The per-connection handler dispatches synchronously, so concurrency comes from concurrent
+# connections. Pool capacity is workers(2) + queue(2) = 4 in flight; assert >= 6 of N bounce.
 BURST_LOG="$WORK/burst.log"
 python3 - "$SOCKET" >"$BURST_LOG" 2>&1 <<'PY'
 import json, socket, sys, threading, time, uuid
@@ -335,10 +313,8 @@ overloaded=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['overloa
 pass "burst: $received/12 responded, $overloaded overloaded"
 
 step 8 "daemon-hosted plugin.<name>.<cmd> + _module.run dispatch"
-# Calls go to the well-known daemon socket directly — no GUI involved.
-# The stub plugin was dropped into XDG_CONFIG_HOME before step 1, so
-# the daemon has it in its registry. `hello` returns JSON → daemon
-# parses; `_module.run` returns {stdout, exit_code}.
+# Calls go straight to the daemon socket, no GUI. The stub plugin was placed in
+# XDG_CONFIG_HOME before step 1.
 DISP_LOG="$WORK/dispatch.log"
 python3 - "$SOCKET" >"$DISP_LOG" 2>&1 <<'PY'
 import json, socket, sys, uuid
@@ -368,7 +344,6 @@ mod_stdout=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['module
 [[ "$mod_stdout" == "tick" ]] || fail "_module.run: expected result.stdout='tick', got $mod_stdout (summary: $SUMMARY)"
 pass "_module.run e2e-stub/clock → stdout='tick'"
 
-# Negative paths: unknown plugin, unknown module.
 ERR_LOG="$WORK/dispatch-err.log"
 python3 - "$SOCKET" >"$ERR_LOG" 2>&1 <<'PY'
 import json, socket, sys, uuid
@@ -394,11 +369,9 @@ um_code=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['unknown_m
 pass "negative paths return not_found"
 
 step 9 "GUI→daemon bridge via _bus.publish + echo gate"
-# Verifies the Stage B bridge: a registered GUI can publish events
-# onto the daemon bus, those events get `bridge_id` set, and the
-# symmetric daemon→GUI forwarder DOES NOT echo them back to the
-# originating GUI. Positive control: a daemon-native completion
-# event (`bridge_id=None`) still flows through.
+# A registered GUI publishes onto the daemon bus; those events get `bridge_id` set and the
+# daemon->GUI forwarder must NOT echo them back to the originating GUI. Positive control: a
+# daemon-native completion event (`bridge_id=None`) still flows through.
 BRIDGE_LOG="$WORK/bridge.log"
 python3 - "$SOCKET" >"$BRIDGE_LOG" 2>&1 <<'PY'
 import json, socket, sys, threading, time, uuid
@@ -529,12 +502,8 @@ ctrl_seen=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['saw_posi
 pass "positive control: __test.slow_blocking.completed delivered (forwarder alive)"
 
 step 10 "host_triggers=true cut-over → daemon dispatches trigger from bridged event"
-# Tear down the running daemon and restart it with COPADD_HOST_TRIGGERS=1
-# plus a config.toml containing a `[[trigger]]` that listens on a
-# synthetic kind and fires `system.log`. A registered mock GUI then
-# pushes the matching event via `_bus.publish`; the daemon's
-# TriggerEngine consumes it (via the pump thread that's now running)
-# and the configured system.log emits to daemon stderr.
+# Restart with COPADD_HOST_TRIGGERS=1 and a config whose [[trigger]] listens on a synthetic
+# kind; a registered mock GUI pushes the matching event via `_bus.publish`.
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""
@@ -549,8 +518,7 @@ params = { message = "e2e-cutover-fired" }
 event_kind = "e2e.cutover"
 TOML
 
-# Record the daemon log size BEFORE the restart so the assertion can
-# isolate the new run's stderr from prior step output.
+# Record the log size before the restart so the assertion sees only the new run's stderr.
 DAEMON_LOG_OFFSET=$(wc -c < "$DAEMON_LOG")
 
 COPADD_HOST_TRIGGERS=1 "$DAEMON" >>"$DAEMON_LOG" 2>&1 &
@@ -620,9 +588,7 @@ pass "register ack advertises host_triggers=true under COPADD_HOST_TRIGGERS=1"
 pub_ok=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['publish_ok'])" "$C_SUMMARY")
 [[ "$pub_ok" == "True" ]] || fail "_bus.publish: expected ok=true, got $pub_ok"
 
-# Poll daemon stderr for the trigger's system.log output, considering
-# only bytes WRITTEN AFTER the restart. The configured params.message
-# is "e2e-cutover-fired"; system.log emits "[system.log] <message>".
+# Poll only bytes written after the restart for the trigger's "[system.log] <message>" line.
 fire_deadline=$(( SECONDS + 5 ))
 fired=0
 while (( SECONDS < fire_deadline )); do
@@ -636,11 +602,7 @@ done
 pass "daemon dispatched bridged e2e.cutover → system.log fired"
 
 step 11 "coctl event publish fires daemon trigger end-to-end"
-# Rewrite the trigger config so the new e2e.publish kind matches a
-# fresh `system.log` action. The daemon's 2s mtime watcher picks up
-# the change without restart. Then coctl event publish from a
-# separate shell process fires the trigger; daemon dispatches the
-# trigger and emits the configured system.log to stderr.
+# Rewrite the trigger config; the daemon's 2s mtime watcher reloads it without a restart.
 cat > "$XDG_CONFIG_HOME/copad/config.toml" <<'TOML'
 [[triggers]]
 name = "e2e-publish"
@@ -650,8 +612,7 @@ params = { message = "e2e-publish-fired" }
 event_kind = "e2e.publish"
 TOML
 
-# Watcher tick is 2s; allow a couple ticks for the file mtime to
-# overtake the prior config write.
+# The watcher ticks every 2s; allow a couple of ticks for the mtime to overtake the prior write.
 wait_for_count 'trigger config reloaded' "$DAEMON_LOG" 1 8 \
     || fail "daemon's config watcher did not pick up the new trigger config"
 
@@ -662,9 +623,7 @@ echo "$PUBLISH_OUT" | grep -q 'queued' \
     || fail "coctl event publish did not return queued: got $PUBLISH_OUT"
 pass "coctl event publish returned queued"
 
-# Verify the daemon dispatched the trigger via the watcher-reloaded
-# config. Offset-based grep so prior steps' system.log lines don't
-# false-match.
+# Offset-based grep so earlier steps' system.log lines cannot false-match.
 fire_deadline=$(( SECONDS + 5 ))
 fired=0
 while (( SECONDS < fire_deadline )); do
@@ -678,11 +637,9 @@ done
 pass "daemon dispatched coctl-published e2e.publish → system.log fired"
 
 step 12 "system.spawn inherits primary GUI's curated env"
-# Register a mock GUI with custom HYPRLAND_INSTANCE_SIGNATURE, fire
-# a system.spawn trigger that writes the env var to a marker file,
-# verify the child saw the GUI's value (not the daemon's empty/absent
-# value). Proves the Stage E env merge end-to-end:
-# GUI capture → daemon whitelist → primary_gui_env → Command::envs.
+# Register a mock GUI with a custom HYPRLAND_INSTANCE_SIGNATURE and fire a system.spawn
+# trigger that writes the variable to a marker file; the child must see the GUI's value, not
+# the daemon's (GUI capture -> daemon whitelist -> primary_gui_env -> Command::envs).
 ENV_MARKER="$WORK/spawn-env-marker"
 ENV_RELOAD_COUNT_BEFORE=$(grep -cE 'trigger config reloaded' "$DAEMON_LOG" 2>/dev/null) || ENV_RELOAD_COUNT_BEFORE=0
 cat > "$XDG_CONFIG_HOME/copad/config.toml" <<TOML
@@ -754,8 +711,7 @@ reg_ok=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['register_ok
 pub_ok=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['publish_ok'])" "$E_SUMMARY")
 [[ "$pub_ok" == "True" ]] || fail "_bus.publish failed: $E_SUMMARY"
 
-# Marker file should now contain the GUI-supplied signature. system.spawn
-# is fire-and-forget so poll briefly for the file.
+# system.spawn is fire-and-forget, so poll briefly for the marker file.
 marker_deadline=$(( SECONDS + 5 ))
 captured=""
 while (( SECONDS < marker_deadline )); do
@@ -770,8 +726,6 @@ done
 pass "system.spawn child inherited HYPRLAND_INSTANCE_SIGNATURE from primary GUI's gui_env"
 
 step 13 "daemon event.subscribe pattern filtering"
-# Subscribe with patterns=["e2e.sub.*"], publish two events (one match,
-# one non-match), assert only the match crossed the wire.
 SUB_LOG=$WORK/event_subscribe.json
 python3 - "$SOCKET" "$SUB_LOG" <<'PY' &
 import json, socket, sys, threading, time, uuid
@@ -818,7 +772,6 @@ with open(out_path, "w") as fh:
     json.dump(out, fh)
 PY
 SUB_PID=$!
-# Let the subscriber establish before publishing.
 sleep 0.5
 
 publish_event() {
@@ -837,9 +790,7 @@ print(f.readline().decode().strip())
 PY
 }
 
-# Non-matching event first → must NOT appear in the subscriber's output.
 publish_event "e2e.sub.skip.first" >/dev/null
-# Matching event second → must appear.
 publish_event "e2e.sub.match.fire" >/dev/null
 
 wait $SUB_PID 2>/dev/null || true
@@ -855,10 +806,8 @@ types=$(python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print(','.j
 pass "event.subscribe filtered out non-matching kind, delivered match"
 
 step 14 "dispatch_via_gui publishes <method>.completed on daemon bus"
-# Inline short-lived mock GUI (all capabilities, primary) so this step
-# is independent of the persistent mock's reconnect backoff after prior
-# daemon restarts. The mock serves invokes for 8s — plenty of time for
-# the test to dispatch tab.new and observe the completion event.
+# Short-lived inline mock GUI (all capabilities, primary), independent of the persistent
+# mock's reconnect backoff after earlier daemon restarts. It serves invokes for 8s.
 DISPATCH_GUI_LOG=$WORK/dispatch_gui.log
 python3 - "$SOCKET" "$DISPATCH_GUI_LOG" <<'PY' &
 import json, socket, sys, time, uuid
@@ -901,7 +850,6 @@ for raw in f:
             fh.write(f"echoed_invoke={msg['invoke']}\n")
 PY
 DISPATCH_GUI_PID=$!
-# Wait for the register ack to be observed by the mock.
 deadline=$(( SECONDS + 4 ))
 while (( SECONDS < deadline )); do
     grep -q "register_ok=True" "$DISPATCH_GUI_LOG" 2>/dev/null && break

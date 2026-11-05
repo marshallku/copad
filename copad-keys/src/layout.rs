@@ -22,7 +22,6 @@ pub fn us_base_evdev(code: u32) -> Option<char> {
     }
 }
 
-/// The US-layout character of a macOS virtual key code (`kVK_ANSI_*`).
 pub fn us_base_macos(code: u16) -> Option<char> {
     Some(match code {
         0 => 'a',
@@ -77,9 +76,7 @@ pub fn us_base_macos(code: u16) -> Option<char> {
     })
 }
 
-/// The key a macOS virtual key code names when that key types nothing on its own (or is a
-/// keypad key, which the protocol reports as its own key). `None` = a text key, identified
-/// by the characters it types.
+/// `None` = a text key, identified by the characters it types. Keypad keys are reported as their own key.
 pub fn macos_functional(code: u16) -> Option<Key> {
     Some(match code {
         36 => Key::Enter,
@@ -163,8 +160,8 @@ mod tests {
         assert_eq!(us_base_evdev(41), Some('`'));
         assert_eq!(us_base_evdev(43), Some('\\'));
         assert_eq!(us_base_evdev(57), Some(' '));
-        assert_eq!(us_base_evdev(1), None); // Esc
-        assert_eq!(us_base_evdev(28), None); // Enter
+        assert_eq!(us_base_evdev(1), None);
+        assert_eq!(us_base_evdev(28), None);
     }
 
     #[test]
@@ -176,7 +173,7 @@ mod tests {
         assert_eq!(macos_functional(76), Some(Key::Kp(Kp::Enter)));
         assert_eq!(macos_functional(99), Some(Key::F(3)));
         assert_eq!(macos_functional(0), None);
-        assert_eq!(macos_functional(49), None); // Space is a text key
+        assert_eq!(macos_functional(49), None);
     }
 }
 
@@ -201,7 +198,6 @@ pub fn macos_key(code: u16, unmodified: &str) -> Option<Key> {
     us_base_macos(code).map(Key::Char)
 }
 
-/// The single character of `s`, if it is exactly one (and not a control character).
 pub fn single_char(s: &str) -> Option<char> {
     let mut chars = s.chars();
     match (chars.next(), chars.next()) {
@@ -218,7 +214,6 @@ mod macos_key_tests {
     fn names_keys_by_code_then_character_then_position() {
         assert_eq!(macos_key(36, "\r"), Some(Key::Enter));
         assert_eq!(macos_key(0, "a"), Some(Key::Char('a')));
-        // A Russian layout's key at the `c` position.
         assert_eq!(macos_key(8, "с"), Some(Key::Char('с')));
         // Caps Lock / a layout that types capitals unmodified still names the lowercase key.
         assert_eq!(macos_key(0, "A"), Some(Key::Char('a')));
@@ -233,8 +228,7 @@ mod macos_key_tests {
     }
 }
 
-/// The key an X keysym (GDK keyval) names when that key types nothing on its own (or is a
-/// keypad key, which the protocol reports as its own key). `None` = a text key.
+/// `None` = a text key, identified by the characters it types. Keypad keys are reported as their own key.
 pub fn xkb_functional(sym: u32) -> Option<Key> {
     Some(match sym {
         0xff1b => Key::Escape,
@@ -292,7 +286,6 @@ pub fn xkb_functional(sym: u32) -> Option<Key> {
         0xffe8 => Key::Modifier(Modifier::RightMeta),
         0xfe03 => Key::Modifier(Modifier::IsoLevel3Shift),
         0xfe11 => Key::Modifier(Modifier::IsoLevel5Shift),
-        // XF86 media keys → the protocol's media numbers.
         0x1008ff14 => Key::Code(57428), // AudioPlay
         0x1008ff31 => Key::Code(57429), // AudioPause
         0x1008ff15 => Key::Code(57432), // AudioStop
@@ -325,7 +318,7 @@ mod xkb_tests {
             xkb_functional(0xffe1),
             Some(Key::Modifier(Modifier::LeftShift))
         );
-        assert_eq!(xkb_functional(0x61), None); // `a`
-        assert_eq!(xkb_functional(0x20), None); // space types text
+        assert_eq!(xkb_functional(0x61), None);
+        assert_eq!(xkb_functional(0x20), None);
     }
 }

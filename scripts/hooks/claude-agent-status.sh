@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# claude-agent-status.sh — publish copad agent-status events from Claude
-# Code hooks so copad can toast when an agent finishes a turn or needs
-# your input.
+# claude-agent-status.sh — publish copad agent-status events from Claude Code hooks so copad
+# can toast when an agent finishes a turn or needs input.
 #
 # Point your Claude Code hooks at this script (see docs/harness-hooks.md
 # § "Agent status → toast"):
@@ -9,31 +8,22 @@
 #   Stop         → claude-agent-status.sh stopped
 #   Notification → claude-agent-status.sh notification
 #
-# It reads the hook's JSON payload on stdin and publishes a
-# `claude.<event>` bus event via `coctl event publish --quiet`. Pair it
-# with the triggers in examples/triggers/claude-agent-status.toml.
+# It reads the hook's JSON payload on stdin and publishes a `claude.<event>` bus event via
+# `coctl event publish --quiet`. Pair it with the triggers in
+# examples/triggers/claude-agent-status.toml.
 #
-# Design notes (why this shape):
-#   - `Stop` carries no "is this the FINAL stop" signal — a blocking
-#     sibling Stop hook can continue the agent, and there is no
-#     `stop_hook_active` field in the current hook schema. So `stopped`
-#     is OCCURRENCE-based: every Stop publishes. Dedup/coalescing is a
-#     Slice-2 concern (the tab-badge tracker), not this notify-only path.
-#   - `Notification` fires for many reasons; only permission/input-waiting
-#     types mean "the agent needs you." We filter on the structured
-#     `notification_type` field, never on localized message text.
-#   - `$COPAD_PANEL_ID` is exported into each copad pane's shell env; we
-#     carry it in the payload so Slice 2 can key a per-tab badge off it.
-#     Outside copad the var is unset and the hook is a silent no-op.
-#   - Payload is built with `jq -n --arg` so a hostile `cwd`/`message`
-#     can never break out of the JSON string.
+#   - `Stop` has no "final stop" signal (a sibling Stop hook can continue the agent), so
+#     `stopped` is occurrence-based: every Stop publishes.
+#   - `Notification` fires for many reasons; filter on the structured `notification_type`,
+#     never on localized message text.
+#   - `$COPAD_PANEL_ID` is exported into each copad pane's shell and carried in the payload.
+#   - The payload is built with `jq -n --arg` so a hostile `cwd`/`message` cannot break out
+#     of the JSON string.
 
 set -euo pipefail
 
-# Notification types that mean "the agent is waiting for the human."
-# From the Claude Code hooks schema `notification_type` enum. Other
-# types (auth_success, elicitation_complete/response, idle_prompt,
-# agent_completed) are not input-waits and are dropped.
+# `notification_type` values that mean "the agent is waiting for the human". The others
+# (auth_success, elicitation_complete/response, idle_prompt, agent_completed) are dropped.
 AWAITING_TYPES_RE='^(permission_prompt|elicitation_dialog|agent_needs_input)$'
 
 usage() {
@@ -41,9 +31,8 @@ usage() {
     exit 2
 }
 
-# Publish one event. Best-effort: `--quiet` makes coctl exit 0 when the
-# daemon is down, and `|| true` guards the rare non-quiet failure so a
-# publish problem never fails the host hook.
+# Best-effort: `--quiet` exits 0 when the daemon is down and `|| true` covers other failures,
+# so a publish problem never fails the host hook.
 publish() {
     local kind="$1" payload="$2"
     coctl event publish "$kind" --quiet "$payload" >/dev/null 2>&1 || true
@@ -64,9 +53,8 @@ emit() {
 
     case "$event" in
     working)
-        # UserPromptSubmit → the agent is now working on a turn. Drives the
-        # cockpit's "working" state. Optional wiring (see docs/harness-hooks.md);
-        # note: NOT `claude.session_started`, which is reserved for SessionStart.
+        # Drives the cockpit's "working" state. Not `claude.session_started`, which is
+        # reserved for SessionStart.
         local payload
         payload="$(jq -n \
             --arg panel_id "$panel_id" \
@@ -87,12 +75,8 @@ emit() {
     notification)
         local nt msg payload
         nt="$(jq -r '.notification_type // empty' <<<"$input" 2>/dev/null || true)"
-        # Only permission/input-waiting notifications are agent-status
-        # events; everything else is noise for this feature.
         [[ "$nt" =~ $AWAITING_TYPES_RE ]] || return 0
         msg="$(jq -r '.message // empty' <<<"$input" 2>/dev/null || true)"
-        # `session` is included so the cockpit's per-pane model can display which
-        # session is awaiting (parity with stopped/working).
         payload="$(jq -n \
             --arg panel_id "$panel_id" \
             --arg cwd "$cwd" \
@@ -122,8 +106,6 @@ self_test() {
         fi
     }
 
-    # Assert the emitted payload's .session equals expected (catches a broken
-    # .session_id extraction, not just the kind).
     check_session() { # desc expected-session actual-line
         local desc="$1" want="$2"
         local got; got="$(printf '%s' "${3#*$'\t'}" | jq -r '.session // empty' 2>/dev/null)"
@@ -132,34 +114,26 @@ self_test() {
     }
 
     export COPAD_PANEL_ID="pane-test"
-    # UserPromptSubmit → working.
     check "working emits claude.working" "claude.working" \
         "$(emit working '{"cwd":"/tmp/x","session_id":"s1"}')"
     check_session "working carries session" "s1" \
         "$(emit working '{"cwd":"/tmp/x","session_id":"s1"}')"
-    # Stop always emits.
     check "stop emits session_stopped" "claude.session_stopped" \
         "$(emit stopped '{"cwd":"/tmp/x","session_id":"s1"}')"
     check_session "stop carries session" "s1" \
         "$(emit stopped '{"cwd":"/tmp/x","session_id":"s1"}')"
-    # Notification: permission_prompt emits awaiting.
     check "notification permission emits" "claude.awaiting_input" \
         "$(emit notification '{"cwd":"/tmp/x","notification_type":"permission_prompt","message":"allow?"}')"
     check_session "awaiting carries session" "s9" \
         "$(emit notification '{"session_id":"s9","notification_type":"permission_prompt"}')"
-    # elicitation_dialog emits.
     check "notification elicitation emits" "claude.awaiting_input" \
         "$(emit notification '{"notification_type":"elicitation_dialog"}')"
-    # auth_success is filtered out (no emit).
     check "notification auth_success filtered" "" \
         "$(emit notification '{"notification_type":"auth_success"}')"
-    # idle_prompt is filtered out.
     check "notification idle_prompt filtered" "" \
         "$(emit notification '{"notification_type":"idle_prompt"}')"
-    # missing notification_type filtered out.
     check "notification no type filtered" "" \
         "$(emit notification '{"message":"hi"}')"
-    # Hostile cwd with quotes stays valid JSON (jq -c round-trips).
     local hostile
     hostile="$(emit stopped '{"cwd":"/x\"; rm -rf /","session_id":"s"}')"
     if printf '%s' "${hostile#*$'\t'}" | jq -e . >/dev/null 2>&1; then
@@ -168,12 +142,10 @@ self_test() {
         printf '  FAIL %s\n' "hostile cwd broke JSON"; fails=$((fails + 1))
     fi
 
-    # --- gate tests: exercise main() (not just emit) with a stubbed coctl on
-    # PATH, so the COPAD_PANEL_ID-or-COPAD_SOCKET gate is actually verified. ---
+    # Gate tests run main() with a stubbed coctl on PATH to verify the panel-id/socket gate.
     local tmp stub captured
     tmp="$(mktemp -d)"; stub="$tmp/bin"; captured="$tmp/published"
     mkdir -p "$stub"
-    # stub coctl records "publish <kind>" when invoked as `coctl event publish …`.
     printf '#!/bin/sh\n[ "$1" = event ] && [ "$2" = publish ] && echo "publish $3" >>"%s"\nexit 0\n' \
         "$captured" > "$stub/coctl"
     chmod +x "$stub/coctl"
@@ -209,12 +181,9 @@ main() {
         return
     fi
     local event="$1"
-    # Gate: only act when a copad daemon is reachable. That's true either
-    # inside a local copad pane ($COPAD_PANEL_ID is exported there) or over
-    # SSH when the daemon socket has been forwarded and $COPAD_SOCKET points
-    # at it (see docs/ssh-remote.md). Over SSH $COPAD_PANEL_ID is NOT
-    # forwarded, so requiring it would make the remote path silently no-op;
-    # emit() defaults panel_id to "" and the Slice-1 toast uses cwd anyway.
+    # Act only when a copad daemon is reachable: inside a local pane ($COPAD_PANEL_ID) or over
+    # SSH with a forwarded socket ($COPAD_SOCKET, docs/ssh-remote.md). $COPAD_PANEL_ID is not
+    # forwarded over SSH, so requiring it would silently no-op the remote path.
     if [ -z "${COPAD_PANEL_ID:-}" ] && [ -z "${COPAD_SOCKET:-}" ]; then
         exit 0
     fi

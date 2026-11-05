@@ -1,28 +1,21 @@
 #!/bin/sh
 # copadd launch wrapper (macOS LaunchAgent ProgramArguments target).
 #
-# Why a wrapper instead of running copadd directly: plugin bearer tokens
-# (COPAD_WEB_BRIDGE_TOKEN, …) must reach copadd's environment so its plugin
-# supervisor injects them into plugins — but the LaunchAgent plist is
-# repo-tracked and world-readable (mode 644), so secrets must NOT live there.
-# This wrapper sources an operator-owned secrets file (mode 600) that
-# install-macos.sh generates once and NEVER overwrites, so the token survives
-# reinstalls. launchd sets HOME for gui/<uid> agents, so $HOME resolves here.
-# launchd hands a gui/<uid> agent a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
-# copadd's plugins shell out to Homebrew-installed tools — the web-bridge runs
-# `tmux` (for the mobile live-attach / send), git plugins run `git`, etc. — so
-# put the Homebrew bin dirs (Apple Silicon + Intel) ahead of the minimal PATH.
-# Without this, `tmux` isn't found and the mobile pane list comes back empty.
-# Also prepend the two dirs copadd itself may live in: install.sh (prebuilt
-# release) drops it in ~/.local/bin, install-macos.sh (from source, via
-# `cargo install`) in ~/.cargo/bin.
+# Plugin bearer tokens (COPAD_WEB_BRIDGE_TOKEN, ...) must reach copadd's environment, but the
+# plist is repo-tracked and world-readable (644), so secrets cannot live there. This sources
+# an operator-owned secrets file (mode 600) that install-macos.sh generates once and never
+# overwrites. launchd sets HOME for gui/<uid> agents.
+#
+# launchd hands agents a minimal PATH, but plugins shell out to Homebrew tools (web-bridge
+# runs `tmux`, git plugins run `git`), so Homebrew bin dirs go first; without them the mobile
+# pane list comes back empty. The dirs copadd itself may live in are prepended too:
+# ~/.local/bin (install.sh) and ~/.cargo/bin (install-macos.sh).
 PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
 
-# launchd agents inherit no LANG/LC_*, and without a UTF-8 locale tmux
-# sanitizes non-printable bytes in format output — it rewrites the TAB field
-# separators in web-bridge's `list-panes -F` to `_`, so the mobile pane list
-# parses to zero rows. Default to a UTF-8 locale (respect an explicit override).
+# launchd agents inherit no LANG/LC_*; without a UTF-8 locale tmux rewrites the TAB
+# separators in web-bridge's `list-panes -F` to `_` and the mobile pane list parses to zero
+# rows. An explicit override is respected.
 : "${LANG:=en_US.UTF-8}"
 export LANG
 
@@ -30,12 +23,10 @@ set -a
 [ -f "$HOME/.config/copad/secrets.env" ] && . "$HOME/.config/copad/secrets.env"
 set +a
 
-# Resolve copadd. An installer pins the exact path it just installed to
-# ~/.config/copad/copadd.path (overwritten every install), so a switch between
-# a --user (~/.local/bin) and --system (/usr/local/bin) install always launches
-# the just-installed binary rather than a stale copy left in another bin dir.
-# Fall back to a search across the known install dirs, then PATH — hardcoding
-# one would put a launchd KeepAlive agent into a restart loop on the others.
+# An installer pins the path it just installed to ~/.config/copad/copadd.path (overwritten
+# every install), so switching between --user and --system installs launches the fresh
+# binary, not a stale copy in another bin dir. Otherwise search the known install dirs, then
+# PATH: hardcoding one would put a KeepAlive agent into a restart loop on the others.
 COPADD=""
 if [ -f "$HOME/.config/copad/copadd.path" ]; then
     pinned="$(cat "$HOME/.config/copad/copadd.path" 2>/dev/null || true)"

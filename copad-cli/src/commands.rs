@@ -1257,9 +1257,6 @@ impl Cli {
                     if let Some(p) = project {
                         obj.insert("project".into(), json!(p));
                     }
-                    // `--values <json>` precedence; falls back to building
-                    // the object from repeated `--value name=val` flags
-                    // (per codex-plan Q8). Both omitted → empty object.
                     let values_obj: serde_json::Value = if let Some(s) = values {
                         match serde_json::from_str::<serde_json::Value>(s) {
                             Ok(v) if v.is_object() => v,

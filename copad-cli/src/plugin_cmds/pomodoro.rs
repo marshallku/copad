@@ -1,16 +1,6 @@
-//! `coctl pomodoro` — ergonomic wrapper over the `pomodoro.*` action
-//! surface exposed by `copad-plugin-pomodoro`.
-//!
-//! | CLI                                            | Action                  |
-//! |------------------------------------------------|-------------------------|
-//! | `pomodoro status`                              | `pomodoro.status`       |
-//! | `pomodoro start [--minutes N] [--label TEXT]`  | `pomodoro.start`        |
-//! | `pomodoro pause` / `resume` / `toggle` / `reset` | `pomodoro.{…}`         |
-//! | `pomodoro set-durations [--work N] …`          | `pomodoro.set_durations`|
-//!
-//! `status` (and every mutating action) renders the one-line status text by
-//! default — that is exactly what the plugin's `[[modules]]` entry shells
-//! each second (`coctl pomodoro status`) to paint the status bar.
+//! `coctl pomodoro` — wrapper over the `pomodoro.*` actions. `status` and every mutating action
+//! print the one-line status text by default; the plugin's `[[modules]]` entry shells
+//! `coctl pomodoro status` each second to paint the status bar.
 
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -56,8 +46,6 @@ pub enum PomodoroCommand {
     },
 }
 
-/// Print the `text` field the plugin renders; fall back to a compact
-/// phase/remaining summary if it's somehow absent.
 fn render_line(result: &Value) {
     if let Some(text) = result.get("text").and_then(Value::as_str) {
         println!("{text}");

@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-# e2e for the Browser Workbench history restore (work unit B2, macOS).
+# e2e for the Browser Workbench history restore (macOS).
 #
-# Under `restore = "full"`, a pane must come back with its back/forward stack
-# and scroll offset — not just its URL. The check that matters is the BACK-LIST
-# DEPTH: a corrupt or cross-version `interactionState` fails silently inside
-# WebKit and leaves a view reporting exactly the URL a plain `load()` fallback
-# would have produced, so the URL alone proves nothing.
+# Under `restore = "full"` a pane must come back with its back/forward stack and scroll
+# offset, not just its URL. The check that matters is the BACK-LIST DEPTH: a corrupt or
+# cross-version `interactionState` fails silently inside WebKit and leaves a view reporting
+# exactly the URL a plain `load()` fallback would produce.
 #
-# Under `restore = "origin"` the same sequence must write NO blob at all — the
-# blob is sensitive persistence and only the explicit opt-in earns it.
+# Under `restore = "origin"` the same sequence must write NO blob: the blob is sensitive
+# persistence and only the explicit opt-in earns it.
 #
-# Pages are served from a local throwaway HTTP server rather than example.com:
-# the scroll assertion needs a page that is GENUINELY tall, and one whose height
-# is the same after a restart. Injecting `body.style.height` into a short page
-# does not survive — the restored document is short again, the browser clamps
-# the offset to 0, and the test would be asserting something unachievable.
-# Serving real pages also makes the run offline and deterministic.
+# Pages come from a local throwaway HTTP server: the scroll assertion needs a page that is
+# genuinely tall before and after a restart (injecting `body.style.height` does not survive,
+# the browser clamps the restored offset to 0), and it keeps the run offline and
+# deterministic.
 #
-# The harness temporarily rewrites the real ~/.config/copad/config.toml, because
-# the Swift side resolves config through `homeDirectoryForCurrentUser`, which
-# ignores $HOME. Everything else is isolated in a temp home. The original
+# The harness temporarily rewrites the real ~/.config/copad/config.toml, because the Swift
+# side ignores $HOME for config. Everything else is isolated in a temp home. The original
 # config is restored on every exit path, including a signal.
 set -uo pipefail
 
@@ -41,17 +37,14 @@ cleanup() {
     [ -n "${SERVER_PID:-}" ] && kill -9 "$SERVER_PID" 2>/dev/null
     [ -n "${WWW:-}" ] && rm -rf "$WWW"
 }
-# Cleanup runs on EXIT only. `trap cleanup EXIT INT TERM` looks equivalent and is
-# not: bash runs a signal handler and then RESUMES the script, so the cleanup
-# would delete the temp $HOME the very next command reads from and the run would
-# carry on asserting against wiped state. INT/TERM therefore just `exit` with the
-# conventional status, which fires the EXIT trap exactly once (codex C1).
+# EXIT only: with `trap cleanup EXIT INT TERM` bash runs the handler and then RESUMES the
+# script, deleting the temp $HOME the next command reads. INT/TERM just `exit`, which fires
+# the EXIT trap once.
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Three tall pages, so a back-list has somewhere to go and the scroll offset
-# has room to survive.
+# Three tall pages, so a back-list has somewhere to go and the scroll offset room to survive.
 WWW=$(mktemp -d /private/tmp/copad-www-XXXXXX)
 for page in a b c; do
     cat > "$WWW/$page.html" <<HTML
@@ -118,8 +111,8 @@ build_history() {
     rpc webview.navigate "{\"url\":\"$BASE/c.html\"}" >/dev/null
     sleep 2
     rpc webview.execute_js '{"code":"window.scrollTo(0,1200); String(window.scrollY)"}' >/dev/null
-    # The scroll reporter is a trailing 150ms throttle, and the session save is
-    # debounced 0.8s on top of that.
+    # The scroll reporter is a trailing 150ms throttle, and the session save is debounced 0.8s
+    # on top.
     sleep 2
 }
 
@@ -142,7 +135,6 @@ else:
 PY
 }
 
-# ---------------------------------------------------------------------------
 echo "[1/3] restore = full: a blob is written with a real back-list depth"
 set_policy full
 TMPHOME=$(mktemp -d /private/tmp/copad-e2e-XXXXXX)
@@ -160,9 +152,8 @@ if [ -n "$GEN" ] && [ "${DEPTH:-0}" -ge 2 ] && [ "$BLOBS" -ge 1 ]; then
 else
     echo "  FAIL: generation='$GEN' depth='$DEPTH' blobs=$BLOBS"; RC=1
 fi
-# Sampling scroll only on didFinish captured the position the page LOADED at,
-# which is always 0 — so every snapshot persisted scroll_y: 0 and restore put
-# the user back at the top of a page they had read halfway down.
+# Sampling scroll only on didFinish captured the position the page LOADED at (always 0), so
+# restore put the user back at the top.
 if python3 -c "import sys; sys.exit(0 if float(sys.argv[1] or 0) > 500 else 1)" "$SAVED_SCROLL"; then
     echo "  PASS: the scroll offset was captured, not left at 0"
 else
@@ -191,9 +182,8 @@ if [ "$CANBACK" = "true" ]; then
 else
     echo "  FAIL: can_go_back=$CANBACK (a plain URL load would look exactly like this)"; RC=1
 fi
-# The scroll offset is a RESTORE HINT, not an exact measurement: a page whose
-# height changed clamps it. Assert it landed in the right neighbourhood rather
-# than on an exact pixel.
+# The scroll offset is a restore hint (a page whose height changed clamps it): assert it
+# landed in the right neighbourhood, not on an exact pixel.
 if [ -n "$SCROLL" ] && [ "$SCROLL" -gt 500 ]; then
     echo "  PASS: scroll restored to $SCROLL (was ~1200 before the restart)"
 else

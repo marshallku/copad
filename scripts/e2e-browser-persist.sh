@@ -1,21 +1,14 @@
 #!/usr/bin/env bash
-# e2e for the Browser Workbench persistence + focus claims (macOS).
+# e2e for Browser Workbench persistence + focus claims (macOS).
 #
-#   1. A browser pane persists a tab snapshot whose id SURVIVES A RESTART, and a
-#      snapshot
-#      taken before the page finishes loading keeps its URL instead of writing
-#      "" and erasing the pane. That erasure was a live bug: a session.json in
-#      the wild held `{"kind":"webview","url":""}` for a pane the user had open.
-#      An unroutable address is used for the second case so WKWebView never
-#      produces a URL at all.
-#   2. Driving the browser steals neither the frontmost application nor the
-#      mouse cursor — the owner's hard requirement that
-#      agent automation never fights the human for the pointer.
+#   1. A browser pane persists a tab snapshot whose id survives a restart, and a snapshot taken
+#      before the page finishes loading keeps its URL instead of writing "" (which erases the
+#      pane). An unroutable address makes WKWebView never produce a URL for that case.
+#   2. Driving the browser steals neither the frontmost application nor the mouse cursor.
 #
-# Isolated by $HOME, so it cannot touch the user's live session.json. Note the
-# Swift side reads config through `homeDirectoryForCurrentUser`, which ignores
-# $HOME — config is therefore the real one (read-only here), while everything
-# Rust writes lands in the temp home.
+# Isolated by $HOME, so it cannot touch the live session.json. The Swift side reads config via
+# `homeDirectoryForCurrentUser`, which ignores $HOME: config is the real one (read-only here),
+# while everything Rust writes lands in the temp home.
 #
 # Usage: scripts/e2e-browser-persist.sh
 #
@@ -31,20 +24,13 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$REPO/copad-macos/.build/debug/Copad.app/Contents/MacOS/Copad"
 COCTL="$REPO/target/release/coctl"; [ -x "$COCTL" ] || COCTL="$REPO/target/debug/coctl"
-# Every CLI invocation below runs after `export COPAD_SOCKET=` for the instance
-# under test. Without that a `coctl` call inherits the ambient socket and opens
-# a tab in the user's REAL copad — which is not a test failure, it is a test
-# that reached out and touched something it had no business touching.
+# Every CLI call below runs after `export COPAD_SOCKET=` for the instance under test;
+# otherwise coctl inherits the ambient socket and opens a tab in the user's REAL copad.
 [ -x "$APP" ] || { echo "build the bundle first — see the header"; exit 2; }
 
-# Raw JSON-RPC over the per-instance GUI socket.
-#
-# Not `coctl` for the interaction commands: every `coctl webview <verb>`
-# requires `--id <panel-uuid>`, and no CLI verb exposes panel ids (`session
-# list`/`session info` report tabs, not panes). macOS's dispatcher DOES accept
-# an omitted `id` and falls back to the active webview, so the socket reaches
-# what the CLI cannot address. That gap is itself worth recording: it is why
-# `coctl` subcommands land with each feature in B3/B4/B5 rather than up front.
+# Raw JSON-RPC over the per-instance GUI socket. `coctl webview <verb>` requires `--id` and no
+# CLI verb exposes panel ids; the macOS dispatcher falls back to the active webview when `id`
+# is omitted.
 rpc() {
     python3 - "$COPAD_SOCKET" "$1" "${2:-{\}}" <<'PY'
 import json, socket, sys
@@ -65,22 +51,12 @@ PY
 
 RC=0
 
-# Every instance this run launched, so the reaper below can get them all.
-#
-# This script starts SIX app instances and kills each one inline when its case
-# is done. That is not enough on its own: a failing assertion `exit`s, and Ctrl-C
-# never reaches the inline kill at all — which is how a run on 2026-09-09 left a
-# debug Copad holding a temp $HOME for seventeen hours. The inline kills stay
-# (they keep six GUIs from piling up during a pass); this is the backstop.
-#
-# A FILE, not an array: `launch` is called inside `$(...)`, a subshell, so an
-# array appended there would not survive back into the parent. The record is
-# written before the caller ever reads the pid, so an interrupt between the spawn
-# and the read is still reapable.
+# Every instance this run launched, for the reaper below. The inline kills do not run when an
+# assertion `exit`s or on Ctrl-C (a run once left a debug Copad holding a temp $HOME for 17
+# hours). A FILE, not an array: `launch` runs in `$(...)`, a subshell. The record is written
+# before the caller reads the pid, so an interrupt between spawn and read is still reapable.
 LAUNCHED=$(mktemp /private/tmp/copad-e2e-pids-XXXXXX)
 cleanup() {
-    # Tolerates a missing record so it is safe to run more than once and safe to
-    # run before the record exists at all.
     [ -n "${LAUNCHED:-}" ] && [ -f "$LAUNCHED" ] || return 0
     while read -r pid home sock; do
         [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
@@ -89,21 +65,16 @@ cleanup() {
     done <"$LAUNCHED"
     rm -f "$LAUNCHED"
 }
-# Cleanup runs on EXIT only. `trap cleanup EXIT INT TERM` looks equivalent and is
-# not: bash runs a signal handler and then RESUMES the script, so the cleanup
-# would delete the temp $HOME the very next command reads from and the run would
-# carry on asserting against wiped state. INT/TERM therefore just `exit` with the
-# conventional status, which fires the EXIT trap exactly once (codex C1).
+# EXIT only: with `trap cleanup EXIT INT TERM` bash runs the handler and then RESUMES the
+# script, deleting the temp $HOME the next command reads. INT/TERM just `exit`, which fires
+# the EXIT trap once.
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 SESSION_REL="Library/Application Support/copad/session.json"
 
-# The Swift side resolves config through `homeDirectoryForCurrentUser`, which
-# ignores $HOME — so this harness cannot isolate config, and the app under test
-# reads the REAL `[browser] restore`. Derive expectations from it rather than
-# assuming origin-only, or a user who has opted into `url`/`full` sees these
-# assertions fail for behaving correctly.
+# The Swift side ignores $HOME for config, so the app reads the REAL `[browser] restore`.
+# Derive expectations from it, or a user who opted into `url`/`full` sees false failures.
 RESTORE=$(python3 - "$HOME/.config/copad/config.toml" <<'PY'
 import re, sys
 try:
@@ -203,10 +174,8 @@ sys.exit(0 if ok else 1)
 PY
 }
 
-# Last TABID= line emitted by check_pane, or empty.
 tabid_of() { grep '^TABID=' <<<"$1" | tail -1 | cut -d= -f2; }
 
-# --- 1. a page that loads normally, and its id survives a restart ----------
 echo "[1/5] a browser pane persists a tab snapshot whose id survives a restart"
 H1=$(mktemp -d /private/tmp/copad-e2e-XXXXXX)
 read -r PID1 SOCK1 <<<"$(launch "$H1")" || exit 1
@@ -222,7 +191,6 @@ OUT1=$(check_pane "$H1/$SESSION_REL" "$(expected_url https://example.com /)") ||
 echo "$OUT1" | grep -v '^TABID='
 ID1=$(tabid_of "$OUT1")
 
-# --- 2. focus + cursor are not taken ---------------------------------------
 echo "[2/5] agent-driven commands take neither focus nor the cursor"
 DROVE=0
 drive() {
@@ -236,9 +204,8 @@ drive() {
 }
 drive webview.page_info
 drive webview.query '{"selector":"h1"}'
-# NOT `a`: example.com's only link goes to iana.org, and now that a navigation
-# schedules a save, clicking it would race the restart assertion below into
-# persisting the wrong origin. `h1` exercises the same click path and stays put.
+# Not `a`: example.com's only link goes to iana.org, and clicking it would race the restart
+# assertion below into persisting the wrong origin. `h1` exercises the same click path.
 drive webview.click '{"selector":"h1"}'
 drive webview.screenshot
 NOW_FRONT=$(front) || RC=1
@@ -255,7 +222,6 @@ fi
 kill -TERM "$PID1" 2>/dev/null; sleep 1; kill -9 "$PID1" 2>/dev/null; rm -f "$SOCK1"
 read -r PID1B SOCK1B <<<"$(launch "$H1")" || exit 1
 export COPAD_SOCKET="$SOCK1B"; sleep 3
-# Nudge a save so the restored pane is written back.
 "$COCTL" webview open "https://example.org" --mode tab >/dev/null 2>&1
 sleep 2
 if [ -n "$ID1" ]; then
@@ -266,13 +232,12 @@ else
 fi
 kill -9 "$PID1B" 2>/dev/null; rm -f "$SOCK1B"; rm -rf "$H1"
 
-# --- 3. a page that never loads --------------------------------------------
 echo "[3/5] a pane whose page never loads still persists its URL"
 H2=$(mktemp -d /private/tmp/copad-e2e-XXXXXX)
 read -r PID2 SOCK2 <<<"$(launch "$H2")" || exit 1
 export COPAD_SOCKET="$SOCK2"; sleep 1
-# Unroutable: WKWebView never produces a url, so the snapshot must come from
-# the pending restore URL or the pane is written out as "" and lost.
+# Unroutable: WKWebView never produces a url, so the snapshot must come from the pending
+# restore URL or the pane is written out as "" and lost.
 "$COCTL" webview open "https://10.255.255.1/never-loads" --mode tab >/dev/null 2>&1 \
     || { echo "  FAIL: webview open failed"; RC=1; }
 sleep 2.5
@@ -280,14 +245,12 @@ OUT2=$(check_pane "$H2/$SESSION_REL" "$(expected_url https://10.255.255.1 /never
 echo "$OUT2" | grep -v '^TABID='
 kill -9 "$PID2" 2>/dev/null; rm -f "$SOCK2"; rm -rf "$H2"
 
-# --- 3b. the same guarantee via navigate, not just via open ----------------
 echo "[3b/5] a BLANK pane navigated to an unloadable URL also persists it"
 H2B=$(mktemp -d /private/tmp/copad-e2e-XXXXXX)
 read -r PID2B SOCK2B <<<"$(launch "$H2B")" || exit 1
 export COPAD_SOCKET="$SOCK2B"; sleep 1
-# Open with NO url (blank placeholder), then navigate. This reaches the erasure
-# by a different route than [3/5]: `pendingURL` is seeded at init there, so only
-# this covers `navigate(to:)`.
+# Open blank, then navigate: `pendingURL` is seeded at init in [3/5], so only this covers
+# `navigate(to:)`.
 "$COCTL" webview open "about:blank" --mode tab >/dev/null 2>&1
 sleep 1
 drive_ok=$(rpc webview.navigate '{"url":"https://10.255.255.2/never-loads"}')
@@ -297,13 +260,10 @@ OUT2B=$(check_pane "$H2B/$SESSION_REL" "$(expected_url https://10.255.255.2 /nev
 echo "$OUT2B" | grep -v '^TABID='
 kill -9 "$PID2B" 2>/dev/null; rm -f "$SOCK2B"; rm -rf "$H2B"
 
-# --- 4. wired-but-unimplemented methods say so ------------------------------
 echo "[4/5] not-yet-built methods answer unsupported_capability, not unknown_method"
 H3=$(mktemp -d /private/tmp/copad-e2e-XXXXXX)
 read -r PID3 SOCK3 <<<"$(launch "$H3")" || exit 1
 export COPAD_SOCKET="$SOCK3"; sleep 1
-# The list shrinks as the units land — that is the point of registering them.
-# Only the profile surface is still unbuilt.
 for m in webview.profile.list webview.profile.clear; do
     OUT=$(rpc "$m")
     if grep -q '"unsupported_capability"' <<<"$OUT"; then
@@ -312,11 +272,6 @@ for m in webview.profile.list webview.profile.clear; do
         echo "  FAIL: $m -> $OUT"; RC=1
     fi
 done
-# And the case that motivated answering "not built" BEFORE the policy gate:
-# without that ordering `browser.secret.fill` would have said
-# `requires_protected` and pointed the caller at `webview.tab.protect`, which
-# was itself unimplemented. Now that both are built, the refusal is the
-# genuinely useful one.
 OUT=$(rpc browser.secret.fill '{"credential_id":"nobody/nothing"}')
 if grep -q "requires_protected" <<<"$OUT"; then
     echo "  PASS: browser.secret.fill on an unprotected tab -> requires_protected"
@@ -325,19 +280,16 @@ else
 fi
 kill -9 "$PID3" 2>/dev/null; rm -f "$SOCK3"; rm -rf "$H3"
 
-# --- 5. a navigation the PAGE starts is persisted too -----------------------
 echo "[5/5] a page-initiated navigation updates the persisted URL"
 H4=$(mktemp -d /private/tmp/copad-e2e-XXXXXX)
 read -r PID4 SOCK4 <<<"$(launch "$H4")" || exit 1
 export COPAD_SOCKET="$SOCK4"; sleep 1
 "$COCTL" webview open "https://example.com" --mode tab >/dev/null 2>&1
 sleep 3
-# A navigation the PAGE starts, via `location.href` — it never passes through
-# navigate()/goBack()/reload(), so it is the one that exercises
-# `didStartProvisionalNavigation` adopting a navigation this controller did not
-# initiate. Deliberately NOT a click on example.com's own link: WebKit follows
-# that synthetic click only sometimes, which made the assertion depend on the
-# browser's mood rather than on the behaviour under test.
+# A page-initiated navigation via `location.href` never passes through navigate()/goBack()/
+# reload(), so it exercises `didStartProvisionalNavigation` adopting a navigation this
+# controller did not start. Not a click on example.com's link: WebKit follows that synthetic
+# click only sometimes.
 GO=$(rpc webview.execute_js '{"code":"location.href = \"https://example.org/\"; \"ok\""}')
 grep -q '"ok":true' <<<"$GO" || { echo "  FAIL: execute_js rejected: $GO"; RC=1; }
 
@@ -360,9 +312,7 @@ else:
 PY
 }
 
-# POLL rather than sleep: this assertion depends on a real page load over the
-# network, and a fixed wait makes it pass or fail on latency rather than on the
-# behaviour under test.
+# Poll, not sleep: this depends on a real page load over the network.
 FOUND=""
 for _ in $(seq 1 30); do
     FOUND=$(persisted_url "$H4/$SESSION_REL")

@@ -24,10 +24,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libvte-2.91-gtk4-dev libwebkitgtk-6.0-dev libdbus-1-dev
 
-      # Add the musl target for the fully-static comux build (see "Build static
-      # comux"). rustup provides the target's std; zig (below) provides the C
-      # cross-linker — plain musl-gcc can't build copad-mux's C dep (ring, via
-      # reqwest's rustls: it rejects musl-gcc's -m64), so cargo-zigbuild is used.
+      # musl target for the static comux; cargo-zigbuild because musl-gcc rejects -m64 when
+      # building ring (reqwest's rustls).
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -36,28 +34,20 @@ jobs:
 
       - name: Build release
         run: |
-          # Stamp the tag's version into the workspace so built binaries
-          # self-report their true version via CARGO_PKG_VERSION. Git tags alone
-          # don't bump Cargo.toml, and comux's status-bar update check +
-          # `coctl update check` compare the running version against the latest
-          # release — a stale CARGO_PKG_VERSION would make them misreport forever.
+          # Stamp the tag's version into the workspace: comux's update check and `coctl update
+          # check` compare CARGO_PKG_VERSION with the latest release.
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           cargo build --workspace --release
 
-      # Toolchain for the static musl build: zig as the C cross-linker + the
-      # cargo-zigbuild cargo wrapper. Needed because copad-mux pulls in ring (C)
-      # via reqwest's rustls, which fails to build under Debian's musl-gcc.
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
 
       - name: Install cargo-zigbuild
         run: cargo install --locked cargo-zigbuild
 
-      # Fully-static comux for glibc-incompatible machines (musl-libc distros like
-      # Alpine, or hosts whose glibc is older than the runner's ~2.39). Runs after
-      # the version sed above so the static binary self-reports the right version.
-      # Only copad-mux is built here — the GTK app / daemon can't be static-linked.
+      # Static comux for musl distros and hosts whose glibc is older than the runner's. Built
+      # after the version sed so it self-reports the right version.
       - name: Build static comux (musl)
         run: |
           cargo zigbuild --release --target x86_64-unknown-linux-musl -p copad-mux
@@ -70,28 +60,17 @@ jobs:
           cp target/release/copad dist/
           cp target/release/coctl dist/
           cp target/release/comux dist/
-          # copadd: the background daemon. install.sh installs it + starts the
-          # systemd --user unit (already shipped under dist/systemd/), so Linux
-          # release users get the daemon (update-check notifications, triggers,
-          # status bar) — not just the GUI.
           cp target/release/copadd dist/
-          # Desktop file basename matches the GTK app_id so Wayland
-          # compositors map running windows to this launcher entry.
+          # Basename matches the GTK app_id so Wayland maps windows to this launcher.
           cp copad-linux/com.marshall.copad.desktop dist/
-          # Carry the hicolor icon set so install.sh can lay it out
-          # under share/icons/hicolor/<size>/apps/. The shape mirrors
-          # the in-repo copad-linux/icons/ tree exactly.
           cp -r copad-linux/icons dist/icons
           tar -czf "${ARCHIVE}" -C dist .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
-          # Also publish comux as a standalone release asset — a single
-          # self-contained binary (no GTK / no daemon) for users who want only
-          # the multiplexer. install-comux.sh downloads exactly this.
+          # Standalone comux asset (no GTK, no daemon); install-comux.sh downloads this.
           COMUX_ASSET="comux-v${VERSION}-x86_64-linux"
           cp target/release/comux "${COMUX_ASSET}"
           echo "COMUX_ASSET=${COMUX_ASSET}" >> "$GITHUB_ENV"
-          # Static (musl) comux asset — the `-musl` suffix distinguishes it from the
-          # glibc-linked one above. install-comux.sh auto-picks this on musl systems.
+          # The `-musl` suffix tells it apart; install-comux.sh picks it on musl systems.
           COMUX_MUSL_ASSET="comux-v${VERSION}-x86_64-linux-musl"
           cp target/x86_64-unknown-linux-musl/release/comux "${COMUX_MUSL_ASSET}"
           echo "COMUX_MUSL_ASSET=${COMUX_MUSL_ASSET}" >> "$GITHUB_ENV"
@@ -108,21 +87,12 @@ jobs:
 
   build-macos:
     name: Build macOS arm64
-    # macos-15 = arm64 + Xcode 16. copad-macos/Package.swift declares
-    # swift-tools-version 6.0 (so macos-14's Swift 5.10 errors at manifest
-    # parse), and the Swift sources use trailing commas in parameter lists
-    # (SE-0439, Swift 6.1+) — so the default Xcode on macos-15 (Swift 6.0)
-    # ALSO fails. The setup-xcode action below picks the newest stable
-    # Xcode installed on the runner image, which is currently 16.3+ /
-    # Swift 6.1+. Keep this even if the runner image upgrades — it makes
-    # the toolchain selection explicit instead of relying on whichever
-    # Xcode happens to be at /Applications/Xcode.app.
+    # macos-15: Package.swift needs swift-tools-version 6.0, and the sources use trailing
+    # commas in parameter lists (SE-0439, Swift 6.1+), which the default Xcode (Swift 6.0)
+    # rejects; setup-xcode below selects the newest stable Xcode.
     runs-on: macos-15
-    # Developer ID signing + notarization is gated on these secrets. When they
-    # are absent (a fork, or before they are configured) the Stage step logs
-    # "signing secrets absent" and falls back to ad-hoc signing, so the build
-    # never fails for lack of credentials. Setup guide:
-    # docs/macos-signing-notarization.md.
+    # Without these secrets (fork, unconfigured) the Stage step falls back to ad-hoc signing
+    # instead of failing. See docs/macos-signing-notarization.md.
     env:
       MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
       # Notarization via App Store Connect API key (notarytool --key/--key-id/--issuer).
@@ -141,18 +111,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Import the Developer ID Application cert into a throwaway keychain so
-      # codesign can find the identity by name in the Stage step. No-op when the
-      # cert secret is absent (ad-hoc fallback). See docs/macos-signing-notarization.md.
+      # Throwaway keychain so codesign finds the identity by name in the Stage step.
       - name: Import Developer ID certificate
         env:
           MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
-          # NOTE: -e is intentionally OFF. A cert-import failure (missing
-          # password, wrong password, malformed p12) must NOT abort the job —
-          # the Stage step's all-secrets gate then finds no identity and falls
-          # back to ad-hoc signing. So every failure here warns and exit 0s.
+          # -e is OFF on purpose: an import failure must not abort the job, because the Stage
+          # step's gate then finds no identity and falls back to ad-hoc signing.
           set -uo pipefail
           if [ -z "${MACOS_CERTIFICATE_BASE64:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
             echo "signing cert secrets incomplete (need BASE64 + PASSWORD) — skipping import (ad-hoc fallback)"
@@ -171,18 +137,14 @@ jobs:
           # Allow codesign to use the key without an interactive prompt.
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null \
             || fallback "set-key-partition-list failed"
-          # Put our keychain first in the search list so the identity resolves.
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g) || true
           rm -f "$RUNNER_TEMP/cert.p12"
           echo "imported: $(security find-identity -v -p codesigning "$KEYCHAIN" | grep -c 'Developer ID Application') Developer ID Application identity(ies)"
 
-      # copad-linux depends on GTK4/VTE so `cargo build --workspace` fails
-      # on Darwin. List the macOS-buildable crates explicitly. Keep the
-      # plugin set in sync with install-macos.sh's MACOS_PLUGINS array.
+      # copad-linux needs GTK4/VTE and cannot build on Darwin, so list the crates explicitly.
+      # Keep the plugin set in sync with install-macos.sh's MACOS_PLUGINS.
       - name: Build Rust crates (workspace minus copad-linux)
         run: |
-          # Stamp the tag's version into the workspace (see the Linux job) so
-          # comux/coctl self-report their true version.
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           cargo build --release \
@@ -222,7 +184,6 @@ jobs:
           rm -rf "$DIST"
           mkdir -p "$DIST"
 
-          # ---- Copad.app bundle ----
           STAGING="$DIST/Copad.app"
           MACOS_DIR="$STAGING/Contents/MacOS"
           RESOURCES="$STAGING/Contents/Resources"
@@ -232,9 +193,8 @@ jobs:
             cp copad-macos/Resources/AppIcon.icns "$RESOURCES/AppIcon.icns"
           fi
 
-          # Info.plist gets the release tag's version baked into both
-          # CFBundleVersion and CFBundleShortVersionString. LSMinimumSystemVersion
-          # mirrors install-macos.sh.
+          # The tag's version is baked into CFBundleVersion and CFBundleShortVersionString.
+          # LSMinimumSystemVersion mirrors install-macos.sh.
           cat > "$STAGING/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -266,22 +226,14 @@ jobs:
           </plist>
           EOF
 
-          # Signing is DEFERRED until after every binary (CLIs + plugins) is
-          # staged into $DIST, so a single pass can Developer-ID-sign them all
-          # and then notarize the app. See the "Sign + notarize" block below.
+          # Signing is deferred until every binary is staged, so one pass signs them all.
 
-          # ---- Top-level CLI binaries ----
           cp target/release/coctl "$DIST/coctl"
           cp target/release/copadd "$DIST/copadd"
           cp target/release/comux "$DIST/comux"
 
-          # ---- Plugins (binary + plugin.toml + panel.html / triggers.example.toml) ----
-          # Layout matches what install-macos.sh writes into
-          # ~/Library/Application Support/copad/plugins/<name>/. PluginSupervisor
-          # resolves `services.exec` against the plugin dir first, so the
-          # binary co-located with the manifest wins over $PATH lookup.
-          # Keep this list in sync with install-macos.sh's MACOS_PLUGINS array
-          # AND the Build Rust crates step above.
+          # Layout matches install-macos.sh. Keep this list in sync with its MACOS_PLUGINS
+          # and the Build Rust crates step above.
           mkdir -p "$DIST/plugins"
           for name in echo git llm calendar kb todo pomodoro bookmark slack discord jira docs claude pilot web-bridge; do
             crate="copad-plugin-$name"
@@ -295,47 +247,28 @@ jobs:
             chmod 755 "$plugin_dir/$crate"
           done
 
-          # ---- Shell hooks (live-cwd tracking for session restore) ----
           mkdir -p "$DIST/shell-hooks"
           cp copad-macos/shell-hooks/copad-cwd.* "$DIST/shell-hooks/"
-          # Phase 22.1 context bridge (zsh) — install-macos.sh ships this too;
-          # keep the prebuilt installer's shell-hook set in parity.
+          # Same context bridge install-macos.sh ships; keep the two in step.
           cp examples/shell/copad-context.zsh "$DIST/shell-hooks/"
 
-          # ---- LaunchAgent plist + launch wrapper (HOME_PLACEHOLDER
-          #      unexpanded; downstream consumers — install.sh, install-macos.sh —
-          #      substitute their own path, since launchd does not expand `~`).
-          #      The plist runs copadd through the wrapper (sources
-          #      ~/.config/copad/secrets.env before exec), so ship BOTH: an
-          #      installer that lays down the plist without the wrapper would
-          #      create a LaunchAgent pointing at a missing script. ----
+          # HOME_PLACEHOLDER stays unexpanded (launchd does not expand `~`); installers
+          # substitute their own. Ship the wrapper with the plist, which runs copadd through it.
           cp dist/launchd/com.marshall.copad.daemon.plist "$DIST/com.marshall.copad.daemon.plist"
           cp dist/launchd/copadd-launch.sh "$DIST/copadd-launch.sh"
 
-          # ---- Sign + notarize ----
-          # With signing secrets present: Developer-ID-sign EVERY Mach-O
-          # (CLIs + plugin binaries + the app) with a hardened runtime and a
-          # secure timestamp, then notarize + staple the .app only (the CLIs
-          # are terminal-run, where a Developer ID signature already suffices,
-          # and per the chosen scope only the app is notarized). Signing all
-          # binaries — not just the app — is required so macOS 26 (Tahoe) does
-          # not delete the ad-hoc executables (copadd, plugins) on first spawn.
-          # Without secrets: fall back to the previous ad-hoc signature so the
-          # build still works on forks. See docs/macos-signing-notarization.md.
-          #
-          # Gate on ALL required inputs, not just the identity: require the
-          # signing identity + the three App Store Connect API-key secrets
-          # (notarytool auth) AND that the cert actually imported into the
-          # keychain (so a partial config — e.g. identity set but cert or an API
-          # secret missing — takes the ad-hoc fallback instead of failing the
-          # release at codesign/notarytool).
+          # Sign EVERY Mach-O (hardened runtime + timestamp) so macOS 26 does not delete
+          # ad-hoc executables (copadd, plugins) on first spawn; only the .app is notarized.
+          # See docs/macos-signing-notarization.md.
+          # Gate on ALL inputs (identity, the three API-key secrets, cert in the keychain): a
+          # partial config falls back to ad-hoc instead of failing at codesign/notarytool.
           if [ -n "${MACOS_SIGNING_IDENTITY:-}" ] \
              && [ -n "${APP_STORE_CONNECT_KEY_ID:-}" ] \
              && [ -n "${APP_STORE_CONNECT_ISSUER_ID:-}" ] \
              && [ -n "${APP_STORE_CONNECT_KEY_P8:-}" ] \
              && security find-identity -v -p codesigning | grep -qF "$MACOS_SIGNING_IDENTITY"; then
             echo "==> Developer ID signing (identity: $MACOS_SIGNING_IDENTITY)"
-            # Sign leaf binaries first (inside-out): CLIs, then every plugin.
+            # Inside-out: leaf binaries first, then the app bundle.
             for b in "$DIST/coctl" "$DIST/copadd" "$DIST/comux"; do
               codesign --force --options runtime --timestamp \
                 --sign "$MACOS_SIGNING_IDENTITY" "$b"
@@ -345,17 +278,13 @@ jobs:
                   codesign --force --options runtime --timestamp \
                     --sign "$MACOS_SIGNING_IDENTITY" "$pbin"
                 done
-            # Then the app bundle (signs its Contents/MacOS/Copad executable).
             codesign --force --options runtime --timestamp \
               --sign "$MACOS_SIGNING_IDENTITY" "$STAGING"
             codesign --verify --strict --verbose=2 "$STAGING"
 
             echo "==> notarizing $STAGING (App Store Connect API key)"
-            # Restore the .p8 from the secret — accept either a raw PEM key or a
-            # base64-encoded one (the setup guide recommends base64).
             P8="$RUNNER_TEMP/AuthKey.p8"
-            # Guarantee the private key is wiped even if decode/ditto/submit
-            # fails under set -e — don't leave it in $RUNNER_TEMP.
+            # Wipe the private key even if decode/ditto/submit fails under set -e.
             trap 'rm -f "$P8"' EXIT
             if printf '%s' "$APP_STORE_CONNECT_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
               printf '%s' "$APP_STORE_CONNECT_KEY_P8" > "$P8"
@@ -377,15 +306,10 @@ jobs:
             codesign -dv "$STAGING" 2>&1 | head -5 || true
           fi
 
-          # ---- Pack ----
-          # Strip the dist-macos/ prefix so consumers see Copad.app / coctl / …
-          # at the tarball root.
           tar -czf "$ARCHIVE" -C "$DIST" .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
-          # Standalone comux binary asset (see the Linux job + install-comux.sh).
-          # Copy from $DIST/comux — the copy the Sign+notarize block above
-          # signed — so the comux-only installer gets a Developer-ID-signed
-          # (Tahoe-safe) binary, not the unsigned target/release/comux.
+          # Copy the signed $DIST/comux, not target/release/comux, so the comux-only installer
+          # gets a Developer-ID-signed (Tahoe-safe) binary.
           COMUX_ASSET="comux-v${VERSION}-aarch64-apple-darwin"
           cp "$DIST/comux" "$COMUX_ASSET"
           echo "COMUX_ASSET=${COMUX_ASSET}" >> "$GITHUB_ENV"
@@ -430,10 +354,8 @@ jobs:
             artifacts/macos-aarch64/comux-*
           generate_release_notes: false
 
-  # Publish the just-released artifacts to the Homebrew tap (cask + comux
-  # formula). Runs after the release exists because it downloads the published
-  # assets to checksum and signature-verify them. Backfill an older tag with
-  # `gh workflow run homebrew.yml -f version=vX.Y.Z`.
+  # Runs after the release exists: it downloads the published assets to checksum and
+  # signature-verify them.
   homebrew:
     name: Update Homebrew tap
     needs: [release]

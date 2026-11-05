@@ -1,31 +1,21 @@
 #!/usr/bin/env bash
-# End-to-end verification of the Browser Workbench dispatcher gate on Linux
-# (work unit B1c). Drives the REAL copad GTK app over its per-instance socket.
+# End-to-end verification of the Browser Workbench dispatcher gate on Linux, driving the REAL
+# copad GTK app over its per-instance socket.
 #
-# What it asserts:
-#   1. Every method registered-but-not-built answers `unsupported_capability`,
-#      not `unknown_method` — the whole point of registering them.
-#   2. A typo is NOT claimed by the gate. The gate must not swallow the
-#      difference between "not built yet" and "no such method" (see step 2 for
-#      why this is asserted negatively).
-#   3. An UNPROTECTED pane behaves exactly as before: reads return page data and
-#      a failed write still reports why. `redacts_write_result` is false without
-#      protection, and a response shape that changed regardless of protection
-#      would itself be a signal.
-#   4. A `tab_id` that names a tab the pane does not hold answers `tab_closed`,
-#      never a silent retarget onto the active tab.
-#   5. A panel id that never existed still answers the handler's own `not_found`.
-#      The delivery-time fail-closed is for a pane that vanished MID-FLIGHT; a
-#      request that never had a target read nothing, and reporting `tab_closed`
-#      for it would describe a pane closing that was never open.
+#   1. Every method registered-but-not-built answers `unsupported_capability`, not
+#      `unknown_method`.
+#   2. A typo is NOT claimed by the gate (asserted negatively, see step 2).
+#   3. An UNPROTECTED pane behaves as before: reads return page data and a failed write still
+#      reports why (`redacts_write_result` is false without protection).
+#   4. A `tab_id` naming a tab the pane does not hold answers `tab_closed`, never a silent
+#      retarget onto the active tab.
+#   5. A panel id that never existed still answers the handler's own `not_found`; the
+#      delivery-time fail-closed is only for a pane that vanished MID-FLIGHT.
 #
-# Not asserted here: the behaviour of a PROTECTED tab. `webview.tab.protect` is
-# itself unimplemented on Linux (work unit B7d), so there is no way to enter the
-# mode yet. The refusal paths it drives are unit-tested in copad-core; this
-# script grows the protected cases in the unit that builds protection.
+# Not asserted: the behaviour of a PROTECTED tab, since `webview.tab.protect` is unimplemented
+# on Linux. Its refusal paths are unit-tested in copad-core.
 #
-# Requires a display: copad is a GTK app and this runs it for real. It opens a
-# window on the current session for a few seconds and then kills it.
+# Requires a display: it opens a window on the current session for a few seconds, then kills it.
 
 set -euo pipefail
 
@@ -51,11 +41,9 @@ if ! printf '%s' "$WORK" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
     exit 2
 fi
 
-# A copad pane exports COPAD_SOCKET into its shell, so running this script from
-# inside copad would otherwise hand every child the USER'S LIVE socket — copadd
-# refused to start with "already bound by another copadd", and the failure mode
-# had it not refused is driving the user's real browser panes. Cleared first,
-# before anything is launched.
+# A copad pane exports COPAD_SOCKET, so running this from inside copad would hand every
+# child the USER'S LIVE socket and could drive their real browser panes. Clear it before
+# launching anything.
 unset COPAD_SOCKET
 
 # Isolate every path the app touches. XDG_RUNTIME_DIR is what decides where the
@@ -104,7 +92,6 @@ call() {
     "$COCTL" call "$method" --params "$params" 2>&1 || true
 }
 
-# Assert the response for `method` carries `code`.
 expect_code() {
     local label="$1" method="$2" params="$3" code="$4"
     local out
@@ -168,15 +155,11 @@ done
 
 echo
 echo "== 2. a typo is not claimed by the gate =="
-# The assertion is NEGATIVE on purpose. An unrecognised method on Linux does not
-# come back as `unknown_method`: copad-linux proxies anything the GUI does not
-# know to copadd (`socket.rs`'s default arm -> `daemon_forward::forward`), and
-# with no daemon in this harness that call never produces a response at all —
-# the client just waits. That is pre-existing behaviour, unrelated to this unit
-# and documented in docs/troubleshooting.md; B1c only has to prove it does not
-# make things WORSE by claiming a typo as "not built yet".
-#
-# So: a short timeout, and the pass condition is that the gate did not answer.
+# NEGATIVE on purpose: on Linux an unrecognised method does not come back as
+# `unknown_method`. copad-linux proxies anything the GUI does not know to copadd (`socket.rs`
+# default arm -> `daemon_forward::forward`), and with no daemon here the client just waits
+# (docs/troubleshooting.md). So: a short timeout, and the pass condition is that the gate did
+# not answer.
 expect_not_claimed() {
     local label="$1" method="$2"
     local out
@@ -201,7 +184,6 @@ else
 fi
 
 if [[ -n "$PANEL_ID" ]]; then
-    # Give the blank page a moment to commit before driving it.
     sleep 1
 
     STATE_OUT="$(call webview.state "{\"id\":\"$PANEL_ID\"}")"
@@ -233,12 +215,9 @@ expect_code "unknown panel id" webview.state '{"id":"no-such-panel"}' 'not_found
 
 echo
 echo "== 6. the DAEMON-routed path reaches the same gate =="
-# Steps 1-5 speak to the GUI socket directly. A real `coctl` call does not: it
-# goes to copadd, which routes by capability (`gui_registry::method_capability`).
-# `browser.*` was daemon-owned by omission there, so `coctl secret list` answered
-# `unknown_method` for a method the GUI does register — the exact ambiguity this
-# unit exists to remove. Asserted end to end rather than only in the unit test,
-# because the unit test proves the mapping and this proves the route.
+# Steps 1-5 speak to the GUI socket. A real `coctl` call goes to copadd, which routes by
+# capability (`gui_registry::method_capability`); `browser.*` once fell through there as
+# `unknown_method` for a method the GUI registers. This proves the route end to end.
 COPAD_SOCKET="$DAEMON_SOCKET" \
     expect_code "browser.secret.list via copadd" browser.secret.list '{}' 'unsupported_capability'
 COPAD_SOCKET="$DAEMON_SOCKET" \

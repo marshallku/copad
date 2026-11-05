@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
-# e2e for browser observability (work unit B4, macOS).
-#
-# The claims:
-#   1. `fetch` and `XMLHttpRequest` a page makes are captured, and readable
-#      through `coctl webview net`.
-#   2. `console.*` and uncaught errors are captured, readable through
-#      `coctl webview console`, and filterable by level.
-#   3. Navigations are captured NATIVELY — the user script cannot see them, and
-#      without that a page that was merely navigated to would look like it made
-#      no requests at all.
-#   4. Every read declares its coverage, so an empty list is never read as
-#      "nothing happened".
+# e2e for browser observability (macOS):
+#   1. `fetch` and `XMLHttpRequest` a page makes are captured, readable via `coctl webview net`.
+#   2. `console.*` and uncaught errors are captured, readable via `coctl webview console`,
+#      and filterable by level.
+#   3. Navigations are captured NATIVELY (the user script cannot see them); otherwise a page
+#      merely navigated to would look like it made no requests.
+#   4. Every read declares its coverage, so an empty list is never read as "nothing happened".
 #   5. Credential-shaped content is redacted before it reaches the file.
 #   6. A BACKGROUND tab's activity is captured and scoped by `--tab-id`.
 #   7. Reading the log takes neither the frontmost app nor the cursor.
 #
-# Pages come from a local throwaway HTTP server so the run is offline and the
-# request the page makes is one we control.
+# Pages come from a local throwaway HTTP server so the run is offline and the page's request
+# is one we control.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,11 +27,9 @@ cleanup() {
     [ -n "${WWW:-}" ] && rm -rf "$WWW"
     [ -n "${TMPHOME:-}" ] && rm -rf "$TMPHOME"
 }
-# Cleanup runs on EXIT only. `trap cleanup EXIT INT TERM` looks equivalent and is
-# not: bash runs a signal handler and then RESUMES the script, so the cleanup
-# would delete the temp $HOME the very next command reads from and the run would
-# carry on asserting against wiped state. INT/TERM therefore just `exit` with the
-# conventional status, which fires the EXIT trap exactly once (codex C1).
+# EXIT only: with `trap cleanup EXIT INT TERM` bash runs the handler and then RESUMES the
+# script, deleting the temp $HOME the next command reads. INT/TERM just `exit`, which fires
+# the EXIT trap once.
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM

@@ -7,10 +7,9 @@
 # socket AND a throwaway state file — without the latter it would restore (and then
 # kill) the user's real sessions.
 #
-# Every request runs under a deadline on purpose: the first version of this script
-# caught a wedged server (a pane whose shell outlived its SIGHUP blocked the
-# single-writer loop inside `PaneTerm::drop`), and a hang is the exact regression
-# worth failing on rather than waiting out.
+# Every request runs under a deadline: a hang (a pane whose shell outlived its SIGHUP blocked the
+# single-writer loop inside `PaneTerm::drop`) is the exact regression worth failing on rather
+# than waiting out.
 #
 # Steps:
 #   1. headless server on an isolated socket/state
@@ -26,7 +25,7 @@
 #  11. list-agents (empty vs populated) + wait-agent level-match / deadline / refusals
 #  12. `comux skill` emits the embedded agent guide, and the recipe it teaches works
 #  13. bell + title: an unfocused pane's BEL and OSC 0 title reach `list --json`
-#  14. a codex pane reads ready/blocked, not the `idle` it used to fall through to
+#  14. a codex pane reads ready/blocked, not `idle`
 #  15. an agent's DOING line is read from its own structured log (agentpoll)
 #  16. `comux host` publishes CPU/memory/GPU/load, omitting what it could not read
 #  17. the top bar: off by default, and it moves the sidebar AND its click zones
@@ -64,12 +63,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMUX="$REPO/target/debug/comux"
-# BUILD, rather than merely checking the binary exists. Testing a stale binary is the worst
-# outcome this script has: it reports a failure that is not in the tree (or, worse, a pass for
-# a fix that is not in the binary), and the message points at the code under test. It cost a
-# real session — a rebase pulled in a fleet fix, the binary was 20 minutes older, and step 20
-# reported the deadlock that commit had just removed. `COMUX_E2E_NO_BUILD=1` opts out for the
-# rare deliberate case of running against a binary you built some other way.
+# BUILD, rather than merely checking the binary exists: a stale binary reports failures that are
+# not in the tree (or passes a fix that is not in the binary). `COMUX_E2E_NO_BUILD=1` opts out
+# for a binary built some other way.
 if [[ "${COMUX_E2E_NO_BUILD:-0}" != 1 ]]; then
     (cd "$REPO" && cargo build -q -p copad-mux) || { echo "build failed"; exit 2; }
 fi
@@ -87,11 +83,9 @@ export COPAD_MUX_QUIET_SSH=1
 # real server, and verbs that default to "the caller's pane" would read it — a step that wants
 # a caller pane sets one explicitly from the throwaway server.
 unset COPAD_MUX_PANE COPAD_MUX
-# Config isolation. Without this the throwaway server reads the DEVELOPER's real
-# `~/.config/copad/mux.toml`, so every assertion below silently depends on their personal
-# settings — a custom prefix, `sidebar = false`, a different `sidebar_density`. Point
-# `XDG_CONFIG_HOME` at the work dir so the run starts from documented defaults, and so a step
-# that needs a setting can write one without touching anything the user owns.
+# Config isolation: without it the throwaway server reads the DEVELOPER's real
+# `~/.config/copad/mux.toml`, so assertions depend on personal settings (a custom prefix,
+# `sidebar = false`, a different `sidebar_density`). Steps that need a setting write one here.
 export XDG_CONFIG_HOME="$WORK/cfg"
 mkdir -p "$WORK/cfg/copad"
 
@@ -132,7 +126,6 @@ t() {
     wait "$pid"
 }
 
-# Entries in a `--json` listing's array field, read from a file `t` wrote.
 count() { python3 -c 'import json,sys; print(len(json.load(sys.stdin)[sys.argv[1]] or []))' "$1" <"$WORK/json"; }
 panes_now() { t 10 "$COMUX" list --json >"$WORK/json"; count panes; }
 tabs_now() { t 10 "$COMUX" list-tabs --json >"$WORK/json"; count tabs; }
@@ -187,10 +180,9 @@ grep -q "last session" "$WORK/out" || fail "expected a 'last session' error, got
 ok "refused, and the session survives"
 
 echo "6. a shell that ignores SIGHUP is reaped without wedging the server"
-# `Pty::drop` SIGHUPs the pane's shell and then `waitpid`s for it with no timeout, so a
-# shell that survives the signal used to block whoever dropped the pane — on the server
-# that is the single-writer loop, i.e. the whole mux. Reproduce it deterministically
-# rather than waiting for a slow-starting shell to lose the same race by accident.
+# `Pty::drop` SIGHUPs the pane's shell and then `waitpid`s for it with no timeout, so a shell
+# that survives the signal blocks whoever drops the pane; on the server that is the
+# single-writer loop, i.e. the whole mux. Reproduced with a shell that ignores SIGHUP.
 pgrep -P "$SERVER_PID" | sort >"$WORK/pids-before"
 t 10 "$COMUX" new-session e2e-deaf >/dev/null
 sleep 2 # let the shell finish sourcing its rc files, so it can accept the trap
@@ -218,17 +210,14 @@ token0="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["t
 [[ "$token0" == *-* ]] || fail "token '$token0' is not <nonce>-<counter>"
 t 10 "$COMUX" notify --pane "$token0" --kind blocked "e2e says hello" >"$WORK/out" \
     || fail "notify on a live pane failed"
-# The response echoes WHERE the notification was attributed (`tool · space/tab`). A pushing
-# hook has no other way to tell a mis-addressed pane from a correctly addressed one — the
-# toast is the only other evidence and it is transient. The tab half is the point: a space
-# can hold many agents, so the space name alone does not answer "which one is asking me".
+# The response echoes where the notification was attributed (`tool · space/tab`). The tab half
+# matters: a space can hold many agents.
 grep -q '/' "$WORK/out" || fail "notify did not report which tab it was attributed to: $(cat "$WORK/out")"
 COPAD_MUX_PANE="$token0" t 10 "$COMUX" rename-tab "e2e-tab" >/dev/null || fail "rename-tab failed"
 t 10 "$COMUX" notify --pane "$token0" --kind done "named" >"$WORK/out" \
     || fail "notify after rename-tab failed"
 grep -q '/e2e-tab$' "$WORK/out" || fail "a named tab must title the notification: $(cat "$WORK/out")"
-# Clearing the name falls back to the 1-based index — the `Ctrl-b <n>` that jumps there,
-# which is more useful than repeating the space name on every row.
+# Clearing the name falls back to the 1-based tab index (the `Ctrl-b <n>` that jumps there).
 COPAD_MUX_PANE="$token0" t 10 "$COMUX" rename-tab "" >/dev/null || fail "clearing the tab name failed"
 t 10 "$COMUX" notify --pane "$token0" --kind done "unnamed" >"$WORK/out" \
     || fail "notify after clearing the tab name failed"
@@ -247,7 +236,6 @@ set +e
 (unset COPAD_MUX_PANE; t 10 "$COMUX" notify "orphan" >/dev/null 2>&1); code=$?
 set -e
 [[ "$code" == "2" ]] || fail "expected usage exit 2 for a pane-less notify, got $code"
-# Jump crosses sessions by identity: switch away, then jump back by the token.
 t 10 "$COMUX" new-session e2e-jump >/dev/null
 t 10 "$COMUX" list-sessions --json >"$WORK/json"
 active="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["active_session"])' <"$WORK/json")"
@@ -285,7 +273,6 @@ for _ in $(seq 1 50); do
     sleep 0.2
 done
 [[ -n "$found" ]] || fail "capture-pane never saw the marker: $(tail -3 "$WORK/cap")"
-# Addressing by token and by index must agree once output has gone quiet.
 t 10 "$COMUX" list --json >"$WORK/json"
 tok="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])' <"$WORK/json")"
 sleep 0.5
@@ -293,13 +280,11 @@ t 10 "$COMUX" capture-pane "$tok" >"$WORK/by-token"
 t 10 "$COMUX" capture-pane --index 0 >"$WORK/by-index"
 diff -q "$WORK/by-token" "$WORK/by-index" >/dev/null \
     || fail "capture by token and by index disagree"
-# The resolved pane is echoed, so a defaulted target is auditable.
 t 10 "$COMUX" capture-pane --json >"$WORK/json"
 echoed="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
 [[ "$echoed" == "$tok" ]] || fail "capture-pane echoed pane '$echoed', expected '$tok'"
 # A deep request must be answered by the budget, not by hanging.
 t 10 "$COMUX" capture-pane -S 999999 >/dev/null || fail "an over-long capture failed"
-# Refusals.
 t 10 "$COMUX" capture-pane no-such-pane >/dev/null 2>&1 && fail "unknown target should fail"
 t 10 "$COMUX" capture-pane -S 0 >/dev/null 2>&1 && fail "--lines 0 should fail"
 set +e
@@ -309,18 +294,15 @@ set -e
 ok "marker read back; token/index agree; resolved pane echoed; refusals honored"
 
 echo "10. wait-output blocks until a pane's text matches"
-# The marker is ASSEMBLED IN THE PANE from fragments: the sent command contains "MARK-%s"
-# and the id separately, never "MARK-<id>" as a literal. Otherwise the shell's echo of the
-# command satisfies the wait before the command has run, and this step would pass while
-# testing nothing. The id is fresh per run so a leftover match can't satisfy it either.
+# The marker is ASSEMBLED IN THE PANE from fragments: the sent command contains "MARK-%s" and the
+# id separately, never "MARK-<id>". Otherwise the shell's echo of the command satisfies the wait
+# before the command has run. The id is fresh per run so a leftover match can't satisfy it.
 ID="$$-$RANDOM-$(date +%s)"
 t 10 "$COMUX" send 0 "sleep 1; printf 'MARK-%s\n' '$ID'" >/dev/null
 t 10 "$COMUX" send 0 $'\n' >/dev/null
-# Wait on the pane EXPLICITLY (the same one we sent to), not on whatever is focused.
 t 30 "$COMUX" wait-output "$tok" --timeout 20 --interval 100 "MARK-$ID" >"$WORK/wait" \
     || fail "wait-output did not see MARK-$ID: $(cat "$WORK/wait")"
 grep -q "MARK-$ID" "$WORK/wait" || fail "wait-output printed no matching line"
-# A pattern that never appears must hit the deadline (124), not hang the harness.
 start=$(date +%s)
 set +e
 t 20 "$COMUX" wait-output --timeout 2 --interval 100 "NEVER_APPEARS_$ID" >/dev/null 2>&1; code=$?
@@ -328,7 +310,7 @@ set -e
 elapsed=$(( $(date +%s) - start ))
 [[ "$code" == "124" ]] || fail "expected timeout exit 124, got $code"
 (( elapsed <= 8 )) || fail "the deadline did not fire promptly (${elapsed}s)"
-# Usage refusals, including the --timeout overflow that used to panic with exit 101.
+# Usage refusals, including an overflowing --timeout (a panic would exit 101).
 set +e
 t 10 "$COMUX" wait-output --interval 0 X >/dev/null 2>&1; c1=$?
 t 10 "$COMUX" wait-output >/dev/null 2>&1; c2=$?
@@ -337,7 +319,6 @@ set -e
 [[ "$c1" == "2" ]] || fail "--interval 0 should be usage exit 2, got $c1"
 [[ "$c2" == "2" ]] || fail "a missing pattern should be usage exit 2, got $c2"
 [[ "$c3" == "2" ]] || fail "an overflowing --timeout should be usage exit 2, got $c3 (101 = panic)"
-# An unknown pane fails rather than waiting out the clock.
 set +e
 start=$(date +%s)
 t 15 "$COMUX" wait-output no-such-pane X --timeout 10 >/dev/null 2>&1; c4=$?
@@ -345,10 +326,9 @@ elapsed=$(( $(date +%s) - start ))
 set -e
 [[ "$c4" == "1" ]] || fail "an unknown pane should fail with 1, got $c4"
 (( elapsed <= 5 )) || fail "an unknown pane was waited out instead of refused (${elapsed}s)"
-# Run the recipe `comux wait-output --help` PRINTS, verbatim. The help is there to be
-# pasted, and it has already shipped broken once (Rust string escaping turned $'\n' into a
-# literal backslash-n, so the command was never submitted) — a test that only reads the
-# source cannot catch that.
+# Run the recipe `comux wait-output --help` prints, verbatim. The help is meant to be pasted, and
+# a test that only reads the source cannot catch Rust string escaping turning $'\n' into a
+# literal backslash-n.
 id=$(date +%s%N)
 t 10 "$COMUX" send 0 "printf 'MARK-%s\n' '$id'" >/dev/null
 t 10 "$COMUX" send 0 $'
@@ -373,10 +353,8 @@ python3 -c 'import json,sys; a=json.load(sys.stdin)["agents"]; sys.exit(0 if a==
 # hermetic harness can check.
 mkdir -p "$WORK/bin"
 ln -sf /bin/sleep "$WORK/bin/claude" || fail "could not build the agent fixture"
-# Give the pane a status the heuristic can actually read. A bare `sleep` shows no agent UI,
-# so it resolves to `idle` — which is deliberately NOT waitable (it also means "no reading").
-# Printing "esc to interrupt" first is, incidentally, a live demonstration of the caveat the
-# --help states: ordinary output can be read as an agent status.
+# Give the pane a status the heuristic can read. A bare `sleep` shows no agent UI, so it resolves
+# to `idle`, which is deliberately NOT waitable (it also means "no reading").
 t 10 "$COMUX" send 0 "printf 'esc to interrupt\n'; $WORK/bin/claude 600" >/dev/null
 t 10 "$COMUX" send 0 $'\n' >/dev/null
 seen=""
@@ -395,11 +373,9 @@ atok="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["agents"][0]["to
 astat="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["agents"][0]["status"])' <"$WORK/json")"
 [[ "$atok" == "$tok" ]] || fail "list-agents reported token '$atok', expected '$tok'"
 [[ "$astat" == "working" ]] || fail "expected the fixture to read as 'working', got '$astat'"
-# Waiting for the status it IS in returns at once (level-triggered, as documented).
 t 15 "$COMUX" wait-agent "$tok" --status working --timeout 10 >"$WORK/out" \
     || fail "wait-agent did not match the agent's current status"
 grep -q working "$WORK/out" || fail "wait-agent printed no status line"
-# Waiting for a status it is NOT in must reach the deadline, not hang and not fail early.
 start=$(date +%s)
 set +e
 t 20 "$COMUX" wait-agent "$tok" --status blocked --timeout 2 --interval 100 >/dev/null 2>&1; code=$?
@@ -407,7 +383,6 @@ set -e
 elapsed=$(( $(date +%s) - start ))
 [[ "$code" == "124" ]] || fail "wait-agent on a non-matching status should time out (124), got $code"
 (( elapsed <= 8 )) || fail "wait-agent did not honor its deadline (${elapsed}s)"
-# Refusals: an absent pane fails fast; unwaitable/unknown statuses and a missing target are usage errors.
 set +e
 start=$(date +%s)
 t 15 "$COMUX" wait-agent no-such-pane --status ready --timeout 10 >/dev/null 2>&1; c1=$?
@@ -430,12 +405,9 @@ t 10 "$COMUX" skill >"$WORK/skill.md" || fail "comux skill failed"
 [[ "$(head -1 "$WORK/skill.md")" == "---" ]] || fail "the skill has no YAML frontmatter"
 grep -q 'COPAD_MUX' "$WORK/skill.md" || fail "the skill lost its inside-comux gate"
 (( $(wc -l <"$WORK/skill.md") > 50 )) || fail "the skill looks truncated"
-# Run the recipe the SKILL teaches, as it teaches it. A skill is a document the model
-# FOLLOWS, so the only honest check is that following it works.
-#
-# Deliberately NOT against pane 0: the first version used a disposable pane 0 and so could
-# not have caught the recipe's real defect — a hard-coded index, which on a one-pane tab is
-# the AGENT'S OWN pane. The split names the pane it created, so nothing is inferred.
+# Run the recipe the SKILL teaches, as taught. A disposable pane 0 would hide a hard-coded index,
+# which on a one-pane tab is the agent's own pane; the split names the pane it created, so
+# nothing is inferred.
 sib="$(t 10 "$COMUX" split --from "$tok")" || fail "split --from failed"
 [[ -n "$sib" && "$sib" != "$tok" ]] || fail "split did not name a NEW pane (got '$sib')"
 id=$(date +%s%N)
@@ -443,11 +415,8 @@ t 10 "$COMUX" send "$sib" "printf 'DONE-%s\n' '$id'" >/dev/null
 t 10 "$COMUX" send "$sib" $'\n' >/dev/null
 t 30 "$COMUX" wait-output "$sib" "DONE-$id" --timeout 20 --interval 100 >/dev/null \
     || fail "the recipe the skill teaches does not work"
-# The pane we split FROM must not have received it — the defect a disposable pane 0 hid.
 t 10 "$COMUX" capture-pane "$tok" -S 60 >"$WORK/orig"
 grep -q "DONE-$id" "$WORK/orig" && fail "the recipe typed into the source pane, not the new one"
-# `split --from` must refuse an identity it cannot resolve, and refuse a raw terminal id
-# (recycled across restarts) rather than splitting something arbitrary.
 t 10 "$COMUX" split --from no-such-pane >/dev/null 2>&1 && fail "split --from should refuse an unknown pane"
 ok_split_panes="$(panes_now)"
 # A token-addressed send crosses sessions WITHOUT moving the user's view — that is the whole
@@ -465,13 +434,11 @@ act_after="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["active_ses
 [[ "$act_before" == "$act_after" ]] \
     || fail "a cross-session send moved the active session ($act_before -> $act_after)"
 t 10 "$COMUX" kill-session "$act_after" >/dev/null || fail "could not clean up the send session"
-# Refusals: a terminal id is not an address for a WRITE; no target at all is a usage error.
 t 10 "$COMUX" send term0 "x" >/dev/null 2>&1 && fail "send should refuse a raw terminal id"
 set +e
 t 10 "$COMUX" send >/dev/null 2>&1; c=$?
 set -e
 [[ "$c" == "2" ]] || fail "a target-less send should be usage exit 2, got $c"
-# Index addressing must still work exactly as before.
 t 10 "$COMUX" list --json >"$WORK/json"
 sib_i="$(SIB="$sib" python3 -c 'import json,sys,os; d=json.load(sys.stdin); print(next(p["index"] for p in d["panes"] if p["token"]==os.environ["SIB"]))' <"$WORK/json")"
 iid=$(date +%s%N)
@@ -483,10 +450,9 @@ t 10 "$COMUX" close "$sib_i" >/dev/null || fail "could not clean up the split"
 ok "skill recipe runs on a server-named pane; token send crosses sessions without moving the view; index send unchanged"
 
 echo "13. bell and title, the two pane events comux used to drop"
-# Must be an UNFOCUSED pane. The focused one is acknowledged on the next frame (that is the
-# rule — a bell you are looking at is a bell you saw), so testing it would assert nothing.
-# This headless server has NO client attached, so nothing is acknowledged at all here, which
-# is itself the detached half of the contract.
+# Must be an UNFOCUSED pane: the focused one is acknowledged on the next frame, so testing it
+# would assert nothing. This headless server has NO client attached, so nothing is acknowledged
+# at all, which is the detached half of the contract.
 bell_pane="$(t 10 "$COMUX" split --from "$tok")" || fail "split --from failed"
 t 10 "$COMUX" focus 0 >/dev/null || fail "could not focus away from the bell pane"
 t 10 "$COMUX" send "$bell_pane" "printf '\a'" >/dev/null
@@ -500,12 +466,9 @@ for _ in $(seq 1 40); do
     sleep 0.2
 done
 [[ -n "$rang" ]] || fail "a BEL in an unfocused pane was not reported"
-# A title set via OSC 0 must show up WITHOUT displacing the process label — the label comes
-# from the foreground process sweep, which is the more trustworthy of the two.
-# `; sleep 8` matters: the shell rewrites the title on every PROMPT (zsh/bash commonly set
-# it to the cwd), so a title set by a command that then returns is overwritten before the
-# poll can see it. That is exactly why titles are NOT used as pane labels — the process
-# sweep is the more trustworthy source — and the test has to hold the shell to observe one.
+# A title set via OSC 0 must show up WITHOUT displacing the process label. `; sleep 8` holds the
+# shell: it rewrites the title on every prompt, so a title set by a command that returns is
+# overwritten before the poll sees it.
 t 10 "$COMUX" send "$bell_pane" "printf '\033]0;e2e-title\a'; sleep 8" >/dev/null
 t 10 "$COMUX" send "$bell_pane" $'\n' >/dev/null
 titled=""
@@ -525,20 +488,15 @@ t 10 "$COMUX" close "$bi" >/dev/null || fail "could not clean up the bell pane"
 ok "an unfocused pane's BEL is reported; its OSC 0 title is exposed without displacing the label"
 
 echo "14. a codex pane is classified, not left at 'idle'"
-# Regression guard for the bug this step exists for: comux read an agent pane's status with
-# markers that only knew Claude's UI, so a codex pane reported `idle` BOTH when parked at its
-# composer and when blocked on an approval — and `idle` is deliberately not waitable, so
-# codex was invisible to `wait-agent`, the attention count and the blocked toast alike.
+# Guards against a codex pane reading `idle` both at its composer and when blocked on an
+# approval: `idle` is not waitable, so codex was invisible to `wait-agent`, the attention count
+# and the blocked toast.
 #
-# The fixture RENDERS codex's real screen text (captured verbatim from codex-cli 0.154.0)
-# rather than running codex: a real agent needs credentials, costs quota and is not
-# deterministic. This checks the wiring end to end — process name -> classification ->
-# marker resolution -> the wire -> wait-agent — which the unit tests cannot reach.
+# The fixture renders codex's real screen text (from codex-cli 0.154.0) instead of running
+# codex, which needs credentials and is not deterministic.
 #
-# The screens are written to FILES here and `cat`-ed in the pane. Typing them as a `printf`
-# argument made the test pass for the wrong reason: the shell ECHOES the command line, so the
-# marker was on screen whether or not the command ever ran — the same trap `wait-output
-# --help` warns callers about, hit by its own harness.
+# The screens are written to files and `cat`-ed in the pane: typing them as a `printf` argument
+# leaves the marker on screen via the shell's echo whether or not the command ran.
 mkdir -p "$WORK/bin"
 ln -sf /bin/sleep "$WORK/bin/codex" || fail "could not build the codex fixture"
 printf '\xe2\x80\xba Ask Codex to do anything\n  Luna Reserve medium \xc2\xb7 /private/tmp\n' \
@@ -571,19 +529,14 @@ t 10 "$COMUX" close "$cxi" >/dev/null || fail "could not clean up the codex pane
 ok "codex reads ready at its composer and blocked on an approval, not idle"
 
 echo "15. an agent's activity line is read from its own log"
-# End-to-end for the `agentpoll` thread: pane label -> the wanted-set handed to the poller ->
-# source-file resolution (which forks `lsof` on macOS, off the render loop) -> bounded tail
-# read -> parse -> the wire. None of that is reachable from a unit test.
-#
-# The CODEX path is the one that can be faked honestly: it locates the log by finding a
-# rollout file the agent process holds OPEN, so a fixture that is named `codex` and holds one
-# open exercises the real resolution. (Claude's path derives its transcript from
-# `~/.claude/sessions/<pid>.json`, a file the harness does not own, so it is covered by unit
-# tests plus an ignored live oracle — `cargo test -p copad-mux -- --ignored live_`.)
+# End-to-end for the `agentpoll` thread: pane label -> wanted-set -> source resolution (forks
+# `lsof` on macOS, off the render loop) -> bounded tail read -> parse -> the wire. The codex path
+# can be faked honestly: it locates the log by a rollout file the agent process holds open.
+# (Claude's path reads `~/.claude/sessions/<pid>.json`, covered by unit tests plus an ignored
+# live oracle: `cargo test -p copad-mux -- --ignored live_`.)
 mkdir -p "$WORK/bin2" "$WORK/sessions"
 roll="$WORK/sessions/rollout-2026-09-12T00-00-00-01a09154-4f7e-76a1-81e0-daae1f6d49b3.jsonl"
-# A real codex `CommandExecution`: `command` is an ARRAY and codex pre-parses it into
-# `parsed_cmd`. Reading `command` as a string is a bug a hand-written fixture hid once.
+# A real codex `CommandExecution`: `command` is an ARRAY and codex pre-parses it into `parsed_cmd`.
 cat >"$roll" <<'ROLLEOF'
 {"type":"response_item","timestamp":"2026-09-12T00:00:01.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run the tests"}]}}
 {"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test --all\"}"}}
@@ -591,31 +544,22 @@ cat >"$roll" <<'ROLLEOF'
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning"}}}
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","cargo test --all"],"parsed_cmd":[{"type":"unknown","cmd":"cargo test --all"}]}}}
 ROLLEOF
-# The SECOND conversation, written up front: the fixture must be ONE process that rotates its
-# own rollout, not two processes. Killing the fixture and starting another changes the agent
-# PID, which retires the cache entry and resolves from scratch — a rotation test built that way
-# passes with the fix reverted, which is exactly what the first draft of this step did.
+# The second conversation is written up front: the fixture must be ONE process that rotates its
+# own rollout. A new process changes the agent PID, which retires the cache entry and resolves
+# from scratch, so the test would pass with the fix reverted.
 roll2="$WORK/sessions/rollout-2026-09-12T01-00-00-01a09154-4f7e-76a1-81e0-daae1f6d49b4.jsonl"
 cat >"$roll2" <<'ROLLEOF'
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","git bisect run"],"parsed_cmd":[{"type":"unknown","cmd":"git bisect run"}]}}}
 ROLLEOF
 dx="$(t 10 "$COMUX" split --from "$tok")" || fail "split for the activity fixture failed"
-# The fixture is `codex` symlinked to PYTHON, holding its own rollout open and rotating it on
-# cue. Three shapes this went through, each ruled out by something real:
-#   * NOT `exec`-ing it: the pane's shell has to survive the Ctrl-C below, or the pane closes
-#     itself and the cleanup has nothing to address.
-#   * NOT `codex -c 'exec 9< …; sleep 600'` with `codex` a symlink to `/bin/sh`. That only held
-#     on macOS, whose `/bin/sh` is bash 3.2. Where `/bin/sh` is a modern bash or dash, the shell
-#     EXEC-OPTIMISES the last command of a `-c` list, so the process replaces itself with
-#     `sleep` and its `comm` stops being `codex` — the fd survives, the IDENTITY does not, and
-#     the sweep never classifies the pane as an agent at all.
-#   * NOT the pane's shell holding the descriptor and a `sleep`-symlink inheriting it. That is
-#     fine for reading ONE conversation, but an inherited fd is a copy: the agent process can
-#     never rotate it, and rotating by killing and restarting the fixture changes the agent PID
-#     — which retires the cache entry and resolves from scratch, so the test passes with the fix
-#     reverted. (It did. That draft is why this comment exists.)
-# Python holds its own rollout, swaps it in place, and optimises nothing away — which is also
-# what real codex does.
+# The fixture is `codex` symlinked to PYTHON, holding its own rollout open and rotating it on cue.
+#   * Not `exec`-ed: the pane's shell has to survive the Ctrl-C below.
+#   * Not `codex -c 'exec 9< ...; sleep 600'` with `codex` a symlink to /bin/sh: a modern bash
+#     or dash exec-optimises the last command of a `-c` list, so the process becomes `sleep` and
+#     its `comm` stops being `codex`; the sweep never classifies the pane as an agent.
+#   * Not an fd inherited from the pane's shell: the agent can never rotate a copy, and
+#     restarting the fixture changes the agent PID, which retires the cache entry, so the test
+#     would pass with the fix reverted.
 cat >"$WORK/rotate.py" <<'PYEOF'
 import os, sys, time
 live = open(sys.argv[1])
@@ -645,13 +589,11 @@ done
 det="$(DX="$dx" python3 -c 'import json,sys,os; print(next(x["detail"] for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"]))' <"$WORK/json")"
 [[ "$det" == "running: cargo test --all" ]] \
     || fail "expected the NEWEST rollout item, got '$det'"
-# The conversation itself is exposed too: its id and the file it is logged to.
 DX="$dx" ROLL="$roll" python3 -c 'import json,sys,os
 a=next(x for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"])
 assert os.path.realpath(a["transcript_path"])==os.path.realpath(os.environ["ROLL"]), a
 assert a["agent_session_id"]=="01a09154-4f7e-76a1-81e0-daae1f6d49b3", a' <"$WORK/json" \
     || fail "list-agents did not expose the conversation id + transcript: $(cat "$WORK/json")"
-# ...and `agent-log` reads that conversation back, normalized, oldest first.
 t 10 "$COMUX" agent-log "$dx" --last 2 --json >"$WORK/log.json" || fail "agent-log failed: $(cat "$WORK/log.json")"
 python3 -c 'import json,sys; d=json.load(sys.stdin); e=d["entries"]
 assert d["tool"]=="codex" and d["partial"] is False, d
@@ -669,10 +611,9 @@ if python3 -c 'import json,sys
 sys.exit(0 if any("detail" in x for x in json.load(sys.stdin)["agents"] if x["tool"]!="codex") else 1)' <"$WORK/json"; then
     fail "a pane with no readable log must omit detail entirely, not send an empty one"
 fi
-# The conversation can change INSIDE the same pid — `codex /new` rotates to a fresh rollout,
-# `claude /clear` mints a new sessionId — and in both cases the PREVIOUS log stays on disk. A
-# resolver that re-resolves only when its cached file has VANISHED therefore never fires, and
-# republishes the old conversation forever.
+# The conversation can change inside the same pid (`codex /new`, `claude /clear`) while the
+# previous log stays on disk; a resolver that re-resolves only when its cached file vanishes
+# never fires and republishes the old conversation forever.
 touch "$WORK/switch"
 # Deliberately longer than SOURCE_RECHECK (30s): resolving a codex source forks `lsof`, which
 # decision #88 bars from the sweep cadence, so the rotation is picked up on a timer rather than
@@ -735,16 +676,13 @@ grep -qE '^(cpu|mem|gpu|load1) ' "$WORK/out" || fail "plain host readout printed
 ok "host metrics are published, in range, and omit what could not be read"
 
 echo "17. the top bar, and what it does to every coordinate below it"
-# The top bar is a LAYOUT change: it pushes the pane grid, the sidebar and every sidebar click
-# zone down a row. The rendering is only checkable by looking at a real frame, and the click
-# zones only by clicking — so this step drives a real client over a pty.
+# The top bar is a layout change: it pushes the pane grid, the sidebar and every sidebar click
+# zone down a row. Rendering is only checkable in a real frame and click zones only by clicking,
+# so this drives a real client over a pty.
 #
-# The offsets are easy to half-apply: the first version of this change moved the sidebar's
-# DRAWING but only two of its four click zones, which reads perfectly and sends clicks to the
-# wrong session.
-# NOT named `pty.py`: a script with that name SHADOWS the standard-library `pty` module it
-# imports, and the failure is `module 'pty' has no attribute 'fork'` from inside its own
-# import line.
+# The offsets are easy to half-apply (drawing moved but only some click zones), which sends
+# clicks to the wrong session.
+# Not named `pty.py`: that shadows the stdlib `pty` module it imports.
 cat >"$WORK/ptydrive.py" <<'PYEOF'
 import os, pty, sys, time, select, re, fcntl, termios, struct
 # capture:  pty.py cap  -- cmd...        -> prints the final frame
@@ -811,7 +749,6 @@ PYEOF
 
 active_session () { t 10 "$COMUX" list-sessions | awk '/active/{print $3}'; }
 
-# Baseline: OFF by default, so an existing layout does not shrink on upgrade.
 python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
 # NOTE `grep -q … && fail …` cannot be used here: when grep does not match — the SUCCESS
 # case — the expression returns 1 and `set -e` kills the run with no message at all.
@@ -936,7 +873,6 @@ python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
 dcol="$(python3 - "$WORK/frame" <<'PYEOF'
 import sys
 rows = open(sys.argv[1]).read().splitlines()
-# The sidebar's own border is the LEFTmost such column; the pane divider is the next one.
 cands = {}
 for line in rows[2:20]:
     for i, ch in enumerate(line):
@@ -961,7 +897,6 @@ assert a[1] < b[1], f"the right pane should have shrunk: {b} -> {a}"
 assert sum(a) == sum(b), f"cells must be conserved: {b} -> {a}"
 PYEOF
 
-# A NESTED branch on the other axis: dragging its divider must move IT, not the outer one.
 t 10 "$COMUX" split -v --from "$first_tok" >/dev/null || fail "could not nest a split"
 sleep 1
 outer_before="$(pane_cols)"
@@ -980,15 +915,14 @@ python3 - "$(pane_rows)" <<'PYEOF' || fail "a divider drag collapsed a pane"
 import sys
 assert all(int(v) > 0 for v in sys.argv[1].split()), sys.argv[1]
 PYEOF
-# A drag must not survive the view moving under it. Input is SHARED, so the active tab can
-# change while a client holds a divider — and a ROUND TRIP is the case that defeats every
-# "are we still on the tab we grabbed in" check, because it restores each field while the
-# pointer has moved somewhere unrelated.
+# A drag must not survive the view moving under it. Input is shared, so the active tab can change
+# while a client holds a divider; a round trip defeats every "still on the tab we grabbed" check
+# because it restores each field while the pointer is elsewhere.
 #
-# Two round trips, run SEPARATELY because each masks the other: selecting a tab away and back,
-# and creating a tab (which activates it) then closing it (which promotes a neighbour). The
-# first version ran them together and the trailing `select-tab` bumped the generation for both,
-# so the create/close path passed with its cancellation removed.
+# Two round trips, run separately because each masks the other: select a tab away and back, and
+# create a tab then close it (which promotes a neighbour). Run together, the trailing
+# `select-tab` bumps the generation for both and the create/close path passes without its
+# cancellation.
 cat >"$WORK/dragdisturb.py" <<'PYEOF'
 import os, pty, time, select, fcntl, termios, struct, subprocess, sys, threading
 rows, cols = 24, 100
@@ -1059,8 +993,8 @@ print(tall[1] + 1 if len(tall) > 1 else 0)
 PYEOF
 }
 
-# Each case re-locates the divider: the drags above MOVED it, and clicking empty space starts
-# no drag at all — which is how an earlier version of this test passed against the bug.
+# Each case re-locates the divider: earlier drags moved it, and clicking empty space starts no
+# drag at all.
 check_view_moved () { # check_view_moved <label> <disturb-spec>
     local d; d="$(find_divider)"
     [[ "$d" != "0" ]] || { cat "$WORK/frame" >&2; fail "no divider to grab for: $1"; }
@@ -1079,7 +1013,6 @@ check_view_moved () { # check_view_moved <label> <disturb-spec>
 # `new-tab` just created is the last one, index 1 while only tab 0 existed.
 check_view_moved "a tab being created and closed" "new-tab;close-tab,1"
 
-# (b) select away and back, which needs a second tab to exist.
 t 10 "$COMUX" new-tab >/dev/null || fail "could not create a second tab"
 t 10 "$COMUX" select-tab 0 >/dev/null || fail "could not return to the first tab"
 sleep 1
@@ -1088,15 +1021,13 @@ check_view_moved "the tab being selected away and back" "select-tab,1;select-tab
 ok "a dragged divider lands under the pointer, conserves cells, addresses the right branch, clamps, and dies when the view moves"
 
 echo "19. a jump into a copad tab"
-# `winfocus` can only activate an APPLICATION — a pid names the emulator, not one of its tabs
-# — so a toast click lands on whichever copad tab happened to be active. Copad exports
-# `COPAD_SOCKET` and `COPAD_PANEL_ID` into every tab's shell, so a client running inside one
-# can name its exact tab; comux asks copad to focus it.
+# `winfocus` can only activate an APPLICATION, so a toast click lands on whichever copad tab was
+# active. Copad exports `COPAD_SOCKET` and `COPAD_PANEL_ID` into every tab's shell, so a client
+# inside one can name its exact tab and comux asks copad to focus it.
 #
-# Driven against a FAKE copad speaking the same line-JSON protocol. That covers comux's whole
-# half — the client handshake, the server bookkeeping, the response, the dial and the reply
-# parse. copad's own `panel.focus` handler is covered separately: the GTK one was driven against
-# a real copad window on Linux (decision #115), the AppKit one on macOS.
+# Driven against a FAKE copad speaking the same line-JSON protocol, which covers comux's whole
+# half. copad's own `panel.focus` handler is covered separately (GTK on Linux, decision #115;
+# AppKit on macOS).
 cat >"$WORK/fakecopad.py" <<'PYEOF'
 import json, os, socket, sys, threading, time
 # mode: 1 = focused and raised, 0 = did not own the panel, 2 = focused but cannot raise
@@ -1152,8 +1083,7 @@ attach_as_copad_tab () {
 
 start_copad 1
 attach_as_copad_tab
-# The response must NAME the tab. Without this the CLI has nothing to dial and silently
-# degrades to application activation — which looks identical until you have two copad tabs.
+# The response must name the tab; otherwise the CLI silently degrades to application activation.
 t 10 "$COMUX" jump "$tok" --json >"$WORK/out" || fail "jump failed while attached"
 python3 -c 'import json,sys
 r = json.load(sys.stdin)
@@ -1203,10 +1133,9 @@ assert "copad_host" not in r, r' <"$WORK/out" \
 ok "the jump names the copad tab, dials it, falls back when refused, unraised or dead, and forgets it on detach"
 
 echo "20. the SSH fleet readout"
-# One comux server per machine, reached by running `comux list-agents --json` there over
-# ordinary ssh. Driven against a FAKE `ssh` on PATH, which covers everything except OpenSSH
-# itself: config parsing, the remote command line, concurrency, and — the point of the whole
-# feature — that a machine which does NOT answer is reported rather than dropped.
+# One comux server per machine, reached by `comux list-agents --json` over ssh. Driven against a
+# FAKE `ssh` on PATH: covers config parsing, the remote command line, concurrency, and that a
+# machine which does not answer is reported rather than dropped.
 mkdir -p "$WORK/fleetbin"
 cat >"$WORK/fleetbin/ssh" <<'SSHEOF'
 #!/usr/bin/env bash
@@ -1221,11 +1150,8 @@ case "$dest" in
   quiet-box)
     echo '{"ok":true,"agents":[]}' ;;
   big-box)
-    # A reply far larger than a pipe buffer (~64 KiB). The first version of `query_one` left
-    # both pipes undrained until the child exited, so ssh blocked in `write`, never exited,
-    # and a perfectly reachable machine was killed at the deadline and reported as timed out —
-    # failing precisely where the feature earns its keep, since the more agents a machine has
-    # the bigger its reply.
+    # A reply far larger than a pipe buffer (~64 KiB): query_one must drain both pipes while the
+    # child runs, or ssh blocks in `write` and a reachable machine is reported as timed out.
     python3 - <<'PYBIG'
 import json
 pad = "x" * 300
@@ -1273,7 +1199,6 @@ set -e
 grep -q 'Bash: run the tests' "$WORK/out" || fail "the reachable machine's agent was not shown: $(cat "$WORK/out")"
 grep -q 'UNREACHABLE' "$WORK/out" || fail "the unreachable machine was DROPPED instead of reported: $(cat "$WORK/out")"
 grep -q 'Operation timed out' "$WORK/out" || fail "the unreachable machine gave no reason: $(cat "$WORK/out")"
-# "no agents" and "could not reach" must be visibly different rows.
 grep -q 'no agents' "$WORK/out" || fail "an idle machine must say so, not vanish: $(cat "$WORK/out")"
 
 # The remote command line: a socket path with a SPACE must survive the remote login shell.
@@ -1351,28 +1276,20 @@ unset FAKE_SSH_LOG
 ok "the fleet is queried in parallel; an unreachable machine is reported with a reason, never dropped; a stalled descendant cannot hold up the deadline"
 
 echo "21. a HIDDEN pane's bell still reaches the rendered status bar"
-# Only a VISIBLE pane's output recomposes the frame now (`App::drain_pane_dirty`): with dozens
-# of panes, one background agent's spinner used to drive the whole visible screen to recompose
-# at the frame rate. That filter is only sound because every visible value that is a live
-# function of a HIDDEN pane gained its own comparison on the label cadence — and a bell is one
-# of them (`App::refresh_bells`), since `bell()`/`bell_count()` read each pane's atomic counter
-# at render time.
+# Only a VISIBLE pane's output recomposes the frame (`App::drain_pane_dirty`), so every visible
+# value that is a live function of a HIDDEN pane needs its own comparison on the label cadence;
+# a bell is one (`App::refresh_bells`).
 #
-# So this asserts the exact combination: ring a bell in a pane on another TAB (truly off
-# screen, unlike step 13's same-tab split, and unlike step 13 this reads a REAL rendered frame
-# rather than `list --json`) and require the tab chip's `!` to appear. Without `refresh_bells`
-# the bell has no way to reach the frame at all once hidden panes stop dirtying it.
+# Rings a bell in a pane on another TAB (off screen, unlike step 13's same-tab split, and read
+# from a rendered frame, not `list --json`) and requires the tab chip's `!`. Without
+# `refresh_bells` the bell cannot reach the frame.
 #
-# The bell has to ring while a client is ALREADY ATTACHED, and with no control traffic of its
-# own. Both attaching and any mutating `ctl` verb dirty the frame by themselves, so a bell rung
-# before the client connects — or delivered by a `send` — would repaint for reasons that have
-# nothing to do with this fix, and the check would pass with `refresh_bells` deleted. Hence the
-# self-timed bell: arm it in the pane, hide the pane, then attach and wait it out.
+# The bell must ring while a client is already attached and with no control traffic: attaching
+# and any mutating `ctl` verb dirty the frame themselves, so the check would pass with
+# `refresh_bells` deleted. Hence the self-timed bell: arm it, hide the pane, attach, wait.
 hidden_tok="$(t 10 "$COMUX" split -h)" || fail "could not create the pane that will ring"
 t 10 "$COMUX" send "$hidden_tok" "(sleep 3; printf '\a') &" >/dev/null
 t 10 "$COMUX" send "$hidden_tok" $'\n' >/dev/null
-# Move it out of sight: a new tab becomes the active one, so everything on the old tab is
-# hidden from the composed frame.
 t 10 "$COMUX" new-tab >/dev/null || fail "new-tab failed"
 # `cap` attaches, drains for 6s, then detaches — so the bell lands mid-drain and the label
 # cadence has seconds to turn it into a repaint.
@@ -1383,16 +1300,11 @@ fi
 ok "a hidden tab's bell still repaints the chrome, without its output driving the frame"
 
 echo "22. an idle client silently repaints itself, and never clears to do it"
-# The render self-heal (`reconcile_secs`), verified where it has to work: a REAL client on a pty.
-#
-# Residue lives BELOW the client's buffer — ratatui's incremental diff believes a cell is already
-# correct while the terminal shows something else — so no delta can ever repair it and the user
-# ends up pressing `Ctrl-b r`. The fix is to re-emit the whole screen periodically. Nothing here
-# can corrupt a real terminal's memory from outside, so what is asserted is the contract that
-# makes the fix work: while NOTHING is happening the client keeps re-emitting the screen, and it
-# does so WITHOUT a clear. The missing clear is the whole reason this can ship on by default —
-# `COPAD_MUX_REDRAW_MS` did the same job for a year with `Clear(All)` in front of it and had to
-# stay off because it flashed a blank frame every tick.
+# The render self-heal (`reconcile_secs`) on a real client over a pty. Residue lives below the
+# client's buffer (ratatui's diff believes a cell is correct while the terminal shows otherwise),
+# so only re-emitting the whole screen periodically repairs it. Asserts the contract: while idle
+# the client keeps re-emitting the screen WITHOUT a clear. A clear flashes a blank frame every
+# tick, which is why `COPAD_MUX_REDRAW_MS` had to stay off.
 cat >"$WORK/idlewatch.py" <<'PYEOF'
 import os, pty, sys, time, select, fcntl, termios, struct
 # Settle, then watch an IDLE client for `window` seconds and report what it emitted.
@@ -1470,11 +1382,9 @@ for args in "list --bogus" "list-sessions --bogus" "list-agents --owner x" "list
     rc=0; t 10 "$COMUX" $args >/dev/null 2>&1 || rc=$?
     [[ "$rc" == 2 ]] || fail "comux $args: expected exit 2, got $rc"
 done
-# `--json` under a usage error still answers in JSON on stdout.
 rc=0; t 10 "$COMUX" list --bogus --json >"$WORK/out" 2>/dev/null || rc=$?
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is False and d["code"]=="usage", d' \
     <"$WORK/out" || fail "a --json usage error did not print a JSON error: $(cat "$WORK/out")"
-# A body after `--` is literal, including the global `--json` switch.
 t 10 "$COMUX" list --json >"$WORK/json"
 tok="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])' <"$WORK/json")"
 t 10 "$COMUX" send "$tok" -- --json-literal-e2e >/dev/null || fail "send -- --json-literal-e2e failed"
@@ -1488,7 +1398,6 @@ echo "24. an index-less rename targets the caller's tab and session"
 t 10 "$COMUX" list --json >"$WORK/json"
 tokA="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])' <"$WORK/json")"
 t 10 "$COMUX" new-session wu2-viewed >/dev/null || fail "could not create the viewed session"
-# The user now looks at `wu2-viewed`; the caller's pane lives in the other session.
 COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-tab callers-tab >/dev/null || fail "caller rename-tab failed"
 COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-session callers-space >/dev/null || fail "caller rename-session failed"
 t 10 "$COMUX" list-tabs --json >"$WORK/json"
@@ -1545,7 +1454,6 @@ python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["code"]=="ambiguou
     || fail "--json ambiguity should carry code=ambiguous: $(cat "$WORK/out")"
 rc=0; t 10 "$COMUX" select-session name:nope >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 1 ]] || fail "an unknown session name should exit 1, got $rc"
-# By name and by path: the view follows, and the named tab is the active one.
 t 10 "$COMUX" select-session name:sel-a >/dev/null || fail "select-session name:sel-a failed"
 t 10 "$COMUX" list-sessions --json >"$WORK/json"
 python3 -c 'import json,sys; s=json.load(sys.stdin)["sessions"]; assert [x for x in s if x["active"]][0]["name"]=="sel-a", s' <"$WORK/json" \
@@ -1594,7 +1502,6 @@ t 10 "$COMUX" list-tree --session "$first" --json >"$WORK/json"
 [[ "$(count tree)" == 1 ]] || fail "list-tree --session should return one session: $(cat "$WORK/json")"
 t 10 "$COMUX" list-tree >"$WORK/out" || fail "list-tree (human) failed"
 grep -q "$first:t" "$WORK/out" || fail "the human tree shows no tab ids: $(cat "$WORK/out")"
-# Every agent row's location must agree with the tree.
 t 10 "$COMUX" list-agents --json >"$WORK/agents.json"
 python3 - "$WORK/tree.json" "$WORK/agents.json" <<'PYEOF' || fail "list-agents' location fields disagree with list-tree"
 import json, sys
@@ -1620,7 +1527,6 @@ for _ in $(seq 1 60); do
     sleep 0.25
 done
 [[ -n "$S" && "$S" -gt 0 ]] || fail "the seq fixture never read as working with a seq: $(cat "$WORK/json")"
-# Level-triggered without --after-seq: the CURRENT status matches, and says its seq.
 t 15 "$COMUX" wait-agent "$P" --status working --timeout 10 --json >"$WORK/out" || fail "level wait failed"
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] and d["agent"]["seq"]=='"$S"', d' <"$WORK/out" \
     || fail "wait-agent --json did not report the agent and its seq: $(cat "$WORK/out")"
@@ -1639,14 +1545,12 @@ rc=0; wait "$EDGE_PID" || rc=$?
 [[ "$rc" == 0 ]] || fail "--after-seq missed the newer change (exit $rc): $(cat "$WORK/edge")"
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["agent"]["status"]=="blocked" and d["agent"]["seq"]>'"$S"', d' <"$WORK/edge" \
     || fail "the edge wait should report the newer seq: $(cat "$WORK/edge")"
-# wait-output answers in JSON too, success and failure alike.
 t 15 "$COMUX" wait-output "$P" "Do you want" --timeout 5 --json >"$WORK/out" || fail "wait-output --json failed"
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] and d["pane"]=="'"$P"'" and "Do you want" in d["line"], d' <"$WORK/out" \
     || fail "wait-output --json shape: $(cat "$WORK/out")"
 rc=0; t 15 "$COMUX" wait-output no-such-pane x --timeout 3 --json >"$WORK/out" 2>/dev/null || rc=$?
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is False and d["code"]=="not_found", d' <"$WORK/out" \
     || fail "a failed wait-output --json should print an error object: $(cat "$WORK/out")"
-# A plain verb against a dead socket still answers in JSON.
 rc=0; COPAD_MUX_SOCK="$WORK/no-such-sock" t 10 "$COMUX" list --json >"$WORK/out" 2>/dev/null || rc=$?
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["code"]=="unavailable", d' <"$WORK/out" \
     || fail "an unreachable server should be a JSON error under --json: $(cat "$WORK/out")"
@@ -1670,7 +1574,6 @@ t 15 "$COMUX" wait-output "$P" '^[[200~onetwo^[[201~' --timeout 10 >/dev/null \
     || fail "a bracketed paste was not wrapped (or the embedded delimiter survived): $(t 10 "$COMUX" capture-pane "$P")"
 t 10 "$COMUX" send "$P" $'\x03' >/dev/null # Ctrl-C out of cat
 sleep 0.3
-# With bracketed paste OFF there is nothing to wrap in.
 t 10 "$COMUX" send "$P" --enter -- "printf '\\033[?2004l'; cat -v" >/dev/null
 sleep 0.5
 t 10 "$COMUX" send "$P" --paste --enter -- "plain-paste" >/dev/null
@@ -1679,7 +1582,6 @@ t 10 "$COMUX" capture-pane "$P" >"$WORK/out"
 tail -3 "$WORK/out" | grep -q '200~plain' && fail "a paste was bracketed for a program that did not ask: $(cat "$WORK/out")"
 t 10 "$COMUX" send "$P" $'\x03' >/dev/null
 sleep 0.3
-# --file sends the file's contents.
 printf 'echo FROMFILE-$((1+1))' >"$WORK/send.txt"
 t 10 "$COMUX" send "$P" --file "$WORK/send.txt" --enter >/dev/null || fail "send --file failed"
 t 15 "$COMUX" wait-output "$P" "FROMFILE-2" --timeout 10 >/dev/null || fail "send --file did not send the file"
@@ -1703,11 +1605,9 @@ python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["session"]["id"]==
 B="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
 btab="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tab"]["id"])' <"$WORK/json")"
 [[ "$(view)" == "$v0" ]] || fail "new-tab --session moved a view: $v0 -> $(view)"
-# The shell started in --cwd.
 t 10 "$COMUX" send "$B" --enter -- 'pwd; echo PWD-$((7*6))' >/dev/null
 t 15 "$COMUX" wait-output "$B" "PWD-42" --timeout 10 >/dev/null || fail "the background tab's shell never ran"
 t 10 "$COMUX" capture-pane "$B" | grep -qF "$WORK/place dir" || fail "new-tab --cwd was not honored: $(t 10 "$COMUX" capture-pane "$B")"
-# Split a pane in a BACKGROUND tab of a BACKGROUND session.
 t 10 "$COMUX" split --from "$B" --json >"$WORK/json" || fail "split --from a background pane failed: $(cat "$WORK/json")"
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["tab"]["id"]=="'"$btab"'", d' <"$WORK/json" \
     || fail "the background split landed elsewhere: $(cat "$WORK/json")"
@@ -1749,7 +1649,6 @@ grep -q -- "-" "$WORK/out" || fail "plain spawn should print the pane token: $(c
 [[ "$(tabs_in)" == 3 ]] || fail "a caller-relative spawn did not land in the caller's session"
 for _ in $(seq 1 40); do [[ "$(tabs_in)" == 2 ]] && break; sleep 0.25; done
 [[ "$(tabs_in)" == 2 ]] || fail "a spawned program exited but its tab stayed"
-# --keep leaves a shell behind, which still takes input.
 t 10 "$COMUX" spawn --session "$sp" --keep --json -- sh -c 'echo KEPT-$((1+1))' >"$WORK/json" || fail "spawn --keep failed"
 K="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
 t 15 "$COMUX" wait-output "$K" "KEPT-2" --timeout 15 >/dev/null || fail "the --keep program never ran"
@@ -1775,14 +1674,12 @@ mine="$(COPAD_MUX_PANE="$A" t 10 "$COMUX" list --json | python3 -c 'import json,
 [[ "$mine" == "['$A', '$S']" ]] || fail "list inside a background pane should list ITS tab: $mine"
 active="$(COPAD_MUX_PANE="$A" t 10 "$COMUX" list --active --json | python3 -c 'import json,sys; print([p["token"] for p in json.load(sys.stdin)["panes"]])')"
 [[ "$active" == "$on_screen" ]] || fail "list --active should list the tab on screen: $active vs $on_screen"
-# send 1 / capture-pane --index 1 / wait-output --index 1 all reach the sibling list showed.
 COPAD_MUX_PANE="$A" t 10 "$COMUX" send 1 --enter -- 'echo IDX-$((3*4))' >/dev/null || fail "send by index from a background pane failed"
 t 15 "$COMUX" wait-output "$S" "IDX-12" --timeout 10 >/dev/null || fail "send 1 did not reach the caller's sibling: $(t 10 "$COMUX" capture-pane "$S")"
 COPAD_MUX_PANE="$A" t 10 "$COMUX" capture-pane --index 1 --json >"$WORK/json"
 python3 -c 'import json,sys; assert json.load(sys.stdin)["pane"]=="'"$S"'"' <"$WORK/json" || fail "capture-pane --index 1 read another pane: $(cat "$WORK/json")"
 COPAD_MUX_PANE="$A" t 15 "$COMUX" wait-output --index 1 "IDX-12" --timeout 10 --json >"$WORK/json" || fail "wait-output --index from a background pane failed: $(cat "$WORK/json")"
 python3 -c 'import json,sys; assert json.load(sys.stdin)["pane"]=="'"$S"'"' <"$WORK/json" || fail "wait-output --index pinned another pane"
-# focus moves focus in that tab only; close 1 closes the sibling, not a pane on screen.
 COPAD_MUX_PANE="$A" t 10 "$COMUX" focus 1 >/dev/null || fail "focus by index from a background pane failed"
 COPAD_MUX_PANE="$A" t 10 "$COMUX" list --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["focused"]==1' || fail "focus 1 did not focus the caller's sibling"
 [[ "$(view)" == "$v0" ]] || fail "an index verb from a background pane moved a view: $v0 -> $(view)"
@@ -1808,7 +1705,6 @@ t 10 "$COMUX" spawn --session "$sp" --name e2e-child --owner "$PARENT" --keep --
 CHILD="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
 owned() { t 10 "$COMUX" list-tree --owner "$1" --json | python3 -c 'import json,sys; print([t["name"] for s in json.load(sys.stdin)["tree"] for t in s["tabs"]])'; }
 [[ "$(owned "$PARENT")" == "['e2e-child']" ]] || fail "list-tree --owner should show the child tab: $(owned "$PARENT")"
-# The child reports to whoever owns its tab, without knowing that pane's token.
 echo "the report" >"$WORK/report.txt"
 (cd "$WORK" && COPAD_MUX_PANE="$CHILD" t 10 "$COMUX" notify --to owner --kind done --result report.txt -- "child done") >/dev/null \
     || fail "notify --to owner failed"
@@ -1825,7 +1721,6 @@ t 10 "$COMUX" inbox "$PARENT" --json | python3 -c 'import json,sys; assert json.
     || fail "a printed message should have been acknowledged"
 rc=0; t 10 "$COMUX" inbox "$PARENT" --wait --timeout 1 >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 124 ]] || fail "an empty inbox --wait should time out with 124, got $rc"
-# A message arriving DURING the wait is picked up.
 ( sleep 1; COPAD_MUX_PANE="$CHILD" "$COMUX" notify --to owner --kind failed -- "late" >/dev/null ) &
 t 15 "$COMUX" inbox "$PARENT" --wait --timeout 10 >"$WORK/out" || fail "inbox --wait missed a message sent during the wait"
 grep -qF "late" "$WORK/out" || fail "inbox --wait printed the wrong thing: $(cat "$WORK/out")"
@@ -1835,7 +1730,6 @@ rc=0; COPAD_MUX_PANE="$CHILD" t 10 "$COMUX" close-tab --owned-by "$PARENT" --yes
 [[ "$rc" == 1 ]] || fail "close-tab --owned-by from inside an owned tab should be refused, got $rc"
 t 10 "$COMUX" close-tab --owned-by "$PARENT" --dry-run --json >"$WORK/json" || fail "close-tab --dry-run failed"
 [[ "$(count closed)" == 1 && "$(owned "$PARENT")" == "['e2e-child']" ]] || fail "a dry run should list one tab and close none"
-# Ownership survives a restart even though every token changes.
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server before the restart failed"
 for _ in $(seq 1 100); do [[ -S "$COPAD_MUX_SOCK" ]] || break; sleep 0.1; done
 "$COMUX" server >>"$WORK/server.log" 2>&1 &
@@ -1872,11 +1766,9 @@ t 10 "$COMUX" back >/dev/null
 t 10 "$COMUX" forward >"$WORK/out" || fail "comux forward failed"
 [[ "$(attached)" == nav2 ]] || fail "forward should return to nav2, on $(attached)"
 grep -q "nav2/" "$WORK/out" || fail "forward should print where it landed: $(cat "$WORK/out")"
-# Killing the attached session lands on the one used before it, not the first-created.
 t 10 "$COMUX" select-session name:nav3 >/dev/null
 t 10 "$COMUX" kill-session name:nav3 >/dev/null || fail "kill-session nav3 failed"
 [[ "$(attached)" == nav2 ]] || fail "killing nav3 should land on nav2 (previous), on $(attached)"
-# The rendered switcher: Ctrl-f opens with the PREVIOUS session marked, so Enter toggles.
 t 10 "$COMUX" select-session name:nav1 >/dev/null
 t 10 "$COMUX" select-session name:nav2 >/dev/null
 python3 - "$WORK/ptydrive.py" "$WORK/keydrive.py" <<'PYEOF'
@@ -1910,18 +1802,16 @@ PYEOF
 PTY_KEYS='\x06' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
 grep -E "▸ .*nav1" "$WORK/frame" >/dev/null \
     || { cat "$WORK/frame" >&2; fail "Ctrl-f should open with the previous session (nav1) selected"; }
-# ...and Enter on it switches there — the two-key toggle.
 PTY_KEYS='\x06|\r' python3 "$WORK/keydrive.py" cap -- "$COMUX" >/dev/null 2>&1
 [[ "$(attached)" == nav1 ]] || fail "Ctrl-f Enter should toggle to nav1, on $(attached)"
-# The prefix key: Ctrl-b ; toggles back.
 PTY_KEYS='\x02;' python3 "$WORK/keydrive.py" cap -- "$COMUX" >/dev/null 2>&1
 [[ "$(attached)" == nav2 ]] || fail "Ctrl-b ; should toggle back to nav2, on $(attached)"
 for n in nav1 nav2; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
 ok "last toggles, back/forward walk the trail, kill lands on the previous session, Ctrl-f preselects it, Ctrl-b ; toggles"
 
 echo "34. wide (Korean) text inside the overlays"
-# The switcher, prompt, confirm and notification center counted CHARS, so a Korean name ran
-# past the box border. Read the real frame back and check the border column on every row.
+# Overlays must size by display width, not chars: a Korean name otherwise runs past the box
+# border. Checks the border column on every row of the real frame.
 KO="한글세션이름이아주길어서박스를넘칠수도있는이름"
 t 10 "$COMUX" new-session "$KO" >/dev/null || fail "new-session with a Korean name failed"
 PTY_KEYS='\x06' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
@@ -1954,7 +1844,6 @@ grep -q "split the pane side by side" "$WORK/frame" \
     || { cat "$WORK/frame" >&2; fail "Ctrl-b ? should list the keymap"; }
 grep -q "prefix — press ^b first" "$WORK/frame" \
     || { cat "$WORK/frame" >&2; fail "the help should name the live prefix"; }
-# A rebinding shows up as bound NOW, via reload — the help is built from the live keymap.
 printf '[keys]\nkey-help = "/"\n' >"$XDG_CONFIG_HOME/copad/mux.toml"
 t 10 "$COMUX" reload >/dev/null || fail "reload failed"
 PTY_KEYS='\x02' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
@@ -2040,7 +1929,6 @@ python3 -c '
 import json,sys
 t=[x["pane"] for x in json.load(sys.stdin)["targets"]]
 assert "'"$BC1"'" in t and "'"$BC2"'" in t, t' <"$WORK/json" || fail "the dry run should list both sessions: $(cat "$WORK/json")"
-# From INSIDE e2ebc1's pane: the session's other panes get it, the caller does not.
 t 10 "$COMUX" split --from "$BC1" -h --json >"$WORK/json" || fail "split in e2ebc1 failed"
 BC1B="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
 COPAD_MUX_PANE="$BC1" t 10 "$COMUX" broadcast --session name:e2ebc1 --yes --enter -- 'echo BCSENT-$((20+22))' >"$WORK/out" \
@@ -2080,7 +1968,6 @@ t 10 "$COMUX" new-session --json e2ecopy >"$WORK/json" || fail "new-session e2ec
 CP="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
 t 10 "$COMUX" send "$CP" --enter -- 'for i in $(seq 1 60); do echo CPL$i; done; echo CPDONE-$((1+1))' >/dev/null
 t 15 "$COMUX" wait-output "$CP" --timeout 10 CPDONE-2 >/dev/null || fail "the copy fixture never printed"
-# A raw dump of what the client received, to find the OSC 52 the yank sends.
 cat >"$WORK/rawdrive.py" <<'PYEOF'
 import os, pty, sys, time, select, fcntl, termios, struct
 keys = sys.argv[1]; out = sys.argv[2]; cmd = sys.argv[sys.argv.index("--") + 1:]
@@ -2115,7 +2002,6 @@ raw = open(sys.argv[1], "rb").read()
 hits = [base64.b64decode(m) for m in re.findall(rb"\x1b\]52;[a-z]*;([A-Za-z0-9+/=]+)(?:\x07|\x1b\\)", raw)]
 assert any(h.strip() == b"CPL17" for h in hits), hits
 PYEOF
-# y left copy mode: no COPY chip in a fresh frame, and q (separately) leaves too.
 python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
 if tail -1 "$WORK/frame" | grep -qF " COPY "; then fail "y should have left copy mode"; fi
 PTY_KEYS='\x02[|q' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
@@ -2158,7 +2044,6 @@ lg "$LR" add -A && lg "$LR" commit -q -m base || fail "the land fixture's base r
 lg "$LR" worktree add -q -b e2eland "$WORK/landwt" || fail "git worktree add failed"
 echo feature >"$WORK/landwt/feature.txt"
 lg "$WORK/landwt" add -A && lg "$WORK/landwt" commit -q -m "e2e feature" || fail "the worktree revision failed"
-# Refused while the worktree has untracked work — and nothing is rewritten.
 echo scratch >"$WORK/landwt/scratch.txt"
 rc=0; (cd "$LR" && t 15 "$COMUX" worktree land e2eland >"$WORK/out" 2>&1) || rc=$?
 [[ "$rc" == 1 ]] && grep -q "untracked" "$WORK/out" || fail "a dirty worktree should be refused: rc=$rc $(cat "$WORK/out")"
@@ -2227,14 +2112,12 @@ else
     for _ in $(seq 1 50); do [[ -s "$WORK/fork.log" ]] && break; sleep 0.2; done
     grep -qF -- "FORKED: --resume $FID --fork-session" "$WORK/fork.log" \
         || fail "the new tab should run claude --resume $FID --fork-session: $(cat "$WORK/fork.log" 2>/dev/null)"
-    # --no-focus left the view on the agent's tab; a plain fork moves it to the new one.
     active_tab() { t 10 fx list-tabs --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["active_tab"], len(d["tabs"]))'; }
     before="$(active_tab)"
     t 15 fx fork "$AG" >/dev/null || fail "a focused fork failed"
     after="$(active_tab)"
     [[ "${after#* }" -gt "${before#* }" && "${after% *}" != "${before% *}" ]] \
         || fail "a plain fork should open AND show a new tab (before: $before, after: $after)"
-    # A plain shell pane is refused, and nothing opens.
     t 10 fx list --json >"$WORK/json"
     SH="$(python3 -c 'import json,sys; p=json.load(sys.stdin)["panes"]; print(p[0]["token"])' <"$WORK/json")"
     rc=0; t 10 fx fork "$SH" >/dev/null 2>&1 || rc=$?
@@ -2242,8 +2125,6 @@ else
     ok "a live (fake) claude pane forks into a tab running 'claude --resume <id> --fork-session'; a shell pane is refused"
 
     echo "45b. a blocked claude says what it waits for"
-    # The same fake agent, now blocked on a permission the way Claude writes it to its session
-    # file. The sweep must carry it to the wire as both text and a structured kind.
     printf '{"pid":%s,"sessionId":"%s","status":"waiting","waitingFor":"approve Bash: git status"}\n' \
         "$APID" "$FID" >"$FH/.claude/sessions/$APID.json"
     agent_field() {
@@ -2287,8 +2168,6 @@ print("" if v is None else v)' "$AG" "$1" <"$WORK/json"
     ok "busy -> idle reads ready + unseen; a jump to the pane clears it"
 
     echo "45d. two agents in one worktree are flagged"
-    # Two more fake agents, launched in the same (fake) git checkout. The first fake agent
-    # runs elsewhere, so only these two may be flagged — one peer each.
     mkdir -p "$WORK/shared-repo/.git" "$WORK/shared-repo/sub"
     t 10 fx spawn --keep --json --cwd "$WORK/shared-repo" -- "$FA/claude" 601 >"$WORK/json" || fail "spawn 1 failed"
     S1="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
@@ -2309,7 +2188,6 @@ for a in json.load(sys.stdin)["agents"]:
     ok "two agents in one checkout read worktree_peers=1, the one elsewhere 0"
 
     echo "45e. an agent's context fill, and its statusline report, reach list-agents"
-    # The transcript says how full the context is; only the statusline says the window and cost.
     mkdir -p "$FH/.claude/projects/e2e"
     printf '{"type":"assistant","message":{"model":"m","usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":49000,"output_tokens":5}}}\n' \
         >"$FH/.claude/projects/e2e/$FID.jsonl"
@@ -2342,7 +2220,6 @@ for a in json.load(sys.stdin)["agents"]:
     [[ "$(cat "$WORK/compact-gate/$FID")" == 1 ]] || fail "the deferral should be counted"
     [[ "$(gate manual)" == "{}" ]] || fail "a /compact by hand is never deferred"
     [[ -e "$WORK/compact-gate/$FID" ]] && fail "a manual compaction should end the streak"
-    # 50002 of 200000 used: a 160000 headroom is not there, so it goes through.
     [[ "$(gate auto --headroom 160000)" == "{}" ]] || fail "too close to the window, it must not defer"
     gate auto --max-deferrals 1 >/dev/null
     [[ "$(gate auto --max-deferrals 1)" == "{}" ]] || fail "past --max-deferrals it must let it through"
@@ -2368,7 +2245,6 @@ for a in json.load(sys.stdin)["agents"]:
     rgate | grep -q '"decision":"block"' || fail "after the request was used, it should defer again"
     t 10 fx compact "$AG" >/dev/null; t 10 fx compact "$AG" --cancel >/dev/null
     rgate | grep -q '"decision":"block"' || fail "a withdrawn request must not fire"
-    # A /compact by hand answers a queued request: it must not fire again right after.
     t 10 fx compact "$AG" >/dev/null
     printf '{"session_id":"%s","transcript_path":"%s","trigger":"manual"}' "$FID" "$TP" \
         | t 10 env COPAD_MUX_PANE="$AG" COPAD_MUX_SOCK="$F_SOCK" COPAD_MUX_STATE="$WORK/fstate.json" \
@@ -2421,19 +2297,16 @@ print(eval(sys.argv[3]) if a else "")' "$WORK/gjson" "$AG" "$1" 2>/dev/null
     [[ "$(gfield '[s["agent"] for s in a["steps"] if s["kind"]=="read"]')" == "[0, 1]" ]] || fail "the subagent's read is its own"
     [[ "$(gfield 'a["pending"]')" == "[$(gfield '[s["seq"] for s in a["steps"] if s["kind"]=="spawn"][0]')]" ]] \
         || fail "the spawn waits for its subagent: $(cat "$WORK/gjson")"
-    # One pane's history, page by page.
     t 5 fx graph "$AG" --limit 3 --json >"$WORK/pjson" || fail "comux graph <pane> failed"
     python3 -c 'import json,sys; p=json.load(open(sys.argv[1]))["graph"]; assert len(p["steps"])==3 and p["next_before"]==p["page_first_seq"], p' "$WORK/pjson" \
         || fail "a 3-step page: $(cat "$WORK/pjson")"
     t 5 fx graph "$AG" >"$WORK/out"; grep -q "parse.rs" "$WORK/out" || fail "the plain listing: $(cat "$WORK/out")"
-    # Kept on disk, beside the state file.
     GFILE="$WORK/graphs/claude-$FID.json"
     for _ in $(seq 1 40); do [[ -s "$GFILE" ]] && break; sleep 0.25; done
     [[ -s "$GFILE" ]] || fail "the graph should be saved at $GFILE"
     # GNU first: on Linux `stat -f` is filesystem status and "succeeds" with the wrong answer.
     [[ "$(stat -c %a "$GFILE" 2>/dev/null || stat -f %Lp "$GFILE")" == 600 ]] || fail "the saved graph should be 0600"
     grep -q '"/repo/src/parse.rs"' "$GFILE" || fail "the saved graph should hold the files"
-    # The subagent finishes in the background.
     printf '{"type":"user","timestamp":"2026-11-04T00:00:09.000Z","message":{"content":"<task-notification>\\n<tool-use-id>g5</tool-use-id>\\n<status>completed</status>"}}\n' >>"$TP"
     res g5 false
     gwait '[s["status"] for s in a["subagents"]]' "['completed']" 60
@@ -2456,7 +2329,6 @@ print(eval(sys.argv[3]) if a else "")' "$WORK/gjson" "$AG" "$1" 2>/dev/null
     gwait 'a["counts"]["reads"]' 4 60
     sleep 6.5
     [[ ! -e "$GFILE" ]] || fail "graph_persist = false must not write the graph (reload said: $(cat "$WORK/reload.out"); $(ls -la "$WORK/graphs"))"
-    # And off entirely: the topic empties.
     { printf '%s\n' "$MCFG_OLD"; printf 'graph = false\n'; } >"$MCFG"
     t 10 fx reload >/dev/null
     for _ in $(seq 1 40); do [[ -z "$(gfield 'a["token"]')" ]] && break; sleep 0.25; done

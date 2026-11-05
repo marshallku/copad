@@ -1,11 +1,8 @@
-//! `coctl background cache` — rebuild the wallpaper list file by scanning a
-//! directory. Purely local (reads `config.toml`, writes the list file), so it
-//! works over SSH and with no copad running, like `usage` and `agent status`.
+//! `coctl background cache` — rebuild the wallpaper list file by scanning a directory. Purely
+//! local (reads `config.toml`, writes the list file), so it works over SSH with no copad running.
 //!
-//! This exists for the curated-list workflow: point `[background] image` at a
-//! directory and copad scans it live — no cache needed. Generate a list file
-//! when you want the source to be an explicit set (hand-pruned, filtered by a
-//! separate tool, or spanning several directories).
+//! Only needed for an explicit curated source (hand-pruned, filtered, or spanning several
+//! directories); pointing `[background] image` at a directory makes copad scan it live.
 
 use std::path::PathBuf;
 
@@ -45,13 +42,10 @@ pub fn run(
         .or_else(|| config.background.list_path())
         .unwrap_or_else(default_list_path);
 
-    // Overwriting silently would destroy a hand-curated list (the legacy
-    // `terminal-wallpapers.txt` is a *filtered* subset of its source
-    // directory, so a naive rescan would quietly re-add everything).
-    // Existence is decided by `symlink_metadata`, not by whether we can read
-    // the contents: an unreadable, binary, or dangling-symlink output path is
-    // still something the write would destroy. The line count is reporting
-    // detail only.
+    // Overwriting silently would destroy a hand-curated list (the legacy `terminal-wallpapers.txt`
+    // is a filtered subset of its source directory). Existence is decided by `symlink_metadata`,
+    // not readability: an unreadable, binary or dangling-symlink path is still destroyed by the
+    // write. The line count is reporting only.
     let existing = existing_line_count(&out);
     if out.symlink_metadata().is_ok() && !force {
         match existing {
@@ -87,9 +81,8 @@ pub fn run(
         }
     };
 
-    // `write_list` drops non-UTF-8 paths, which the line-based list format
-    // cannot represent — report them rather than letting the counts differ
-    // with no explanation.
+    // `write_list` drops non-UTF-8 paths (the line-based format cannot hold them); report them so
+    // the counts are explained.
     let skipped = entries.len().saturating_sub(written);
 
     if json {
@@ -117,7 +110,8 @@ pub fn run(
     0
 }
 
-/// Same default the Linux GUI uses when `[background] list` is unset.
+/// Same default the Linux GUI uses when `[background] list` is unset
+/// (`copad-linux/src/background.rs`).
 fn default_list_path() -> PathBuf {
     expand_tilde("~/.cache/terminal-wallpapers.txt")
 }

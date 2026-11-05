@@ -1,24 +1,9 @@
-//! `coctl context` aggregator (Phase 19.2 slice a).
+//! `coctl context` aggregator: fans out to several plugin actions and renders one "where am I"
+//! view. `coctl --json context` without `--full` keeps the raw `context.snapshot` shape and is
+//! handled in main.rs.
 //!
-//! Default `coctl context` (no flags) and `coctl context --full`
-//! both go through this module: fan out to `context.snapshot`,
-//! `session.info`, `git.list_workspaces`, `git.status`, `todo.list`,
-//! `calendar.list_events`, `slack.auth_status`, `discord.auth_status`
-//! and render a single dense "where am I" view.
-//!
-//! `coctl --json context` (no `--full`) keeps the raw
-//! `context.snapshot` shape verbatim for backward compatibility with
-//! scripts already piping it; main.rs handles that fast path.
-//! `coctl --json context --full` returns the aggregate as one
-//! object — useful for scripting "what's the user's current
-//! cross-plugin state?" without N round-trips from the caller.
-//!
-//! Each section is independent: a failed sub-call (e.g. lazy `git.*`
-//! wakeup timing out, calendar plugin in fatal_config) shows
-//! `(unavailable)` for that section, never aborts the whole render.
-//! Cross-plugin enrichment via composition, not via a new aggregate
-//! action — keeps the plugin protocol surface flat and the
-//! enrichment logic in one place (this file).
+//! Each section is independent: a failed sub-call shows `(unavailable)` for that section and never
+//! aborts the render.
 
 use serde_json::{Value, json};
 use std::path::Path;
@@ -44,16 +29,9 @@ pub fn dispatch(socket_path: &str, json_out: bool) -> i32 {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    // Side calls — each Result<Value> is "did this succeed", with
-    // None meaning "skip this section".
-    // session.info contract is platform-divergent: copad-linux respects
-    // the `id` param and returns that panel's info, but copad-macos's
-    // current impl ignores `id` and returns active-tab info regardless
-    // (copad-macos is stub-only per project memory; tracked as a
-    // cross-platform follow-up). Defensive guard: only accept the
-    // response when its `id` field actually matches what we asked
-    // for. On macOS this drops the panel-detail rendering rather
-    // than showing wrong-panel info; on Linux it's a no-op.
+    // copad-macos ignores the `id` param of session.info and returns the active tab; only accept
+    // a response whose `id` matches, so macOS drops the panel detail instead of showing the wrong
+    // panel.
     let panel_info = active_panel.as_ref().and_then(|id| {
         let resp = fetch(socket_path, "session.info", json!({ "id": id })).ok()?;
         let returned_id = resp.get("id").and_then(Value::as_str)?;
@@ -62,14 +40,8 @@ pub fn dispatch(socket_path: &str, json_out: bool) -> i32 {
     let workspace = active_cwd
         .as_deref()
         .and_then(|cwd| resolve_workspace_from_cwd(socket_path, cwd));
-    // git.status with `workspace=ws` reports the primary checkout's
-    // state; with `path=cwd` it reports the cwd's own worktree state.
-    // For "where am I" semantics we want the latter — when the user
-    // sits in a secondary worktree under `<repo>-worktrees/<branch>`,
-    // that worktree's branch/ahead/behind/dirty matters, not the
-    // primary checkout's. Plugin's allow-list still validates the
-    // path is under a configured workspace's `path` or
-    // `worktree_root` (copad-plugin-git/src/main.rs::action_status).
+    // `path=cwd` reports the cwd's own worktree; `workspace=ws` would report the primary checkout.
+    // The plugin still validates the path against configured workspace paths.
     let git_status = active_cwd
         .as_deref()
         .and_then(|cwd| fetch(socket_path, "git.status", json!({ "path": cwd })).ok());
@@ -114,8 +86,6 @@ pub fn dispatch(socket_path: &str, json_out: bool) -> i32 {
     0
 }
 
-/// Issue a single action call. `Err((code, message))` on either
-/// transport failure or a rejected response.
 fn fetch(socket_path: &str, method: &str, params: Value) -> Result<Value, (String, String)> {
     let resp = client::send_command(socket_path, method, params)
         .map_err(|e| ("transport_error".to_string(), e.to_string()))?;
@@ -130,10 +100,7 @@ fn fetch(socket_path: &str, method: &str, params: Value) -> Result<Value, (Strin
     }
 }
 
-/// Longest-prefix match cwd against canonicalized `path` /
-/// `worktree_root` from `git.list_workspaces`. Mirrors `plugin_cmds::git`'s
-/// resolver. `None` on any failure (workspace-bound aggregate sections
-/// then skip).
+// Mirrors plugin_cmds::git::resolve_workspace.
 fn resolve_workspace_from_cwd(socket_path: &str, cwd: &str) -> Option<String> {
     let resp = fetch(socket_path, "git.list_workspaces", json!({})).ok()?;
     let arr = resp.get("workspaces").and_then(Value::as_array)?;
@@ -143,9 +110,6 @@ fn resolve_workspace_from_cwd(socket_path: &str, cwd: &str) -> Option<String> {
         .unwrap_or_else(|_| cwd_path.to_path_buf());
     let mut best: Option<(usize, String)> = None;
     for w in arr {
-        // Skip malformed rows rather than aborting the whole lookup —
-        // a single bad workspace entry shouldn't suppress otherwise
-        // valid matches. Mirrors `plugin_cmds::git::resolve_workspace`.
         let Some(name) = w.get("name").and_then(Value::as_str) else {
             continue;
         };
@@ -179,7 +143,6 @@ fn render_human(
     slack_auth: Option<&Value>,
     discord_auth: Option<&Value>,
 ) {
-    // ── header ──────────────────────────────────────────────────────
     let header = match (workspace, git_status) {
         (Some(ws), Some(gs)) => format!("context  workspace={ws}  {}", git_summary(gs)),
         (Some(ws), None) => format!("context  workspace={ws}"),
@@ -187,7 +150,6 @@ fn render_human(
     };
     println!("{header}");
 
-    // ── panel + cwd ─────────────────────────────────────────────────
     println!();
     println!("panel");
     if let Some(p) = panel_info {
@@ -207,7 +169,6 @@ fn render_human(
     }
     println!("  cwd {}", active_cwd.unwrap_or("(none)"));
 
-    // ── todos ───────────────────────────────────────────────────────
     println!();
     if let Some(t) = todos {
         render_todos_section(t, workspace.unwrap_or("?"));
@@ -216,7 +177,6 @@ fn render_human(
         println!("  (unavailable)");
     }
 
-    // ── calendar ────────────────────────────────────────────────────
     println!();
     println!("calendar (next 2h)");
     if let Some(c) = calendar {
@@ -225,7 +185,6 @@ fn render_human(
         println!("  (unavailable)");
     }
 
-    // ── messengers ──────────────────────────────────────────────────
     println!();
     println!("messengers");
     println!("  slack    {}", auth_summary(slack_auth));
@@ -285,7 +244,6 @@ fn render_todos_section(t: &Value, workspace: &str) {
         .map(str::len)
         .max()
         .unwrap_or(20);
-    // in-progress first (more relevant), then open, capped at 10 total
     let total = open.len() + in_progress.len();
     let limit = 10;
     for (shown, t) in in_progress.iter().chain(open.iter()).enumerate() {
@@ -317,9 +275,7 @@ fn render_calendar_section(c: &Value) {
         return;
     }
     for ev in arr {
-        // calendar.list_events emits `start_time` as RFC3339 +
-        // a separate `all_day` boolean. For all-day events there
-        // is no clock time worth showing — render "all day" instead.
+        // all-day events carry no clock time worth showing
         let title = ev
             .get("title")
             .and_then(Value::as_str)
@@ -329,8 +285,6 @@ fn render_calendar_section(c: &Value) {
             "all-day".to_string()
         } else {
             let start = ev.get("start_time").and_then(Value::as_str).unwrap_or("");
-            // Trim RFC3339 to HH:MM (strip date prefix). Falls back
-            // to the raw value if the string isn't `<date>T<time>...`.
             start
                 .split_once('T')
                 .map(|(_, t)| t.split(':').take(2).collect::<Vec<_>>().join(":"))
@@ -363,8 +317,6 @@ fn auth_summary(auth: Option<&Value>) -> String {
     if !authenticated {
         return "configured · not signed in".into();
     }
-    // Identity preference order: username > user_id; team_id when
-    // present (Slack).
     let username = a.get("username").and_then(Value::as_str);
     let user_id = a.get("user_id").and_then(Value::as_str);
     let team_id = a.get("team_id").and_then(Value::as_str);

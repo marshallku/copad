@@ -1,29 +1,19 @@
 #!/usr/bin/env bash
-# e2e for the no-focus-theft guarantee (work unit B6, macOS).
-#
-# The owner's hard requirement: agent-driven clicking and capture must work
-# without taking the mouse or the keyboard away from the human. The other
-# suites each check this for their own commands; this one is the audit — EVERY
-# browser method, in one run, against three signals rather than one:
+# e2e for the no-focus-theft guarantee (macOS): agent-driven clicking and capture must not
+# take the mouse or keyboard from the human. This is the audit of EVERY browser method in
+# one run, against:
 #
 #   - the frontmost application
 #   - the mouse cursor position
-#   - copad's OWN focus state: key window, first responder, and focused pane.
-#     "Did the frontmost app change" misses focus moving WITHIN copad, which
-#     would swallow the user's keystrokes while every system signal still
-#     looked clean.
-#   - terminal input arriving COMPLETE AND IN ORDER while the browser is being
-#     driven hard from another process.
+#   - copad's own focus state (key window, first responder, focused pane), since a change
+#     of the frontmost app misses focus moving WITHIN copad
+#   - terminal input arriving complete and in order while the browser is driven hard from
+#     another process
 #
-# On the last one: the ideal test is synthetic KEYSTROKES, because those would
-# also catch a command that briefly grabbed first responder. That needs
-# Accessibility permission for whatever runs this script, and on this machine
-# `System Events` reports success while doing nothing — it cannot even bring an
-# app frontmost. Rather than pretend, the phase feeds the terminal through
-# copad's own input path (which exercises the same concurrency) and the
-# first-responder question is answered directly by phase 2 instead. A real
-# keystroke run is queued in docs/pending-linux-verification.md for a session
-# where Accessibility is granted.
+# The last phase feeds the terminal through copad's own input path instead of synthetic
+# keystrokes: those need Accessibility permission, and on this machine `System Events`
+# reports success while doing nothing. Phase 2 answers the first-responder question
+# directly. A real keystroke run is queued in docs/pending-linux-verification.md.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,11 +30,9 @@ cleanup() {
     [ -n "${TMPHOME:-}" ] && rm -rf "$TMPHOME"
     [ -n "${ORIGINAL_FRONT:-}" ] && osascript -e "tell application \"$ORIGINAL_FRONT\" to activate" >/dev/null 2>&1
 }
-# Cleanup runs on EXIT only. `trap cleanup EXIT INT TERM` looks equivalent and is
-# not: bash runs a signal handler and then RESUMES the script, so the cleanup
-# would delete the temp $HOME the very next command reads from and the run would
-# carry on asserting against wiped state. INT/TERM therefore just `exit` with the
-# conventional status, which fires the EXIT trap exactly once (codex C1).
+# EXIT only: with `trap cleanup EXIT INT TERM` bash runs the handler and then RESUMES the
+# script, deleting the temp $HOME the next command reads. INT/TERM just `exit`, which fires
+# the EXIT trap once.
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -102,13 +90,9 @@ TAB2=$(field "$(rpc webview.tab.new "{\"url\":\"$BASE/page.html\"}")" tab_id)
 sleep 2
 PANEL=$(field "$(rpc webview.tab.list)" panel_id)
 
-# Every method the browser surface exposes.
-#
-# `webview.open` appears TWICE on purpose: once with `background: true` (the
-# agent-facing shape) and once in its DEFAULT shape, which switches copad tabs
-# and calls `makeFirstResponder`. The default is what a `coctl webview open`
-# actually does, and asserting only the polite variant would have left the
-# common path unmeasured.
+# Every method the browser surface exposes. `webview.open` appears twice on purpose: with
+# `background: true` (the agent-facing shape) and in its default shape, which switches copad
+# tabs and calls `makeFirstResponder`.
 run_all() {
     rpc webview.state
     rpc webview.page_info
@@ -135,9 +119,7 @@ run_all() {
     rpc webview.tab.protect '{"on":false}'
     rpc webview.devtools '{"action":"toggle"}'
     rpc webview.clear_log
-    # select/move/close operate on a SCRATCH tab, not $TAB2: phase 3 needs
-    # $TAB2 to still exist, and a sweep that quietly destroyed its own fixture
-    # would leave that phase asserting nothing.
+    # select/move/close use a SCRATCH tab, not $TAB2: phase 3 still needs $TAB2.
     local scratch
     scratch=$(field "$(rpc webview.tab.new "{\"url\":\"$BASE/page.html\"}")" tab_id)
     if [ -n "$scratch" ]; then
@@ -146,8 +128,8 @@ run_all() {
         rpc webview.tab.close "{\"tab_id\":\"$scratch\"}"
     fi
     rpc webview.open "{\"url\":\"$BASE/page.html\",\"background\":true}"
-    # The DEFAULT open — switches copad tabs and moves first responder. This is
-    # what a plain `coctl webview open` does, so it belongs in the audit.
+    # The DEFAULT open switches copad tabs and moves first responder; it is what a plain
+    # `coctl webview open` does.
     rpc webview.open "{\"url\":\"$BASE/page.html\"}"
 }
 
@@ -172,18 +154,11 @@ else
 fi
 
 echo "[2/4] and copad's own key window, first responder and focused pane"
-# Split deliberately, and the split is the claim.
-#
-# The exceptions, stated rather than discovered: `tab.select` and `tab.move`
-# (the user asked to switch/reorder), a plain `webview.open` (the user asked to
-# go there), `tab.close` of the ACTIVE tab (its view is gone, so something must
-# take focus), and `tab.protect` (the transition destroys and rebuilds the web
-# view — that IS the mechanism). Folding those in would make this assertion
-# either wrong or meaningless.
-#
-# What must hold for them is covered by phase 1, whose frontmost-app and cursor
-# guarantees admit no exceptions at all — and they are all in that sweep. The
-# agent-facing `webview.open --background`, in every mode, is in THIS list
+# The exceptions are `tab.select`/`tab.move` (the user asked to switch/reorder), a plain
+# `webview.open` (the user asked to go there), `tab.close` of the ACTIVE tab (something must
+# take focus), and `tab.protect` (it destroys and rebuilds the web view). They stay out of
+# this list; phase 1 covers them with the frontmost-app and cursor checks, which admit no
+# exceptions. The agent-facing `webview.open --background`, in every mode, is in THIS list
 # because it must not move anything.
 page_level_only() {
     rpc webview.state
@@ -204,10 +179,8 @@ page_level_only() {
     rpc browser.secret.list
     rpc webview.tab.list
     rpc webview.tab.new "{\"url\":\"$BASE/page.html\"}"
-    # The agent-facing open, in every mode. Unlike the default shape none of
-    # these may move focus, which is precisely why they belong in this half —
-    # and `split_h`/`split_v` ignored `background` entirely until this suite
-    # started checking them.
+    # The agent-facing open, in every mode: none of these may move focus (including `split_h` and
+    # `split_v`, which must honor `background`).
     rpc webview.open "{\"url\":\"$BASE/page.html\",\"background\":true}"
     rpc webview.open "{\"url\":\"$BASE/page.html\",\"background\":true,\"mode\":\"split_h\"}"
     rpc webview.open "{\"url\":\"$BASE/page.html\",\"background\":true,\"mode\":\"split_v\"}"
@@ -224,10 +197,9 @@ else
 fi
 
 echo "[3/4] a background tab is driven and captured without being raised"
-# The sweep above created panes and switched tabs, so address $TAB2's PANE
-# explicitly. Without `--id` these would resolve to whatever pane happens to be
-# active, error out, and the "active tab did not move" check would pass while
-# having driven nothing at all.
+# The sweep created panes and switched tabs, so address $TAB2's pane explicitly; otherwise
+# these would hit whatever pane is active, error out, and "active tab did not move" would
+# pass having driven nothing.
 BEFORE_ACTIVE=$(field "$(rpc webview.tab.list "{\"id\":\"$PANEL\"}")" active)
 DRIVEN=$(rpc webview.execute_js "{\"id\":\"$PANEL\",\"tab_id\":\"$TAB2\",\"code\":\"document.title\"}")
 SHOT=$(rpc webview.screenshot "{\"id\":\"$PANEL\",\"tab_id\":\"$TAB2\"}")
@@ -248,8 +220,8 @@ PANE=$(python3 -c "
 import json,sys
 try: print(json.loads(sys.argv[1])['result'].get('active_pane',''))
 except Exception: print('')" "$(rpc window.focus_state)")
-# Drive by PANEL id: with a terminal tab active, a browser command with no `id`
-# resolves to "no active webview" and the concurrency would be fake.
+# Drive by PANEL id: with a terminal tab active, a command with no `id` resolves to "no
+# active webview" and the concurrency would be fake.
 drive_by_id() {
     for _ in 1 2 3 4; do
         rpc webview.page_info "{\"id\":\"$PANEL\"}"

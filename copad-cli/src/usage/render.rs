@@ -23,10 +23,9 @@ fn money(cost: f64, priced: bool, estimated: bool) -> String {
     format!("{tilde}${cost:.2}")
 }
 
-/// A subtotal/total cost cell. `has_unpriced` = some tokens in scope had no
-/// rate. When NOTHING was priced (`cost == 0` with unpriced tokens) render `—`
-/// rather than `$0.00`, so "unknown" never reads as "free" (codex C2). When
-/// some priced + some unpriced, append `+` ("at least this").
+/// A subtotal/total cost cell. When nothing was priced (`cost == 0` with unpriced tokens) it
+/// renders `—` rather than `$0.00`, so unknown never reads as free; a mix of priced and unpriced
+/// appends `+` ("at least this").
 fn cost_cell(cost: f64, estimated: bool, has_unpriced: bool) -> String {
     if has_unpriced && cost == 0.0 {
         return "—".to_string();
@@ -37,7 +36,6 @@ fn cost_cell(cost: f64, estimated: bool, has_unpriced: bool) -> String {
 }
 
 fn short_model(m: &str) -> String {
-    // Trim the vendor prefix for a tidier column: `claude-opus-4-8` → `opus-4-8`.
     m.strip_prefix("claude-").unwrap_or(m).to_string()
 }
 
@@ -181,13 +179,10 @@ mod tests {
 
     #[test]
     fn cost_cell_semantics() {
-        // fully priced
         assert_eq!(cost_cell(6.1, false, false), "$6.10");
-        // priced + estimated
         assert_eq!(cost_cell(0.9, true, false), "~$0.90");
-        // some priced, some unpriced → "at least this"
         assert_eq!(cost_cell(6.1, false, true), "$6.10+");
-        // NOTHING priced → em dash, never "$0.00" (codex C2)
+        // NOTHING priced: em dash, never "$0.00"
         assert_eq!(cost_cell(0.0, false, true), "—");
     }
 

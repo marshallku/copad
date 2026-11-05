@@ -22,16 +22,13 @@ if [ ! -d "$PLUGINS_SRC_DIR" ]; then
     exit 1
 fi
 
-# Idempotent claude-prompt layer scaffolding. The Todo plugin reads
-# these files at `todo.start` time to assemble the layered prompt
-# fed into claude.start (Phase 18.2). They're plain markdown — vim
-# them whenever the common preamble drifts. We only create empty
-# stubs when missing; existing user content is never touched.
+# Idempotent claude-prompt layer scaffolding: the Todo plugin reads these files at
+# `todo.start` to assemble the layered prompt fed into claude.start. Empty stubs are created
+# only when missing; existing content is never touched.
 #
-# Path derivation MUST match `copad-plugin-todo::prompt::docs_root_for`
-# at runtime: `parent(COPAD_TODO_ROOT)`. Default is `~/docs/todos` →
-# stubs at `~/docs/claude/`. Anything else here would create stubs
-# the plugin never reads.
+# The path derivation MUST match `copad-plugin-todo::prompt::docs_root_for` at runtime:
+# `parent(COPAD_TODO_ROOT)`, default `~/docs/todos` -> stubs at `~/docs/claude/`. Anything
+# else creates stubs the plugin never reads.
 TODO_ROOT="${COPAD_TODO_ROOT:-$HOME/docs/todos}"
 DOCS_ROOT="$(dirname -- "$TODO_ROOT")"
 ensure_claude_stub() {
@@ -71,16 +68,10 @@ for name in "$@"; do
         continue
     fi
     mkdir -p "$dst"
-    # Copy every non-binary, non-build file (manifest + panel.html etc).
-    # Plugin authors put HTML/CSS/JS alongside plugin.toml; copy
-    # them all so the plugin's WebView panel can find its assets.
-    # Exclude Cargo.toml — it lives alongside plugin.toml in the
-    # source tree (one dir per plugin) but is build-time only and
-    # has no runtime use in ~/.config/copad/plugins/<name>/.
+    # Copy every non-binary, non-build file (manifest, panel.html, assets) so the plugin's
+    # WebView panel finds them. Cargo.toml is build-time only and stays out.
     find "$src" -maxdepth 1 -type f ! -name 'Cargo.toml' -exec cp -f {} "$dst/" \;
 
-    # Symlink the binary if it's a [[services]] plugin. Bare-
-    # panel plugins (no services entry) don't need a binary.
     exec_name=$(awk '/^\[\[services\]\]/,/^$/' "$src/plugin.toml" \
                 | awk -F'=' '/^[[:space:]]*exec[[:space:]]*=/ { gsub(/[[:space:]"]/, "", $2); print $2; exit }')
     if [ -n "$exec_name" ]; then

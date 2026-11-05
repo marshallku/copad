@@ -1,9 +1,8 @@
 //! comux **Mux API v1** (L0): what a host UI — copad on macOS/Linux, web-bridge, the iOS
 //! client — needs to draw comux's chrome natively, and to drive it.
 //!
-//! See `docs/comux-native-integration-plan.md` for the design and the codex rounds behind it.
-//! This crate is deliberately serde-only (plus `std` for [`link`]) so a host can depend on it
-//! without pulling comux's terminal stack.
+//! This crate is serde-only (plus `std` for [`link`]) so a host can depend on it without pulling comux's
+//! terminal stack. Design: `docs/comux-native-integration-plan.md`.
 //!
 //! # Wire
 //!
@@ -68,7 +67,6 @@ pub const PING_SECS: u64 = 10;
 /// Silence after which the server drops a subscriber's claims (the TUI chrome returns).
 pub const CLAIM_EXPIRY_SECS: u64 = 30;
 
-/// Topic names, in snapshot order.
 pub mod topic {
     pub const TREE: &str = "tree";
     pub const AGENTS: &str = "agents";
@@ -80,7 +78,6 @@ pub mod topic {
     pub const ALL: [&str; 6] = [TREE, AGENTS, NOTIFICATIONS, STATUS, CLIENTS, GRAPH];
 }
 
-/// A piece of TUI chrome a host can take over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Feature {
@@ -104,24 +101,28 @@ impl Feature {
     }
 }
 
-/// Client → server, one per line.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", rename_all = "kebab-case")]
 pub enum SubMsg {
-    /// First line: open an L0 stream.
-    Subscribe { v: u32 },
-    /// Run a comux control request (`req` = the `{"cmd":…}` object).
-    Cmd { id: String, req: Value },
+    Subscribe {
+        v: u32,
+    },
+    Cmd {
+        id: String,
+        req: Value,
+    },
     /// Claim `attachment` (an id from the `clients` topic) for `features`.
     HostReady {
         attachment: u64,
         incarnation: String,
         features: Vec<Feature>,
     },
-    /// Release a claim.
-    HostGone { attachment: u64 },
-    /// Liveness; also what keeps claims alive.
-    Ping { id: u64 },
+    HostGone {
+        attachment: u64,
+    },
+    Ping {
+        id: u64,
+    },
     /// The answer to an [`PubMsg::Overlay`] (P3): `choice` for a picker/confirm, `text` for a
     /// prompt; both absent = cancelled.
     OverlayResult {
@@ -146,22 +147,18 @@ pub enum SubMsg {
     },
 }
 
-/// One topic value inside a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopicValue {
     pub rev: u64,
     pub data: Value,
 }
 
-/// Server → client, one per line.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", rename_all = "kebab-case")]
 pub enum PubMsg {
     Welcome {
         proto: u32,
-        /// Minted at server start; changes on every restart.
         incarnation: String,
-        /// comux's crate version, for diagnostics.
         version: String,
     },
     Snapshot {
@@ -173,7 +170,6 @@ pub enum PubMsg {
         rev: u64,
         data: Value,
     },
-    /// The topic could not be published whole (too large): drop the cached value.
     Unavailable {
         topic: String,
         rev: u64,
@@ -204,7 +200,6 @@ pub enum PubMsg {
     OverlayClosed {
         overlay: u64,
     },
-    /// A protocol-level refusal (bad first line, version mismatch).
     Error {
         code: String,
         message: String,
@@ -250,7 +245,6 @@ pub enum OverlaySpec {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         no_filter: bool,
     },
-    /// A single-line text prompt (rename, new session name, worktree branch).
     Prompt {
         title: String,
         #[serde(default)]
@@ -258,11 +252,15 @@ pub enum OverlaySpec {
         #[serde(default)]
         placeholder: String,
     },
-    /// A yes/no question (kill session, close pane).
-    Confirm { message: String },
+    Confirm {
+        message: String,
+    },
     /// A context menu (right-click on a tab chip / session / agent): the host shows its own
     /// menu and answers with the chosen item's id.
-    Menu { title: String, items: Vec<MenuItem> },
+    Menu {
+        title: String,
+        items: Vec<MenuItem>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -346,7 +344,6 @@ pub struct PickerKey {
     pub stays: bool,
 }
 
-/// A pane's screen as styled runs (`pane-preview`), what the TUI switcher previews.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Preview {
     pub pane: String,
@@ -358,7 +355,6 @@ pub struct Preview {
     pub lines: Vec<Vec<Run>>,
 }
 
-/// Cells of one style. Default colours and false attributes are omitted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Run {
     pub t: String,
@@ -378,7 +374,6 @@ pub struct Run {
     pub reverse: bool,
 }
 
-/// A palette index (0–255, the host's theme for 0–15) or `#rrggbb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunColor {
     Indexed(u8),
@@ -415,15 +410,9 @@ impl<'de> Deserialize<'de> for RunColor {
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// Topic payloads
-// ---------------------------------------------------------------------------------------
-
-/// `tree`: every session → tab → pane.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Tree {
     pub sessions: Vec<Session>,
-    /// The active session's id.
     #[serde(default)]
     pub active: String,
 }
@@ -433,7 +422,6 @@ pub struct Session {
     /// Stable id (`local`, `s3` …) — the join key and the `select-session` target.
     pub id: String,
     pub index: usize,
-    /// Display name (what a rename changes; the id when unnamed).
     pub name: String,
     pub active: bool,
     /// git branch of the session's directory, empty when none.
@@ -449,7 +437,6 @@ pub struct Tab {
     /// Stable tab selector (`s3:t7`) — the `select-tab` target.
     pub id: String,
     pub index: usize,
-    /// Custom name, empty when unnamed.
     #[serde(default)]
     pub name: String,
     /// What the TUI chip shows: the custom name, else the focused pane's process label.
@@ -476,7 +463,6 @@ pub struct Pane {
     pub status: String,
 }
 
-/// `agents`: every agent pane across sessions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Agents {
     pub agents: Vec<Agent>,
@@ -489,7 +475,6 @@ pub struct Agent {
     pub space_id: String,
     pub tab_id: String,
     pub tab_index: usize,
-    /// The row title the sidebar uses (tab name, else `tab <n>`).
     pub title: String,
     pub tool: String,
     /// `working` / `ready` / `blocked` / `idle` — cached and inferred.
@@ -524,12 +509,10 @@ pub struct Agent {
     pub focused: bool,
 }
 
-/// `notifications`: the notification center (`Ctrl-b a`), newest first.
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
-/// What a blocked agent waits for.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentWait {
     /// `approval` (a permission it cannot continue without), `question` (a question or
@@ -543,7 +526,6 @@ pub struct AgentWait {
 /// usage gauge (green < 70% ≤ yellow < 90% ≤ red), and only the raw count without `window`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentContext {
-    /// Tokens in the window at the agent's last response (its input side).
     pub used: u64,
     /// The window's size, when known: Codex logs it; Claude reports it only through its
     /// statusline (`comux agent-report`), since its log does not tell a 200k model from 1M.
@@ -583,18 +565,12 @@ pub struct Notification {
 /// `status`: everything the TUI status bar shows besides the tabs (which are in `tree`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Status {
-    /// Some attached client is mid-chord (`^b` armed).
     pub prefix_armed: bool,
-    /// The prefix chord's label (`^b`, `^a`).
     pub prefix_label: String,
-    /// The current outcome/warning line, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flash: Option<Flash>,
-    /// Panes with an unacknowledged bell.
     pub bells: usize,
-    /// Blocked agents (`⚑N`).
     pub attention: usize,
-    /// Agent panes (`● N`).
     pub agents: usize,
     pub unread: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -643,9 +619,7 @@ pub struct UsagePage {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UsageWindow {
-    /// `claude` / `codex`.
     pub provider: String,
-    /// `5h` / `wk`.
     pub window: String,
     pub pct: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -659,7 +633,6 @@ pub struct UsageWindow {
     pub reset_text: Option<String>,
 }
 
-/// `clients`: render attachments, so a host can find (and claim) its own.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Clients {
     pub clients: Vec<ClientInfo>,
@@ -680,7 +653,6 @@ pub struct ClientInfo {
     pub claimed: Vec<Feature>,
 }
 
-/// A host's view of every topic, kept current by [`Model::apply`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Model {
     pub incarnation: String,
@@ -694,21 +666,15 @@ pub struct Model {
     revs: BTreeMap<String, u64>,
 }
 
-/// What [`Model::apply`] did with a message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Applied {
-    /// The server restarted (or this is the first welcome): every cached id is invalid.
     Welcome,
-    /// These topics changed.
     Topics(Vec<String>),
-    /// A topic went unavailable.
     Dropped(String),
-    /// Older than what we hold, or not state at all.
     Ignored,
 }
 
 impl Model {
-    /// Fold one server message into the model.
     pub fn apply(&mut self, msg: &PubMsg) -> Applied {
         match msg {
             PubMsg::Welcome {
@@ -758,7 +724,6 @@ impl Model {
         }
     }
 
-    /// Whether every topic `features` needs is held.
     pub fn can_host(&self, features: &[Feature]) -> bool {
         features.iter().flat_map(|f| f.needs()).all(|t| self.has(t))
     }

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Stream a long file while you interact with the scrollback. Reproduces
-# the conditions that exposed the double-render bug fix: high-rate
-# trackpad scroll + concurrent PTY output.
+# Stream a long file while you interact with the scrollback: high-rate trackpad scroll
+# plus concurrent PTY output.
 #
 # What to watch:
 #   - Trackpad / mouse wheel scroll stays smooth while output flows.

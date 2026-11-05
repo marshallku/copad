@@ -50,13 +50,11 @@ echo "ZWJ family:    👨‍👩‍👧‍👦 (4 codepoints + 3 ZWJ → 1 graph
 echo "Skin tone:     👋🏻 👋🏼 👋🏽 👋🏾 👋🏿 (base + Fitzpatrick modifier)"
 echo "Profession:    👨🏻‍💻 👩🏿‍🚀 🧑🏽‍🎤 (base + tone + ZWJ + role)"
 echo "Regional flag: 🇰🇷 🇯🇵 🇺🇸 🇩🇪 (regional indicator pairs)"
-# Combining marks: base + combining acute / circumflex / tilde
 printf 'Combining:     e\xcc\x81 e\xcc\x82 e\xcc\x83 (e + acute/circumflex/tilde)\n'
 echo "CJK mix:       안녕하세요 こんにちは 你好 (Hangul / Hiragana / Hanzi)"
 echo "RTL mix:       Latin شَلوم العَرَبية עִברית (Arabic/Hebrew — BiDi if supported)"
 # Zero-width space and joiner — surrounding text should look unbroken
 printf 'Zero-width:    a\xe2\x80\x8bb\xe2\x80\x8cc (should look like "abc", no gap)\n'
-# Combining mark on Hangul leading consonant
 printf 'Wide+combo:    ㅎ\xcc\x81 ㅏ\xcc\x82 (combining mark on Korean jamo)\n'
 echo "VT100 box:"
 printf "\e(0lqqqqqqqqkx        xtqqqqqqqquxx        xmqqqqqqqqj\e(B\n"

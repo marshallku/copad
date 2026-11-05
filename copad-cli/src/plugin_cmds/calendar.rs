@@ -1,11 +1,4 @@
 //! `coctl calendar` — wrapper over `calendar.*` actions.
-//!
-//! | CLI                                  | Action                  |
-//! |--------------------------------------|-------------------------|
-//! | `calendar today`                     | `calendar.list_events`  |
-//! | `calendar next [--within Nh]`        | `calendar.list_events`  |
-//! | `calendar event <id>`                | `calendar.event_details`|
-//! | `calendar auth-status`               | `calendar.auth_status`  |
 
 use chrono::{DateTime, Local, NaiveDate};
 use clap::Subcommand;

@@ -1,8 +1,5 @@
-//! `coctl usage` — local Claude/Codex token + cost aggregation.
-//!
-//! Runs entirely from local transcript files (no daemon, no socket) so it works
-//! over SSH and inside a tmux `status-right`. See submodules for the per-turn
-//! dedup (claude) and cumulative-vs-delta (codex) subtleties.
+//! `coctl usage` — local Claude/Codex token + cost aggregation from transcript files (no daemon,
+//! no socket), so it works over SSH and in a tmux `status-right`.
 
 mod claude;
 mod codex;
@@ -16,7 +13,6 @@ use copad_usage::limits;
 use model::{Aggregate, Record, Tool, Warnings};
 use std::path::Path;
 
-/// Parse a `5h` / `30m` / `2d` / `90s` rolling-window duration.
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let split = s
@@ -29,8 +25,8 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     if n < 0 {
         return Err(format!("duration must be non-negative: '{s}'"));
     }
-    // `try_*` (not `Duration::hours` etc.) so a huge-but-valid i64 like
-    // `9223372036854775807d` returns an error instead of panicking (codex C3).
+    // `try_*` (not `Duration::hours` etc.) so a huge-but-valid i64 like `9223372036854775807d`
+    // errors instead of panicking.
     let dur = match unit {
         "s" => Duration::try_seconds(n),
         "m" => Duration::try_minutes(n),
@@ -41,8 +37,6 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     dur.ok_or_else(|| format!("duration out of range: '{s}'"))
 }
 
-/// Resolve `(since, window_label)` from the flags. `--since` wins over
-/// `--window`; `all` → no lower bound.
 fn resolve_window(
     args: &UsageArgs,
     now: DateTime<Local>,
@@ -70,7 +64,6 @@ fn resolve_window(
     }
 }
 
-/// Fold records into per-tool / per-model rollups with cost.
 fn aggregate(records: Vec<Record>, warns: Warnings, label: String) -> Aggregate {
     let mut agg = Aggregate {
         window_label: label,
@@ -107,7 +100,6 @@ fn aggregate(records: Vec<Record>, warns: Warnings, label: String) -> Aggregate 
     agg
 }
 
-/// Entry point for `main.rs`'s local dispatch. Returns a process exit code.
 pub fn run(args: &UsageArgs, json: bool) -> i32 {
     if args.limits {
         return run_limits(args, json);
@@ -171,10 +163,9 @@ pub fn run(args: &UsageArgs, json: bool) -> i32 {
     0
 }
 
-/// `--limits`: subscription rate-limit window utilization (percent), a
-/// different data source than the token/cost aggregation (see `limits.rs`).
-/// Honors `--tool`; `--window`/`--since` don't apply (the windows are fixed by
-/// the provider). `--oneline` is implied — the plain form is already one line.
+/// `--limits`: subscription rate-limit window utilization, a different data source than the
+/// token/cost aggregation (see `limits.rs`). Honors `--tool`; `--window`/`--since` don't apply.
+/// `--oneline` is implied.
 fn run_limits(args: &UsageArgs, json: bool) -> i32 {
     let tool = args.tool.as_deref();
     if let Some(t) = tool
@@ -201,8 +192,7 @@ fn run_limits(args: &UsageArgs, json: bool) -> i32 {
     } else {
         println!("{}", limits::oneline(&l, &stale));
     }
-    // Reasons a provider is missing go to stderr (comux reads only stdout, so the
-    // status bar is unaffected) — makes "why is Claude missing?" self-answering.
+    // Why a provider is missing goes to stderr (comux reads only stdout).
     for d in &diags {
         eprintln!("coctl usage: {d}");
     }
@@ -223,7 +213,7 @@ mod tests {
         assert!(parse_duration("5x").is_err()); // bad unit
         assert!(parse_duration("-1h").is_err()); // negative
         assert!(parse_duration("abc").is_err());
-        // huge-but-valid i64 must error, not panic (codex C3)
+        // a huge-but-valid i64 must error, not panic
         assert!(parse_duration("9223372036854775807d").is_err());
     }
 
@@ -300,9 +290,7 @@ mod tests {
             },
         ];
         let agg = aggregate(records, Warnings::default(), "today".into());
-        // opus input rate $15/Mtok → $15.00
         assert!((agg.claude.cost - 15.0).abs() < 1e-9);
-        // gpt-5 input rate $1.25/Mtok → $1.25, and flagged estimated
         assert!((agg.codex.cost - 1.25).abs() < 1e-9);
         assert!(agg.any_estimated);
         assert_eq!(agg.total.total(), 2_000_000);
@@ -326,6 +314,6 @@ mod tests {
         assert!(!m.priced);
         assert_eq!(m.usage.total(), 600);
         assert_eq!(agg.total_cost, 0.0);
-        assert!(agg.has_unpriced); // total must flag "+" so $0.00 ≠ "free" (C2)
+        assert!(agg.has_unpriced); // the total must flag "+" so $0.00 is not read as free
     }
 }

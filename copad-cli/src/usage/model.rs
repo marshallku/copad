@@ -1,21 +1,13 @@
 //! Shared usage aggregation types for `coctl usage`.
 //!
-//! `RawUsage` uses a category split (uncached-input / cache-write /
-//! cache-read / output) that maps cleanly onto BOTH providers' billing so
-//! `pricing::cost` is provider-agnostic:
-//!   * Claude `message.usage`: input_tokens is already the *uncached* input;
-//!     cache_creation → cache_write, cache_read_input → cache_read.
-//!   * Codex `last_token_usage`: input_tokens is the *full* input INCLUDING
-//!     the cached portion, so the parser subtracts `cached_input_tokens`
-//!     into `cache_read` (codex has no separate cache-write meter).
-//!
-//! `output` already INCLUDES reasoning tokens for codex — reasoning is a
-//! subset of `output_tokens`, not an addend (verified: input+output == total).
-//! Adding it again would double-count both tokens and cost.
+//! `RawUsage` splits tokens into uncached input / cache-write / cache-read / output, which fits
+//! both providers' billing so `pricing::cost` is provider-agnostic. Claude's `input_tokens` is
+//! already uncached; Codex's includes the cached portion, so its parser subtracts
+//! `cached_input_tokens` into `cache_read`. Codex `output` already includes reasoning tokens;
+//! adding them again would double-count tokens and cost.
 
 use std::collections::BTreeMap;
 
-/// Which provider a record came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Claude,
@@ -31,23 +23,18 @@ impl Tool {
     }
 }
 
-/// Token counts for one already-deduplicated turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RawUsage {
-    /// Uncached input tokens (billed at the input rate).
     pub input: u64,
-    /// Cache-write / cache-creation tokens (billed at the write rate).
     pub cache_write: u64,
-    /// Cache-read / cached-input tokens (billed at the read rate).
     pub cache_read: u64,
     /// Output tokens (already includes reasoning tokens; do not add them).
     pub output: u64,
 }
 
 impl RawUsage {
-    /// Saturating so a malformed transcript with an absurd `u64` field can't
-    /// panic a debug build or wrap a release build into a wrong total (codex C4).
-    /// Real usage is nowhere near `u64::MAX`, so saturation only bites garbage.
+    /// Saturating so a malformed transcript with an absurd `u64` field cannot panic a debug build
+    /// or wrap a release build into a wrong total.
     pub fn add(&mut self, o: &RawUsage) {
         self.input = self.input.saturating_add(o.input);
         self.cache_write = self.cache_write.saturating_add(o.cache_write);
@@ -55,7 +42,6 @@ impl RawUsage {
         self.output = self.output.saturating_add(o.output);
     }
 
-    /// All billable tokens, for the human "tok" column.
     pub fn total(&self) -> u64 {
         self.input
             .saturating_add(self.cache_write)
@@ -64,17 +50,15 @@ impl RawUsage {
     }
 }
 
-/// One parsed, deduplicated record before aggregation. Window-filtering already
-/// happened in the scanner, so no timestamp is carried here.
+/// One parsed, deduplicated record before aggregation; the scanner already applied the window.
 pub struct Record {
     pub tool: Tool,
     pub model: String,
     pub usage: RawUsage,
 }
 
-/// Non-fatal problems encountered while scanning — surfaced on stderr and in
-/// `--json` so silent format drift or permission errors don't masquerade as
-/// legitimate zero usage (codex review I2).
+/// Non-fatal scan problems, surfaced on stderr and in `--json` so format drift or permission
+/// errors don't masquerade as zero usage.
 #[derive(Debug, Clone, Default)]
 pub struct Warnings {
     pub unreadable_files: u64,
@@ -92,19 +76,17 @@ impl Warnings {
     }
 }
 
-/// Per-model rollup within a tool.
 #[derive(Debug, Clone, Default)]
 pub struct ModelAgg {
     pub usage: RawUsage,
     pub cost: f64,
-    /// True when priced from a rate table entry flagged "best-effort estimate"
-    /// (currently all non-Anthropic models) — rendered with a `~` and footnote.
+    /// Priced from a rate entry flagged "best-effort estimate" (currently all non-Anthropic
+    /// models): rendered with a `~` and a footnote.
     pub estimated: bool,
-    /// True when NO rate matched — tokens are real, cost is unknown (shown `—`).
+    /// False when NO rate matched: tokens are real, cost is unknown (shown `—`).
     pub priced: bool,
 }
 
-/// Per-tool rollup: models sorted for stable output, plus a subtotal.
 #[derive(Debug, Clone, Default)]
 pub struct ToolAgg {
     pub models: BTreeMap<String, ModelAgg>,
@@ -112,7 +94,6 @@ pub struct ToolAgg {
     pub cost: f64,
 }
 
-/// The full aggregate handed to the renderers.
 #[derive(Debug, Clone, Default)]
 pub struct Aggregate {
     pub window_label: String,
@@ -120,11 +101,9 @@ pub struct Aggregate {
     pub codex: ToolAgg,
     pub total: RawUsage,
     pub total_cost: f64,
-    /// Any tool contributed an estimated price → render the footnote.
     pub any_estimated: bool,
-    /// A model with real tokens had NO rate → its cost is excluded from totals,
-    /// so cost figures render with a trailing `+` ("at least this") instead of
-    /// implying the unpriced tokens were free (codex C2).
+    /// A model with real tokens had NO rate: its cost is left out of the totals, so cost figures
+    /// render with a trailing `+` ("at least this") instead of implying those tokens were free.
     pub has_unpriced: bool,
     pub warnings: Warnings,
 }

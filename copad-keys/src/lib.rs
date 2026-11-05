@@ -1,25 +1,17 @@
 //! The kitty keyboard protocol for copad's own terminal windows (decisions #164).
 //!
-//! A program opts in with `CSI > flags u` and from then on expects keys in the protocol's
-//! forms — which is how Claude Code, nvim and helix tell Shift+Enter from Enter. This crate
-//! holds the parts both GUIs share:
+//! - [`encode`]: one key event to the bytes the program asked for, from the published spec.
+//! - [`Tracker`]: the negotiation read off the program's output, for the Linux window, whose VTE widget
+//!   lacks the protocol (VTE issue #2601). macOS gets it from alacritty_terminal.
+//! - [`layout`]: physical key to US-layout key tables behind the "base layout key".
 //!
-//! - [`encode`]: one key event → the bytes the program asked for (written from the published
-//!   specification, <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>).
-//! - [`Tracker`]: the negotiation itself, read off the program's output, for the Linux window
-//!   whose VTE widget does not implement the protocol (VTE issue #2601). The macOS window gets
-//!   it from alacritty_terminal.
-//! - [`layout`]: the physical key → US-layout key tables behind the "base layout key".
-//!
-//! comux has its own encoder (`copad-mux/src/keys.rs`): its input arrives already decoded by
-//! crossterm, with that library's quirks, which is a different job.
+//! comux has its own encoder (`copad-mux/src/keys.rs`) because its input arrives already decoded by crossterm.
 
 pub mod layout;
 mod tracker;
 
 pub use tracker::Tracker;
 
-/// The progressive-enhancement flags (`CSI = flags u`).
 pub mod flags {
     pub const DISAMBIGUATE: u8 = 1;
     pub const EVENT_TYPES: u8 = 2;
@@ -29,7 +21,6 @@ pub mod flags {
     pub const ALL: u8 = 31;
 }
 
-/// The modifier bits (the escape code carries `1 + bits`).
 pub mod mods {
     pub const SHIFT: u8 = 1;
     pub const ALT: u8 = 2;
@@ -95,7 +86,6 @@ pub enum Modifier {
 }
 
 impl Modifier {
-    /// The modifier bit this key drives (0 for the level shifts, which have none).
     pub fn bit(self) -> u8 {
         use Modifier::*;
         match self {
@@ -135,7 +125,6 @@ pub enum Key {
     PrintScreen,
     Pause,
     Menu,
-    /// F1–F35.
     F(u8),
     Kp(Kp),
     Modifier(Modifier),
@@ -145,7 +134,6 @@ pub enum Key {
 }
 
 impl Key {
-    /// Keys the protocol reports only when every key is reported (flag 8).
     fn is_modifier_class(self) -> bool {
         matches!(
             self,
@@ -176,7 +164,6 @@ pub enum Encoded {
     /// The key types its text, which the platform's normal text path (and its input method)
     /// should deliver as it always has.
     Text,
-    /// Send these bytes instead.
     Bytes(Vec<u8>),
     /// Nothing is sent for this event (a release nobody asked for, a lone modifier).
     Nothing,
@@ -309,12 +296,10 @@ fn text_key(c: char, ev: &KeyEvent, m: u8, action: Action, flags: u8, has_text: 
     }))
 }
 
-/// The keys the legacy encoding covers: a US keyboard's printable ASCII.
 fn is_legacy_ascii(c: char) -> bool {
     c == ' ' || (c.is_ascii_graphic() && !c.is_ascii_uppercase())
 }
 
-/// The C0 byte Ctrl turns an ASCII key into, or the key itself where Ctrl does nothing.
 fn ctrl_byte(c: char) -> u8 {
     match c {
         ' ' | '@' | '2' => 0,
@@ -329,14 +314,10 @@ fn ctrl_byte(c: char) -> u8 {
     }
 }
 
-/// The legacy bytes for an ASCII text key under Shift / Alt / Ctrl / Shift+Alt / Ctrl+Alt, or
-/// `None` for a combination the legacy encoding has no form for.
 fn legacy_text_key(c: char, shifted: Option<char>, m: u8) -> Option<Vec<u8>> {
     if !is_legacy_ascii(c) && !shifted.is_some_and(is_legacy_ascii) {
         return None;
     }
-    // Shift picks the shifted character; the legacy encoding covers only Shift, Alt, Ctrl,
-    // Shift+Alt and Ctrl+Alt (and two Space chords). Anything else is CSI u.
     let key = match shifted.filter(|_| m & mods::SHIFT != 0) {
         Some(s) => s,
         None => c,
@@ -419,7 +400,6 @@ fn functional_key(key: Key, m: u8, action: Action, flags: u8, cursor_key_mode: b
     }))
 }
 
-/// Legacy Enter / Escape / Backspace / Tab with modifiers.
 fn legacy_modified_c0(key: Key, m: u8) -> Option<Vec<u8>> {
     let alt = m & mods::ALT != 0;
     let mut out = if alt { vec![ESC] } else { vec![] };
@@ -434,7 +414,6 @@ fn legacy_modified_c0(key: Key, m: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The protocol's number and final byte for a functional key.
 fn functional_number(key: Key) -> (u32, u8) {
     let u = |n: u32| (n, b'u');
     let tilde = |n: u32| (n, b'~');
@@ -507,8 +486,6 @@ struct Fields<'a> {
     trailer: u8,
 }
 
-/// `CSI number[:shifted[:base]] [; mods[:event]] [; text] trailer`, with every optional field
-/// left out when it carries its default.
 fn csi(f: &Fields) -> Vec<u8> {
     let trailer = if f.trailer == 0 { b'u' } else { f.trailer };
     let add_action = f.events && f.action != Action::Press;

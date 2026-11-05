@@ -1,20 +1,8 @@
-//! Subscription rate-limit window utilization — the shared readout behind
-//! `coctl usage --limits` and the comux status bar.
+//! Subscription rate-limit window utilization, shared by `coctl usage --limits` and the comux status bar.
 //!
-//! A DIFFERENT data source than coctl's token/cost aggregation: percentages are
-//! what Claude Code's `/usage` and Codex's TUI show ("X% of your 5h limit"),
-//! sourced per provider:
-//!
-//!   * **Claude** — a live `GET https://api.anthropic.com/api/oauth/usage`
-//!     with the OAuth bearer token from `~/.claude/.credentials.json` (or, on
-//!     macOS with a keychain-only login, the `Claude Code-credentials` login
-//!     Keychain item). Returns `five_hour.utilization` / `seven_day.utilization`
-//!     (already a percent). Skipped (→ `None`) when the token is missing or
-//!     already expired — refreshing the OAuth token is Claude Code's job, not ours.
-//!   * **Codex** — the newest `~/.codex/sessions/**/rollout-*.jsonl` records a
-//!     `rate_limits` snapshot (`payload.rate_limits`) on every turn. Read the
-//!     most recent one — no auth, no network, but only as fresh as the last
-//!     Codex turn.
+//! Claude: live `GET /api/oauth/usage` with the OAuth token from `~/.claude/.credentials.json` (macOS login
+//! Keychain as fallback); skipped when the token is missing or expired, since refreshing it is Claude Code's job.
+//! Codex: the last `rate_limits` snapshot in the newest `~/.codex/sessions/**/rollout-*.jsonl`.
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -24,15 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
-/// How long a cached value may stand in for a live one. Bridges the minutes-to-
-/// hours gaps where Claude's OAuth token has lapsed (Claude Code idle) so the
-/// readout doesn't blink out — but old enough to be misleading past this, so
-/// beyond it the provider drops rather than showing a stale percent.
+/// Max age of a cached value that may stand in for a live one; past it the provider drops rather than showing a stale percent.
 const STALE_MAX_MS: i64 = 3 * 60 * 60 * 1000;
 
-/// Per-provider rate-limit windows. Percentages are backend-rounded (e.g.
-/// `27.0` = 27%). `None` = provider/window unavailable (no auth, expired token,
-/// no rollout, network error) — rendered as absent, never as `0%`.
+/// Percentages are backend-rounded. `None` = unavailable, rendered as absent, never as `0%`.
 #[derive(Debug, Clone, Default)]
 pub struct Limits {
     pub claude: Option<ClaudeLimits>,
@@ -43,17 +26,13 @@ pub struct Limits {
 pub struct ClaudeLimits {
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
-    /// UNIX epoch SECONDS at which each window's utilization resets. `None` when
-    /// the backend omitted it (older API shape) — the readout then shows the
-    /// percent with no countdown. Kept parallel to the pct fields (rather than a
-    /// `{pct, reset}` struct) so adding reset didn't break existing constructors.
+    /// UNIX epoch seconds at which each window resets; `None` when the backend omitted it.
     pub five_hour_reset: Option<i64>,
     pub seven_day_reset: Option<i64>,
 }
 
 impl ClaudeLimits {
-    /// At least one window has a value — an all-`None` result is a 200 with no
-    /// usable data and must NOT be cached over a good prior reading.
+    /// An all-`None` result is a 200 with no usable data and must not be cached over a good prior reading.
     fn has_window(&self) -> bool {
         self.five_hour.is_some() || self.seven_day.is_some()
     }
@@ -62,7 +41,6 @@ impl ClaudeLimits {
 #[derive(Debug, Clone, Default)]
 pub struct CodexLimits {
     pub weekly: Option<f64>,
-    /// UNIX epoch SECONDS at which the weekly window resets. See [`ClaudeLimits`].
     pub weekly_reset: Option<i64>,
 }
 
@@ -72,18 +50,14 @@ impl CodexLimits {
     }
 }
 
-/// Which providers were served from the on-disk cache (a live fetch failed) —
-/// rendered with a leading `~` so a stale value never reads as current.
 #[derive(Debug, Clone, Default)]
 pub struct Stale {
     pub claude: bool,
     pub codex: bool,
 }
 
-/// Last-known-good cache. Each provider is persisted to its OWN file
-/// (`~/.cache/copad/usage-limits-{claude,codex}.json`) so independent refreshes
-/// never clobber each other; this in-memory pair just carries both for
-/// `apply_cache`. Each entry has its own timestamp.
+/// Last-known-good cache. Each provider persists to its own file (`~/.cache/copad/usage-limits-{claude,codex}.json`)
+/// so independent refreshes never clobber each other.
 #[derive(Default)]
 struct Cache {
     claude: Option<ClaudeCache>,
@@ -95,8 +69,7 @@ struct ClaudeCache {
     ts: i64,
     five_hour: Option<f64>,
     seven_day: Option<f64>,
-    // Absent in caches written before reset plumbing → serde defaults an absent
-    // `Option` field to `None`, so an old cache file still deserializes.
+    // Absent in caches written before resets were stored; serde defaults an absent `Option` to `None`.
     five_hour_reset: Option<i64>,
     seven_day_reset: Option<i64>,
 }
@@ -108,7 +81,6 @@ struct CodexCache {
     weekly_reset: Option<i64>,
 }
 
-/// A cache entry's write timestamp, for the monotonic-write guard.
 trait Stamped {
     fn ts(&self) -> i64;
 }
@@ -123,16 +95,12 @@ impl Stamped for CodexCache {
     }
 }
 
-/// Gather both providers' limits, honoring a `want_claude`/`want_codex` filter.
-/// The second tuple element is human-readable diagnostics for any provider that
-/// was requested but came back empty — coctl prints them to stderr (the status
-/// bar reads only the values), so a "why is Claude missing?" is answerable
-/// without a debugger; comux ignores them.
+/// The second element is diagnostics for each requested provider that came back empty; coctl prints them to
+/// stderr, comux ignores them.
 pub fn collect(home: &str, want_claude: bool, want_codex: bool) -> (Limits, Vec<String>) {
     let mut diags = Vec::new();
-    // A parsed-but-empty result (200 with no window fields) is treated as
-    // unavailable, NOT a fresh value — otherwise it would overwrite a good cache
-    // with `None`s and defeat the stale fallback (codex R4/C1).
+    // A parsed-but-empty result (200 with no window fields) counts as unavailable: caching it would
+    // overwrite a good entry with `None`s and defeat the stale fallback.
     let claude = if want_claude {
         match claude_limits(home) {
             Ok(c) if c.has_window() => Some(c),
@@ -166,15 +134,9 @@ pub fn collect(home: &str, want_claude: bool, want_codex: bool) -> (Limits, Vec<
     (Limits { claude, codex }, diags)
 }
 
-/// Live limits, backfilled from a short-lived on-disk cache when a provider is
-/// momentarily unavailable (the common case: Claude's OAuth token lapsed while
-/// Claude Code sat idle — codex, a local file read, keeps working). Fresh
-/// values refresh the cache; a gap is filled from it and flagged in `Stale`
-/// (rendered with `~`). Diagnostics from the live attempt pass through.
 pub fn resolve(home: &str, want_claude: bool, want_codex: bool) -> (Limits, Stale, Vec<String>) {
     let (mut live, diags) = collect(home, want_claude, want_codex);
     let now = Local::now().timestamp_millis();
-    // Only touch a provider's cache when it was requested (`--tool`).
     let mut cache = Cache {
         claude: if want_claude {
             load_json(&claude_cache_path(home))
@@ -188,12 +150,9 @@ pub fn resolve(home: &str, want_claude: bool, want_codex: bool) -> (Limits, Stal
         },
     };
     let stale = apply_cache(&mut live, &mut cache, now, want_claude, want_codex);
-    // Persist ONLY a provider we FRESHLY fetched (`live.X` present AND not
-    // stale-filled), each to its OWN file — so a claude write never clobbers a
-    // concurrent codex write, and we never rewrite a cache we merely loaded (which
-    // could overwrite another process's fresh value with the older one we read).
-    // `save_json` is monotonic (skips if the file is already newer), so a delayed
-    // same-provider write can't regress a fresher one.
+    // Persist only providers freshly fetched (not stale-filled), each to its own file, so a claude write never
+    // clobbers a concurrent codex write and a merely-loaded cache is never rewritten over a fresher one.
+    // `save_json` is monotonic, so a delayed same-provider write can't regress it.
     if live.claude.is_some()
         && !stale.claude
         && let Some(c) = &cache.claude
@@ -209,9 +168,6 @@ pub fn resolve(home: &str, want_claude: bool, want_codex: bool) -> (Limits, Stal
     (live, stale, diags)
 }
 
-/// Refresh the cache from any fresh values, and backfill any requested-but-
-/// missing provider from a cache entry younger than [`STALE_MAX_MS`]. Pure
-/// (no I/O) so the staleness policy is unit-testable.
 fn apply_cache(
     live: &mut Limits,
     cache: &mut Cache,
@@ -271,10 +227,8 @@ fn apply_cache(
     stale
 }
 
-/// Is a cache entry stamped `ts` usable at `now`? `saturating_sub` so a garbage
-/// `i64::MIN` timestamp can't panic a checked build; the `0..=` lower bound
-/// rejects a FUTURE timestamp (clock skew / corruption) instead of treating its
-/// negative age as fresh.
+/// `saturating_sub` keeps a garbage `i64::MIN` timestamp from panicking; the `0..=` bound rejects a
+/// future timestamp (clock skew, corruption) instead of treating its negative age as fresh.
 fn fresh_enough(now: i64, ts: i64) -> bool {
     (0..=STALE_MAX_MS).contains(&now.saturating_sub(ts))
 }
@@ -292,15 +246,9 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_str(&s).ok()
 }
 
-/// Best-effort atomic, monotonic write. The temp file is PER-PROCESS
-/// (`.<pid>.tmp`) so two concurrent writers (the comux poller thread + a manual
-/// `coctl usage --limits` run) never write the same inode; each renames its own temp over `path`
-/// (rename is atomic on one filesystem, so a reader always sees a whole file).
-/// Before writing we re-read the file and SKIP if it already holds a newer entry
-/// — so a delayed process can't regress a fresher value another just wrote (the
-/// residual window between this check and the rename leaves at most a one-poll-
-/// old percent, which self-heals next cycle). Any failure is silently ignored —
-/// the cache is only an optimization.
+/// Best-effort atomic, monotonic write. The temp file is per-process so concurrent writers never share an
+/// inode. Skips the write when the file already holds a newer entry, so a delayed process can't regress a
+/// fresher value; the residual race window self-heals next poll. Failures are ignored: the cache is an optimization.
 fn save_json<T: Serialize + serde::de::DeserializeOwned + Stamped>(path: &Path, val: &T) {
     if let Some(existing) = load_json::<T>(path)
         && existing.ts() > val.ts()
@@ -318,8 +266,6 @@ fn save_json<T: Serialize + serde::de::DeserializeOwned + Stamped>(path: &Path, 
         let _ = std::fs::remove_file(&tmp);
     }
 }
-
-// ── Claude: live OAuth usage endpoint ──────────────────────────────────────
 
 fn claude_limits(home: &str) -> Result<ClaudeLimits, String> {
     let creds = load_claude_credentials(home)?;
@@ -370,26 +316,18 @@ fn claude_limits(home: &str) -> Result<ClaudeLimits, String> {
     Ok(parse_claude_usage(&body))
 }
 
-/// Load Claude's OAuth credentials JSON. Prefers the plaintext file
-/// `~/.claude/.credentials.json`; on macOS — where Claude Code may keep the credentials
-/// in the login Keychain with NO file on disk — falls back to the Keychain, which stores
-/// the same JSON blob. If both fail, surfaces the file error (readout hides, as before).
 fn load_claude_credentials(home: &str) -> Result<Value, String> {
     let path = Path::new(home).join(".claude/.credentials.json");
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
-        // File missing/unreadable → try the Keychain (macOS keychain-only logins land here).
         Err(file_err) => claude_keychain_credentials()
             .ok_or_else(|| format!("cannot read {}: {file_err}", path.display()))?,
     };
     serde_json::from_str(&raw).map_err(|e| format!("credentials not valid JSON: {e}"))
 }
 
-/// Read the Claude OAuth credentials blob from the macOS login Keychain
-/// (`security find-generic-password -s "Claude Code-credentials" -w`, the same JSON Claude
-/// Code writes). `None` off macOS, or when the item is absent / access is denied / headless —
-/// the Keychain item is ACL-restricted, so a first read from a new binary may prompt for
-/// access in a GUI session and fails silently when denied or without a GUI.
+/// Reads the Claude OAuth credentials blob from the macOS login Keychain. The item is ACL-restricted: a
+/// first read from a new binary may prompt in a GUI session, and fails silently when denied or headless.
 #[cfg(target_os = "macos")]
 fn claude_keychain_credentials() -> Option<String> {
     let out = std::process::Command::new("security")
@@ -414,8 +352,6 @@ fn claude_keychain_credentials() -> Option<String> {
     None
 }
 
-/// Pull the two window utilizations (and their reset times) out of the
-/// `/api/oauth/usage` body. Pure so it can be tested against a captured response.
 fn parse_claude_usage(body: &Value) -> ClaudeLimits {
     let pct = |k: &str| {
         body.get(k)
@@ -435,10 +371,7 @@ fn parse_claude_usage(body: &Value) -> ClaudeLimits {
     }
 }
 
-/// Read a `resets_at` value as UNIX epoch SECONDS. Accepts an integer/float epoch
-/// (Codex, and newer Claude) or an RFC3339 string (older Claude), so the readout
-/// survives either backend shape. `None` for anything else (incl. a placeholder
-/// like `"..."`), which simply hides the countdown for that window.
+/// Accepts an integer/float epoch or an RFC3339 string; anything else yields `None`.
 fn parse_epoch(v: &Value) -> Option<i64> {
     if let Some(n) = v.as_i64() {
         return Some(n);
@@ -453,8 +386,6 @@ fn parse_epoch(v: &Value) -> Option<i64> {
     }
     None
 }
-
-// ── Codex: newest rollout rate_limits snapshot ─────────────────────────────
 
 fn codex_limits(home: &str) -> Result<CodexLimits, String> {
     let root = Path::new(home).join(".codex/sessions");
@@ -489,11 +420,9 @@ fn codex_limits(home: &str) -> Result<CodexLimits, String> {
     Err("newest rollout has no rate_limits snapshot yet".into())
 }
 
-/// The first tail read of a rollout, and the most ever read.
 const TAIL_START: u64 = 256 * 1024;
 const TAIL_MAX: u64 = 8 * 1024 * 1024;
 
-/// The LAST rate_limits snapshot in `text`; only matching lines are parsed.
 fn last_rate_limits(text: &str) -> Option<CodexLimits> {
     text.lines()
         .rev()
@@ -502,7 +431,6 @@ fn last_rate_limits(text: &str) -> Option<CodexLimits> {
         .find_map(|v| find_key(&v, "rate_limits").map(parse_codex_rate_limits))
 }
 
-/// The rollout file with the most recent mtime under `root` (recursive).
 fn newest_rollout(root: &Path) -> Option<PathBuf> {
     let mut best: Option<(SystemTime, PathBuf)> = None;
     collect_newest(root, &mut best);
@@ -532,7 +460,6 @@ fn collect_newest(dir: &Path, best: &mut Option<(SystemTime, PathBuf)>) {
     }
 }
 
-/// Recursively find the first value under `key` anywhere in the JSON tree.
 fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     match v {
         Value::Object(map) => {
@@ -546,9 +473,7 @@ fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-/// From `{primary: {used_percent, window_minutes}, secondary: {...}}` pick the
-/// widest window (≥ 1 day) as "weekly". Codex reports 5h + weekly as
-/// primary/secondary in no fixed order, so choose by `window_minutes`.
+/// Codex reports 5h + weekly as primary/secondary in no fixed order, so pick by `window_minutes`.
 fn parse_codex_rate_limits(rl: &Value) -> CodexLimits {
     const DAY_MINUTES: f64 = 1440.0;
     let mut weekly = None;
@@ -569,8 +494,6 @@ fn parse_codex_rate_limits(rl: &Value) -> CodexLimits {
         {
             widest = window;
             weekly = Some(used);
-            // Codex already reports `resets_at` as an absolute epoch (seconds),
-            // so no anchoring to the rollout event time is needed.
             weekly_reset = w.get("resets_at").and_then(parse_epoch);
         }
     }
@@ -580,11 +503,6 @@ fn parse_codex_rate_limits(rl: &Value) -> CodexLimits {
     }
 }
 
-// ── Rendering ──────────────────────────────────────────────────────────────
-
-/// One line for a status bar: `claude 5h 5% wk 27% · codex wk 45%`. Windows
-/// that are unavailable are omitted; a provider served from the cache is prefixed
-/// `~` (stale); all-absent → `no limits`.
 pub fn oneline(l: &Limits, stale: &Stale) -> String {
     let mut parts = Vec::new();
     if let Some(c) = &l.claude {
@@ -612,10 +530,7 @@ pub fn oneline(l: &Limits, stale: &Stale) -> String {
     parts.join(" · ")
 }
 
-/// Machine shape. Mirrors `oneline`: unavailable providers/windows are OMITTED,
-/// not emitted as `null` — so `--tool codex` never mentions `claude`, and a
-/// provider with no populated windows drops out entirely. A cache-served
-/// provider carries `"stale": true`.
+/// Unavailable providers/windows are omitted, not `null`. A cache-served provider carries `"stale": true`.
 pub fn to_json(l: &Limits, stale: &Stale) -> Value {
     let mut root = serde_json::Map::new();
     if let Some(c) = &l.claude {
@@ -662,8 +577,6 @@ mod tests {
 
     #[test]
     fn parses_claude_usage_body() {
-        // A non-timestamp placeholder (`"..."`) simply yields no reset — the pct
-        // still parses. Real reset formats are covered by `parses_claude_reset`.
         let body = json!({
             "five_hour": {"utilization": 5.0, "resets_at": "..."},
             "seven_day": {"utilization": 27.0, "resets_at": "..."},
@@ -676,15 +589,13 @@ mod tests {
 
     #[test]
     fn parses_claude_reset() {
-        // Integer epoch seconds …
         let body = json!({
             "five_hour": {"utilization": 5.0, "resets_at": 1_786_160_089_i64},
-            // … or an RFC3339 string → converted to the same epoch seconds.
             "seven_day": {"utilization": 27.0, "resets_at": "2026-08-06T00:00:00Z"},
         });
         let c = parse_claude_usage(&body);
         assert_eq!(c.five_hour_reset, Some(1_786_160_089));
-        assert_eq!(c.seven_day_reset, Some(1_785_974_400)); // 2026-08-06T00:00:00Z
+        assert_eq!(c.seven_day_reset, Some(1_785_974_400));
     }
 
     #[test]
@@ -710,7 +621,6 @@ mod tests {
 
     #[test]
     fn load_claude_credentials_reads_the_file_first() {
-        // A present, valid file is parsed directly (no Keychain needed on any platform).
         let dir = std::env::temp_dir().join(format!("copad-cli-creds-{}", std::process::id()));
         let _ = std::fs::create_dir_all(dir.join(".claude"));
         let creds = r#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":9999999999999}}"#;
@@ -720,9 +630,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Non-macOS only: on macOS this would invoke the real login Keychain (`security`), which
-    // can display or block on an ACL prompt during `cargo test`. Off macOS the fallback is a
-    // compile-time no-op, so a missing file deterministically yields the file read error.
+    // Non-macOS only: on macOS this would hit the real login Keychain, which can block on an ACL prompt.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn load_claude_credentials_errors_when_absent() {
@@ -743,14 +651,11 @@ mod tests {
             }}})
             .to_string()
         };
-        let filler = format!("{{\"t\":\"{}\"}}\n", "x".repeat(200)).repeat(3_000); // ~600 KB
+        let filler = format!("{{\"t\":\"{}\"}}\n", "x".repeat(200)).repeat(3_000);
         let file = dir.join("rollout-a.jsonl");
-        // Snapshot at the very end of a large file: found in the first tail window.
         std::fs::write(&file, format!("{}\n{filler}{}\n", snap(10.0), snap(42.0))).unwrap();
         let h = home.to_str().unwrap();
         assert_eq!(codex_limits(h).unwrap().weekly, Some(42.0));
-        // Only deeper than the first window: the window grows until it reaches it, and a
-        // line cut by the window edge is never mistaken for a snapshot.
         std::fs::write(&file, format!("{}\n{filler}", snap(7.0))).unwrap();
         assert_eq!(codex_limits(h).unwrap().weekly, Some(7.0));
         let _ = std::fs::remove_dir_all(&home);
@@ -758,7 +663,6 @@ mod tests {
 
     #[test]
     fn picks_weekly_window_by_width() {
-        // primary is the 5h window, secondary the weekly — weekly must win.
         let rl = json!({
             "primary": {"used_percent": 12.0, "window_minutes": 300},
             "secondary": {"used_percent": 45.0, "window_minutes": 10080},
@@ -777,7 +681,6 @@ mod tests {
 
     #[test]
     fn codex_captures_weekly_reset() {
-        // Codex reports `resets_at` as an absolute epoch already — carried as-is.
         let rl = json!({
             "primary": {"used_percent": 1.0, "window_minutes": 10080, "resets_at": 1_786_160_089_i64},
             "secondary": null,
@@ -840,7 +743,6 @@ mod tests {
 
     #[test]
     fn json_omits_unavailable_providers_and_windows() {
-        // --tool codex: no claude key at all (not `"claude": null`).
         let l = Limits {
             claude: None,
             codex: Some(CodexLimits {
@@ -852,7 +754,6 @@ mod tests {
         assert!(v.get("claude").is_none());
         assert_eq!(v["codex"]["weekly"], json!(45.0));
 
-        // A present provider with an unavailable window omits just that window.
         let l = Limits {
             claude: Some(ClaudeLimits {
                 five_hour: Some(6.0),
@@ -866,13 +767,11 @@ mod tests {
         assert!(v["claude"].get("seven_day").is_none());
         assert!(v.get("codex").is_none());
 
-        // Nothing available → empty object, never `{"claude":null,"codex":null}`.
         assert_eq!(to_json(&Limits::default(), &Stale::default()), json!({}));
     }
 
     #[test]
     fn cache_backfills_missing_claude_and_marks_stale() {
-        // Live has codex but not claude; a recent cache entry fills claude in.
         let mut live = Limits {
             claude: None,
             codex: Some(CodexLimits {
@@ -897,7 +796,6 @@ mod tests {
             oneline(&live, &stale),
             "~claude 5h 6% wk 27% · codex wk 50%"
         );
-        // The live codex value refreshed the cache with the current timestamp.
         assert_eq!(cache.codex.as_ref().unwrap().ts, 1000 + STALE_MAX_MS);
     }
 
@@ -913,7 +811,6 @@ mod tests {
             }),
             codex: None,
         };
-        // One ms past the window → not backfilled.
         let stale = apply_cache(&mut live, &mut cache, 1000 + STALE_MAX_MS + 1, true, true);
         assert!(!stale.claude);
         assert!(live.claude.is_none());
@@ -921,7 +818,6 @@ mod tests {
 
     #[test]
     fn empty_result_has_no_window() {
-        // A 200 with no utilization fields → not cacheable (would clobber good data).
         assert!(!ClaudeLimits::default().has_window());
         assert!(
             ClaudeLimits {
@@ -964,12 +860,12 @@ mod tests {
     #[test]
     fn fresh_enough_rejects_future_and_garbage_timestamps() {
         let now = 1_000_000_000_000;
-        assert!(fresh_enough(now, now)); // just now
-        assert!(fresh_enough(now, now - STALE_MAX_MS)); // exactly the boundary
-        assert!(!fresh_enough(now, now - STALE_MAX_MS - 1)); // just too old
-        assert!(!fresh_enough(now, now + 60_000)); // future ts → rejected, not "fresh"
-        assert!(!fresh_enough(now, i64::MIN)); // garbage → no panic, rejected
-        assert!(!fresh_enough(now, i64::MAX)); // garbage future → rejected
+        assert!(fresh_enough(now, now));
+        assert!(fresh_enough(now, now - STALE_MAX_MS));
+        assert!(!fresh_enough(now, now - STALE_MAX_MS - 1));
+        assert!(!fresh_enough(now, now + 60_000));
+        assert!(!fresh_enough(now, i64::MIN));
+        assert!(!fresh_enough(now, i64::MAX));
     }
 
     #[test]
@@ -984,7 +880,6 @@ mod tests {
             }),
             codex: None,
         };
-        // want_claude=false → even a fresh cache entry is ignored.
         let stale = apply_cache(&mut live, &mut cache, 1000, false, true);
         assert!(!stale.claude);
         assert!(live.claude.is_none());
@@ -1011,7 +906,6 @@ mod tests {
     #[test]
     fn oneline_empty() {
         assert_eq!(oneline(&Limits::default(), &Stale::default()), "no limits");
-        // A claude struct with no populated windows also collapses to empty.
         let l = Limits {
             claude: Some(ClaudeLimits::default()),
             codex: None,
