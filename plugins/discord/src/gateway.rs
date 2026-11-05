@@ -1,47 +1,25 @@
 //! Discord Gateway WebSocket client.
 //!
-//! Flow per connection:
-//! 1. `GET /gateway/bot` (or `/gateway`) returns the WSS URL. Discord
-//!    handles its own load-balancing here. Resume connections instead
-//!    use the `resume_gateway_url` from the prior session's READY.
-//! 2. Connect via tungstenite. WS handshake is plain — auth happens in
-//!    the IDENTIFY/RESUME payload.
-//! 3. First server frame is HELLO (op 10) which carries
-//!    `heartbeat_interval` (ms). We schedule heartbeat sends AND set
-//!    the underlying TCP read timeout to a fraction of that interval
-//!    so the single-threaded read loop wakes up to send heartbeats on
-//!    schedule.
-//! 4. Send IDENTIFY (op 2) on first connect, or RESUME (op 6) when we
-//!    have a live `session_id` + `seq`. Server responds with READY
-//!    (op 0 t=READY) capturing `user.id`, `session_id`, and
-//!    `resume_gateway_url`, OR RESUMED (op 0 t=RESUMED) for a
-//!    successful resume, OR INVALID_SESSION (op 9) which forces a
-//!    full IDENTIFY after a small random delay.
-//! 5. Steady state reads:
-//!    - op 0 DISPATCH — update `seq`, parse `t`+`d`, hand to
-//!      `events::from_dispatch`, deliver to `on_event`.
-//!    - op 1 HEARTBEAT — server-prompted; reply immediately.
-//!    - op 7 RECONNECT — close + reconnect with RESUME.
-//!    - op 9 INVALID_SESSION — `d=true` resumable; `d=false` full
-//!      reset (clear session_id+seq+resume_url, IDENTIFY fresh).
-//!    - op 10 HELLO — only valid as the first frame; later HELLO is
-//!      a protocol surprise and ignored.
-//!    - op 11 HEARTBEAT_ACK — touch `last_ack` for zombie detection.
-//! 6. Zombie detection: if we sent a heartbeat but didn't receive an
-//!    ACK before the next send, the connection is dead — close and
-//!    reconnect with RESUME. Discord recommends this exact heuristic.
+//! Per connection: fetch the WSS URL (`GET /gateway/bot`; resumes use the prior READY's
+//! `resume_gateway_url`), connect via tungstenite (auth is in IDENTIFY/RESUME, not the handshake),
+//! read HELLO (op 10) for `heartbeat_interval`, then send IDENTIFY (op 2) or, with a live
+//! `session_id` + `seq`, RESUME (op 6). READY / RESUMED / INVALID_SESSION (op 9, which forces a
+//! full IDENTIFY after a small random delay) follow.
 //!
-//! Threading: single thread per connection. Heartbeat scheduling is
-//! interleaved with frame reads via a TCP read timeout — a cleaner
-//! design than spawning a heartbeat thread that contends with the
-//! reader for `WebSocket` access. The TCP timeout is set to roughly
-//! `heartbeat_interval / 4` so we wake up at least four times per
-//! interval to check for due heartbeats and the zombie deadline.
+//! Steady-state ops: 0 DISPATCH (update `seq`, hand `t`+`d` to `events::from_dispatch`), 1
+//! HEARTBEAT (server-prompted, reply at once), 7 RECONNECT (close, RESUME), 9 INVALID_SESSION
+//! (`d=true` resumable; `d=false` clears session_id+seq+resume_url), 10 HELLO (ignored after the
+//! first frame), 11 HEARTBEAT_ACK (touches `last_ack`).
 //!
-//! Intents bitfield: see `GATEWAY_INTENTS` constant below for the
-//! current value and per-bit purpose. Privileged MESSAGE_CONTENT
-//! must be enabled on the application's Bot tab; we surface a clear
-//! error if Discord rejects IDENTIFY due to it (close code 4014).
+//! Zombie detection: a heartbeat sent without an ACK before the next send means the connection is
+//! dead; close and RESUME (Discord's recommended heuristic).
+//!
+//! Threading: one thread per connection. Heartbeats are interleaved with frame reads through a TCP
+//! read timeout of roughly `heartbeat_interval / 4`, instead of a heartbeat thread contending with
+//! the reader for `WebSocket` access.
+//!
+//! Intents: see `GATEWAY_INTENTS`. Privileged MESSAGE_CONTENT must be enabled on the application's
+//! Bot tab; Discord rejects IDENTIFY otherwise (close code 4014) and we surface a clear error.
 
 use std::io::ErrorKind;
 use std::sync::Arc;
@@ -57,15 +35,14 @@ use crate::events::{DiscordEvent, from_dispatch};
 use crate::store::TokenStore;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
-/// `GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGES |
-/// DIRECT_MESSAGE_REACTIONS | MESSAGE_CONTENT`. The privileged
-/// `MESSAGE_CONTENT` bit needs Developer Portal → Bot tab opt-in;
-/// without it `content` arrives empty for non-mentions and keyword
-/// triggers can't match. Reaction bits are non-privileged but must
-/// still be in the field or `MESSAGE_REACTION_ADD` never dispatches.
+/// `GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGES | DIRECT_MESSAGE_REACTIONS |
+/// MESSAGE_CONTENT`. The privileged `MESSAGE_CONTENT` bit needs Developer Portal -> Bot tab
+/// opt-in; without it `content` arrives empty for non-mentions and keyword triggers can't match.
+/// Reaction bits are non-privileged but must be present or `MESSAGE_REACTION_ADD` never
+/// dispatches.
 const GATEWAY_INTENTS: u64 = (1 << 9) | (1 << 10) | (1 << 12) | (1 << 13) | (1 << 15);
-/// Recheck cadence when no credentials — fresh `auth` is picked up
-/// without supervisor restart (slack-plugin parallel).
+/// Recheck cadence when there are no credentials, so a fresh `auth` is picked up without a
+/// supervisor restart.
 const NO_CREDS_RECHECK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -74,8 +51,8 @@ pub struct ResolvedCredentials {
     pub source: &'static str, // "env" | "store"
 }
 
-/// Env wins (test overrides), store falls back. Discord uses a single
-/// token so there's no cross-source-mixing pitfall (cf. Slack pair).
+/// Env wins (test overrides), store falls back. Discord uses a single token, so there is no
+/// cross-source mixing pitfall.
 pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<ResolvedCredentials> {
     if let Some(t) = &config.bot_token_env
         && !t.is_empty()
@@ -100,8 +77,7 @@ struct GatewaySession {
     bot_user_id: Option<String>,
     session_id: Option<String>,
     seq: Option<i64>,
-    /// Discord may issue a region-specific gateway URL; resuming on the
-    /// wrong host bounces with INVALID_SESSION.
+    /// Region-specific gateway URL; resuming on the wrong host bounces with INVALID_SESSION.
     resume_gateway_url: Option<String>,
 }
 
@@ -110,12 +86,9 @@ impl GatewaySession {
         self.session_id.is_some() && self.seq.is_some()
     }
     fn full_reset(&mut self) {
-        // Keep `bot_user_id` across resets — it's the bot's identity,
-        // not a session artifact. Re-IDENTIFY will overwrite it from
-        // the next READY frame anyway, but holding it across a brief
-        // INVALID_SESSION window means the events filter doesn't
-        // accidentally treat self-messages as user messages between
-        // disconnect and re-READY.
+        // Keep `bot_user_id`: it is the bot's identity, not a session artifact, and holding it
+        // across an INVALID_SESSION window keeps the events filter from treating self-messages as
+        // user messages before the next READY.
         self.session_id = None;
         self.seq = None;
         self.resume_gateway_url = None;
@@ -199,9 +172,8 @@ fn connect_and_serve<F>(
 where
     F: FnMut(DiscordEvent),
 {
-    // Decide URL. RESUME prefers the per-session gateway URL Discord
-    // returned in READY; fall back to bootstrap for first connect or
-    // when a server-side rotation invalidated the cached URL.
+    // RESUME prefers the per-session gateway URL from READY; first connect (or a server-side
+    // rotation that invalidated the cached URL) uses the bootstrap URL.
     let wss_url = if session.can_resume()
         && let Some(url) = &session.resume_gateway_url
     {
@@ -215,7 +187,6 @@ where
     let (mut ws, _resp) = tungstenite::connect(uri).map_err(|e| format!("ws connect: {e}"))?;
     eprintln!("[discord] gateway WS connected");
 
-    // Step 1: receive HELLO
     let hello = read_text_with_timeout(&mut ws, Duration::from_secs(15))
         .ok_or_else(|| "no HELLO before timeout".to_string())??;
     let hello_v: Value = serde_json::from_str(&hello).map_err(|e| format!("HELLO parse: {e}"))?;
@@ -231,7 +202,6 @@ where
     set_read_timeout(&mut ws, heartbeat_period / 4)
         .map_err(|e| format!("set TCP read_timeout: {e}"))?;
 
-    // Step 2: send IDENTIFY or RESUME
     if session.can_resume() {
         let frame = json!({
             "op": 6,
@@ -273,21 +243,18 @@ where
         / 1024.0;
     let mut next_heartbeat =
         Instant::now() + Duration::from_millis((jitter * heartbeat_interval_ms as f64) as u64);
-    // last_ack starts at "now" — without an ACK reference point, the
-    // first zombie check would trip immediately. The first scheduled
-    // heartbeat won't fire for at least `jitter * interval` ms so we
-    // have a real ACK before the next deadline.
+    // last_ack starts at "now": without a reference point the first zombie check would trip
+    // immediately. The first heartbeat is at least `jitter * interval` away, so a real ACK
+    // arrives before the next deadline.
     let mut last_ack = Instant::now();
     let mut heartbeat_in_flight = false;
 
     while !stop.load(Ordering::SeqCst) {
-        // Heartbeat scheduling: send if due, then check zombie state.
         let now = Instant::now();
         if now >= next_heartbeat {
             if heartbeat_in_flight && last_ack < next_heartbeat - heartbeat_period {
-                // Sent a heartbeat last cycle, never got an ACK before
-                // the next deadline → zombied connection. Discord docs
-                // recommend close + RESUME.
+                // Heartbeat sent last cycle, no ACK before the next deadline: zombied connection;
+                // Discord recommends close + RESUME.
                 return Err("zombied connection (no HEARTBEAT_ACK)".to_string());
             }
             send_heartbeat(&mut ws, session.seq)?;
@@ -309,27 +276,19 @@ where
                 }
             }
             Ok(Message::Binary(_)) => {
-                // Discord gateway is JSON-encoded text — binary would be
-                // ETF (Erlang Term Format), opt-in via encoding=etf. We
-                // don't request it.
+                // The gateway is JSON text; binary would be ETF, which we don't request.
             }
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
-                // tungstenite handles WS-level ping/pong automatically
-                // when we drive read() regularly.
+                // tungstenite answers WS-level ping/pong while read() is driven.
             }
             Ok(Message::Close(frame)) => {
                 let reason = frame
                     .as_ref()
                     .map(|f| format!("close {} '{}'", u16::from(f.code), f.reason))
                     .unwrap_or_else(|| "close (no frame)".to_string());
-                // Some Discord close codes are NOT recoverable via
-                // RESUME — surface them with a hint so the user can
-                // diagnose. 4004 auth failed, 4013 invalid intent,
-                // 4014 disallowed (privileged) intent. After these we
-                // also clear the session so the next connect goes
-                // through fresh IDENTIFY (which will fail again until
-                // the user fixes config, but at least logs are
-                // useful).
+                // Some close codes are NOT recoverable via RESUME (4004 auth failed, 4013 invalid
+                // intent, 4014 disallowed privileged intent). Clear the session so the next
+                // connect does a fresh IDENTIFY, and surface a hint.
                 let close_code = frame.as_ref().map(|f| u16::from(f.code)).unwrap_or(0);
                 if matches!(close_code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014) {
                     session.full_reset();
@@ -343,7 +302,6 @@ where
             Err(tungstenite::Error::Io(e))
                 if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
             {
-                // Read timeout — loop falls through to heartbeat check.
                 continue;
             }
             Err(tungstenite::Error::ConnectionClosed) => {
@@ -372,17 +330,14 @@ where
     let frame: Value = serde_json::from_str(s).map_err(|e| format!("bad frame: {e}"))?;
     let op = frame.get("op").and_then(Value::as_u64).unwrap_or(u64::MAX);
     if let Some(s_val) = frame.get("s").and_then(Value::as_i64) {
-        // Only DISPATCH (op 0) carries non-null `s`; other ops set it
-        // to null which serde_json::Value::as_i64 returns None for.
-        // Tracking the latest seq across all ops would corrupt RESUME
-        // if Discord ever changes that contract.
+        // Only DISPATCH (op 0) carries a non-null `s`; tracking seq across other ops would
+        // corrupt RESUME.
         if op == 0 {
             session.seq = Some(s_val);
         }
     }
     match op {
         0 => {
-            // DISPATCH
             let event_name = frame
                 .get("t")
                 .and_then(Value::as_str)
@@ -420,30 +375,20 @@ where
             }
         }
         1 => {
-            // Server-requested HEARTBEAT — reply immediately. Don't
-            // touch our normal scheduling; the next scheduled
-            // heartbeat will fire on its own clock.
+            // Server-requested HEARTBEAT: reply at once without touching the normal schedule.
             send_heartbeat(ws, session.seq)?;
             *heartbeat_in_flight = true;
         }
         7 => {
-            // RECONNECT — graceful reconnect with RESUME.
             eprintln!("[discord] op 7 RECONNECT received");
             return Ok(Some("server requested reconnect"));
         }
         9 => {
-            // INVALID_SESSION. `d` is `true` when resumable. False
-            // means the session is gone — clear and re-IDENTIFY.
-            //
-            // Discord docs require a randomized 1–5s delay before
-            // reconnecting on INVALID_SESSION (otherwise a server-
-            // side bug can spin clients fast enough to exhaust
-            // session_start_limit, ~1000/day for most bots). The
-            // outer reconnect loop's backoff doesn't cover this
-            // because we return Ok (graceful) — Ok resets backoff to
-            // initial and immediately retries. Insert the sleep
-            // here, inside the Ok path, so a tight INVALID_SESSION
-            // storm self-throttles.
+            // `d` true = resumable; false = session gone, re-IDENTIFY. Discord requires a random
+            // 1-5s delay before reconnecting on INVALID_SESSION (a server-side bug can otherwise
+            // exhaust session_start_limit, ~1000/day). The outer loop's backoff doesn't cover it
+            // because we return Ok, which resets backoff and retries at once, so the sleep lives
+            // here to throttle an INVALID_SESSION storm.
             let resumable = frame.get("d").and_then(Value::as_bool).unwrap_or(false);
             eprintln!("[discord] op 9 INVALID_SESSION (resumable={resumable})");
             if !resumable {
@@ -463,14 +408,10 @@ where
             }));
         }
         10 => {
-            // Stray HELLO — Discord doesn't send these post-init in
-            // normal operation. Log and continue rather than fail; a
-            // mid-stream HELLO would be a server-side change we can
-            // observe via the log.
+            // Discord doesn't send HELLO after init; log and continue rather than fail.
             eprintln!("[discord] unexpected mid-stream HELLO ignored");
         }
         11 => {
-            // HEARTBEAT_ACK
             *last_ack = Instant::now();
             *heartbeat_in_flight = false;
         }
@@ -485,16 +426,14 @@ fn send_heartbeat(
     ws: &mut tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>,
     seq: Option<i64>,
 ) -> Result<(), String> {
-    // `d: null` is correct when we have no seq yet (first heartbeat
-    // before any DISPATCH); serde_json maps None → Null automatically.
+    // `d: null` is correct before the first DISPATCH (no seq yet); None maps to Null.
     let frame = json!({"op": 1, "d": seq});
     ws.send(Message::Text(frame.to_string()))
         .map_err(|e| format!("send heartbeat: {e}"))
 }
 
-/// Walks through the TLS wrapper. Without a read timeout the loop
-/// would block until a frame arrives, starving heartbeat scheduling
-/// on a quiet channel and tripping Discord's 4009 (session timeout).
+/// Walks through the TLS wrapper. Without a read timeout the loop would block until a frame
+/// arrives, starving heartbeats on a quiet channel and tripping Discord's 4009 (session timeout).
 fn set_read_timeout(
     ws: &mut tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>,
     timeout: Duration,
@@ -502,15 +441,14 @@ fn set_read_timeout(
     match ws.get_mut() {
         MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(timeout)),
         MaybeTlsStream::Rustls(s) => s.get_mut().set_read_timeout(Some(timeout)),
-        // Other TLS variants (NativeTls) aren't compiled in via our
-        // tungstenite features list — explicit catch-all keeps us
-        // forward-compatible if that changes.
+        // NativeTls etc. aren't compiled in via our tungstenite features; the catch-all keeps this
+        // forward-compatible.
         _ => Ok(()),
     }
 }
 
-/// Bounded one-shot text-frame read for the initial HELLO. `None` on
-/// timeout, `Some(Ok)` on a text frame, `Some(Err)` on IO/parse errors.
+/// Bounded one-shot text-frame read for the initial HELLO. `None` on timeout, `Some(Err)` on
+/// IO/parse errors.
 fn read_text_with_timeout(
     ws: &mut tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>,
     total: Duration,
@@ -530,9 +468,7 @@ fn read_text_with_timeout(
     }
 }
 
-/// `resume_gateway_url` arrives without query params; the
-/// `v=10&encoding=json` suffix pins the wire format (server defaults
-/// have changed over time).
+/// `resume_gateway_url` arrives without query params; `v=10&encoding=json` pins the wire format.
 fn ensure_query(url: &str) -> String {
     if url.contains("v=") {
         url.to_string()
@@ -543,9 +479,8 @@ fn ensure_query(url: &str) -> String {
     }
 }
 
-/// Authenticated `/gateway/bot` (vs public `/gateway`) so over-quota
-/// IDENTIFYs surface at connect time via session-start-limit instead
-/// of mid-loop.
+/// Authenticated `/gateway/bot` (vs public `/gateway`) so over-quota IDENTIFYs surface at connect
+/// time via session-start-limit instead of mid-loop.
 fn bootstrap_url(token: &str) -> Result<String, String> {
     let resp = ureq::get(&format!("{DISCORD_API_BASE}/gateway/bot"))
         .set("Authorization", &format!("Bot {token}"))
@@ -567,9 +502,8 @@ fn bootstrap_url(token: &str) -> Result<String, String> {
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX);
         if remaining < 5 {
-            // Surfacing the warning loud — once `remaining` hits 0
-            // Discord refuses IDENTIFY entirely until the daily
-            // reset, so the plugin would loop on errors all day.
+            // Surface loudly: at 0 Discord refuses IDENTIFY until the daily reset, so the plugin
+            // would loop on errors all day.
             eprintln!(
                 "[discord] WARNING session_start_limit.remaining={remaining} \
                  (resets in {}ms)",

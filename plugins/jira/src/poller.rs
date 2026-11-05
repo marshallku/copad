@@ -1,35 +1,22 @@
 //! Background poller that publishes the four `jira.*` event kinds.
 //!
-//! Loop:
-//! 1. Wait until the supervisor has sent `initialized` (so events
-//!    don't leak before copad has finished the handshake).
-//! 2. First tick runs IMMEDIATELY (no leading sleep), then sleep
-//!    `poll_interval` between subsequent ticks. Same posture as
-//!    calendar's poller.
-//! 3. If `fatal_error` is set OR neither env nor store has usable
-//!    credentials, skip silently — the user can fix the env or run
-//!    `copad-plugin-jira auth` while copad is already running and
-//!    the next tick picks up the new state.
-//! 4. Fetch ticket pages via `jira::search` (ORDER BY updated DESC,
-//!    JQL: `(assignee = currentUser() OR watcher = currentUser()) AND
-//!    updated > -<lookback>h[ AND project in (X, Y)]`), follow
-//!    pagination via `next_start_at`, capped at MAX_PAGES.
-//! 5. Diff each ticket against the prior `TicketSnapshot`:
-//!    - **First sight** (snapshot is None): emit `jira.ticket_assigned`
-//!      iff assigned to me right now. Do NOT emit `status_changed` —
-//!      we have no `from` to report.
-//!    - **Subsequent sight**: assignee changed → `jira.ticket_assigned`
-//!      iff newly assigned to me. Status changed → `jira.status_changed`.
-//!      Walk the inline `fields.comment.comments[]` and emit
-//!      `jira.comment_added` per comment whose parsed `created`
-//!      instant is strictly newer than the per-ticket watermark,
-//!      plus `jira.mention` when the comment body mentions me.
-//! 6. Save the new snapshot.
-//! 7. Dedupe via a `HashSet<(key, kind, discriminator)>` so a transient
-//!    re-publication can't fire twice. Cap at 4096; flush past cap.
+//! Loop: wait for the supervisor's `initialized`, run the first tick IMMEDIATELY, then sleep
+//! `poll_interval` between ticks (same posture as calendar's poller). A tick is skipped silently
+//! when `fatal_error` is set or no credentials are usable, so the user can fix env or run
+//! `copad-plugin-jira auth` while copad is running and the next tick picks it up.
 //!
-//! All errors are logged to stderr and swallowed; one bad poll tick
-//! must not kill the daemon.
+//! Each tick fetches pages via `jira::search` (ORDER BY updated DESC, JQL
+//! `(assignee = currentUser() OR watcher = currentUser()) AND updated > -<lookback>h[ AND project
+//! in (X, Y)]`), following `next_page_token` up to MAX_PAGES, and diffs each ticket against the
+//! prior `TicketSnapshot`:
+//! - First sight: `jira.ticket_assigned` iff assigned to me now; no `status_changed` (no `from`).
+//! - Later: assignee changed -> `jira.ticket_assigned` iff newly mine; status changed ->
+//!   `jira.status_changed`; each inline `fields.comment.comments[]` entry whose parsed `created`
+//!   is strictly newer than the per-ticket watermark -> `jira.comment_added`, plus `jira.mention`
+//!   when the body mentions me.
+//!
+//! Comment events are deduped by id via `fired_comments` (cap 4096; flushed past it).
+//! All errors are logged to stderr and swallowed; one bad tick must not kill the daemon.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,23 +49,19 @@ pub struct Poller {
 
 #[derive(Default)]
 struct PollerState {
-    /// Cached across ticks. `my_identity_signature` records the
-    /// (base_url, email) the cache was built for — a hot re-auth to a
-    /// different Atlassian account invalidates the cache so
-    /// assigned-to-me / mention detection doesn't silently mis-attribute
-    /// to the prior user.
+    /// Cached across ticks. `my_identity_signature` records the (base_url, email) the cache was
+    /// built for; a hot re-auth to a different Atlassian account invalidates it so
+    /// assigned-to-me / mention detection doesn't mis-attribute to the prior user.
     my_account_id: Option<String>,
     my_identity_signature: Option<(String, String)>,
-    /// Sole guard against cross-tick re-emission: each `process_ticket`
-    /// mutates the snapshot to current, so the next tick (or a duplicate
-    /// observation later in the same paginated response) emits nothing
-    /// unless something genuinely changed Jira-side.
+    /// Sole guard against cross-tick re-emission: each `process_ticket` updates the snapshot to
+    /// current, so the next tick (or a duplicate later in the same paginated response) emits
+    /// nothing unless something changed Jira-side.
     snapshots: HashMap<String, TicketSnapshot>,
-    /// Per-comment dedupe (cap 4096; flush past cap). Snapshot mutation
-    /// alone isn't enough: backfilling many comments across pages can
-    /// see the same comment id twice if a fresh one lands mid-paginate.
-    /// Status/assignee transitions are NOT deduped — a genuine
-    /// `Open → In Progress → Open → In Progress` bounce must emit each.
+    /// Per-comment dedupe (cap 4096; flush past cap). Snapshot mutation alone isn't enough:
+    /// backfilling comments across pages can see the same comment id twice if a fresh one lands
+    /// mid-paginate. Status/assignee transitions are NOT deduped: a genuine
+    /// `Open -> In Progress -> Open -> In Progress` bounce must emit each.
     fired_comments: HashSet<String>,
 }
 
@@ -99,9 +82,8 @@ impl Poller {
     }
 
     pub fn run(&self) {
-        // Wait for the `initialized` notification before starting
-        // any poll cycle. Without this, an event published during
-        // init would race against the supervisor's handshake.
+        // Wait for `initialized` before any poll cycle, or an event published during init would
+        // race the supervisor's handshake.
         while !self.initialized.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(100));
         }
@@ -129,22 +111,16 @@ impl Poller {
             email: &creds.email,
             api_token: &creds.api_token,
         };
-        // Pass the account_id_hint atomically with the creds — without
-        // this, `resolve_my_account_id` would re-read self.store and
-        // could pair the live env creds with a stale store account_id
-        // if the store changed between the two reads.
+        // Pass the account_id_hint atomically with the creds: re-reading self.store in
+        // `resolve_my_account_id` could pair live env creds with a stale store account_id.
         let my_account_id = self.resolve_my_account_id(creds_borrow, &creds.account_id_hint)?;
 
         let jql =
             jira::build_polling_jql(self.config.lookback_hours, self.config.projects.as_deref());
-        // `*all` returns every field including customs so `event_json`
-        // in emitted events carries the verbatim payload we promise
-        // (triggers reach `event.event_json.fields.customfield_10001`
-        // etc.). Trade-off: ~5-10× larger response than the explicit
-        // field list. Acceptable for v1 — typical workspaces have a
-        // few dozen tickets in the lookback window. If response size
-        // becomes a real cost we can add `COPAD_JIRA_LEAN_PAYLOAD=1`
-        // to opt out, but only when someone actually reports it.
+        // `*all` returns every field including customs, so `event_json` in emitted events carries
+        // the verbatim payload we promise (triggers reach
+        // `event.event_json.fields.customfield_10001` etc.), at ~5-10x the response size of an
+        // explicit field list.
         let fields = ["*all"];
         let (tickets, truncated) = self.fetch_all_tickets(creds_borrow, &jql, &fields)?;
         eprintln!(
@@ -152,22 +128,14 @@ impl Poller {
             tickets.len()
         );
 
-        // Process inside a single state-lock scope so a concurrent
-        // shutdown can't observe a half-applied snapshot diff.
+        // One state-lock scope so a concurrent shutdown can't see a half-applied snapshot diff.
         let mut state = self.state.lock().unwrap();
-        // Prune snapshots for tickets that fell out of the lookback
-        // window. Without this a ticket that goes inactive for >
-        // lookback_hours then later receives an update would diff
-        // against months-old state — emitting a bogus
-        // `jira.status_changed` for transitions that already
-        // happened, replaying every comment since the snapshot as
-        // brand-new `jira.comment_added` / `jira.mention`, etc.
-        // Treating the re-entry as first-sight suppresses status/
-        // comment events (no baseline) but still emits
-        // `jira.ticket_assigned` if it's currently mine — exactly
-        // the right semantics. Skipped on truncation: if the search
-        // hit MAX_PAGES we don't have the full picture and pruning
-        // would drop legitimate state.
+        // Prune snapshots for tickets that left the lookback window. Otherwise a ticket inactive
+        // for > lookback_hours that later updates would diff against months-old state: a bogus
+        // `jira.status_changed`, every comment since replayed as `jira.comment_added` /
+        // `jira.mention`. Re-entry as first sight suppresses status/comment events (no baseline)
+        // but still emits `jira.ticket_assigned` if it's mine. Skipped on truncation (MAX_PAGES
+        // hit): without the full picture, pruning would drop legitimate state.
         if !truncated {
             let observed: HashSet<String> = tickets.iter().map(|t| t.key.clone()).collect();
             state.snapshots.retain(|key, _| observed.contains(key));
@@ -179,9 +147,8 @@ impl Poller {
         Ok(())
     }
 
-    /// Returns `(tickets, truncated)`. `truncated == true` means MAX_PAGES
-    /// stopped us short — the caller skips snapshot pruning to avoid
-    /// dropping state for tickets outside the truncated subset.
+    /// Returns `(tickets, truncated)`. `truncated == true` means MAX_PAGES stopped us short, so
+    /// the caller skips snapshot pruning to avoid dropping state for tickets outside the subset.
     fn fetch_all_tickets(
         &self,
         creds: jira::Creds,
@@ -212,12 +179,10 @@ impl Poller {
         Ok((all, true))
     }
 
-    /// Cached resolution; uses `account_id_hint` (atomically captured by
-    /// `current_credentials`) for stored creds, falls back to a `/myself`
-    /// call for env-source creds. Cache invalidates when the live
-    /// `(base_url, email)` differs from the one the cached id was built
-    /// for, so a hot re-auth doesn't mis-attribute mention detection
-    /// to the prior account.
+    /// Cached resolution; uses `account_id_hint` (captured atomically by `current_credentials`)
+    /// for stored creds and falls back to `/myself` for env-source creds. The cache invalidates
+    /// when the live `(base_url, email)` differs from the one it was built for, so a hot re-auth
+    /// doesn't mis-attribute mention detection to the prior account.
     fn resolve_my_account_id(
         &self,
         creds: jira::Creds,
@@ -226,8 +191,7 @@ impl Poller {
         let live_signature = (creds.base_url.to_string(), creds.email.to_string());
         {
             let state = self.state.lock().unwrap();
-            // Cache hit only when the signature matches — stale
-            // entry from a previous account is treated as a miss.
+            // Hit only when the signature matches; a stale entry from a previous account is a miss.
             if let (Some(id), Some(sig)) = (&state.my_account_id, &state.my_identity_signature)
                 && sig == &live_signature
             {
@@ -243,10 +207,8 @@ impl Poller {
             }
         };
         let mut state = self.state.lock().unwrap();
-        // Identity changed — also invalidate per-ticket snapshots
-        // since the prior account's "assigned to me" set has no
-        // bearing on the new account's. fired_comments stays — they
-        // were emitted historically and shouldn't fire again.
+        // Identity changed: also invalidate per-ticket snapshots, since the prior account's
+        // "assigned to me" set is irrelevant. fired_comments stays: those were emitted already.
         if state.my_identity_signature.as_ref() != Some(&live_signature) {
             if state.my_identity_signature.is_some() {
                 eprintln!(
@@ -274,11 +236,9 @@ impl Poller {
 
         match &prev {
             None => {
-                // First sight. Only emit ticket_assigned if currently
-                // assigned to me; status_changed needs a baseline.
-                // Comments: do NOT emit historical events — just
-                // record the high water mark so the next tick has a
-                // baseline to filter against.
+                // First sight: emit ticket_assigned only if currently mine (status_changed needs
+                // a baseline). No historical comment events; just record the high-water mark as
+                // the next tick's baseline.
                 if ticket.assignee_account_id.as_deref() == Some(my_account_id) {
                     self.publish_event("jira.ticket_assigned", ticket, serde_json::Map::new());
                 }
@@ -287,29 +247,23 @@ impl Poller {
                 }
             }
             Some(prev_snap) => {
-                // Status change. No cross-tick dedup — the snapshot
-                // diff guarantees one emit per genuine transition;
-                // a bounce `Open → In Progress → Open → In Progress`
-                // legitimately fires three events, one per state
-                // change.
+                // No cross-tick dedup for status changes: the snapshot diff guarantees one emit
+                // per genuine transition, so a bounce `Open -> In Progress -> Open -> In Progress`
+                // legitimately fires each.
                 if prev_snap.status_name != new_snap.status_name {
                     let mut extras = serde_json::Map::new();
                     extras.insert("from".to_string(), json!(prev_snap.status_name.clone()));
                     extras.insert("to".to_string(), json!(new_snap.status_name.clone()));
                     self.publish_event("jira.status_changed", ticket, extras);
                 }
-                // Assignee transitioned to me. Same posture as above.
                 let was_mine = prev_snap.assignee_account_id.as_deref() == Some(my_account_id);
                 let is_mine = ticket.assignee_account_id.as_deref() == Some(my_account_id);
                 if !was_mine && is_mine {
                     self.publish_event("jira.ticket_assigned", ticket, serde_json::Map::new());
                 }
-                // Comment delta — walk inline comments and emit for
-                // any whose `created` timestamp is strictly newer than
-                // the prior snapshot's high water mark. Robust against
-                // deletion: deleting an old comment doesn't affect the
-                // ordering of newer ones, and we filter by timestamp
-                // not by index so deletion can't make us skip.
+                // Comment delta: emit for comments whose `created` is strictly newer than the
+                // prior high-water mark. Filtering by timestamp, not index, keeps it robust
+                // against deletions.
                 if self.config.fetch_comments {
                     let new_water = self.process_new_comments(
                         ticket,
@@ -326,9 +280,8 @@ impl Poller {
         state.snapshots.insert(ticket.key.clone(), new_snap);
     }
 
-    /// Latest inline-comment `created` instant as canonical UTC RFC 3339.
-    /// Parses to chrono before comparing — raw-string max would mis-order
-    /// Jira's mixed `+0000`/`+00:00` offsets. None when no parseable comments.
+    /// Latest inline-comment `created` instant as canonical UTC RFC 3339. Parses to chrono before
+    /// comparing, since a raw-string max would mis-order Jira's mixed `+0000`/`+00:00` offsets.
     fn high_water_mark(&self, ticket: &Ticket) -> Option<String> {
         extract_inline_comments(&ticket.raw_json)
             .into_iter()
@@ -337,19 +290,15 @@ impl Poller {
             .map(|t| t.to_rfc3339())
     }
 
-    /// Emits `jira.comment_added` (and `jira.mention` when applicable)
-    /// for inline comments whose parsed `created` is strictly after
-    /// `since_iso`. Returns the new high-water mark as canonical UTC
-    /// RFC 3339. Timestamp-vs-index rationale: see `event::TicketSnapshot`.
-    /// Mixed `+0000`/`+00:00` offset handling: see `event::parse_jira_timestamp`.
+    /// Emits `jira.comment_added` (and `jira.mention` when applicable) for inline comments whose
+    /// parsed `created` is strictly after `since_iso`. Returns the new high-water mark as
+    /// canonical UTC RFC 3339. Timestamp-vs-index rationale: see `event::TicketSnapshot`; mixed
+    /// `+0000`/`+00:00` offsets: see `event::parse_jira_timestamp`.
     ///
-    /// **Inline-comment cap (known limitation)**: `/search` returns at most
-    /// 50 inline comments per ticket. If the watermark is older than the
-    /// oldest inline comment AND there are >50 newer than the watermark,
-    /// the gap range is silently lost. Closing this requires falling back
-    /// to `/issue/{key}/comment` paged when the oldest inline comment is
-    /// newer than the watermark (signal of pagination overflow); deferred
-    /// until a real workflow hits it.
+    /// **Inline-comment cap (known limitation)**: `/search` returns at most 50 inline comments per
+    /// ticket. If the watermark is older than the oldest inline comment AND more than 50 are newer
+    /// than it, the gap is silently lost. Closing it needs a paged fallback to
+    /// `/issue/{key}/comment`.
     fn process_new_comments(
         &self,
         ticket: &Ticket,
@@ -358,9 +307,8 @@ impl Poller {
         state: &mut PollerState,
     ) -> Option<String> {
         let since_instant = since_iso.and_then(event::parse_jira_timestamp);
-        // Parse each comment's created upfront; drop any whose
-        // timestamp doesn't parse rather than risk mis-ordering them
-        // against the watermark.
+        // Parse `created` upfront; drop comments that don't parse rather than risk mis-ordering
+        // them against the watermark.
         let mut parsed: Vec<(Comment, chrono::DateTime<chrono::Utc>)> =
             extract_inline_comments(&ticket.raw_json)
                 .into_iter()
@@ -369,14 +317,12 @@ impl Poller {
         parsed.sort_by_key(|(_, t)| *t);
         let mut high_water_instant: Option<chrono::DateTime<chrono::Utc>> = None;
         for (comment, instant) in parsed {
-            // Track high water across ALL comments (not just
-            // newly-emitted ones) so the next tick has the most
-            // recent baseline regardless of filtering.
+            // Track the high water across ALL comments (not just newly emitted ones) so the next
+            // tick has the latest baseline regardless of filtering.
             high_water_instant = match high_water_instant {
                 Some(curr) if curr >= instant => Some(curr),
                 _ => Some(instant),
             };
-            // Filter to strictly-newer-than-watermark.
             if let Some(since) = since_instant
                 && instant <= since
             {
@@ -387,10 +333,9 @@ impl Poller {
         high_water_instant.map(|t| t.to_rfc3339())
     }
 
-    /// Emits `jira.comment_added` + (`jira.mention` when body mentions
-    /// me and isn't self-authored) for one comment. Dedupes by id —
-    /// guards against the same comment surviving two ticks if clock skew
-    /// kept the watermark from advancing past it.
+    /// Emits `jira.comment_added` + (`jira.mention` when the body mentions me and isn't
+    /// self-authored) for one comment. Dedupes by id, guarding against the same comment surviving
+    /// two ticks if clock skew kept the watermark from advancing past it.
     fn emit_comment_events(
         &self,
         ticket: &Ticket,
@@ -414,9 +359,8 @@ impl Poller {
         }
     }
 
-    /// Worst case after a flush: a comment from a mid-pagination race
-    /// on the same tick re-fires on the next tick (snapshot moved past
-    /// it but dedupe memory is gone). Acceptable vs per-entry timestamps.
+    /// After a flush, a comment from a mid-pagination race can re-fire on the next tick (the
+    /// snapshot moved past it but the dedupe memory is gone). Accepted over per-entry timestamps.
     fn gc_dedupe_set(&self, state: &mut PollerState) {
         if state.fired_comments.len() > DEDUPE_CAP {
             eprintln!(
@@ -470,9 +414,8 @@ mod tests {
     }
 
     fn fake_ticket(key: &str, status: &str, assignee_id: Option<&str>, comments: u64) -> Ticket {
-        // Generate `comments` synthetic inline comments, each authored
-        // by 5b-other (non-self) at increasing timestamps so the
-        // watermark-based filter exercises real ordering.
+        // `comments` synthetic inline comments by a non-self author at increasing timestamps, so
+        // the watermark filter exercises real ordering.
         let inline_comments: Vec<Value> = (0..comments)
             .map(|i| {
                 json!({
@@ -562,7 +505,6 @@ mod tests {
             api_token: "t",
         };
         let mut state = p.state.lock().unwrap();
-        // Status is "Done" but no baseline → no status_changed.
         let ticket = fake_ticket("PROJ-1", "Done", Some("5b-other"), 0);
         p.process_ticket(creds, &ticket, "5b-me", &mut state);
         drop(state);
@@ -579,13 +521,10 @@ mod tests {
             api_token: "t",
         };
         let mut state = p.state.lock().unwrap();
-        // First tick: assigned to other.
         let t1 = fake_ticket("PROJ-1", "Open", Some("5b-other"), 0);
         p.process_ticket(creds, &t1, "5b-me", &mut state);
         drop(state);
         let _ = drain_kinds(&rx);
-        // Second tick: now assigned to me, with a different updated_iso
-        // (real Jira would bump the timestamp).
         let mut state = p.state.lock().unwrap();
         let mut raw = t1.raw_json.clone();
         raw["fields"]["updated"] = json!("2026-05-05T11:00:00.000+0000");
@@ -629,9 +568,7 @@ mod tests {
         let mut state = p.state.lock().unwrap();
         let ticket = fake_ticket("PROJ-1", "Open", Some("5b-me"), 0);
         p.process_ticket(creds, &ticket, "5b-me", &mut state);
-        // Process again with same updated_iso → no fresh event.
-        // (Snapshot now exists but updated didn't change so neither
-        // does any other field — branches don't fire.)
+        // Processing again with the same updated_iso emits nothing: no field changed.
         let kinds_after_first = drain_kinds(&rx).len();
         p.process_ticket(creds, &ticket, "5b-me", &mut state);
         drop(state);
@@ -652,10 +589,8 @@ mod tests {
 
     #[test]
     fn status_changed_emits_on_repeated_bounce() {
-        // Codex round-2 C2: a ticket bouncing Open → In Progress →
-        // Open → In Progress must emit ALL three transitions, not
-        // just the first one (the cross-tick `<from>-><to>` dedup
-        // we removed used to suppress the third).
+        // A ticket bouncing Open -> In Progress -> Open -> In Progress must emit ALL transitions,
+        // not just the first (a cross-tick `<from>-><to>` dedup would suppress the third).
         let (p, rx) = mk_poller_with_tx();
         let creds = jira::Creds {
             base_url: "https://x.atlassian.net",
@@ -663,22 +598,18 @@ mod tests {
             api_token: "t",
         };
         let mut state = p.state.lock().unwrap();
-        // T0: Open (first sight, no event)
         let t0 = fake_ticket("PROJ-1", "Open", Some("5b-me"), 0);
         p.process_ticket(creds, &t0, "5b-me", &mut state);
         let _ = drain_kinds(&rx);
-        // T1: → In Progress
         let mut raw = t0.raw_json.clone();
         raw["fields"]["status"] = json!({ "name": "In Progress" });
         raw["fields"]["updated"] = json!("2026-05-05T11:00:00.000+0000");
         let t1 = from_jira_json(&raw, "https://x.atlassian.net").unwrap();
         p.process_ticket(creds, &t1, "5b-me", &mut state);
-        // T2: → Open
         raw["fields"]["status"] = json!({ "name": "Open" });
         raw["fields"]["updated"] = json!("2026-05-05T12:00:00.000+0000");
         let t2 = from_jira_json(&raw, "https://x.atlassian.net").unwrap();
         p.process_ticket(creds, &t2, "5b-me", &mut state);
-        // T3: → In Progress AGAIN
         raw["fields"]["status"] = json!({ "name": "In Progress" });
         raw["fields"]["updated"] = json!("2026-05-05T13:00:00.000+0000");
         let t3 = from_jira_json(&raw, "https://x.atlassian.net").unwrap();
@@ -698,12 +629,8 @@ mod tests {
 
     #[test]
     fn comment_delivery_robust_against_deletion_index_shift() {
-        // Codex round-7 C1: Jira's comment indices shift left when
-        // an old comment is deleted. A startAt=N fetch after a
-        // deletion would skip the new comment that shifted into
-        // position N. The timestamp-based watermark this method
-        // uses is robust to that — `created` timestamps don't
-        // change when other comments are deleted.
+        // Jira's comment indices shift left when an old comment is deleted, so a startAt=N fetch
+        // would skip the comment that shifted into N. The timestamp watermark is robust to that.
         let (p, rx) = mk_poller_with_tx();
         let creds = jira::Creds {
             base_url: "https://x.atlassian.net",
@@ -712,27 +639,21 @@ mod tests {
         };
         let mut state = p.state.lock().unwrap();
 
-        // Tick 1: ticket has 5 comments, all timestamps known.
-        // First sight: no comment events emitted, but watermark is set
-        // to the latest comment's `created`.
+        // Tick 1: first sight emits no comment events, but the watermark is set to the latest
+        // comment's `created`.
         let t1 = fake_ticket("PROJ-1", "Open", Some("5b-me"), 5);
         p.process_ticket(creds, &t1, "5b-me", &mut state);
-        // Drain ticket_assigned event (first sight, mine).
         let _ = drain_kinds(&rx);
         let snap = state.snapshots.get("PROJ-1").unwrap().clone();
         assert!(snap.last_comment_created_iso.is_some());
         let watermark_after_first = snap.last_comment_created_iso.clone().unwrap();
-        // fake_ticket comment 4 has created="2026-05-05T14:00:00..."
         assert!(
             watermark_after_first.starts_with("2026-05-05T14:00:00"),
             "got {watermark_after_first}"
         );
 
-        // Between ticks: comment[1] deleted (index 1), 2 NEW comments
-        // added with timestamps 16:00 and 17:00. The remaining comments
-        // are at indices [0, 2, 3, 4, new1, new2] = 6 items but with
-        // the original [10000, 10002, 10003, 10004] + new ids.
-        // Watermark filter sees only timestamps > 14:00 and emits 2.
+        // Between ticks: comment[1] is deleted and 2 NEW comments (16:00, 17:00) are added.
+        // The timestamp watermark sees only those > 14:00 and emits 2.
         let raw = json!({
             "key": "PROJ-1",
             "fields": {
@@ -760,15 +681,11 @@ mod tests {
         p.process_ticket(creds, &t2, "5b-me", &mut state);
         drop(state);
         let kinds = drain_kinds(&rx);
-        // Two new comments → exactly 2 comment_added events.
-        // Status didn't change, assignee didn't change, so no other
-        // events.
         assert_eq!(
             kinds,
             vec!["jira.comment_added", "jira.comment_added"],
             "expected 2 comment_added events for 2 new comments after deletion; got {kinds:?}"
         );
-        // Watermark advanced to the latest new comment's timestamp.
         let snap = p
             .state
             .lock()
@@ -788,19 +705,15 @@ mod tests {
 
     #[test]
     fn snapshot_pruning_treats_re_entry_as_first_sight() {
-        // Codex round-6 C1: a ticket that falls out of the lookback
-        // window then re-enters must NOT diff against months-old
-        // state (which would replay historical comments / emit a
-        // bogus status_changed for transitions that already happened).
-        // The tick() loop prunes snapshots not in the current
-        // observed set, so re-entry hits the first-sight branch.
+        // A ticket that falls out of the lookback window and re-enters must NOT diff against
+        // months-old state (replayed comments, bogus status_changed); tick() prunes snapshots not
+        // observed, so re-entry hits the first-sight branch.
         let (p, rx) = mk_poller_with_tx();
         let creds = jira::Creds {
             base_url: "https://x.atlassian.net",
             email: "e",
             api_token: "t",
         };
-        // Tick 1: ticket assigned to me with 5 comments. Establishes baseline.
         let mut state = p.state.lock().unwrap();
         let t1 = fake_ticket("PROJ-1", "Open", Some("5b-me"), 5);
         p.process_ticket(creds, &t1, "5b-me", &mut state);
@@ -812,9 +725,8 @@ mod tests {
             "snapshot should exist after first tick"
         );
 
-        // Simulate: tick observes EMPTY result set (ticket fell out
-        // of lookback window). The pruning logic in tick() drops
-        // snapshots not in the observed set.
+        // The tick observes an EMPTY result set (ticket fell out of the lookback window) and
+        // prunes snapshots.
         let observed: HashSet<String> = HashSet::new();
         p.state
             .lock()
@@ -827,11 +739,9 @@ mod tests {
             "snapshot should be pruned after disappearance"
         );
 
-        // Now ticket re-enters with status changed AND 10 more comments.
-        // First-sight semantics: emits ticket_assigned (still mine),
-        // does NOT emit status_changed (no baseline), does NOT
-        // backfill historical comments (no watermark → high_water
-        // mark seeded silently from the inline comments).
+        // Re-entry with changed status AND 10 more comments: first-sight semantics emit
+        // ticket_assigned (still mine), no status_changed (no baseline), and no comment backfill
+        // (the high-water mark is seeded silently).
         let mut state = p.state.lock().unwrap();
         let mut raw = t1.raw_json.clone();
         raw["fields"]["status"] = json!({ "name": "Done" });
@@ -850,12 +760,9 @@ mod tests {
 
     #[test]
     fn account_id_cache_invalidates_on_credential_change() {
-        // Codex round-9 C2: re-auth to a different Atlassian account
-        // while copad stays up must invalidate the cached
-        // my_account_id (and snapshots, since the prior account's
-        // assigned-to-me set is irrelevant). Otherwise mention
-        // detection would compare against the old account
-        // indefinitely.
+        // Re-auth to a different Atlassian account while copad stays up must invalidate the cached
+        // my_account_id and the snapshots; otherwise mention detection would compare against the
+        // old account indefinitely.
         let (p, _rx) = mk_poller_with_tx();
         let creds_a = jira::Creds {
             base_url: "https://x.atlassian.net",
@@ -866,7 +773,6 @@ mod tests {
             .resolve_my_account_id(creds_a, &Some("5b-alice".into()))
             .unwrap();
         assert_eq!(id_a, "5b-alice");
-        // Seed a snapshot to confirm it gets cleared on identity change.
         p.state.lock().unwrap().snapshots.insert(
             "PROJ-1".into(),
             TicketSnapshot {
@@ -877,7 +783,6 @@ mod tests {
             },
         );
 
-        // Re-auth: same base_url, different email.
         let creds_b = jira::Creds {
             base_url: "https://x.atlassian.net",
             email: "bob@example.com",
@@ -892,7 +797,6 @@ mod tests {
             "snapshots should clear on identity change"
         );
 
-        // Same creds again → cache hit.
         let id_b2 = p
             .resolve_my_account_id(creds_b, &Some("5b-bob".into()))
             .unwrap();
@@ -901,13 +805,11 @@ mod tests {
 
     #[test]
     fn first_sight_watermark_uses_parsed_instants() {
-        // Codex round-9 C1: high_water_mark must parse to chrono
-        // before max() so mixed +0000 / +00:00 forms order
+        // high_water_mark must parse to chrono before max(), so mixed +0000 / +00:00 forms order
         // chronologically rather than lexicographically.
         let (p, _rx) = mk_poller_with_tx();
-        // Build a ticket where the chronologically-latest comment
-        // uses a different offset form than the others. Lexicographic
-        // max would pick wrong; parsed-instant max picks correctly.
+        // The chronologically-latest comment uses a different offset form than the others, so a
+        // lexicographic max would pick wrong.
         let raw = json!({
             "key": "PROJ-1",
             "fields": {
@@ -919,9 +821,7 @@ mod tests {
                 "updated": "2026-05-05T10:00:00.000+0000",
                 "comment": {
                     "comments": [
-                        // Latest in real time, but uses +00:00 offset.
                         { "id": "1", "body": { "type": "doc", "content": [{"type":"paragraph","content":[{"type":"text","text":"latest"}]}] }, "created": "2026-05-05T15:00:00+00:00", "author": { "accountId": "5b-other" } },
-                        // Older in real time, uses +0000 offset.
                         { "id": "2", "body": { "type": "doc", "content": [{"type":"paragraph","content":[{"type":"text","text":"older"}]}] }, "created": "2026-05-05T14:00:00.000+0000", "author": { "accountId": "5b-other" } }
                     ],
                     "total": 2
@@ -930,9 +830,7 @@ mod tests {
         });
         let ticket = from_jira_json(&raw, "https://x.atlassian.net").unwrap();
         let watermark = p.high_water_mark(&ticket).unwrap();
-        // The 15:00 comment is chronologically latest. Both forms
-        // canonicalize to the same UTC RFC 3339, and the parsed-max
-        // picks the 15:00 one regardless of original offset format.
+        // The 15:00 comment is chronologically latest; both offset forms canonicalize to UTC.
         assert!(
             watermark.starts_with("2026-05-05T15:00:00"),
             "watermark should be the chronologically-latest comment, got {watermark}"
@@ -941,21 +839,16 @@ mod tests {
 
     #[test]
     fn poller_skips_when_fatal_error() {
-        // Construct a fresh poller with fatal_error set (the
-        // mk_poller_with_tx helper produces a clean config; we want
-        // the bad branch here). Drive tick() and confirm no panic.
+        // A fresh poller with fatal_error set (mk_poller_with_tx builds a clean config).
         let cfg = Config::minimal_with_error("bad env".to_string());
         let store: Arc<dyn TokenStore> = Arc::new(FixedStore(None));
         let (tx, _rx2) = channel();
         let p = Poller::new(Arc::new(cfg), store, tx, Arc::new(AtomicBool::new(true)));
-        // tick should return Ok(()) without making any HTTP call.
         assert!(p.tick().is_ok());
     }
 
     #[test]
     fn poller_skips_when_no_credentials() {
-        // Empty config (no env, no fatal), empty store: tick is OK,
-        // no HTTP calls.
         let mut cfg = Config::minimal_with_error("x".to_string());
         cfg.fatal_error = None; // pretend env was OK but empty
         let store: Arc<dyn TokenStore> = Arc::new(FixedStore(None));

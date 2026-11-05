@@ -1,26 +1,19 @@
-//! First-party copad plugin: HTTP+WebSocket broker over copadd's
-//! socket surface. Slice 3.0 of the remote-harness effort.
+//! First-party copad plugin: HTTP+WebSocket broker over copadd's socket surface.
 //!
-//! Lifecycle: this binary IS a copad service plugin. The supervisor
-//! spawns it with stdio piped and expects an `initialize` reply, the
-//! same handshake `plugins/discord/src/main.rs` runs. Once that
-//! handshake completes, the stdio side stays idle and the real work
-//! happens in a tokio runtime that owns an axum HTTP+WS listener.
+//! This binary IS a copad service plugin: the supervisor spawns it with stdio piped and expects
+//! an `initialize` reply (same handshake as `plugins/discord/src/main.rs`). An axum HTTP+WS
+//! listener runs in a tokio runtime on its own thread, started before the stdio loop, which
+//! otherwise stays idle.
 //!
-//! Daemon access: the supervisor injects `COPAD_SOCKET` into the
-//! child env (see `copad-daemon/src/service_supervisor.rs` —
-//! `start_service_inner` sets it alongside the plugin metadata env
-//! vars). The plugin opens raw daemon-socket connections (NOT the
-//! service-plugin RPC channel) so requests flow through the daemon's
-//! normal `dispatch()` path → `GuiRegistry` routing, reaching
-//! GUI-owned methods like `terminal.read` / `terminal.feed` /
-//! `session.list`.
+//! Daemon access: the supervisor injects `COPAD_SOCKET` into the child env
+//! (`copad-daemon/src/service_supervisor.rs`, `start_service_inner`). The plugin opens raw
+//! daemon-socket connections (NOT the service-plugin RPC channel) so requests go through the
+//! daemon's `dispatch()` -> `GuiRegistry` routing and reach GUI-owned methods like
+//! `terminal.read` / `terminal.feed` / `session.list`.
 //!
-//! Auth: Bearer token in `Authorization` header, OR
-//! `Sec-WebSocket-Protocol: bearer.<token>` for WS upgrades. The
-//! middleware never accepts a query-string token. The token comes
-//! from `COPAD_WEB_BRIDGE_TOKEN` env and must be ≥32 chars; if
-//! missing/short the plugin exits before binding.
+//! Auth: Bearer token in the `Authorization` header, OR `Sec-WebSocket-Protocol: bearer.<token>`
+//! for WS upgrades; a query-string token is never accepted. The token comes from
+//! `COPAD_WEB_BRIDGE_TOKEN` and must be >=32 chars, else the plugin exits before binding.
 
 mod agents;
 mod cockpit;
@@ -49,11 +42,9 @@ const MAX_RECENT_LINES: u64 = 200;
 type StdoutHandle = Arc<Mutex<std::io::Stdout>>;
 
 fn main() -> ExitCode {
-    // 1. Token validation must happen BEFORE the supervisor handshake
-    //    so a misconfigured deploy fails fast and visibly. If we wait
-    //    until after `initialize`, the plugin appears healthy in the
-    //    supervisor's eyes but the HTTP listener is dead — much harder
-    //    to diagnose.
+    // Validate the token BEFORE the supervisor handshake so a misconfigured deploy fails fast and
+    // visibly; after `initialize` the plugin would look healthy to the supervisor with a dead
+    // listener.
     let token = match validate_token_env(std::env::var("COPAD_WEB_BRIDGE_TOKEN").ok().as_deref()) {
         Ok(t) => t,
         Err(msg) => {
@@ -82,10 +73,8 @@ fn main() -> ExitCode {
         token.len()
     );
 
-    // 2. Spawn the HTTP listener on a tokio runtime in a dedicated
-    //    OS thread. Keep the main thread free for stdio framing so
-    //    the supervisor's `initialize` / `shutdown` messages stay
-    //    responsive even when axum is mid-handling a long WS stream.
+    // HTTP listener on a tokio runtime in a dedicated OS thread, keeping the main thread free for
+    // stdio framing so `initialize` / `shutdown` stay responsive during long WS streams.
     let token_for_server = token.clone();
     let socket_for_server = socket_path.clone();
     let bind_for_server = bind_addr.clone();
@@ -113,11 +102,8 @@ fn main() -> ExitCode {
         })
         .expect("spawn web-bridge-http thread");
 
-    // 3. Stdio RPC handshake loop. Same shape as discord plugin
-    //    (`plugins/discord/src/main.rs` `run_rpc`). For Slice 3.0 we
-    //    only need `initialize` and `shutdown`; the plugin provides
-    //    no actions, so there are no `action.invoke` frames to
-    //    route. Anything else is ignored with a warning.
+    // Stdio RPC loop: only `initialize` and `shutdown` matter (the plugin provides no actions);
+    // anything else is ignored with a warning.
     let stdin = std::io::stdin();
     let stdout: StdoutHandle = Arc::new(Mutex::new(std::io::stdout()));
     let reader = BufReader::new(stdin.lock());
@@ -166,12 +152,7 @@ fn main() -> ExitCode {
                 );
             }
             "initialized" => {
-                // Supervisor's two-phase handshake: we already spun up
-                // the HTTP listener on initialize, so the post-init
-                // notification is informational. Don't need to gate
-                // anything on it (discord does, to delay its Gateway
-                // WS until daemon is fully ready; web-bridge has no
-                // such ordering concern).
+                // The HTTP listener is already running; nothing is gated on this.
             }
             "shutdown" => {
                 emit_response(&stdout, id, &json!({ "ok": true }));
@@ -185,9 +166,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Validate the env-supplied bearer token. Returns `Ok(token)` on
-/// pass, `Err(message)` on fail — caller prints the message and
-/// exits non-zero. Factored out of `main` so it's unit-testable.
+/// Validate the env-supplied bearer token: `Ok(token)` on pass, `Err(message)` on fail (caller
+/// prints it and exits non-zero). Factored out of `main` to be unit-testable.
 fn validate_token_env(raw: Option<&str>) -> Result<String, String> {
     match raw {
         Some(t) if t.len() >= TOKEN_MIN_LEN => Ok(t.to_string()),
@@ -204,10 +184,8 @@ fn validate_token_env(raw: Option<&str>) -> Result<String, String> {
 }
 
 fn emit_response(stdout: &StdoutHandle, id: &str, result: &Value) {
-    // Wire shape mirrors `plugins/discord/src/main.rs::send_response`:
-    // supervisor's frame parser requires `ok: true` alongside `result`,
-    // not just `{id, result}`. Without `ok` the supervisor logs
-    // "sent unparseable line" and the plugin times out on initialize.
+    // The supervisor's frame parser requires `ok: true` alongside `result`; without it the
+    // supervisor logs "sent unparseable line" and the plugin times out on initialize.
     let frame = json!({ "id": id, "ok": true, "result": result });
     write_frame(stdout, &frame);
 }
@@ -233,40 +211,32 @@ fn write_frame(stdout: &StdoutHandle, frame: &Value) {
 struct AppState {
     daemon: DaemonClient,
     token: Arc<String>,
-    /// The terminal font, resolved + validated once at startup. `None` when the
-    /// configured family isn't installed (or the override failed validation) — the
-    /// endpoint then 404s and the PWA keeps its fallback stack, which is exactly
-    /// today's behaviour, so a missing font degrades rather than breaks.
+    /// The terminal font, resolved + validated once at startup. `None` when the configured family
+    /// isn't installed (or the override failed validation): the endpoint 404s and the PWA keeps
+    /// its fallback stack.
     font: Option<Arc<font::Font>>,
-    /// A font carrying the icon glyphs the terminal font lacks.
-    ///
-    /// The desktop renders devicons and powerline separators because the configured family does
-    /// not have them and the SYSTEM falls back to a Nerd Font. A phone has no such chain — it
-    /// gets exactly the files this server sends — so serving only the terminal font rendered
-    /// every one of those codepoints as tofu.
+    /// A font carrying the icon glyphs the terminal font lacks. The desktop gets devicons and
+    /// powerline separators because the SYSTEM falls back to a Nerd Font; a phone only has the
+    /// files this server sends, so serving just the terminal font rendered those codepoints as
+    /// tofu.
     symbol_font: Option<Arc<font::Font>>,
     default_subscribe_patterns: Arc<Vec<String>>,
-    /// In-process 2 s TTL cache for `/api/tmux/panes`. Multiple
-    /// dashboard tabs hitting refresh shouldn't fan out as N tmux
-    /// shell-outs per click; once the snapshot is built we serve it
-    /// from memory until the TTL expires.
+    /// In-process 2 s TTL cache for `/api/tmux/panes`, so several dashboard tabs refreshing don't
+    /// fan out into N tmux shell-outs.
     tmux_cache: Arc<tokio::sync::Mutex<Option<TmuxCacheEntry>>>,
-    /// In-process TTL cache for `/api/board`, and — unlike `tmux_cache` — the plugin's
-    /// single-flight guard for comux reads. The board handler holds this lock ACROSS the
-    /// fetch, so however many phones are polling there is at most one `comux` child alive at
-    /// a time — the handler's two reads are awaited sequentially for the same reason. That
-    /// bound is the point: comux's client reads its socket with no deadline, so a wedged
-    /// server turns every concurrent poll into another stuck child.
+    /// In-process TTL cache for `/api/board`, and unlike `tmux_cache` the single-flight guard for
+    /// comux reads: the board handler holds this lock ACROSS the fetch (and awaits its two reads
+    /// sequentially), so at most one `comux` child is alive however many phones poll. comux's
+    /// client reads its socket with no deadline, so a wedged server would turn every concurrent
+    /// poll into another stuck child.
     board_cache: Arc<tokio::sync::Mutex<Option<TmuxCacheEntry>>>,
-    /// The live L0 subscription (decisions #166): when synced, `/api/board` is served from it
-    /// with no comux child at all; the CLI path above is the fallback.
+    /// The live L0 subscription (decisions #166): when synced, `/api/board` is served from it with
+    /// no comux child at all; the CLI path is the fallback.
     mux_live: mux_live::Shared,
     /// VAPID config from env. `None` disables the push endpoints (501).
     push_config: Arc<Option<push::PushConfig>>,
-    /// Loaded subscription list — serialised through this Mutex on
-    /// every read/write so the file-on-disk and the in-memory mirror
-    /// stay consistent. Pruning on 410 Gone happens through the same
-    /// guard from the push-trigger task.
+    /// Loaded subscription list, serialised through this Mutex so the file on disk and the
+    /// in-memory mirror stay consistent. 410 Gone pruning goes through the same guard.
     push_subs: Arc<tokio::sync::Mutex<Vec<push::Subscription>>>,
 }
 
@@ -276,14 +246,10 @@ struct TmuxCacheEntry {
     value: Value,
 }
 
-/// True when `bind` resolves to a loopback address (`127.0.0.0/8`
-/// for IPv4 or `::1` for IPv6).
-/// Returns false for unparseable bind strings (fail-closed).
-///
-/// This used to gate the Tailscale identity-header auth path, which no longer exists. It now
-/// drives a startup warning: on a loopback bind the only way to this service is from this
-/// machine or through a proxy the operator put there, while on a routable one the bearer token
-/// is the single thing between the LAN and a terminal.
+/// True when `bind` resolves to a loopback address (`127.0.0.0/8` or `::1`); false for
+/// unparseable bind strings (fail-closed). It drives a startup warning: on a loopback bind the
+/// only way in is from this machine or an operator-placed proxy, while on a routable one the
+/// bearer token is the only thing between the LAN and a terminal.
 fn bind_is_loopback(bind: &str) -> bool {
     use std::net::SocketAddr;
     let parsed: Option<SocketAddr> = bind.parse().ok();
@@ -313,13 +279,6 @@ async fn run_server(
             "[web-bridge] COPAD_WEB_BRIDGE_VAPID_PRIVATE/PUBLIC not set — push notifications disabled"
         );
     }
-    // Resolve the terminal font once, at startup, from the SAME config the desktop
-    // terminal uses — so the phone renders in the user's font rather than a guess.
-    // Failure is non-fatal: the PWA just keeps its fallback stack (today's behaviour).
-    // The glyphs the terminal font does not have. Family is configurable; the default is the
-    // Nerd Font the desktop already falls back to. Its own override var, deliberately not
-    // `COPAD_WEB_BRIDGE_FONT` — that pins one exact file, and sharing it would serve the same
-    // glyph-incomplete font from both endpoints.
     let symbol_font = (|| {
         let family = std::env::var("COPAD_WEB_BRIDGE_SYMBOL_FAMILY")
             .unwrap_or_else(|_| "JetBrainsMonoNerdFont".to_string());
@@ -413,7 +372,7 @@ async fn run_server(
         .route("/api/events", get(handle_events_history))
         .route("/api/tmux/panes", get(handle_tmux_panes))
         .route("/api/tmux/send", post(handle_tmux_send))
-        // Phase 24.6 — orchestration cockpit (pilot goal queue + csd + tmx).
+        // Orchestration cockpit (pilot goal queue + csd + tmx).
         .route("/api/pilot/status", get(handle_pilot_status))
         .route("/api/pilot/goals", post(handle_pilot_add))
         .route("/api/pilot/goals/:id/answer", post(handle_pilot_answer))
@@ -446,51 +405,37 @@ async fn run_server(
                 let token = auth_state.token.clone();
                 async move {
                     let path = req.uri().path();
-                    // SPA root + health are unauthenticated so the
-                    // dashboard HTML loads before JS injects the token
-                    // into the Authorization header on subsequent
-                    // /api/* / /ws/* calls. PWA manifest + service
-                    // worker + icon are unauthenticated for the same
-                    // reason — the browser fetches them on install
-                    // without an Authorization header. None of these
-                    // expose data (manifest is metadata, sw.js owns
-                    // only post-permission push notifications).
+                    // The SPA root and health are unauthenticated so the dashboard HTML loads
+                    // before JS injects the token into later /api/* / /ws/* calls. The PWA
+                    // manifest, service worker and icon are fetched on install without an
+                    // Authorization header. None expose data.
                     let public = path == "/"
                         || path == "/healthz"
                         || path == "/manifest.webmanifest"
                         || path == "/sw.js"
                         || path == "/icon.svg"
-                        // The shell's script + stylesheet. A `<script src>` / `<link>` fetch
-                        // sends no Authorization header, so authing these would 401 and leave
-                        // a blank page; neither carries a secret.
+                        // A `<script src>` / `<link>` fetch sends no Authorization header, so
+                        // authing these would 401 and leave a blank page; neither carries a secret.
                         || path == "/app.js"
                         || path == "/app.css"
-                        // A CSS @font-face fetch sends no Authorization header, so an
-                        // authed font URL would 401 and leave the glyphs broken — the
-                        // very bug it exists to fix. Public is therefore forced, which
-                        // is why font::load() validates magic + size + regular-file
-                        // before a byte is served.
+                        // A CSS @font-face fetch sends no Authorization header, so an authed
+                        // font URL would 401 and break the glyphs; public is forced, which is why
+                        // font::load() validates magic + size + regular-file before serving.
                         || path == "/font/terminal"
-                        // Same reason: a CSS @font-face fetch carries no Authorization header.
                         || path == "/font/symbols";
                     let upgrades = path.starts_with("/ws/");
                     if public {
                         return next.run(req).await;
                     }
-                    // There is deliberately NO identity-header auth path here.
-                    //
-                    // `tailscale serve` attaches `Tailscale-User-Login` to every request it
-                    // forwards, and trusting it let a browser on any admitted device reach this
-                    // service with no token. WebSocket upgrades are not subject to CORS and send
-                    // no preflight, so ANY page that device visited could have opened
-                    // `/ws/board/attach` — a terminal that accepts raw keystrokes — and had
-                    // serve supply the identity for it. The bearer path has no equivalent hole:
-                    // a cross-site page cannot produce `Sec-WebSocket-Protocol: bearer.<token>`
-                    // without the token. Closing the gap would have meant an origin policy on
-                    // top of an allowlist, two competing auth decisions, to save typing a token
-                    // once per session. See docs/mobile-access.md.
+                    // There is deliberately NO identity-header auth path here. `tailscale serve`
+                    // attaches `Tailscale-User-Login` to every forwarded request, and trusting it
+                    // let a browser on any admitted device reach this service with no token.
+                    // WebSocket upgrades have no CORS or preflight, so ANY page that device
+                    // visited could have opened `/ws/board/attach` (a terminal accepting raw
+                    // keystrokes) with serve supplying the identity. The bearer path has no such
+                    // hole: a cross-site page cannot produce `Sec-WebSocket-Protocol:
+                    // bearer.<token>` without the token. See docs/mobile-access.md.
                     if upgrades {
-                        // WS auth via Sec-WebSocket-Protocol: bearer.<token>
                         if !ws_subprotocol_ok(req.headers(), &token) {
                             return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
                         }
@@ -503,12 +448,10 @@ async fn run_server(
         ))
         .with_state(state.clone());
 
-    // Push trigger task. Polls the attention queue every 5 s. Anything
-    // strictly newer than the last seen ts gets fanned out to every
-    // subscription whose kinds filter accepts the event. 410 Gone /
-    // 404 Not Found endpoints are pruned in-place. On startup we
-    // anchor at the latest ts in the queue so we don't push the user's
-    // entire backlog at boot. No-op when VAPID isn't configured.
+    // Push trigger task: polls the attention queue every 5 s and fans anything new out to every
+    // subscription whose kinds filter accepts it; 410 Gone / 404 endpoints are pruned in place.
+    // Startup anchors at the queue's latest entries so the backlog isn't pushed at boot. No-op
+    // when VAPID isn't configured.
     if state.push_config.is_some() {
         let push_state = state.clone();
         tokio::spawn(async move { push_loop(push_state).await });
@@ -534,15 +477,12 @@ async fn push_loop(state: AppState) {
         Some(c) => c.clone(),
         None => return,
     };
-    // Per-entry fingerprint dedup instead of just `ts > last_seen`.
-    // The bash hooks write second-granularity timestamps so two events
-    // appended in the same second would collide on `ts` alone — we
-    // need to know each entry by its content, not just its time. Set
-    // capacity grows then GCs to the latest N when overflowing.
+    // Per-entry fingerprint dedup rather than `ts > last_seen`: the bash hooks write
+    // second-granularity timestamps, so two events in the same second would collide on `ts`. The
+    // set grows, then GCs to the latest N on overflow.
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut seen_order: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     const SEEN_CAP: usize = 1024;
-    // Pre-seed with the existing backlog so boot doesn't dump it.
     if let Ok(boot) = agents::read_snapshot() {
         for e in &boot.attention {
             let fp = attention_fingerprint(e);
@@ -555,8 +495,8 @@ async fn push_loop(state: AppState) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        // Pull a fresh tmx snapshot for its attention array. tmx
-        // applies a 60-min cutoff; we just diff against `seen`.
+        // Fresh tmx snapshot for its attention array (tmx applies a 60-min cutoff); we diff
+        // against `seen`.
         let snap = match agents::read_snapshot() {
             Ok(s) => s,
             Err(e) => {
@@ -572,8 +512,6 @@ async fn push_loop(state: AppState) {
         if new_entries.is_empty() {
             continue;
         }
-        // Walk oldest first so notifications arrive in chronological
-        // order on the device.
         new_entries.sort_by_key(|e| e.ts);
 
         let subs_snapshot = state.push_subs.lock().await.clone();
@@ -633,12 +571,11 @@ async fn push_loop(state: AppState) {
     }
 }
 
-/// Send one payload to every subscription, optionally gated by the
-/// subscriber's kind filter. `filter_kind = None` force-delivers to all
-/// subscriptions regardless of their filter — used for pilot gate
-/// notifications, the highest-signal event copad emits (a blocked
-/// autonomous loop waiting on a human). Terminal endpoints (410 Gone /
-/// 404) are appended to `pruned` for the caller to remove in one pass.
+/// Send one payload to every subscription, optionally gated by the subscriber's kind filter.
+/// `filter_kind = None` force-delivers to all regardless of filter (used for pilot gate
+/// notifications, the highest-signal event: a blocked autonomous loop waiting on a human).
+/// Terminal endpoints (410 Gone / 404) are appended to `pruned` for the caller to remove in one
+/// pass.
 async fn fan_out(
     cfg: &push::PushConfig,
     subs: &[push::Subscription],
@@ -662,9 +599,8 @@ async fn fan_out(
     }
 }
 
-/// Drop subscriptions whose endpoints returned a terminal error and
-/// persist the trimmed list. No-op on an empty prune set. `retain`-by-id
-/// is idempotent, so two loops pruning the same id concurrently is safe.
+/// Drop subscriptions whose endpoints returned a terminal error and persist the trimmed list.
+/// `retain`-by-id is idempotent, so two loops pruning the same id concurrently is safe.
 async fn prune_subscriptions(state: &AppState, pruned_ids: &[String]) {
     if pruned_ids.is_empty() {
         return;
@@ -676,25 +612,21 @@ async fn prune_subscriptions(state: &AppState, pruned_ids: &[String]) {
     }
 }
 
-/// Poll task: surfaces pilot goals that hit a gate (`awaiting_gate` —
-/// waiting on a human answer/approval) as Web Push, so a goal that
-/// blocks at 2am pings the phone instead of silently stalling the queue.
+/// Poll task: surfaces pilot goals at a gate (`awaiting_gate`, waiting on a human) as Web Push, so
+/// a goal that blocks at 2am pings the phone.
 ///
-/// Polls `pilot.status` rather than subscribing to the `pilot.goal_blocked`
-/// bus event: events are ephemeral, so a consumer that's down when the
-/// gate opens loses it; a poll re-reads the live queue and is self-healing
-/// across a web-bridge restart. No-op when VAPID is unconfigured or the
-/// pilot plugin isn't running (the RPC just errors and we retry).
+/// Polls `pilot.status` rather than subscribing to the `pilot.goal_blocked` bus event: events are
+/// ephemeral and lost if the consumer is down when the gate opens, while a poll re-reads the live
+/// queue and self-heals across a web-bridge restart. No-op when VAPID is unconfigured or pilot
+/// isn't running (the RPC errors and we retry).
 async fn pilot_push_loop(state: AppState) {
     let cfg = match state.push_config.as_ref().as_ref() {
         Some(c) => c.clone(),
         None => return,
     };
-    // No boot pre-seed (unlike push_loop): the pilot queue is sequential,
-    // so at most one gate is open at any time. Re-surfacing that single
-    // open gate after a web-bridge restart is a desired reminder, not the
-    // stale-backlog dump push_loop guards against. The in-memory `seen`
-    // set still prevents re-pushing the same gate on every 5s tick.
+    // No boot pre-seed (unlike push_loop): the pilot queue is sequential, so at most one gate is
+    // open. Re-surfacing it after a restart is a desired reminder, not the stale-backlog dump
+    // push_loop guards against. `seen` still stops re-pushing it every 5s tick.
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -730,9 +662,8 @@ async fn pilot_push_loop(state: AppState) {
     }
 }
 
-/// One Web Push to emit for a freshly-blocked pilot goal. Owned (not
-/// borrowed) so `pilot_gate_pushes` stays a pure, unit-testable mapping
-/// from a `pilot.status` value to the notifications it implies.
+/// One Web Push for a freshly-blocked pilot goal. Owned so `pilot_gate_pushes` stays a pure,
+/// unit-testable mapping from a `pilot.status` value to notifications.
 struct GatePush {
     title: String,
     body: String,
@@ -740,12 +671,10 @@ struct GatePush {
     url: String,
 }
 
-/// Scan a `pilot.status` response for goals at a gate, returning one
-/// `GatePush` per gate not already in `seen`. The dedup fingerprint
-/// covers the goal id plus the *entire* gate object (kind + prompt +
-/// options + plan_file), so a goal that re-blocks with a different
-/// question or option set notifies again, while a still-open gate seen
-/// on the previous tick stays quiet. Marks every gate seen (even with no
+/// Scan a `pilot.status` response for goals at a gate, returning one `GatePush` per gate not in
+/// `seen`. The fingerprint covers the goal id plus the *entire* gate object (kind + prompt +
+/// options + plan_file), so a goal that re-blocks with a different question or option set
+/// notifies again while a still-open gate stays quiet. Every gate is marked seen (even with no
 /// subscribers) so dedup state advances regardless of delivery.
 fn pilot_gate_pushes(status: &Value, seen: &mut std::collections::HashSet<u64>) -> Vec<GatePush> {
     use std::collections::hash_map::DefaultHasher;
@@ -789,8 +718,6 @@ fn pilot_gate_pushes(status: &Value, seen: &mut std::collections::HashSet<u64>) 
     out
 }
 
-/// Clamp a gate prompt to a notification-sized string on a char boundary
-/// (push bodies render at most a couple of lines on a phone anyway).
 fn truncate_prompt(s: &str) -> String {
     const MAX: usize = 120;
     if s.chars().count() <= MAX {
@@ -801,9 +728,8 @@ fn truncate_prompt(s: &str) -> String {
     out
 }
 
-/// Fingerprint an attention entry across (ts, kind, title, body,
-/// session_id). Stable hasher choice doesn't matter — we never persist
-/// the value across restarts, just dedup within one push_loop lifetime.
+/// Fingerprint an attention entry across (ts, kind, title, body, session_id). Never persisted, so
+/// the hasher choice doesn't matter; it only dedups within one push_loop lifetime.
 fn attention_fingerprint(e: &agents::Attention) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -816,8 +742,6 @@ fn attention_fingerprint(e: &agents::Attention) -> u64 {
     h.finish()
 }
 
-/// Minimal URL-encoder for the path-segment subset we emit. Avoids
-/// pulling in `urlencoding` for one call site.
 fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -834,18 +758,13 @@ fn urlenc(s: &str) -> String {
 
 /// Serve one of the three compile-time files that make up the PWA shell.
 ///
-/// **Caching.** `no-cache` + a strong content ETag, the same shape `/font/terminal` uses and
-/// for the same reason: the page, its script and its stylesheet are separate requests at
-/// stable URLs with no build hash (the HTML is `include_str!`'d and cannot carry one), so
-/// anything with a lifetime could pin a stale `app.js` against a new `index.html` — a mismatch
-/// whose only symptom is a broken page. `no-cache` stores the body but always revalidates, and
-/// the ETag is what makes that revalidation cost a 304 instead of re-sending ~70 KB to a phone
-/// on cellular every single load. Without a validator `no-cache` is just "download it again".
-///
-/// Not `private`: these bytes are identical for every viewer and carry nothing user-specific.
-///
-/// The ETag is content-derived, so it changes exactly when the asset does — there is no build
-/// step here to supply a version, and mtime/size would not survive `include_str!` at all.
+/// **Caching.** `no-cache` + a strong content ETag, as `/font/terminal` and for the same reason:
+/// the page, script and stylesheet are separate requests at stable URLs with no build hash (the
+/// HTML is `include_str!`'d), so a lifetime could pin a stale `app.js` against a new `index.html`,
+/// a mismatch whose only symptom is a broken page. `no-cache` stores the body but always
+/// revalidates, and the ETag makes that a 304 instead of re-sending ~70 KB to a phone on cellular.
+/// The ETag is content-derived (no build step supplies a version; mtime/size don't survive
+/// `include_str!`). Not `private`: the bytes are identical for every viewer.
 fn shell_asset(
     headers: &axum::http::HeaderMap,
     content_type: &'static str,
@@ -889,13 +808,11 @@ async fn handle_index(headers: axum::http::HeaderMap) -> axum::response::Respons
     )
 }
 
-/// `GET /app.js` — the PWA's script, loaded as a module.
-///
-/// Public, like `/sw.js` and `/icon.svg`: a `<script src>` sends no Authorization header, so an
-/// authed URL would 401 and leave a blank page — the same reason `/font/terminal` is public.
-/// It carries no secrets; the bearer token is typed by the user and lives in `sessionStorage`.
-/// The MIME type is load-bearing for a module script: a browser refuses to execute one served
-/// as anything but JavaScript, and it does so silently apart from a console line.
+/// `GET /app.js` — the PWA's script, loaded as a module. Public, like `/sw.js` and `/icon.svg`: a
+/// `<script src>` sends no Authorization header, so an authed URL would 401 and leave a blank
+/// page. It carries no secrets (the bearer token is typed by the user and lives in
+/// `sessionStorage`). The MIME type is load-bearing: a browser silently refuses to execute a
+/// module script served as anything but JavaScript.
 async fn handle_app_js(headers: axum::http::HeaderMap) -> axum::response::Response {
     shell_asset(
         &headers,
@@ -917,18 +834,10 @@ async fn handle_healthz() -> &'static str {
     "ok\n"
 }
 
-/// `GET /api/whoami` — surfaces which auth path the caller is on.
-/// SPA hits this once on load (without an Authorization header) to
-/// decide whether to skip the token-input page entirely. Tailscale
-/// serve injects `Tailscale-User-Login` on every proxied request;
-/// bearer-token requests show that fallback. Anything else gets 401
-/// from the middleware before reaching here.
-/// `GET /api/whoami` — how this request authenticated.
-///
-/// Always `bearer`, because that is now the only way to get here: the route is behind the
-/// auth middleware, so reaching this function already proves a valid token. It must NOT infer
-/// a mode from `Tailscale-User-Login`; reporting an identity the middleware did not act on is
-/// how a client ends up believing it is authenticated by a header that authenticates nothing.
+/// `GET /api/whoami` — how this request authenticated. Always `bearer`: the route is behind the
+/// auth middleware, so reaching it proves a valid token. It must NOT infer a mode from
+/// `Tailscale-User-Login`; reporting an identity the middleware did not act on lets a client
+/// believe a header authenticates it.
 async fn handle_whoami() -> axum::Json<Value> {
     axum::Json(json!({ "auth": "bearer" }))
 }
@@ -966,17 +875,14 @@ async fn handle_icon() -> axum::response::Response {
         .into_response()
 }
 
-/// `GET /font/terminal` — the workstation's terminal font, for the PWA's @font-face.
+/// `GET /font/terminal` — the workstation's terminal font, for the PWA's @font-face. Public (see
+/// the allowlist). `Content-Type` is sniffed from the file's magic, not assumed from a path.
 ///
-/// Public (see the allowlist). `Content-Type` is sniffed from the file's magic rather
-/// than assumed from a path, so the declaration always matches the bytes.
-///
-/// Caching is `private, no-cache` + a strong content-hash ETag, NOT
-/// `immutable`/`max-age`: the URL is stable (the HTML is include_str!'d and can't carry
-/// a build hash), so a long max-age would pin a stale font for its whole lifetime with
-/// the ETag never consulted. `no-cache` still stores the body — it just revalidates —
-/// so the 2.4 MB body transfers once and later loads cost a tiny 304. `private` keeps
-/// shared proxies from storing the user's font bytes.
+/// Caching is `private, no-cache` + a strong content-hash ETag, NOT `immutable`/`max-age`: the URL
+/// is stable (the HTML is include_str!'d and can't carry a build hash), so a long max-age would
+/// pin a stale font with the ETag never consulted. `no-cache` still stores the body and
+/// revalidates, so the 2.4 MB transfers once and later loads cost a 304. `private` keeps shared
+/// proxies from storing the user's font bytes.
 async fn handle_font(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
@@ -984,8 +890,7 @@ async fn handle_font(
     serve_font(state.font.clone(), "terminal", &headers)
 }
 
-/// `GET /font/symbols` — the icon glyphs the terminal font lacks. Public, same as
-/// `/font/terminal` and for the same reason.
+/// `GET /font/symbols` — the icon glyphs the terminal font lacks. Public, as `/font/terminal`.
 async fn handle_symbol_font(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1146,9 +1051,8 @@ async fn handle_push_test(
             }
         }
     }
-    // Retain-by-id instead of full replace so a concurrent subscribe
-    // landed during the send fan-out isn't clobbered. Save only when
-    // we actually pruned to avoid a no-op disk write per test.
+    // Retain-by-id instead of a full replace so a subscribe landing during the send fan-out isn't
+    // clobbered. Save only when something was pruned.
     let pruned = pruned_ids.len();
     if pruned > 0 {
         let mut subs = state.push_subs.lock().await;
@@ -1209,12 +1113,8 @@ struct EventsQuery {
 async fn handle_panes_list(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
-    // Slice 3.0 takes the simpler path: surface session.list
-    // verbatim. cwd + recent_lines per-panel enrichment is a
-    // separate /api/panes/:id/recent call. The dashboard renders
-    // the bare list first (fast) and lazily fills per-pane detail
-    // when the user expands one — avoids the N+1 fan-out on every
-    // refresh.
+    // Surface session.list verbatim; per-pane detail comes from a separate
+    // /api/panes/:id/recent call, avoiding an N+1 fan-out on every refresh.
     let v = state.daemon.rpc("session.list", json!({})).await?;
     Ok(axum::Json(v))
 }
@@ -1239,8 +1139,6 @@ async fn handle_pane_recent(
         .daemon
         .rpc("terminal.history", json!({ "id": id, "lines": lines }))
         .await?;
-    // daemon returns `{text, lines_requested, rows, cols}`; UI consumes
-    // `{lines: [...]}`. Split text into trimmed-trailing-empty lines.
     let text = raw.get("text").and_then(Value::as_str).unwrap_or("");
     let mut split_lines: Vec<&str> = text.split('\n').collect();
     while split_lines.last().map(|s| s.is_empty()).unwrap_or(false) {
@@ -1258,10 +1156,8 @@ struct InputBody {
     text: String,
 }
 
-/// Composite tmux overview: `tmux list-panes -a` + per-pane
-/// `capture-pane` for the last 5 lines. Cached for 2 s in-plugin.
-/// Empty array (NOT error) when no tmux server is running — the SPA
-/// renders a "no tmux sessions yet" empty state.
+/// Composite tmux overview: `tmux list-panes -a` + per-pane `capture-pane` for the last 5 lines,
+/// cached 2 s in-plugin. Empty array (NOT error) when no tmux server is running.
 async fn handle_tmux_panes(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
@@ -1305,13 +1201,10 @@ async fn handle_tmux_send(
     Ok(axum::Json(json!({ "ok": true })))
 }
 
-// --- Phase 24.6: orchestration cockpit (pilot goal queue) ---
-
-/// `GET /api/pilot/status` — the goal queue (pilot.status, via daemon RPC)
-/// aggregated with the live `csd ps` driven sessions and the `tmx agents`
-/// observation snapshot. The two side-cars are best-effort (see
-/// `cockpit::aggregate`); a `no_gui`-style daemon error on pilot.status
-/// itself still surfaces as a 5xx so the UI shows "pilot not running".
+/// `GET /api/pilot/status` — the goal queue (pilot.status via daemon RPC) aggregated with live
+/// `csd ps` sessions and the `tmx agents` snapshot. The two side-cars are best-effort (see
+/// `cockpit::aggregate`); a daemon error on pilot.status itself still surfaces as a 5xx so the UI
+/// shows "pilot not running".
 async fn handle_pilot_status(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
@@ -1325,8 +1218,7 @@ async fn handle_pilot_status(
     .await
     .map_err(|e| AppError::custom("internal", &format!("tmx agents task: {e}")))?;
     let mut out = cockpit::aggregate(pilot, csd, tmx);
-    // Configured projects power the cockpit's cwd picker (so a goal can be
-    // targeted at a project without hand-typing the path). Best-effort.
+    // Configured projects power the cockpit's cwd picker. Best-effort.
     let projects = state
         .daemon
         .rpc("project.list", json!({}))
@@ -1345,7 +1237,6 @@ struct PilotAddBody {
     posture: Option<String>,
 }
 
-/// `POST /api/pilot/goals` — enqueue a goal from the cockpit.
 async fn handle_pilot_add(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::Json(body): axum::Json<PilotAddBody>,
@@ -1362,7 +1253,6 @@ struct PilotAnswerBody {
     text: String,
 }
 
-/// `POST /api/pilot/goals/:id/answer` — answer a clarifying-question gate.
 async fn handle_pilot_answer(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1380,7 +1270,6 @@ struct PilotApproveBody {
     option: Option<u32>,
 }
 
-/// `POST /api/pilot/goals/:id/approve` — approve a plan / permission / trust gate.
 async fn handle_pilot_approve(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1393,7 +1282,6 @@ async fn handle_pilot_approve(
     Ok(axum::Json(state.daemon.rpc("pilot.approve", params).await?))
 }
 
-/// `POST /api/pilot/goals/:id/cancel` — cancel a goal and kill its session.
 async fn handle_pilot_cancel(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1405,26 +1293,22 @@ async fn handle_pilot_cancel(
     Ok(axum::Json(v))
 }
 
-/// `GET /api/board` — the mobile board's fleet read: every comux session and every agent
-/// pane across all of them.
-///
-/// This is the endpoint that exists because `/api/tmux/panes` answers `{"panes":[]}` on a
-/// machine running 10 comux sessions and 27 agents.
+/// `GET /api/board` — the mobile board's fleet read: every comux session and every agent pane
+/// across all of them (`/api/tmux/panes` answers `{"panes":[]}` on a machine running comux).
 ///
 /// **Partial failure is representable on purpose.** `sessions` and `agents` are two separate
-/// `comux` invocations, so one can fail while the other succeeds. A collection is `null` when
-/// it could not be READ and `[]` when it was read and was empty — collapsing those would
-/// render "we could not look" as "your fleet is gone". Whatever succeeded is still returned,
-/// and every failure is named in `errors`.
+/// `comux` invocations, so one can fail while the other succeeds. A collection is `null` when it
+/// could not be READ and `[]` when it was read and empty; collapsing those would render "we could
+/// not look" as "your fleet is gone". Whatever succeeded is returned, and every failure is named
+/// in `errors`.
 ///
-/// **The counts can disagree.** The two calls are sampled at slightly different instants, so
-/// a session's `agents` count need not match how many rows `agents` carries for it during a
-/// change. `fetched_at_ms` is when the composition finished; it says nothing about how fresh
-/// comux's own cached classification is, which is why `status_is_inferred` is always set.
+/// **The counts can disagree.** The two calls are sampled at slightly different instants, so a
+/// session's `agents` count need not match its rows in `agents` during a change. `fetched_at_ms`
+/// is when the composition finished, not how fresh comux's cached classification is, which is why
+/// `status_is_inferred` is always set.
 async fn handle_board(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
-    // The live subscription first: comux's own published values, no child, no TTL needed.
     if let Some((sessions, agents)) = mux_live::board(&state.mux_live) {
         return Ok(axum::Json(json!({
             "fetched_at_ms": std::time::SystemTime::now()
@@ -1447,10 +1331,9 @@ async fn handle_board(
         return Ok(axum::Json(entry.value.clone()));
     }
 
-    // SEQUENTIAL, not `join!`. Running the two reads concurrently would put two children in
-    // flight, and against a wedged comux server both sit there until their deadlines — which
-    // would make the single-flight guard above a half-truth. Both results are still kept, so
-    // partial failure is unaffected; the only cost is two serial socket round trips.
+    // SEQUENTIAL, not `join!`: concurrent reads would put two children in flight, and against a
+    // wedged comux both sit until their deadlines, making the single-flight guard a half-truth.
+    // Partial failure is unaffected; the cost is two serial socket round trips.
     let sessions = comux::list_sessions().await;
     let agents = comux::list_agents().await;
     let mut errors = Vec::new();
@@ -1484,11 +1367,9 @@ async fn handle_board(
     Ok(axum::Json(snapshot))
 }
 
-/// `GET /api/board/attach-preflight` — can the phone open a terminal right now?
-///
-/// This exists because a WebSocket upgrade cannot report WHY it failed: a browser that gets a
-/// 503 on `/ws/board/attach` sees only a closed socket, and the UI can say nothing better than
-/// "disconnected". So the client asks over plain HTTP first and gets an answer it can show.
+/// `GET /api/board/attach-preflight` — can the phone open a terminal right now? A WebSocket
+/// upgrade can't report WHY it failed (the browser sees only a closed socket), so the client asks
+/// over plain HTTP first and gets an answer it can show.
 async fn handle_board_preflight(
     axum::extract::State(_state): axum::extract::State<AppState>,
 ) -> axum::Json<Value> {
@@ -1510,15 +1391,13 @@ struct BoardJump {
 
 /// `POST /api/board/jump` — move the mux's focus to one pane, addressed by its token.
 ///
-/// This is what makes a board row a destination rather than a link to "whatever comux happens to
-/// be showing". It MOVES THE DESKTOP'S VIEW as well, because comux composes one frame for every
-/// attached client — and that is the intended behaviour, not a leak: the person tapping the phone
-/// is the person sitting at the desk. The alternative (a per-client view) is the per-pane semantic
-/// grid, decisions #65/#66.
+/// It MOVES THE DESKTOP'S VIEW as well, because comux composes one frame for every attached
+/// client; that is intended (the person tapping the phone is the person at the desk). The
+/// alternative, a per-client view, is the per-pane semantic grid (decisions #65/#66).
 ///
-/// A refusal is reported rather than smoothed over. Pane tokens are qualified by server
-/// incarnation, so every token the phone is holding goes stale on `comux server restart`; showing
-/// the focused session instead of saying so would reproduce exactly the bug this endpoint fixes.
+/// A refusal is reported, not smoothed over: pane tokens are qualified by server incarnation, so
+/// every token the phone holds goes stale on `comux server restart`, and showing the focused
+/// session instead would reproduce the bug this endpoint fixes.
 async fn handle_board_jump(
     axum::extract::State(_state): axum::extract::State<AppState>,
     axum::Json(body): axum::Json<BoardJump>,
@@ -1528,9 +1407,8 @@ async fn handle_board_jump(
     }
     match comux::jump(&body.token).await {
         Ok(()) => Ok(axum::Json(json!({ "ok": true, "token": body.token }))),
-        // A pane that is not there is the CLIENT's problem — a token it has been holding since
-        // before the last `comux server restart` — not a server fault, and logging it as a 500
-        // would bury the one failure this endpoint expects to see.
+        // A missing pane is the CLIENT's problem (a token held since before the last `comux
+        // server restart`), not a server fault; a 500 would bury the failure this endpoint expects.
         Err(e) if e.to_string().contains("unknown pane") => {
             Err(AppError::custom("unknown_pane", &e.to_string()))
         }
@@ -1539,25 +1417,19 @@ async fn handle_board_jump(
 }
 
 /// `WS /ws/board/attach` — a real terminal on the phone: the comux CLIENT itself, run inside a
-/// PTY and pumped to xterm.js.
-///
-/// Running the actual client rather than reimplementing its rendering means the phone sees
-/// exactly what the desktop sees — same sidebar, status bar, keybindings — and there is no
+/// PTY and pumped to xterm.js, so the phone sees exactly what the desktop sees and there is no
 /// second renderer to keep in sync.
 ///
-/// Two things are load-bearing:
-///
-/// * **`--no-spawn`.** Bare `comux` is connect-or-spawn, so with no server running this would
-///   birth one parented to copadd, whose environment is scrubbed of the volatile session vars
-///   and whose kernel session is a daemon's. That server would then own every pane the user
-///   opens afterwards. The flag makes comux refuse instead.
-/// * **An explicit socket.** The path comes from `comux doctor` and is passed back in as
+/// Load-bearing:
+/// * **`--no-spawn`.** Bare `comux` is connect-or-spawn; with no server running it would birth one
+///   parented to copadd, whose environment is scrubbed of the volatile session vars and whose
+///   kernel session is a daemon's, and that server would then own every pane opened afterwards.
+/// * **An explicit socket.** The path comes from `comux doctor` and is passed back as
 ///   `COPAD_MUX_SOCK`, so the preflight and the client cannot resolve different servers.
 ///
 /// Known limitation: comux adopts the ATTACHING client's session vars for panes that client
-/// creates. copadd's environment has those scrubbed, so a pane created FROM THE PHONE gets no
-/// `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` injected. The desktop client re-applies its own on its
-/// next action, so nothing it creates is affected.
+/// creates, and copadd's are scrubbed, so a pane created FROM THE PHONE gets no
+/// `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`. The desktop client re-applies its own on its next action.
 async fn handle_ws_board_attach(
     axum::extract::State(state): axum::extract::State<AppState>,
     ws: axum::extract::WebSocketUpgrade,
@@ -1598,20 +1470,15 @@ async fn handle_ws_board_attach(
         .into_response()
 }
 
-/// Sync helper used inside `spawn_blocking`. Builds the overview JSON
-/// `{panes, attention, codex_jobs}` by joining our `tmux list-panes`
-/// rows against `tmx agents --json`. tmx owns the agent classification,
-/// process-tree walk, attention queue read, and codex-job scan; we own
-/// pane preview (`capture-pane`) and the join by `pane_pid`.
+/// Sync helper used inside `spawn_blocking`. Builds the overview JSON `{panes, attention,
+/// codex_jobs}` by joining our `tmux list-panes` rows against `tmx agents --json`. tmx owns agent
+/// classification, process-tree walk, attention queue and codex-job scan; we own pane preview
+/// (`capture-pane`) and the join by `pane_pid`.
 ///
-/// Failure modes degrade rather than abort:
-///   * tmx not installed / fails → panes still render, `agent` is null
-///     on every card, attention + codex_jobs are empty.
-///   * Per-pane capture-pane failure → that card's `last_lines: []`.
+/// Failure modes degrade rather than abort: tmx missing/failing leaves panes rendered with a null
+/// `agent` and empty attention + codex_jobs; a per-pane capture failure gives `last_lines: []`.
 fn build_tmux_snapshot() -> Result<Value, AppError> {
     let panes = tmux::list_panes().map_err(|msg| AppError::custom("tmux_error", &msg))?;
-    // codex_jobs ride along in the snapshot since tmx 1.1 (alive-filtered
-    // there) — no local read of `~/.claude/state/codex-companion/`.
     let tmx_snap = agents::read_snapshot().unwrap_or_else(|e| {
         eprintln!("[web-bridge] tmx snapshot unavailable, degrading: {e}");
         agents::TmxSnapshot::default()
@@ -1629,10 +1496,8 @@ fn build_tmux_snapshot() -> Result<Value, AppError> {
                     lines
                 })
                 .unwrap_or_default();
-            // Join on pane_pid — that's the one identifier tmx + our
-            // list_panes both surface. Falls back to None when either
-            // side is missing the pid (old tmx without pane_pid in its
-            // JSON, or a non-numeric pane_pid from the tmux format).
+            // Join on pane_pid, the one identifier tmx and list_panes both surface; None when
+            // either side lacks it (old tmx, or a non-numeric pane_pid).
             let agent = p.pane_pid.and_then(|pid| tmx_snap.agent_for_pane_pid(pid));
             let agent_json = agent.map(|a| {
                 json!({
@@ -1660,8 +1525,6 @@ fn build_tmux_snapshot() -> Result<Value, AppError> {
             })
         })
         .collect();
-    // Attention + codex_jobs come straight from tmx — same window /
-    // zombie-filter / classification it uses for its TUI.
     let mut attention = tmx_snap.attention;
     attention.truncate(20);
     Ok(json!({
@@ -1676,9 +1539,8 @@ async fn handle_pane_input(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::Json(body): axum::Json<InputBody>,
 ) -> Result<axum::Json<Value>, AppError> {
-    // daemon expects `id` (resolve_terminal at copad-linux/src/socket.rs:1225);
-    // sending `panel_id` silently routes to the active terminal — a
-    // remote command would land on the wrong pane.
+    // The daemon expects `id`; `panel_id` would silently route to the active terminal and a remote
+    // command would land on the wrong pane.
     let v = state
         .daemon
         .rpc("terminal.feed", json!({ "id": id, "text": body.text }))
@@ -1686,12 +1548,9 @@ async fn handle_pane_input(
     Ok(axum::Json(v))
 }
 
-/// `WS /ws/tmux/overview` — push a full tmux pane snapshot every 5 s
-/// as a single JSON Text frame. No diff protocol; SPA re-renders the
-/// card grid from each snapshot. Lifecycle: WS close → polling task
-/// returns on next tick (channel closed); we don't need StopOnDrop
-/// because the task itself drives the loop (vs blocking on a daemon
-/// socket).
+/// `WS /ws/tmux/overview` — push a full tmux pane snapshot every 5 s as one JSON Text frame (no
+/// diff protocol). When the WS closes the polling task returns on the next tick; no StopOnDrop
+/// needed since the task itself drives the loop.
 async fn handle_ws_tmux_overview(
     axum::extract::State(state): axum::extract::State<AppState>,
     ws: axum::extract::WebSocketUpgrade,
@@ -1701,8 +1560,6 @@ async fn handle_ws_tmux_overview(
         use axum::extract::ws::Message;
         use futures_util::{SinkExt, StreamExt};
         let (mut sink, mut stream) = futures_split(socket);
-        // Initial snapshot immediately on connect so the UI doesn't
-        // wait 5 s for the first paint.
         loop {
             let snapshot = match tokio::task::spawn_blocking(build_tmux_snapshot).await {
                 Ok(Ok(v)) => v,
@@ -1719,8 +1576,7 @@ async fn handle_ws_tmux_overview(
             if sink.send(Message::Text(payload)).await.is_err() {
                 break;
             }
-            // Sleep 5 s, but bail early if the client sends a close
-            // frame so reconnects don't pile up dead overview tasks.
+            // Sleep 5 s, but bail on a client close frame so reconnects don't pile up dead tasks.
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                 msg = stream.next() => {
@@ -1734,11 +1590,9 @@ async fn handle_ws_tmux_overview(
     })
 }
 
-/// `WS /ws/tmux/attach/:pane_id` — bidirectional xterm.js attach.
-/// Validate pane id → spawn `tmux attach-session -t <session>` inside
-/// a portable_pty PTY pair → forward PTY bytes as WS Binary frames
-/// and WS Binary frames back into PTY stdin. Text/JSON frames carry
-/// `{type:"resize",rows,cols}` control messages.
+/// `WS /ws/tmux/attach/:pane_id` — bidirectional xterm.js attach: spawn `tmux attach-session -t
+/// <session>` in a PTY, forward PTY bytes as WS Binary and WS Binary back to PTY stdin. Text/JSON
+/// frames carry `{type:"resize",rows,cols}`.
 async fn handle_ws_tmux_attach(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(pane_id): axum::extract::Path<String>,
@@ -1772,28 +1626,17 @@ async fn handle_ws_tmux_attach(
         .into_response()
 }
 
-/// Owns the lifecycle of one attach WS: PTY spawn + bidirectional
-/// pump + child kill on close. Errors bubble up so the wrapping
-/// `on_upgrade` future can log them with the pane context.
+/// Owns one attach WS: PTY spawn + bidirectional pump + child kill on close. Errors bubble up so
+/// the `on_upgrade` future can log them with the pane context.
 async fn run_attach(
     socket: axum::extract::ws::WebSocket,
     pane: tmux::TmuxPane,
 ) -> Result<(), String> {
     use portable_pty::CommandBuilder;
 
-    // `tmux attach-session -t <session>` then `select-pane` via a
-    // chained command. tmux supports `\;` as a command separator, but
-    // doing two shell-outs in sequence inside the PTY isn't possible
-    // (the PTY runs ONE command). Instead use `attach-session -t` +
-    // pre-position the active pane via a separate `tmux select-pane`
-    // shell-out BEFORE spawning the PTY. The session's notion of
-    // "active pane" survives the new attach (multi-client tmux model).
-    // Position BOTH the active window and the active pane in the
-    // target session BEFORE attach. select-pane alone does not
-    // reliably promote the containing window to active across all
-    // tmux versions, so a multi-window session can land the new
-    // attach client on the wrong window. Do them in order: window
-    // first, then pane.
+    // Position BOTH the active window and pane in the target session BEFORE attach (the session's
+    // active pane survives the new attach). select-pane alone doesn't reliably promote the
+    // containing window across tmux versions, so select the window first, then the pane.
     let win_status = std::process::Command::new("tmux")
         .args(["select-window", "-t", &pane.window_id])
         .status()
@@ -1816,12 +1659,9 @@ async fn run_attach(
     }
 
     let mut cmd = CommandBuilder::new("tmux");
-    // `-u` forces UTF-8 even when the spawned tmux client can't detect
-    // it from locale. Without this, any non-ASCII byte renders as `?`
-    // in panes whose programs (vim, less, fzf) trust tmux's notion of
-    // UTF-8 support over their own locale.
+    // `-u` forces UTF-8 even when the tmux client can't detect it from locale; otherwise
+    // non-ASCII bytes render as `?` for programs (vim, less, fzf) that trust tmux's notion.
     cmd.args(["-u", "attach-session", "-t", pane.session.as_str()]);
-    // Fallback locale if the parent env had none — guarantees UTF-8.
     if std::env::var("LANG").is_err() && std::env::var("LC_ALL").is_err() {
         cmd.env("LANG", "C.UTF-8");
     }
@@ -1832,10 +1672,7 @@ async fn run_attach(
 }
 
 /// Own one PTY-backed attach WebSocket: spawn `cmd` on a PTY, pump it both ways, and tear the
-/// child down when either side goes.
-///
-/// Extracted from the tmux attach so the comux one can reuse it — the pump never cared which
-/// program it was carrying, only that it speaks a terminal.
+/// child down when either side goes. Shared by the tmux and comux attaches.
 ///
 /// Protocol: PTY output goes out as WS Binary; WS Binary comes back in as keystrokes; a WS Text
 /// frame is JSON control, currently only `{type:"resize",rows,cols}`.
@@ -1847,13 +1684,10 @@ async fn run_pty_attach(
     use futures_util::{SinkExt, StreamExt};
     use portable_pty::{PtySize, native_pty_system};
 
-    /// How long one WebSocket send may take before the attach is considered dead.
-    ///
-    /// A phone that sleeps or loses signal mid-frame leaves the send pending forever. Without
-    /// a bound the whole attach parks: the PTY child stays alive and, because comux sizes its
-    /// composed frame to the SMALLEST attached client, the user's desktop terminal stays
-    /// clamped to that phone's grid until the TCP stack eventually gives up. Dropping the
-    /// attach on a stalled send is what releases both.
+    /// How long one WebSocket send may take before the attach is considered dead. A phone that
+    /// sleeps or loses signal mid-frame leaves the send pending forever; the PTY child would stay
+    /// alive and, because comux sizes its frame to the SMALLEST attached client, the desktop
+    /// terminal would stay clamped to that phone's grid. Dropping the attach releases both.
     const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     let pty_system = native_pty_system();
@@ -1881,10 +1715,9 @@ async fn run_pty_attach(
         .map_err(|e| format!("take PTY writer: {e}"))?;
     let writer = std::sync::Arc::new(std::sync::Mutex::new(writer));
 
-    // MasterPty is `Send + !Sync`, so holding it across an await would
-    // make the upgrade future non-Send (axum::on_upgrade requires
-    // Send). Hand the master to a dedicated blocking task that owns
-    // it; main loop sends resize requests via a channel.
+    // MasterPty is `Send + !Sync`, so holding it across an await would make the upgrade future
+    // non-Send (axum::on_upgrade requires Send). A dedicated blocking task owns it; the main loop
+    // sends resize requests over a channel.
     let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
     let master_box = pair.master;
     let resize_task = tokio::task::spawn_blocking(move || {
@@ -1898,16 +1731,11 @@ async fn run_pty_attach(
         }
     });
 
-    // PTY → WS Binary. Read on a blocking task, push chunks through
-    // a bounded mpsc<Vec<u8>>. Buffer 256 entries × ≤16 KiB = ~4 MiB
-    // worst case. On overflow we close the WS rather than drop bytes
-    // (corrupts xterm state).
+    // PTY -> WS Binary: read on a blocking task, push chunks through a bounded channel (256 x
+    // <=16 KiB, ~4 MiB worst case). On overflow close the WS rather than drop bytes, which would
+    // corrupt xterm state.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
     let read_task = tokio::task::spawn_blocking(move || {
-        // Box<dyn Read + Send> returns from portable-pty; we need the
-        // Read trait method `read()` in scope. BufRead's use up top
-        // doesn't bring it in — explicit import here is for clarity
-        // even though older rustc allowed the call without it.
         use std::io::Read;
         let mut buf = [0u8; 16 * 1024];
         loop {
@@ -1928,8 +1756,8 @@ async fn run_pty_attach(
             chunk = rx.recv() => {
                 match chunk {
                     Some(bytes) => {
-                        // Bounded: an unbounded send against a slept phone parks the whole
-                        // attach and keeps the desktop clamped to that phone's grid.
+                        // Bounded: an unbounded send to a slept phone parks the attach and keeps
+                        // the desktop clamped to that phone's grid.
                         match tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Binary(bytes))).await {
                             Err(_) => break,          // stalled peer — drop the attach
                             Ok(Err(_)) => break,      // socket closed
@@ -1945,7 +1773,6 @@ async fn run_pty_attach(
                     Some(Err(_)) => break,
                     Some(Ok(Message::Close(_))) => break,
                     Some(Ok(Message::Binary(bytes))) => {
-                        // raw keystrokes / mouse → PTY stdin
                         let writer_arc = writer.clone();
                         let send = tokio::task::spawn_blocking(move || {
                             let mut g = writer_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -1954,7 +1781,6 @@ async fn run_pty_attach(
                         if matches!(send, Err(_) | Ok(Err(_))) { break; }
                     }
                     Some(Ok(Message::Text(t))) => {
-                        // JSON control frame — only {type:"resize",rows,cols} for now.
                         if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&t)
                             && obj.get("type").and_then(Value::as_str) == Some("resize")
                             && let (Some(rows), Some(cols)) = (
@@ -1984,15 +1810,10 @@ async fn handle_ws_events(
     axum::extract::State(state): axum::extract::State<AppState>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> impl axum::response::IntoResponse {
-    // Accept the bearer subprotocol so the upgrade handshake echoes
-    // it back per RFC6455 — browsers won't connect without it.
-    // RFC6455: the server MUST echo back one of the subprotocols the
-    // client offered, else most browsers close the connection
-    // immediately. We're authenticating via the subprotocol itself
-    // (`Sec-WebSocket-Protocol: bearer.<token>`), so echo that exact
-    // string. axum filters out non-matches automatically — wrong
-    // tokens are already rejected by the auth middleware upstream,
-    // so by the time we're here we trust the token in state.
+    // The server MUST echo one of the client's offered subprotocols (RFC 6455) or most browsers
+    // close the connection. Authentication is the subprotocol itself
+    // (`Sec-WebSocket-Protocol: bearer.<token>`), so echo that exact string; the auth middleware
+    // already rejected wrong tokens.
     let proto = format!("bearer.{}", state.token);
     ws.protocols([proto]).on_upgrade(move |socket| async move {
         let (mut sink, mut stream) = futures_split(socket);
@@ -2018,10 +1839,9 @@ async fn handle_ws_events(
                         break;
                     }
                 }
-                // Drain client → server so close frames + pings are
-                // observed. Without this branch a sleeping mobile
-                // browser that drops the TCP connection won't surface
-                // until the next failed sink.send — Codex C2.
+                // Drain client -> server so close frames + pings are observed; otherwise a
+                // sleeping mobile browser that drops TCP won't surface until the next failed
+                // sink.send.
                 msg = stream.next() => {
                     match msg {
                         None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
@@ -2047,13 +1867,7 @@ fn futures_split(
 #[derive(Debug)]
 enum AppError {
     Daemon(daemon_client::DaemonError),
-    /// Anything outside the daemon path — tmux shell-outs, internal
-    /// task join failures, etc. Carries `(code, message)` directly so
-    /// `IntoResponse` can route to the right HTTP status.
-    Custom {
-        code: String,
-        message: String,
-    },
+    Custom { code: String, message: String },
 }
 
 impl AppError {
@@ -2089,9 +1903,8 @@ impl axum::response::IntoResponse for AppError {
                 "daemon closed connection".to_string(),
             ),
             AppError::Daemon(daemon_client::DaemonError::Daemon { code, message }) => {
-                // no_gui is the most common expected daemon error
-                // (the UI surfaces it as a banner, not a 5xx), so
-                // map it to 503 to make that distinguishable.
+                // no_gui is the most common expected daemon error (the UI shows a banner, not a
+                // 5xx), so map it to 503 to keep it distinguishable.
                 let status = if code == "no_gui" {
                     StatusCode::SERVICE_UNAVAILABLE
                 } else {
@@ -2100,10 +1913,6 @@ impl axum::response::IntoResponse for AppError {
                 (status, code, message)
             }
             AppError::Custom { code, message } => {
-                // Map known codes to specific status. push_disabled =
-                // 503 (Service Unavailable — feature exists but not
-                // configured); tmux_error = 502 (upstream tmux
-                // failed); anything else falls through to 500.
                 let status = if code == "tmux_error" {
                     StatusCode::BAD_GATEWAY
                 } else if code == "push_disabled" {
@@ -2145,9 +1954,8 @@ fn bearer_ok(headers: &axum::http::HeaderMap, expected: &str) -> bool {
     constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
-/// WebSocket auth via `Sec-WebSocket-Protocol: bearer.<token>`.
-/// Browsers send the subprotocol list comma-separated; we check that
-/// at least one matches `bearer.<expected>`.
+/// WebSocket auth via `Sec-WebSocket-Protocol: bearer.<token>`: browsers send the subprotocol list
+/// comma-separated, and at least one entry must match `bearer.<expected>`.
 fn ws_subprotocol_ok(headers: &axum::http::HeaderMap, expected: &str) -> bool {
     let Some(value) = headers.get("sec-websocket-protocol") else {
         return false;
@@ -2297,7 +2105,6 @@ mod tests {
         assert_eq!(pushes.len(), 2);
         assert_eq!(pushes[0].tag, "copad-pilot-g-abc");
         assert_eq!(pushes[0].body, "answer gate · Which DB?");
-        // null prompt → kind-specific fallback copy.
         assert_eq!(pushes[1].body, "plan gate · plan ready for approval");
     }
 
@@ -2309,7 +2116,6 @@ mod tests {
               "gate": { "kind": "answer", "prompt": "Q1" } },
         ]));
         assert_eq!(pilot_gate_pushes(&st, &mut seen).len(), 1);
-        // Same gate on the next poll → no re-push.
         assert_eq!(pilot_gate_pushes(&st, &mut seen).len(), 0);
     }
 
@@ -2325,7 +2131,6 @@ mod tests {
               "gate": { "kind": "answer", "prompt": "Q2" } },
         ]));
         assert_eq!(pilot_gate_pushes(&g1, &mut seen).len(), 1);
-        // Same goal, different prompt → a new push.
         assert_eq!(pilot_gate_pushes(&g2, &mut seen).len(), 1);
     }
 
@@ -2341,7 +2146,6 @@ mod tests {
               "gate": { "kind": "approve", "prompt": "ok?", "options": ["a", "b", "c"] } },
         ]));
         assert_eq!(pilot_gate_pushes(&g1, &mut seen).len(), 1);
-        // Same kind + prompt but different options → still a new push.
         assert_eq!(pilot_gate_pushes(&g2, &mut seen).len(), 1);
     }
 
@@ -2353,7 +2157,6 @@ mod tests {
             { "id": "g-2", "status": "done" },
         ]));
         assert_eq!(pilot_gate_pushes(&none, &mut seen).len(), 0);
-        // Missing/!array goals → no panic, no pushes.
         assert_eq!(pilot_gate_pushes(&json!({}), &mut seen).len(), 0);
     }
 

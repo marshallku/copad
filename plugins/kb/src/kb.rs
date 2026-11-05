@@ -13,7 +13,6 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-/// Wire error returned to the supervisor as `{code, message}`.
 type KbErr = (String, String);
 
 const RAW_FOLDER: &str = ".raw";
@@ -21,11 +20,9 @@ const SEARCH_LIMIT_DEFAULT: usize = 20;
 const SEARCH_LIMIT_CAP: usize = 100;
 const LIST_LIMIT_DEFAULT: usize = 50;
 const LIST_LIMIT_CAP: usize = 500;
-/// Snippet width on each side of the match (in chars).
 const SNIPPET_RADIUS: usize = 60;
 
 pub struct Kb {
-    /// Logical root the user configured (e.g. `~/docs`).
     root: PathBuf,
     /// Resolved root used to enforce "id cannot escape KB root" against
     /// symlinks. Falls back to `root` if `canonicalize()` failed at construction.
@@ -64,17 +61,10 @@ impl Kb {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
                 PathBuf::from(home).join("docs")
             });
-        // Ensure the root exists so the very first call doesn't fail
-        // for a brand-new install. Caller errors (permissions, etc.)
-        // surface on first use.
         let _ = std::fs::create_dir_all(&raw_root);
-        // Force absolute. The protocol contract is "path is absolute
-        // for FS backends" — a relative `COPAD_KB_ROOT` like `docs`
-        // would otherwise produce relative paths in every response.
-        // First try canonicalize (resolves symlinks too, which is also
-        // what `root_canonical` needs for the symlink-escape check);
-        // if that fails for any reason, manually absolute-ify by
-        // joining with cwd.
+        // Force absolute: the protocol says paths are absolute for FS backends, so a relative
+        // `COPAD_KB_ROOT` would otherwise yield relative paths everywhere. Canonicalize first
+        // (also what `root_canonical` needs); on failure join with cwd.
         let absolute_root = std::fs::canonicalize(&raw_root).unwrap_or_else(|_| {
             if raw_root.is_absolute() {
                 raw_root.clone()
@@ -94,36 +84,24 @@ impl Kb {
         &self.root
     }
 
-    /// Verifies the resolved path stays inside `root_canonical`, defending
-    /// against symlink escapes that `validate_id` can't catch (e.g. a `notes`
-    /// symlink pointing at `/etc`). `must_exist=true` canonicalizes the leaf
-    /// itself; otherwise canonicalizes the existing ancestor and appends the
-    /// tail so `kb.ensure` can create new files while still catching parent
-    /// symlinks. Residual TOCTOU window between check and open is acceptable
-    /// for single-user use; tightening would need `openat2(RESOLVE_BENEATH)`.
+    /// Verifies the resolved path stays inside `root_canonical`, defending against symlink escapes
+    /// that `validate_id` can't catch (e.g. a `notes` symlink to `/etc`). `must_exist=true`
+    /// canonicalizes the leaf; otherwise the existing ancestor is canonicalized and the tail
+    /// appended, so `kb.ensure` can create new files while still catching parent symlinks. The
+    /// residual TOCTOU window is accepted for single-user use (closing it needs
+    /// `openat2(RESOLVE_BENEATH)`).
     fn resolve_within_root(&self, id: &str, must_exist: bool) -> Result<PathBuf, KbErr> {
-        // Refuse if any ancestor of the id (within the KB root) is a
-        // symlink. Without this, `alias -> notes` would let
-        // `kb.ensure("alias/foo.md")` write a file whose subsequent
-        // search-time `id` would be `notes/foo.md` — the protocol
-        // says ids are stable handles, but aliasing breaks that.
-        // `alias -> .raw/slack` is the worse case: the alias-side id
-        // bypasses the `.raw/` asymmetry (the file becomes writable
-        // AND readable AND search-surfaceable under the alias). The
-        // walk-side `.raw/` exclusion is keyed on the LOGICAL id, so
-        // it can't catch this; the trust boundary has to be enforced
-        // at id resolution time.
+        // Refuse if any ancestor of the id is a symlink. `alias -> notes` would let
+        // `kb.ensure("alias/foo.md")` write a file that later searches as `notes/foo.md`, breaking
+        // the "id is a stable handle" contract; `alias -> .raw/slack` would bypass the `.raw/`
+        // exclusion, which is keyed on the LOGICAL id, so it must be enforced at resolution time.
         self.check_no_symlink_ancestors(id)?;
         let candidate = self.root.join(id);
 
-        // If the leaf exists, refuse anything that isn't a regular
-        // file. Documents are files; reading from a FIFO would block
-        // the supervisor indefinitely, reading from a device file
-        // could surface kernel state, and writing to either is
-        // outside the protocol's "filesystem documents" model. We
-        // also reject directories (kb.ensure has a separate check
-        // for this with a more specific error message — that runs
-        // before this point in `ensure()`).
+        // A leaf that exists must be a regular file: reading a FIFO would block the supervisor
+        // forever, a device file could expose kernel state, and neither fits the "filesystem
+        // documents" model. Directories are rejected too (`ensure()` checks that earlier with a
+        // more specific error).
         if let Ok(md) = candidate.symlink_metadata() {
             let ft = md.file_type();
             if ft.is_symlink() {
@@ -149,9 +127,6 @@ impl Kb {
                 }
             })?
         } else {
-            // Walk up until we find an existing ancestor, canonicalize
-            // that, and append the remaining tail. This catches a
-            // symlinked parent without requiring the leaf to exist.
             let mut existing = candidate.as_path();
             let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
             loop {
@@ -183,19 +158,11 @@ impl Kb {
                 format!("id {id} resolves outside KB root (symlink escape?)"),
             ));
         }
-        // Return the original (non-canonical) path so kb.read/append
-        // operate against the user-visible filesystem location and
-        // observe the file the user expects. Canonicalize was a check,
-        // not a substitution.
+        // Return the original path so kb.read/append act on the user-visible location;
+        // canonicalize was a check, not a substitution.
         Ok(candidate)
     }
 
-    /// Refuses any logical path whose existing ancestors contain a symlink.
-    /// Non-existent tail segments are fine. Without this, `alias -> notes`
-    /// would let `kb.ensure("alias/foo.md")` write a file that later searches
-    /// as `notes/foo.md` (different id, breaks the "id is the stable handle"
-    /// contract), and `alias -> .raw/slack` would bypass the `.raw/`
-    /// search-exclusion via the alias-side id.
     fn check_no_symlink_ancestors(&self, logical: &str) -> Result<(), KbErr> {
         let mut cursor = self.root.clone();
         for comp in Path::new(logical).components() {
@@ -210,16 +177,11 @@ impl Kb {
                     }
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Tail doesn't exist — rest of the path can't
-                        // be a symlink. Stop walking.
                         return Ok(());
                     }
                     Err(e) => {
-                        // EACCES / ENOTDIR / other — surface as
-                        // io_error so the caller knows the boundary
-                        // check couldn't actually run, rather than
-                        // silently passing and tripping a vaguer
-                        // error later in the action path.
+                        // EACCES / ENOTDIR / other: surface as io_error, since the boundary
+                        // check couldn't run.
                         return Err(io_error(format!("stat ancestor {}: {e}", cursor.display())));
                     }
                 }
@@ -242,13 +204,9 @@ impl Kb {
         }
     }
 
-    // -------- kb.list (Phase 22.3) --------
-    //
-    // Browse-shaped surface for the KB Panel: returns entry ids (NOT full
-    // content), optionally with mtime / frontmatter, sorted by name or
-    // mtime. Powers the panel's per-folder browser + recent-edits slots.
-    // Same trust-boundary as kb.search — `folder` validated through
-    // resolve_within_root, `.raw/` excluded, symlinks skipped.
+    // kb.list: browse-shaped listing for the KB Panel (ids, optionally mtime / frontmatter).
+    // Same trust boundary as kb.search: `folder` goes through resolve_within_root, `.raw/` is
+    // excluded, symlinks are skipped.
 
     fn list(&self, params: &Value) -> Result<Value, KbErr> {
         let folder_param: Option<String> = match params.get("folder") {
@@ -296,7 +254,6 @@ impl Kb {
             if ft.is_symlink() {
                 return WalkAction::Skip;
             }
-            // `.raw/` exclusion against logical id (consistent with kb.search).
             if let Ok(rel) = path.strip_prefix(&self.root)
                 && rel
                     .components()
@@ -306,14 +263,9 @@ impl Kb {
             {
                 return WalkAction::Skip;
             }
-            // Dotfiles/dotdirs: skip by default. The user-passed folder
-            // itself can be a dotfolder (already past validation) and
-            // we don't reach the dot check for it because it's the walk
-            // root. Walk entries under the root that start with `.` are
-            // tooling indices (`.backlinks/`, `.tags/`, `.git/`) — not
-            // user-facing notes. Surfacing them in a folder browser is
-            // the wrong default; callers wanting them can pass the
-            // dotfolder explicitly as `folder`.
+            // Dot entries under the walk root are tooling indices (`.backlinks/`, `.tags/`,
+            // `.git/`), not notes, so skipped by default; callers wanting one pass it explicitly
+            // as `folder` (the walk root itself is not checked).
             if let Some(name) = path.file_name().and_then(|s| s.to_str())
                 && name.starts_with('.')
             {
@@ -394,8 +346,6 @@ impl Kb {
         Ok(json!({ "entries": page, "total": total }))
     }
 
-    // -------- kb.search --------
-
     fn search(&self, params: &Value) -> Result<Value, KbErr> {
         let query = params
             .get("query")
@@ -411,24 +361,16 @@ impl Kb {
             .min(SEARCH_LIMIT_CAP as u64) as usize;
         let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
-        // Folder is the same trust-boundary input as `id` — same
-        // validation rules apply, surfaced as `forbidden` on traversal
-        // attempts (per protocol). Type-strict: a non-string folder
-        // is `invalid_params`, NOT silently dropped (silent coercion
-        // would widen the search scope contrary to caller intent).
-        // Validation runs against the ORIGINAL string before any
-        // normalization — `folder: ""` and `folder: "/"` MUST fail
-        // validation rather than silently collapsing to "no folder
-        // filter, search the whole root."
+        // Folder is a trust-boundary input like `id`: traversal is `forbidden`, and a non-string
+        // is `invalid_params` (silently dropping it would widen the search scope). Validation runs
+        // on the ORIGINAL string, so `folder: ""` and `"/"` fail instead of collapsing to "no
+        // folder filter".
         let folder_param: Option<String> = match params.get("folder") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => {
                 validate_folder(s)?;
-                // After validation we may safely strip a trailing slash
-                // (the user typed `meetings/` but means `meetings`).
-                // The pre-validation check above guarantees s isn't
-                // empty / `/`, so trimming can't produce an empty
-                // string that would re-enter the whole-root branch.
+                // Trim a trailing slash (`meetings/`); validation already ruled out empty and
+                // `/`, so this can't produce an empty string that re-enters the whole-root branch.
                 Some(s.trim_end_matches('/').to_string())
             }
             Some(_) => {
@@ -437,22 +379,14 @@ impl Kb {
         };
         let search_root = match folder_param {
             None => self.root.clone(),
-            // resolve_within_root already calls
-            // `check_no_symlink_ancestors`, which catches the alias
-            // attack where `notes -> .raw/slack` would surface raw
-            // archives. must_exist=false because the folder might
-            // not be created yet on a fresh install.
+            // resolve_within_root runs `check_no_symlink_ancestors`, which catches the alias
+            // attack (`notes -> .raw/slack`). must_exist=false: the folder may not exist yet.
             Some(f) => self.resolve_within_root(&f, false)?,
         };
 
-        // Probe the search root. If it doesn't exist (e.g. user
-        // passed a folder that hasn't been created yet), zero hits is
-        // the right answer — it's not an error. If it exists but we
-        // can't read it (permissions, ENOTDIR, etc.), surface so the
-        // caller knows their search wasn't actually performed.
-        // Per-file failures during the walk stay silent (skipped),
-        // which is what users want for a personal docs dir with the
-        // occasional unreadable binary or locked file.
+        // A missing search root (folder not created yet) means zero hits, not an error. An
+        // existing but unreadable one is surfaced so the caller knows no search ran. Per-file
+        // failures during the walk stay silent.
         if search_root.exists() {
             std::fs::read_dir(&search_root).map_err(|e| {
                 io_error(format!("read search root {}: {e}", search_root.display()))
@@ -464,24 +398,16 @@ impl Kb {
         let q_lower = query.to_lowercase();
         let mut hits: Vec<KbHit> = Vec::new();
         walk(&search_root, &mut |path, ft| {
-            // Symlinks are skipped entirely — the trust-boundary
-            // contract is "search can't surface anything outside the
-            // KB root." Following a symlink (even to a sibling inside
-            // root) risks recursing into a target outside root, and
-            // any hit produced by such a target would also fail a
-            // subsequent `kb.read` against its `id` (the canonical
-            // path differs from the logical id), breaking the "stable
-            // handle" contract on search hits. The `ft` we got is
-            // from `DirEntry::file_type` which does NOT follow
-            // symlinks, so this check is the authoritative one — no
-            // re-stat that could reopen a TOCTOU window.
+            // Symlinks are skipped entirely: search must not surface anything outside the KB
+            // root, and a hit through one would fail a later `kb.read` of its `id` (canonical path
+            // differs from the logical id). `ft` comes from `DirEntry::file_type`, which does not
+            // follow symlinks, so no re-stat reopens a TOCTOU window.
             if ft.is_symlink() {
                 return WalkAction::Skip;
             }
 
-            // Protocol-mandated `.raw/` exclusion. Computed against
-            // the path relative to the KB root so a user-named file
-            // `notes/.raw-thoughts.md` still surfaces.
+            // Protocol-mandated `.raw/` exclusion, computed against the root-relative path so a
+            // user file `notes/.raw-thoughts.md` still surfaces.
             if let Ok(rel) = path.strip_prefix(&self.root)
                 && rel
                     .components()
@@ -522,31 +448,22 @@ impl Kb {
         let rel = path.strip_prefix(&self.root).ok()?;
         let id = rel_to_id(rel);
 
-        // Filename match is the BASENAME only — querying "meetings"
-        // shouldn't auto-promote every file under `meetings/` to
-        // filename-weight just because the folder name matches. Folder
-        // matches still contribute via body-text scoring if the doc
-        // mentions the term, which is the more honest signal.
+        // Filename match is the BASENAME only, so querying "meetings" doesn't promote every file
+        // under `meetings/`; folder matches still count via body-text scoring.
         let filename = rel
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("")
             .to_lowercase();
 
-        // Filename matches are weighted more than content matches.
-        // A filename hit is a strong signal — the user named the file
-        // for that concept. Weight 10 vs 1 keeps a single filename
-        // match above ~10 isolated body matches but loses to a body
-        // dense with the term.
+        // Filename hits weigh 10 vs 1 for body: one filename match beats ~10 isolated body
+        // matches but loses to a body dense with the term.
         let mut score = 0.0f64;
         let filename_matches = filename.matches(q_lower).count();
         score += (filename_matches as f64) * 10.0;
 
-        // Read content for body match + snippet. Skip files we can't
-        // open (binary, permissions, or TOCTOU-swapped to a symlink
-        // since walk's `file_type` check) silently — they don't
-        // contribute. `O_NOFOLLOW` ensures even a swap-to-symlink
-        // race window can't make us read outside the KB root.
+        // Unopenable files (binary, permissions, swapped to a symlink since walk's `file_type`
+        // check) are skipped silently. O_NOFOLLOW means a swap race can't read outside the root.
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -559,10 +476,8 @@ impl Kb {
         let body_matches = content_lower.matches(q_lower).count();
         score += body_matches as f64;
 
-        // Match-kind reflects how the score was earned. If both fired
-        // we report `fulltext` because that's the more informative
-        // signal for the caller; pure-filename hits stay marked so the
-        // UI can render them differently.
+        // Both filename and body matches report `fulltext` (more informative); pure-filename hits
+        // stay marked so the UI can render them differently.
         let match_kind = if body_matches > 0 {
             "fulltext"
         } else if filename_matches > 0 {
@@ -572,7 +487,6 @@ impl Kb {
         };
 
         let snippet = build_snippet(&content, &content_lower, q_lower).unwrap_or_else(|| {
-            // No body match — preview the first non-empty line.
             content
                 .lines()
                 .find(|l| !l.trim().is_empty())
@@ -594,20 +508,13 @@ impl Kb {
         })
     }
 
-    // -------- kb.read --------
-
     fn read(&self, params: &Value) -> Result<Value, KbErr> {
         let id = require_id(params)?;
         validate_id(&id)?;
         let path = self.resolve_within_root(&id, true)?;
-        // O_NOFOLLOW closes the symlink-swap-at-leaf TOCTOU window:
-        // if a concurrent actor swaps the leaf for a symlink between
-        // `resolve_within_root`'s canonicalize check and this open,
-        // the kernel returns ELOOP rather than dereferencing it.
-        // Residual race window: a swap of an INTERMEDIATE directory
-        // for a symlink is still possible (would need full
-        // `openat2(RESOLVE_BENEATH)` to close). For a single-user
-        // local KB that's an accepted risk; documented in roadmap.
+        // O_NOFOLLOW closes the symlink-swap-at-leaf TOCTOU window (ELOOP instead of following).
+        // Swapping an INTERMEDIATE directory for a symlink stays possible (closing it needs
+        // `openat2(RESOLVE_BENEATH)`); accepted for a single-user local KB.
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -635,18 +542,14 @@ impl Kb {
         }))
     }
 
-    // -------- kb.append --------
-
     fn append(&self, params: &Value) -> Result<Value, KbErr> {
         let id = require_id(params)?;
         validate_id(&id)?;
         let content = require_string(params, "content")?;
         let ensure = require_optional_bool(params, "ensure", false)?;
 
-        // If `ensure=true` we may legitimately be creating the file;
-        // otherwise the leaf must already exist (and the canonicalize
-        // check enforces it stays within the KB root). Either path
-        // catches symlink escapes via existing intermediate parents.
+        // With `ensure=true` the file may be created; otherwise the leaf must exist. Both catch
+        // symlink escapes via existing intermediate parents.
         let path = self.resolve_within_root(&id, !ensure)?;
         let bytes = content.as_bytes();
 
@@ -654,42 +557,26 @@ impl Kb {
             if !ensure {
                 return Err(("not_found".into(), format!("kb id not found: {id}")));
             }
-            // ensure=true winner path: write the payload to the temp
-            // file BEFORE the atomic rename, so a concurrent `kb.read`
-            // never observes a created-but-empty file. This mirrors
-            // the protocol's "winner returns `created=true` with the
-            // template applied" rule and extends it from `kb.ensure`
-            // to `kb.append+ensure`. If we lose the race the file
-            // already exists with someone else's content; we fall
-            // through to the normal append branch below.
+            // ensure=true: write the payload to the temp file BEFORE the atomic rename so a
+            // concurrent `kb.read` never sees a created-but-empty file. If we lose the race the
+            // file exists with someone else's content and we fall through to the normal append.
             create_parents(&path)?;
-            match atomic_create_with_content(&path, bytes)? {
-                true => {
-                    // Won the create race; payload was placed in the
-                    // temp file before rename, so the file already
-                    // contains everything we needed to write. No
-                    // separate O_APPEND step.
-                    return Ok(json!({
-                        "id": id,
-                        "bytes_written": bytes.len(),
-                        "created": true,
-                        "path": path_to_value(&path),
-                    }));
-                }
-                false => {
-                    // Lost the race. Fall through to normal append on
-                    // the now-existing file, with `created=false`.
-                }
+            if atomic_create_with_content(&path, bytes)? {
+                // Won the create race; the payload was in the temp file before the rename, so
+                // no separate O_APPEND step.
+                return Ok(json!({
+                    "id": id,
+                    "bytes_written": bytes.len(),
+                    "created": true,
+                    "path": path_to_value(&path),
+                }));
             }
         }
 
-        // Normal append path: file exists, single-syscall O_APPEND
-        // write. We do NOT use `write_all` (which loops on partial
-        // writes) because the contract is "no interleave with other
-        // appenders", which only holds if we issue exactly one
-        // `write(2)`. A short write surfaces as `io_error` so the
-        // caller knows their payload wasn't fully committed.
-        // O_NOFOLLOW for the same TOCTOU defense as `kb.read`.
+        // Normal append: a single `write(2)` on an O_APPEND fd. NOT `write_all`, which loops on
+        // partial writes: no-interleave with other appenders only holds with exactly one syscall.
+        // A short write surfaces as `io_error`. O_NOFOLLOW for the same TOCTOU defense as
+        // `kb.read`.
         let file = OpenOptions::new()
             .append(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -722,28 +609,20 @@ impl Kb {
         }))
     }
 
-    // -------- kb.ensure --------
-
     fn ensure(&self, params: &Value) -> Result<Value, KbErr> {
         let id = require_id(params)?;
         validate_id(&id)?;
-        // `default_template` is optional but, per protocol, MUST be a
-        // string when present. Silently coercing a non-string to "" is
-        // a contract violation (caller meant to write content).
+        // `default_template` MUST be a string when present; coercing a non-string to "" would
+        // violate the contract.
         let template = require_optional_string(params, "default_template", "")?;
-        // ensure may create the leaf — must_exist=false. The
-        // canonicalize check still rejects an existing intermediate
-        // symlink that escapes the root.
+        // must_exist=false: ensure may create the leaf. The check still rejects an existing
+        // intermediate symlink that escapes the root.
         let path = self.resolve_within_root(&id, false)?;
 
         if let Ok(md) = path.symlink_metadata() {
-            // The id resolves to something that already exists. If
-            // it's a regular file, idempotent return — protocol says
-            // the caller losing the create race gets `created=false`
-            // and the existing content stands. If it's a directory
-            // (e.g. someone passed an id that names a folder) we
-            // refuse: kb.ensure produces documents, not directories,
-            // and silently succeeding would hide the misuse.
+            // The id already exists. A regular file returns idempotently (the caller that lost
+            // the create race gets `created=false`, existing content stands). A directory is
+            // refused: kb.ensure produces documents, and succeeding would hide the misuse.
             if md.file_type().is_dir() {
                 return Err((
                     "invalid_id".into(),
@@ -767,8 +646,6 @@ impl Kb {
     }
 }
 
-// -------- helpers: path / id --------
-
 fn require_id(params: &Value) -> Result<String, KbErr> {
     let raw = params
         .get("id")
@@ -779,7 +656,6 @@ fn require_id(params: &Value) -> Result<String, KbErr> {
     Ok(s.to_string())
 }
 
-/// Require a named string field. Missing or wrong-type → `invalid_params`.
 fn require_string(params: &Value, key: &str) -> Result<String, KbErr> {
     let raw = params
         .get(key)
@@ -799,7 +675,6 @@ fn require_optional_string(params: &Value, key: &str, default: &str) -> Result<S
     }
 }
 
-/// Optional bool field with a default. Wrong type → `invalid_params`.
 fn require_optional_bool(params: &Value, key: &str, default: bool) -> Result<bool, KbErr> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(default),
@@ -808,11 +683,10 @@ fn require_optional_bool(params: &Value, key: &str, default: bool) -> Result<boo
     }
 }
 
-/// Canonical id form: `/`-separated, no empty / `.` / trailing / leading
-/// segments. This is what makes id a stable round-trip handle — multiple
-/// surface forms (`notes//foo.md`, `./notes/foo.md`) would all resolve to
-/// the same file but break search-emit equality. Errors: `invalid_id` for
-/// shape, `forbidden` for trust-boundary violations (`..`, absolute, prefix).
+/// Canonical id form: `/`-separated, no empty / `.` / trailing / leading segments. This makes id a
+/// stable round-trip handle: variants like `notes//foo.md` or `./notes/foo.md` would resolve to
+/// the same file but break search-emit equality. Errors: `invalid_id` for shape, `forbidden` for
+/// trust-boundary violations (`..`, absolute, prefix).
 fn validate_id(id: &str) -> Result<(), KbErr> {
     if id.is_empty() {
         return Err(("invalid_id".into(), "id cannot be empty".into()));
@@ -863,10 +737,9 @@ fn validate_id(id: &str) -> Result<(), KbErr> {
     Ok(())
 }
 
-/// Same trust-boundary + canonical-form rules as `validate_id`, but trailing
-/// slash IS allowed (callers naturally type `meetings/`); call site trims it.
-/// Shape errors surface as `invalid_params` since `kb.search` doesn't define
-/// `invalid_id`.
+/// Same trust-boundary + canonical-form rules as `validate_id`, but a trailing slash IS allowed
+/// (callers type `meetings/`; the call site trims it). Shape errors surface as `invalid_params`
+/// since `kb.search` doesn't define `invalid_id`.
 fn validate_folder(folder: &str) -> Result<(), KbErr> {
     if folder.is_empty() {
         return Err(invalid_params("folder cannot be empty"));
@@ -877,10 +750,8 @@ fn validate_folder(folder: &str) -> Result<(), KbErr> {
     if folder.starts_with('/') {
         return Err(("forbidden".into(), "folder cannot be absolute".into()));
     }
-    // Reject `.` segments and empty segments. We DO permit a trailing
-    // slash (and only a single trailing slash) — the call site trims
-    // it after validation. `meetings//foo` (interior empty) is still
-    // rejected.
+    // `.` and empty segments are rejected. One trailing slash is allowed (the call site trims
+    // it); `meetings//foo` is still rejected.
     let trimmed = folder.trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(("forbidden".into(), "folder cannot be just `/`".into()));
@@ -975,12 +846,8 @@ fn io_error(msg: impl Into<String>) -> KbErr {
     ("io_error".into(), msg.into())
 }
 
-// -------- helpers: filesystem --------
-
-/// Visitor return for `walk`. Handed the `FileType` from `DirEntry::file_type`
-/// (uses readdir's `d_type` when available, falls back to a `lstat` otherwise)
-/// so the visitor can decide is-dir/is-file without a second stat that would
-/// reopen a TOCTOU window if the entry was swapped between calls.
+/// Visitor return for `walk`. The visitor gets the `FileType` from `DirEntry::file_type` so it
+/// needs no second stat, which would reopen a TOCTOU window if the entry was swapped.
 enum WalkAction {
     Recurse,
     Skip,
@@ -996,10 +863,7 @@ where
         Err(_) => return,
     };
     for entry in entries.flatten() {
-        // Use file_type() from the DirEntry itself — it's
-        // populated by readdir's d_type on most filesystems and does
-        // NOT follow symlinks. Falling back to file_type via
-        // symlink_metadata if the FS doesn't expose d_type.
+        // DirEntry::file_type() does NOT follow symlinks (readdir d_type, with an lstat fallback).
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
@@ -1038,8 +902,6 @@ fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr
     let temp_name = format!(".kb-tmp-{}-{}", std::process::id(), next_temp_seq());
     let temp_path = temp_dir.join(temp_name);
 
-    // Write the temp file. O_CREAT|O_EXCL|O_WRONLY here too — paranoia
-    // against another instance picking the same temp name.
     {
         let mut tmp = OpenOptions::new()
             .create_new(true)
@@ -1047,9 +909,7 @@ fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr
             .open(&temp_path)
             .map_err(|e| io_error(format!("create temp {}: {e}", temp_path.display())))?;
         if !content.is_empty() {
-            // Use write_all here — the temp file isn't visible to
-            // readers yet, so multi-syscall writes are fine. (Only
-            // the FINAL rename needs to be atomic for readers.)
+            // write_all is fine here: the temp file isn't visible to readers until the rename.
             use std::io::Write;
             tmp.write_all(content)
                 .map_err(|e| io_error(format!("write temp {}: {e}", temp_path.display())))?;
@@ -1058,19 +918,13 @@ fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr
         }
     }
 
-    // Atomic create-or-fail rename. Routed through `copad_core::fs_atomic`
-    // so the platform-specific syscall (Linux `renameat2(RENAME_NOREPLACE)`,
-    // macOS `renamex_np(RENAME_EXCL)`) lives in one place.
+    // Atomic create-or-fail rename via `copad_core::fs_atomic`, which holds the platform syscall
+    // (Linux `renameat2(RENAME_NOREPLACE)`, macOS `renamex_np(RENAME_EXCL)`).
     match copad_core::fs_atomic::rename_no_replace(&temp_path, path) {
         Ok(()) => Ok(true),
         Err(err) => {
-            // Clean up our orphaned temp file regardless of which branch
-            // we take next.
             let _ = std::fs::remove_file(&temp_path);
             if err.kind() == std::io::ErrorKind::AlreadyExists {
-                // Lost the race — the target file already exists. That's
-                // not an error for our caller; protocol says
-                // `created=false` and the existing content stands.
                 Ok(false)
             } else {
                 Err(io_error(format!(
@@ -1089,8 +943,6 @@ fn next_temp_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-// -------- helpers: snippet, title, frontmatter --------
-
 fn build_snippet(content: &str, content_lower: &str, q_lower: &str) -> Option<String> {
     let pos = content_lower.find(q_lower)?;
     let start = char_floor(content, pos.saturating_sub(SNIPPET_RADIUS));
@@ -1103,8 +955,6 @@ fn build_snippet(content: &str, content_lower: &str, q_lower: &str) -> Option<St
         snippet.push('…');
     }
     let chunk = &content[start..end];
-    // Trim newlines so the snippet stays one-line for callers that
-    // render it inline.
     for ch in chunk.chars() {
         if ch == '\n' || ch == '\r' {
             snippet.push(' ');
@@ -1118,7 +968,6 @@ fn build_snippet(content: &str, content_lower: &str, q_lower: &str) -> Option<St
     Some(snippet)
 }
 
-/// Snap a byte offset down to the nearest UTF-8 char boundary.
 fn char_floor(s: &str, mut byte: usize) -> usize {
     while byte > 0 && !s.is_char_boundary(byte) {
         byte -= 1;
@@ -1126,7 +975,6 @@ fn char_floor(s: &str, mut byte: usize) -> usize {
     byte
 }
 
-/// Snap a byte offset up to the nearest UTF-8 char boundary.
 fn char_ceil(s: &str, mut byte: usize) -> usize {
     while byte < s.len() && !s.is_char_boundary(byte) {
         byte += 1;
@@ -1140,7 +988,6 @@ fn extract_title(content: &str, rel: &Path) -> Option<Value> {
     {
         return Some(Value::String(t.to_string()));
     }
-    // First H1 line: `# Foo`
     for line in content.lines().take(50) {
         if let Some(rest) = line.strip_prefix("# ") {
             let t = rest.trim();
@@ -1149,7 +996,6 @@ fn extract_title(content: &str, rel: &Path) -> Option<Value> {
             }
         }
     }
-    // Fallback: filename without extension.
     rel.file_stem()
         .map(|s| Value::String(s.to_string_lossy().into_owned()))
 }
@@ -1164,7 +1010,6 @@ fn parse_frontmatter(content: &str) -> Option<Value> {
     let body = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))?;
-    // Closing fence: a line containing only `---` (with optional CR).
     let mut offset = 0usize;
     let mut close_at: Option<usize> = None;
     for line in body.split_inclusive('\n') {
@@ -1175,7 +1020,6 @@ fn parse_frontmatter(content: &str) -> Option<Value> {
         }
         offset += line.len();
     }
-    // Also accept a trailing `---` with no newline at EOF.
     if close_at.is_none() && body.trim_end_matches(['\n', '\r']).ends_with("\n---") {
         let trimmed = body.trim_end_matches(['\n', '\r']);
         close_at = trimmed.rfind("\n---").map(|i| i + 1);
@@ -1269,8 +1113,7 @@ mod tests {
 
     #[test]
     fn validate_id_accepts_filename_with_dots() {
-        // Substring `..` inside a name is fine — only bare `..`
-        // segments are traversal.
+        // A `..` substring inside a name is fine; only a bare `..` segment is traversal.
         validate_id("a..b.md").unwrap();
         validate_id("notes/v1.0.0.md").unwrap();
     }
@@ -1283,26 +1126,20 @@ mod tests {
 
     #[test]
     fn validate_id_rejects_non_canonical_forms() {
-        // Empty interior segment.
         assert_eq!(validate_id("notes//foo.md").unwrap_err().0, "invalid_id");
-        // `.` segments.
         assert_eq!(validate_id("./notes/foo.md").unwrap_err().0, "invalid_id");
         assert_eq!(validate_id("notes/./foo.md").unwrap_err().0, "invalid_id");
-        // Trailing slash — would name a directory, not a doc.
         assert_eq!(validate_id("meetings/").unwrap_err().0, "invalid_id");
     }
 
     #[test]
     fn validate_folder_allows_single_trailing_slash() {
-        // The protocol explicitly says trailing slash on folder is
-        // ignored — keep that ergonomic.
         validate_folder("meetings/").unwrap();
         validate_folder("meetings").unwrap();
     }
 
     #[test]
     fn validate_folder_rejects_interior_empty_segment() {
-        // `meetings//` (trailing) is OK — same target. `a//b` (interior) is not.
         assert_eq!(validate_folder("a//b").unwrap_err().0, "invalid_params");
     }
 
@@ -1316,9 +1153,8 @@ mod tests {
 
     #[test]
     fn validate_folder_uses_invalid_params_for_shape() {
-        // Per protocol, kb.search's documented error set does NOT
-        // include `invalid_id`. Shape problems on `folder` surface
-        // as `invalid_params`.
+        // kb.search's documented error set has no `invalid_id`; `folder` shape problems surface as
+        // `invalid_params`.
         assert_eq!(validate_folder("").unwrap_err().0, "invalid_params");
         assert_eq!(validate_folder("a\0b").unwrap_err().0, "invalid_params");
     }
@@ -1438,7 +1274,6 @@ mod tests {
         std::fs::create_dir_all(root.join(".backlinks")).unwrap();
         std::fs::write(root.join(".backlinks/index.tsv"), "a\tb\n").unwrap();
         std::fs::write(root.join("a.md"), "x").unwrap();
-        // Top-level walk: dotfolder hidden.
         let r = kb.list(&json!({})).unwrap();
         let entries = r.get("entries").unwrap().as_array().unwrap();
         let ids: Vec<&str> = entries
@@ -1447,12 +1282,8 @@ mod tests {
             .collect();
         assert!(!ids.contains(&".backlinks"));
         assert!(ids.contains(&"a.md"));
-        // Explicit dotfolder list: walks into it.
-        // But the dotfile-skip filter we use rejects children of dotfolders.
-        // For the panel use case the indices are read directly via kb.read,
-        // not via kb.list, so explicit listing of `.backlinks` returning
-        // empty is acceptable behavior — what matters is that the dotfolder
-        // doesn't pollute the default listing.
+        // The panel reads the dotfolder indices via kb.read; what matters is that the default
+        // listing stays clean.
         let _ = std::fs::remove_dir_all(&root);
     }
 

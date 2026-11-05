@@ -1,19 +1,10 @@
-//! Minimal frontmatter reader/writer for bookmark notes.
+//! Minimal frontmatter reader/writer for bookmark notes. The schema is small and stable (`url`,
+//! `title`, `captured_at`, `status`, `source`, `tags`, `linked_kb`, `fetch_error`, `content_type`)
+//! and users vim-edit the files, so the reader is lenient instead of using `serde_yaml`.
 //!
-//! We could pull `serde_yaml` but the schema is small and stable
-//! (`url`, `title`, `captured_at`, `status`, `source`, `tags`,
-//! `linked_kb`, `fetch_error`, `content_type`), and the user can
-//! vim-edit the file at any time so the reader has to be lenient.
-//!
-//! Reader:
-//! - Recognizes both inline arrays (`tags: [a, b]`) and YAML block-style
-//!   lists (`tags:\n  - a\n  - b`). Vim users tend to reflow into the
-//!   block form, and we don't want to lose their edits.
-//! - Strips ASCII single/double quotes around scalar values.
-//! - Bare strings — no escape handling. Good enough for a personal KB;
-//!   if a user needs colons inside values they can quote them.
-//!
-//! Writer always emits the inline form so a round-trip stays compact.
+//! The reader accepts inline arrays (`tags: [a, b]`) and block lists (vim users reflow into that
+//! form), strips single/double quotes around scalars, and does no escape handling (quote values
+//! containing colons). The writer always emits the inline form.
 
 use std::collections::BTreeMap;
 
@@ -63,8 +54,7 @@ impl Frontmatter {
     }
 }
 
-/// Split a markdown file into (frontmatter, body). If the first line
-/// isn't `---` we treat the whole file as body with empty frontmatter.
+/// Split a markdown file into (frontmatter, body); without a leading `---` the whole file is body.
 pub fn split(file: &str) -> (Frontmatter, &str) {
     let mut lines = file.split_inclusive('\n');
     let first = match lines.next() {
@@ -91,8 +81,7 @@ pub fn split(file: &str) -> (Frontmatter, &str) {
     let body = match body_start {
         Some(idx) => {
             let raw = &file[idx..];
-            // Skip a single leading blank line if present, like every
-            // markdown formatter does.
+            // Skip one leading blank line, as markdown formatters do.
             raw.strip_prefix('\n').unwrap_or(raw)
         }
         None => "", // unterminated frontmatter — treat body as empty.
@@ -118,7 +107,6 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
         let value_raw = value_raw.trim();
 
         if value_raw.is_empty() {
-            // Possibly a block-style list following.
             let mut items = Vec::new();
             while let Some(peeked) = iter.peek() {
                 let stripped = peeked.trim_start_matches([' ', '\t']);
@@ -175,11 +163,10 @@ fn strip_quotes(s: &str) -> &str {
     s
 }
 
-/// Fixed key order; lists always inline. Output: `---\n...---\n\n<body>`
-/// (or `---\n...---\n` for empty body).
+/// Fixed key order, lists always inline. Output: `---\n...---\n\n<body>` (`---\n...---\n` for an empty body).
 pub fn render(fm: &Frontmatter, body: &str) -> String {
-    // Stable canonical key order so diffs stay clean even after vim edits
-    // shuffle them. Unknown keys go after, alphabetically (BTreeMap).
+    // Canonical key order keeps diffs clean after vim edits shuffle them; unknown keys follow
+    // alphabetically.
     const PRIMARY: &[&str] = &[
         "url",
         "title",
@@ -221,8 +208,6 @@ pub fn render(fm: &Frontmatter, body: &str) -> String {
 fn write_kv(out: &mut String, key: &str, v: &FmValue) {
     match v {
         FmValue::Scalar(s) => {
-            // Quote when the scalar contains characters we don't want
-            // a downstream YAML parser to misinterpret.
             if needs_quote(s) {
                 out.push_str(&format!("{key}: {}\n", quote_scalar(s)));
             } else {
@@ -256,8 +241,7 @@ fn needs_quote(s: &str) -> bool {
 }
 
 fn quote_scalar(s: &str) -> String {
-    // Double-quote, escape embedded `"`. Naive but covers our
-    // controlled inputs (URL, title, captured_at, etc).
+    // Double-quote and escape embedded `"`; enough for our controlled inputs.
     format!("\"{}\"", s.replace('"', "\\\""))
 }
 
@@ -328,7 +312,6 @@ mod tests {
         fm.set_scalar("title", "Example");
         fm.set_list("tags", vec!["rust".into()]);
         let out = render(&fm, "body\n");
-        // url before status, tags after status (canonical order).
         let url_idx = out.find("url:").unwrap();
         let status_idx = out.find("status:").unwrap();
         let tags_idx = out.find("tags:").unwrap();

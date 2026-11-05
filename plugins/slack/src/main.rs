@@ -1,25 +1,15 @@
 //! First-party Slack service plugin for copad.
 //!
-//! Two run modes (selected by `argv[1]`):
-//! - **`auth`** — validates the env tokens against Slack's
-//!   `auth.test` endpoint and persists the validated TokenSet
-//!   (with team/user IDs) to the configured store. Exits 0 on
-//!   success.
-//! - **(no args)** — RPC mode. Speaks the copad service-plugin
-//!   protocol over stdio, runs Socket Mode WebSocket in a background
-//!   thread, and publishes `slack.mention` / `slack.dm` events when
-//!   real human messages arrive.
+//! Run mode is selected by `argv[1]`:
+//! - `auth`: validates the env tokens against Slack's `auth.test`, persists the validated TokenSet
+//!   (with team/user IDs) to the store, and exits 0 on success.
+//! - no args: RPC mode. Speaks the service-plugin protocol over stdio, runs Socket Mode in a
+//!   background thread, and publishes `slack.mention` / `slack.dm` for real human messages.
 //!
-//! If RPC mode starts with no stored credentials AND the env tokens
-//! are missing, the supervisor handshake still completes — the
-//! Socket Mode loop just stays paused. The user can run
-//! `copad-plugin-slack auth` while copad is running and the loop
-//! picks up the new credentials on its next reconnect attempt.
-//!
-//! See `docs/service-plugins.md` for the protocol contract. Slack
-//! plugin is purely an event emitter (and an authenticator) — the
-//! action it takes when a mention arrives is entirely user trigger
-//! config (kb.append, webhook.fire, etc.).
+//! With no stored credentials and no env tokens the handshake still completes and the Socket Mode
+//! loop stays paused; running `copad-plugin-slack auth` later is picked up on its next reconnect.
+//! The plugin only emits events and authenticates; what happens on a mention is user trigger
+//! config. Protocol contract: `docs/service-plugins.md`.
 
 #[cfg(not(unix))]
 compile_error!(
@@ -93,11 +83,9 @@ fn run_auth() {
             std::process::exit(1);
         }
     };
-    // `auth.test` on xapp tokens returns `{ok, app_id, app_name}` with
-    // no team_id/user_id, so the cross-workspace match against the bot
-    // can't actually be enforced here. `apps.connections.open` below
-    // is the only meaningful xapp validation Slack supports for our
-    // use case (token alive + has `connections:write` scope).
+    // `auth.test` on xapp tokens returns no team_id/user_id, so the cross-workspace match cannot be
+    // enforced here; `apps.connections.open` is the only xapp validation (token alive, has
+    // `connections:write`).
     eprintln!("[slack] validating app token via apps.connections.open...");
     if let Err(e) = socket_mode::validate_app_token(&config.app_token) {
         eprintln!(
@@ -106,8 +94,7 @@ fn run_auth() {
         );
         std::process::exit(1);
     }
-    // Same-workspace check: a user token from a different team would let
-    // `as_user: true` posts target unintended workspaces.
+    // A user token from a different team would let `as_user: true` posts hit the wrong workspace.
     let user_token = if config.user_token.is_empty() {
         String::new()
     } else {
@@ -185,8 +172,7 @@ fn run_rpc() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    // Single writer thread funnels all outgoing JSON so init reply,
-    // action replies, and event.publish notifications never interleave.
+    // Single writer thread so init reply, action replies and event.publish never interleave.
     let (tx, rx) = channel::<String>();
     let writer_tx = tx.clone();
     thread::spawn(move || {
@@ -201,13 +187,9 @@ fn run_rpc() {
     let initialized = Arc::new(AtomicBool::new(false));
     let stop_signal = Arc::new(AtomicBool::new(false));
 
-    // Socket Mode loop runs in a background thread. It waits for the
-    // `initialized` notification before connecting so events can't
-    // race the handshake. The loop itself is responsible for
-    // resolving credentials (env then store) on every iteration —
-    // running `copad-plugin-slack auth` while copad is already up
-    // populates the store and the loop picks it up on the next
-    // recheck (no plugin process restart required).
+    // Socket Mode runs in a background thread, waiting for `initialized` so events cannot race the
+    // handshake. The loop resolves credentials (env, then store) every iteration, so a later
+    // `copad-plugin-slack auth` is picked up without a restart.
     {
         let init_flag = initialized.clone();
         let stop = stop_signal.clone();
@@ -225,10 +207,10 @@ fn run_rpc() {
                 thread::sleep(std::time::Duration::from_millis(100));
             }
             socket_mode::run_loop(&cfg, store_for_loop, &stop, |event| {
-                // Route to collect/bot_rpc BEFORE the firehose publish so
-                // a slow listener can't delay disk writes / response
-                // matching. Both are best-effort: errors log but never
-                // suppress the outgoing event.publish frame.
+                // Route to collect/bot_rpc before the firehose publish so a slow listener cannot
+                // delay disk
+                // writes or response matching. Errors log but never suppress the event.publish
+                // frame.
                 route_for_collect_and_bot_rpc(
                     &event,
                     &channels_for_loop,
@@ -248,7 +230,6 @@ fn run_rpc() {
         });
     }
 
-    // Sweeper publishes slack.bot_rpc.timeout for each deadlined wait.
     {
         let registry = bot_rpc_registry.clone();
         let stop = stop_signal.clone();
@@ -288,11 +269,9 @@ fn run_rpc() {
     }
 }
 
-/// Routes a `SlackEvent::Raw` message to (a) JSONL append for
-/// collect-profile channels and (b) bot_rpc registry's
-/// `ingest_message` for any pending wait correlations. Both paths
-/// filter on the matcher subtype contract so edits / joins / etc.
-/// don't sneak in.
+/// Routes a `SlackEvent::Raw` message to JSONL append (collect-profile channels) and to the
+/// bot_rpc registry's `ingest_message` for pending waits. Both filter on the matcher subtype
+/// contract so edits and joins do not sneak in.
 fn route_for_collect_and_bot_rpc(
     event: &SlackEvent,
     channels: &Arc<ChannelStore>,
@@ -311,10 +290,8 @@ fn route_for_collect_and_bot_rpc(
     if !is_matchable_subtype(subtype) {
         return;
     }
-    // Author extraction: prefer `user`, accept `bot_message` shape
-    // where Slack puts `user` alongside `bot_id`. Bots without `user`
-    // (rare; legacy webhooks) are dropped — see `wait_user_filter`
-    // contract in bot_rpc.rs.
+    // Prefer `user`, accept the `bot_message` shape where `user` sits beside `bot_id`. Bots without
+    // `user` are dropped (see `wait_user_filter` in bot_rpc.rs).
     let Some(user) = inner.get("user").and_then(Value::as_str) else {
         return;
     };
@@ -334,9 +311,7 @@ fn route_for_collect_and_bot_rpc(
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    // Bot-RPC ingest first — registry's recent buffer must be primed
-    // before the collect append (cheap, in-memory). If a match fires
-    // here, publish completed.
+    // Bot-RPC ingest first: the registry's recent buffer must be primed before the collect append.
     let msg = IncomingMessage {
         channel: channel.clone(),
         ts: ts.clone(),
@@ -351,15 +326,9 @@ fn route_for_collect_and_bot_rpc(
         bot_rpc::dispatch_completed(tx, &matched);
     }
 
-    // Collect: routing reads the channel entry on every message.
-    // Cheap (small JSON file) and avoids cache invalidation when
-    // the user upserts a channel mid-stream.
-    //
-    // Stricter filter than the bot-rpc matcher: knowledge-base capture
-    // wants normal human messages only. `bot_message` subtype is
-    // allowed for bot-rpc (Jira replies) but explicitly excluded here
-    // per the intent's AC — "bot 메시지 또는 subtype 있는 message
-    // (edit/delete/join 등)가 와도 jsonl에 기록되지 않음".
+    // Collect reads the channel entry on every message (small JSON file, no cache invalidation when
+    // a channel is upserted mid-stream). Stricter than the bot-rpc matcher: knowledge-base capture
+    // wants plain human messages, so any subtype (bot_message, edit, delete, join) is skipped.
     if subtype.is_some() {
         return;
     }
@@ -463,9 +432,7 @@ fn handle_frame(
                 Err((code, msg)) => send_error(tx, id, &code, &msg),
             }
         }
-        "event.dispatch" => {
-            // slack plugin doesn't subscribe — quietly ignore.
-        }
+        "event.dispatch" => {}
         "shutdown" => {
             stop_signal.store(true, Ordering::SeqCst);
             std::process::exit(0);
@@ -494,12 +461,9 @@ fn handle_action(
     tx: &Sender<String>,
 ) -> Result<Value, (String, String)> {
     if name == "slack.auth_status" {
-        // Round-5 fix: when env validation produced a fatal_error,
-        // the runtime loop refuses to connect — so auth_status
-        // MUST NOT report `authenticated=true` based on a
-        // fall-through default-workspace store load, otherwise the
-        // status surface would lie about the runtime state.
-        // Short-circuit to the disabled view.
+        // With a fatal config error the runtime loop refuses to connect, so auth_status must not
+        // report
+        // `authenticated=true` from a fall-through store load. Short-circuit to the disabled view.
         if let Some(err) = &config.fatal_error {
             return Ok(json!({
                 "configured": false,
@@ -513,24 +477,15 @@ fn handle_action(
                 "user_id": Value::Null,
             }));
         }
-        // Resolve credentials through the SAME function the Socket
-        // Mode loop uses — keeps reported `credentials_source`
-        // identical to the live source the runtime would actually
-        // use. Returning anything else would let the user see
-        // "store" in auth_status while the loop reads from "env",
-        // which is the round-2 cross-review concern.
+        // Resolve through the same function the Socket Mode loop uses, so the reported
+        // `credentials_source` matches what the runtime would actually use.
         let resolved = socket_mode::current_credentials(config, &**store);
         let stored = store.load();
         let credentials_source = resolved.as_ref().map(|c| c.source).unwrap_or("none");
         let authenticated = resolved.is_some();
-        // Identity (team_id, user_id) only meaningful when the live
-        // source is the store — that's the only path where we
-        // validated identity via auth.test at `auth` time. For
-        // env-overridden credentials we don't have a verified
-        // (team_id, user_id) for THOSE specific tokens, so reporting
-        // the stored identity would be misleading (the env tokens
-        // could be from a different workspace). Surface them only
-        // when consistent with the live source.
+        // Identity (team_id, user_id) is only verified for stored credentials (auth.test at `auth`
+        // time). Env-overridden tokens may belong to another workspace, so report it only for the
+        // store.
         let report_identity = credentials_source == "store";
         let has_user_token = resolved.as_ref().is_some_and(|c| c.user_token.is_some());
         return Ok(json!({
@@ -584,11 +539,8 @@ fn handle_action(
     ))
 }
 
-/// `slack.channels.discover {cursor?, types?, limit?}` — single page
-/// of `conversations.list`. Caller paginates by passing back the
-/// `next_cursor` in subsequent calls. `types` defaults to
-/// `public_channel,private_channel` (DMs/MPIMs rarely have meaningful
-/// names; user can override).
+/// `slack.channels.discover {cursor?, types?, limit?}`: one page of `conversations.list`; the
+/// caller passes back `next_cursor`. `types` defaults to `public_channel,private_channel`.
 fn handle_channels_discover(
     params: &Value,
     config: &Config,
@@ -606,19 +558,15 @@ fn handle_channels_discover(
             .to_string(),
     ))?;
     let cursor = params.get("cursor").and_then(Value::as_str);
-    // Hard-cap at 200 per intent AC ("첫 페이지 최대 200"). Caller can
-    // pass `limit` for *smaller* pages (e.g. 50) to keep modal scroll
-    // sane, but cannot widen — that would invite Tier-2 rate-limit
-    // pressure under user-driven pagination.
+    // Hard cap of 200. A caller may ask for smaller pages but not wider, to avoid Tier-2 rate-limit
+    // pressure from user-driven pagination.
     let limit_raw = params.get("limit").and_then(Value::as_u64).unwrap_or(200);
     let limit = limit_raw.min(200) as u32;
     let types_raw = params
         .get("types")
         .and_then(Value::as_str)
         .unwrap_or("public_channel,private_channel");
-    // Allowlist: Slack documents exactly these four. Reject unknown
-    // segments before sending — the API would 200-with-ok=false but a
-    // pre-check is cleaner than parsing back the error.
+    // Allowlist of the four documented types; cleaner than parsing back an ok=false response.
     for t in types_raw.split(',').map(str::trim) {
         if !matches!(t, "public_channel" | "private_channel" | "mpim" | "im") {
             return Err((
@@ -648,9 +596,8 @@ fn handle_channels_discover(
     }))
 }
 
-/// Map a Slack-shaped error string to (code, message) the same way
-/// `handle_get_message` does — Slack-shaped codes (lowercase + underscore)
-/// promote to top-level so triggers can branch.
+/// Map a Slack-shaped error string to (code, message) like `handle_get_message`: lowercase +
+/// underscore codes are promoted to top-level so triggers can branch.
 fn map_slack_error(err: String) -> (String, String) {
     let bare = err
         .split(|c: char| c.is_whitespace() || c == '(')
@@ -663,11 +610,8 @@ fn map_slack_error(err: String) -> (String, String) {
     }
 }
 
-/// `slack.bot_rpc.invoke {channel, text?}` — posts the configured
-/// template (or `text` override) to the channel and registers a
-/// pending wait for the response. Returns `{request_ts}` so the
-/// caller can correlate the upcoming `slack.bot_rpc.completed` /
-/// `slack.bot_rpc.timeout` notifications.
+/// `slack.bot_rpc.invoke {channel, text?}`: posts the template (or `text` override) and registers
+/// a pending wait. Returns `{request_ts}` to correlate `slack.bot_rpc.completed` / `.timeout`.
 #[allow(clippy::too_many_arguments)]
 fn handle_bot_rpc_invoke(
     params: &Value,
@@ -718,10 +662,8 @@ fn handle_bot_rpc_invoke(
             ),
         ));
     }
-    // Re-validate the loaded entry against current rules — legacy rows
-    // written before the zero-correlation / zero-timeout gates were
-    // added would otherwise sneak past `compile_regex` alone and
-    // complete on unrelated channel chatter.
+    // Re-validate against current rules: legacy rows written before the zero-correlation /
+    // zero-timeout gates would pass `compile_regex` alone and complete on unrelated chatter.
     channels::validate_entry(&entry).map_err(|e| {
         (
             "precondition_failed".to_string(),
@@ -745,10 +687,8 @@ fn handle_bot_rpc_invoke(
             "no 'text' override and channel has empty default_template".to_string(),
         ));
     }
-    // bot_user_id is REQUIRED — without it the self-echo guard in the
-    // matcher can't function. Prefer the resolved credentials' value,
-    // fall back to live auth.test (cached by bot_token) so env-only
-    // setups still work.
+    // bot_user_id is required for the matcher's self-echo guard. Prefer the resolved credentials,
+    // else live auth.test (cached by bot_token) so env-only setups work.
     let bot_user_id = resolve_bot_user_id(&creds, bot_user_id_cache)?;
     let (request_ts, posted_channel) =
         socket_mode::post_message(&creds.bot_token, channel_id, &text, None)
@@ -762,10 +702,8 @@ fn handle_bot_rpc_invoke(
         bot_user_id,
         compiled_regex,
     };
-    // add() also replays the recent message buffer — a response that
-    // arrived between postMessage send and HTTP response receive will
-    // already have been ingested via the Socket Mode loop, so we
-    // catch it here without any race.
+    // add() also replays the recent message buffer, catching a response that arrived between
+    // postMessage send and HTTP response via the Socket Mode loop.
     if let Some(matched) = bot_rpc_registry.add(wait) {
         bot_rpc::dispatch_completed(tx, &matched);
     }
@@ -775,9 +713,7 @@ fn handle_bot_rpc_invoke(
     }))
 }
 
-/// Resolves the bot's own Slack user id, caching against the
-/// originating bot token. Required by `bot_rpc.invoke` so the matcher's
-/// self-echo guard has a real value to compare against.
+/// Resolves the bot's own user id, cached per bot token, for the matcher's self-echo guard.
 fn resolve_bot_user_id(
     creds: &socket_mode::ResolvedCredentials,
     cache: &Arc<std::sync::Mutex<Option<(String, String)>>>,
@@ -814,11 +750,8 @@ fn handle_channels_list(channel_store: &Arc<ChannelStore>) -> Result<Value, (Str
     }))
 }
 
-/// `slack.channels.upsert` — insert or replace by `id`. For C/G prefix
-/// channels, this calls `conversations.info` to enrich `name` (overrides
-/// user-provided name on success; falls back to user input on API failure
-/// so a missing-scope error doesn't block the user from registering a
-/// channel they care about).
+/// `slack.channels.upsert`: insert or replace by `id`. For C/G channels it enriches `name` via
+/// `conversations.info`, falling back to the user's name on API failure (e.g. missing scope).
 fn handle_channels_upsert(
     params: &Value,
     config: &Config,
@@ -833,12 +766,8 @@ fn handle_channels_upsert(
             "missing 'id' (string)".to_string(),
         ))?
         .to_string();
-    // Validate the channel id BEFORE any outbound Slack call (the C/G
-    // `conversations.info` enrichment below). An unvalidated caller-
-    // controlled value would otherwise reach slack.com in the query
-    // string before `invalid_params` is returned — the ChannelStore
-    // re-validates on persist, but only the early check keeps malformed
-    // input out of the network.
+    // Validate the channel id before any outbound call: otherwise caller-controlled input reaches
+    // slack.com in the query string before `invalid_params` is returned.
     if !channels::is_valid_channel_id(&id) {
         return Err((
             "invalid_params".to_string(),
@@ -876,11 +805,8 @@ fn handle_channels_upsert(
         Some(v) => Some(parse_bot_rpc(v)?),
     };
 
-    // Auto-fetch name for public/private channels. Best effort: if the API
-    // fails (no scope, transient error), fall back to user-provided name.
-    // We deliberately do NOT abort upsert on lookup failure — the registry
-    // entry is local-only metadata, and a missing-scope error shouldn't
-    // block the user from saving a channel they care about.
+    // Best effort: on lookup failure keep the user-provided name rather than abort, since the entry
+    // is local-only metadata.
     let resolved_name = if channels::channel_supports_name(&id) {
         let creds = socket_mode::current_credentials(config, &**store);
         match creds.as_ref() {
@@ -1007,12 +933,9 @@ fn handle_get_message(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let token = select_action_token(&creds, as_user)?;
-    // Slack channel ids start with C/D/G/U and are uppercase
-    // alphanumeric. ts looks like "1700000000.000100" — digits and
-    // exactly one dot. Validate to close the same trust-boundary
-    // gap Discord's send_message guards against (a malicious
-    // trigger pushing `../auth.test` into the URL position would
-    // re-route the authenticated request).
+    // Channel ids are uppercase alphanumeric starting with C/D/G/U; ts is digits with one dot.
+    // Validating closes the same trust-boundary gap as Discord's send_message: a trigger pushing
+    // `../auth.test` into the URL position would re-route the authenticated request.
     if !is_valid_slack_id(channel) {
         return Err((
             "invalid_params".to_string(),
@@ -1027,17 +950,11 @@ fn handle_get_message(
     }
     match socket_mode::get_message(token, channel, ts) {
         Ok(value) => Ok(value),
-        // Slack errors come through in two shapes:
-        //   - bare error code (`channel_not_found`, `not_in_channel`,
-        //     `missing_scope`, `message_not_found`)
-        //   - prefix + suffix (`rate_limited (Retry-After: 30)`,
-        //     `conversations.history HTTP 503: <body>`)
-        // Promote the bare-code prefix to the top-level error code
-        // when it parses as Slack-shaped (lowercase + underscore
-        // only — every documented Slack error code is in that
-        // charset). Transport-shaped messages (with `.`, digits,
-        // mixed case in the prefix) stay under `io_error` with the
-        // full body preserved in the message field.
+        // Slack errors are either a bare code (`channel_not_found`, `missing_scope`) or prefix +
+        // suffix
+        // (`rate_limited (Retry-After: 30)`). A prefix that is lowercase + underscore only becomes
+        // the
+        // top-level error code; transport-shaped messages stay `io_error` with the full body.
         Err(err) => {
             let bare = err
                 .split(|c: char| c.is_whitespace() || c == '(')
@@ -1052,8 +969,8 @@ fn handle_get_message(
     }
 }
 
-/// `as_user: true` hard-fails when no user token is configured —
-/// silent fallback to the bot would post under the wrong identity.
+/// `as_user: true` hard-fails with no user token; falling back to the bot would post under the
+/// wrong identity.
 fn select_action_token(
     creds: &socket_mode::ResolvedCredentials,
     as_user: bool,
@@ -1070,8 +987,7 @@ fn select_action_token(
     }
 }
 
-/// `[A-Z0-9]+`. Prefix (C/D/G/U/W/T) is intentionally NOT enforced —
-/// `get_message` works for DM channels and shared-channel mirrors too.
+/// `[A-Z0-9]+`. The prefix is not enforced: `get_message` works for DM channels and mirrors too.
 fn is_valid_slack_id(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
@@ -1098,10 +1014,8 @@ fn handle_post_message(
             "slack plugin is in fatal-config state — see slack.auth_status".to_string(),
         ));
     }
-    // Resolve the bot token through the SAME path the Socket Mode
-    // loop uses so write actions don't accidentally diverge from
-    // read events. A user who's authenticated only via env, or
-    // only via store, gets the right token here either way.
+    // Resolve through the same path the Socket Mode loop uses so write actions do not diverge from
+    // read events.
     let creds = socket_mode::current_credentials(config, &**store).ok_or((
         "not_authenticated".to_string(),
         "no Slack credentials available — run `copad-plugin-slack auth` or set env tokens"
@@ -1127,12 +1041,8 @@ fn handle_post_message(
             "ts": ts,
             "channel": posted_channel,
         })),
-        // Surface Slack's structured error codes verbatim — the
-        // common ones are documented at api.slack.com/methods/chat.postMessage:
-        // `missing_scope`, `not_in_channel`, `channel_not_found`,
-        // `is_archived`, `msg_too_long`, `rate_limited`. Caller
-        // (trigger / coctl) can branch on these without
-        // re-parsing message strings.
+        // Slack's own code (`missing_scope`, `not_in_channel`, `rate_limited`, ...) stays in the
+        // message text; the action error code is always `io_error`.
         Err(err) => Err(("io_error".to_string(), err)),
     }
 }

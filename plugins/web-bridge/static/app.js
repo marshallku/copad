@@ -1,31 +1,19 @@
   (() => {
     const root = document.getElementById("root");
     let token = sessionStorage.getItem("copad.token") || "";
-    // Auth mode is decided by /api/whoami on boot. tailscale-mode
-    // skips the token setup page entirely + omits the Authorization
-    // header from /api/* calls + the bearer.<token> subprotocol from
-    // /ws/* upgrades (the middleware trusts Tailscale-User-Login).
-    // Bearer is the only auth mode. The Tailscale identity-header path was removed: serve
-    // attaches that header to every request it forwards, WebSocket upgrades are not subject to
-    // CORS, and `/ws/board/attach` hands back a terminal — so any page visited on an admitted
-    // device could have driven it with no token. See docs/mobile-access.md.
+// Bearer is the only auth mode. A Tailscale identity header is not trusted: serve attaches it
+// to every request it forwards, WebSocket upgrades are not subject to CORS, and
+// `/ws/board/attach` hands back a terminal, so any page on an admitted device could drive it
+// with no token (docs/mobile-access.md).
 
     function api(path, opts = {}) {
       opts.headers = Object.assign({}, opts.headers || {});
-      // Only send the Bearer header in bearer mode — in tailscale
-      // mode we have no token and the server would 401 on an empty
-      // bearer anyway.
       if (token) {
         opts.headers["Authorization"] = "Bearer " + token;
       }
       if (opts.body && !opts.headers["Content-Type"]) opts.headers["Content-Type"] = "application/json";
       return fetch(path, opts).then(async (r) => {
         if (r.status === 401) {
-          // Only the bearer path treats 401 as "token went bad,
-          // reprompt". In tailscale mode a 401 means the proxy lost
-          // the header — surface it as a generic error rather than
-          // dropping the user back to a setup page that doesn't
-          // apply to them.
           {
             token = ""; sessionStorage.removeItem("copad.token");
             stopBoardPolling();   // no longer authenticated; do not keep hammering 401s
@@ -64,19 +52,14 @@
       noGui: false,
       pilot: null,              // /api/pilot/status result: {pilot:{goals,active,gate,counts}, csd, tmx, errors}
       pilotError: "",           // set when pilot.status RPC fails (plugin not running)
-      pilotAdd: false,          // add-goal form expanded?
+      pilotAdd: false,
       activePane: null,         // pane_id while in attach mode
       ws: { events: null, overview: null, attach: null },
-      term: null,               // xterm.js Terminal instance
-      fit: null,                // FitAddon
+      term: null,
+      fit: null,
       ctrlSticky: false,
-      // PWA push notification state. `status`:
-      //   "unsupported" — browser missing serviceWorker / PushManager
-      //   "denied" — Notification.permission === "denied"
-      //   "off" — supported but user hasn't subscribed
-      //   "on" — subscribed; server has a stored Subscription
-      // kinds is the user-selected filter (empty = receive every kind);
-      // we default to a sensible "useful Claude/Codex" set.
+      // push.status: "unsupported" (no serviceWorker/PushManager), "denied", "off" (supported, not
+      // subscribed), "on" (server holds a Subscription). kinds: empty = every kind.
       push: {
         status: "unsupported",
         kinds: ["notification", "stop", "codex-turn"],
@@ -85,9 +68,7 @@
       },
     };
 
-    // URL-safe base64 → Uint8Array. PushManager.subscribe wants the
-    // VAPID public key as a Uint8Array, but we transport it as the
-    // url-safe base64 string the spec uses.
+    // PushManager.subscribe wants the VAPID public key as a Uint8Array, not url-safe base64.
     function urlB64ToUint8Array(b64) {
       const pad = "=".repeat((4 - b64.length % 4) % 4);
       const norm = (b64 + pad).replace(/-/g, "+").replace(/_/g, "/");
@@ -97,20 +78,10 @@
       return out;
     }
 
-    // Subprotocol list for WebSocket constructors. The server's
-    // upgrade handshake auth checks the `bearer.<token>` subprotocol
-    // when a token is present; in tailscale mode there's no token, so
-    // we omit the second argument and let the Tailscale-User-Login
-    // header (injected on the upgrade request like any HTTP request)
-    // satisfy the middleware.
+    // Subprotocol list for WebSocket constructors; the upgrade auth reads `bearer.<token>`.
     function wsProtocols() {
       return token ? [`bearer.${token}`] : undefined;
     }
-    // True when the SPA still has a way to authenticate the next
-    // reconnect attempt — tailscale mode is always-eligible since
-    // the proxy keeps injecting the header; bearer mode needs the
-    // cached token. Used by overview/events WS onclose handlers so
-    // tailscale sessions don't silently stop reconnecting.
     function canReconnect() {
       return !!token;
     }
@@ -120,9 +91,7 @@
     }
     function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, ""); }
     function fmtTs(ms) { if (!ms) return ""; return new Date(ms).toTimeString().slice(0,8); }
-    // Relative-age string matching tmx's human_age / attention-picker.sh.
-    // `ms` is epoch-millis; `tsSec` is epoch-seconds. Returns "5s"/"3m"/
-    // "2h"/"1d" or "" when missing so callers can chain conditionally.
+    // Relative age like "5s"/"3m"/"2h"/"1d" from epoch millis, "" when missing.
     function humanAgeMs(ms) {
       if (!ms) return "";
       const secs = Math.max(0, Math.floor((Date.now() - ms) / 1000));
@@ -163,9 +132,6 @@
         const t = inp.value.trim();
         if (t.length < 32) { inp.style.borderColor = "var(--accent-err)"; return; }
         token = t; sessionStorage.setItem("copad.token", t);
-        // honor `#pane/<id>` deep-links that arrived through the
-        // pre-auth login flow — without this, a phone shortcut to a
-        // specific pane drops you on overview after the first login.
         bootFromHash();
         bootstrap();
       };
@@ -173,18 +139,8 @@
       inp.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
     }
 
-    // Stable sort key — lower = higher on the page. Order: waiting
-    // (user-blocking) > busy (actively running) > idle (parked) > no
-    // agent (plain shell). Tier 4 panes preserve tmux's own order; tier
-    // 0-2 are tie-broken by newer updated_at_ms so the most recently
-    // active session of a tier floats up.
-    // tmx 1.x status vocabulary (verified against live snapshot):
-    //   working           — mid-turn (was: busy)
-    //   awaiting-decision — permission / selection dialog (was: waiting)
-    //   ready             — at chat prompt
-    //   idle              — plain shell / no signal
-    // `blocked` flag overrides everything — it means the harness has
-    // stop-blocked the session, the user must look.
+    // Stable sort key, lower = higher on the page: blocked/awaiting-decision, working, ready,
+    // then plain shell (tmux's own order). The harness `blocked` flag overrides everything.
     function paneSortRank(p) {
       const a = p.agent;
       if (a && a.flags && a.flags.blocked) return 0;
@@ -195,8 +151,6 @@
       if (status === "idle" && a && (a.kind === "claude" || a.kind === "codex")) return 2;
       return 4;
     }
-    // Map tmx status → existing pill CSS class. Keeps the warn/err/ok
-    // palette consistent without renaming the underlying styles.
     function statusToPillClass(s) {
       if (s === "working") return "busy";
       if (s === "awaiting-decision") return "waiting";
@@ -204,39 +158,23 @@
       return "";
     }
     function paneSorted(panes) {
-      // tmx no longer surfaces a per-agent updated_at, so within a
-      // tier we fall back to tmux's natural order (stable sort).
       return panes.slice().sort((a, b) => paneSortRank(a) - paneSortRank(b));
     }
 
-    /* ==== the comux fleet board ====
-     *
-     * This replaces the tmx-fed `attention` strip and `codex jobs` cards that used to sit in
-     * the overview. Their only producer was the /ws/tmux/overview stream, which this build no
-     * longer opens, so they could only ever render empty here; the board answers the same
-     * question (which agent needs me) from comux, which is what actually runs on this machine.
-     */
-
-    // Status comes from comux and is CACHED AND INFERRED: only Claude's is read from a session
-    // file, everything else is matched against screen text, and `idle` doubles as "no
-    // recognized UI" — i.e. an unresolved reading. So the partition below must be EXHAUSTIVE
-    // and must preserve the raw label. An earlier draft listed blocked/working/idle only,
-    // which would have hidden `ready` — 26 of the 27 agents on this machine.
+    // Status comes from comux and is cached and inferred: only Claude's is read from a session
+    // file, the rest is matched against screen text, and `idle` doubles as "no recognized UI".
+    // So the partition must be exhaustive and keep the raw label, or `ready` agents get hidden.
     const BOARD_ATTENTION = new Set(["blocked"]);
     const BOARD_ACTIVE = new Set(["working"]);
 
-    // Group key. `space_id` is the stable session id, but an older comux does not send it, and
-    // two sessions may legitimately share a display name — so a name-based key is NAMESPACED
-    // and marked ambiguous rather than silently merged with an id-based one.
+    // Group key. An older comux sends no `space_id`, and two sessions may share a display name,
+    // so a name-based key is namespaced and marked ambiguous rather than merged with an id key.
     function boardGroupKey(a) {
       return a.space_id ? `id:${a.space_id}` : `name:${a.space || "?"}`;
     }
 
-    /// The tool worth naming is the one that is NOT what everything else is.
-    ///
-    /// Every agent here is `claude`, so printing it on all 27 rows is 27 repetitions of one
-    /// fact and it costs a column on a phone. Name the tool only where it differs from the
-    /// fleet's dominant one — then seeing `codex` on a row actually means something.
+    // Name the tool only where it differs from the fleet's dominant one, so `codex` on a row means
+    // something and a phone does not spend a column repeating `claude`.
     function dominantTool(agents) {
       const c = new Map();
       for (const a of agents) c.set(a.tool, (c.get(a.tool) || 0) + 1);
@@ -251,17 +189,14 @@
       const where = withSpace
         ? `<span class="row-space">${escapeHtml(a.space || "?")}</span>`
         : "";
-      // `detail` is what the agent was last seen DOING, straight from its own log. Absent means
-      // "no reading", never "doing nothing" — an older comux does not send it at all — so it is
-      // rendered when present and simply left out otherwise, never as a placeholder.
+      // `detail` is what the agent was last seen doing. Absent means "no reading", not "idle", and
+      // an older comux does not send it, so it is left out rather than shown as a placeholder.
       const detail = a.detail
         ? `<div class="row-detail">${escapeHtml(a.detail)}</div>` : "";
       const tool = hideTool ? "" : `<span class="row-tool">${escapeHtml(a.tool || "")}</span>`;
-      // The layout encodes three statuses positionally: `blocked` is the attention band,
-      // `working` is the working band, `ready` is a plain dot in the idle list. Anything else
-      // gets its raw label printed, because collapsing it into the same grey dot would hide a
-      // real distinction — comux documents `idle` as ALSO meaning "no recognized UI", i.e. an
-      // unresolved reading, and an unknown status must not silently read as ready.
+      // `blocked` and `working` are encoded by band, `ready` by a plain dot. Anything else prints
+      // its
+      // raw label: comux's `idle` also means "no recognized UI", and must not read as ready.
       const encoded = BOARD_ATTENTION.has(a.status) || BOARD_ACTIVE.has(a.status)
         || a.status === "ready";
       const status = encoded ? "" : `<span class="row-status">${escapeHtml(a.status || "?")}</span>`;
@@ -294,14 +229,13 @@
       const errs = (b.errors || []).map(e =>
         `<div class="banner">fleet: ${escapeHtml(e.what)} — ${escapeHtml(e.message || e.code)}</div>`).join("")
         + (state.boardNote ? `<div class="banner">${escapeHtml(state.boardNote)}</div>` : "");
-      // Computed BEFORE the early return: without it, a transport failure on top of an
-      // already-partial response would present the retained session count as current.
+      // Computed before the early return, or a transport failure on a partial response would show
+      // the retained session count as current.
       const stale = state.boardStale
         ? `<div class="banner">마지막으로 읽은 내용 — 브리지가 응답하지 않음</div>` : "";
 
-      // null means "could not read"; [] means "read, and empty". Rendering them the same would
-      // report a failed read as an empty fleet — and the agents list IS the board, so
-      // substituting [] would print a confident "idle 0" that is simply false.
+      // null means "could not read"; [] means "read, and empty". Rendering both as an empty fleet
+      // would print a false "idle 0".
       if (b.agents === null) {
         return `${errs}${stale}<div class="board-empty">에이전트 목록을 읽지 못했습니다${
           b.sessions ? ` — 마지막 읽기 기준 세션 ${b.sessions.length}개` : ""}</div>`;
@@ -312,8 +246,7 @@
       const active = agents.filter(a => BOARD_ACTIVE.has(a.status));
       const rest = agents.filter(a => !BOARD_ATTENTION.has(a.status) && !BOARD_ACTIVE.has(a.status));
 
-      // Groups are ALWAYS expanded. There is no toggle: on a phone the question is "what is
-      // going on", and an answer you have to unfold one session at a time is not an answer.
+      // Groups are always expanded; there is no toggle.
       const groups = new Map();
       for (const a of rest) {
         const k = boardGroupKey(a);
@@ -327,9 +260,8 @@
           ${rows.map(a => boardRow(a, true, !!only)).join("")}
         </section>`;
 
-      // Ambiguous grouping is a property of the SERVER, not of one session: an older comux
-      // sends no session id at all, so marking every group "by name" would repeat one global
-      // fact ten times. Per-group only when some groups are keyed by id and some are not.
+      // Ambiguity is a property of the server (an older comux sends no session id), so mark a group
+      // "by name" only when some groups are keyed by id and some are not.
       const someById = [...groups.values()].some(g => !g.ambiguous);
       const allByName = groups.size > 0 && [...groups.values()].every(g => g.ambiguous);
       const idle = rest.length === 0 ? "" : `
@@ -363,25 +295,20 @@
         }</p>`;
     }
 
-    // One outstanding request at a time, the next scheduled only after the previous completes,
-    // and stale responses dropped by epoch. A fixed interval would stack requests whenever the
-    // bridge is slow — and /api/board can spend two sequential subprocess deadlines.
+    // One request at a time, the next scheduled after the previous completes, stale responses
+    // dropped by epoch. /api/board can spend two sequential subprocess deadlines server-side.
     async function loadBoard() {
-      // One request at a time, not one per caller. `startBoardPolling` is invoked on return
-      // from the terminal AND on every foreground, so without this a phone waking up could put
-      // several fetches in flight at once — and each /api/board can spend two sequential
-      // subprocess deadlines server-side.
+      // Single-flight: startBoardPolling runs on return from the terminal and on every foreground,
+      // so without this a waking phone could stack several fetches.
       if (state.boardInFlight) return;
       state.boardInFlight = true;
       const epoch = ++state.boardEpoch;
       let deadline = null;
       try {
-        // `api()` has no timeout of its own. A request that never settles — a phone that lost
-        // signal mid-flight is the ordinary case — would otherwise leave `boardInFlight` set
-        // forever, silently skipping every later refresh while the board showed data that was
-        // never marked stale. The fetch is ABORTED rather than merely raced: abandoning it
-        // would leave the old request outstanding while the next poll started another, which
-        // is the overlap the single-flight guard exists to prevent.
+        // `api()` has no timeout. A request that never settles (lost signal) would leave
+        // `boardInFlight` set forever and skip every later refresh. It is aborted rather than
+        // raced,
+        // since an abandoned request would overlap the next poll.
         const ctl = new AbortController();
         deadline = setTimeout(() => ctl.abort(), 15000);
         const b = await api("/api/board", { signal: ctl.signal });
@@ -390,8 +317,6 @@
         state.boardStale = false;
       } catch {
         if (state.boardEpoch !== epoch) return;
-        // A request that never returns is invisible to the API's own `errors[]`, so transport
-        // failure marks what is on screen as stale rather than blanking it.
         state.boardStale = true;
       } finally {
         if (deadline) clearTimeout(deadline);
@@ -400,27 +325,21 @@
       if (state.mode === "overview") render();
     }
 
-    // The same condition `render()` uses to decide between the app and the token page. Polling
-    // must respect it: on the setup screen `state.mode` is still "overview", so a foreground
-    // event would start the loop, every /api/board would 401, and `api()`'s 401 handler clears
-    // the token and re-renders — wiping the field the user is in the middle of pasting into,
-    // every five seconds.
+    // Same condition `render()` uses to pick the app or the token page. On the setup screen a
+    // foreground event would start polling, every 401 clears the token and re-renders, and the
+    // field being pasted into is wiped every five seconds.
     function isAuthed() {
       return !!token;
     }
 
     function startBoardPolling() {
       if (!isAuthed()) { stopBoardPolling(); return; }
-      // Only the TIMER is reset here, deliberately not the request epoch. `startBoardPolling`
-      // runs on every foreground and on every return from the terminal, and invalidating an
-      // in-flight request there would throw away a good response that is about to land and
-      // then wait a full interval for its replacement. Invalidation belongs to leaving
-      // (`stopBoardPolling`).
+      // Only the timer is reset, not the request epoch: invalidating an in-flight request on every
+      // foreground would discard a good response about to land. Invalidation belongs to
+      // `stopBoardPolling`.
       clearBoardTimer();
-      // Each loop carries a generation, and only the CURRENT generation may schedule. Without
-      // it a restart during an in-flight request forks the loop: the new tick returns early on
-      // the single-flight guard and schedules, then the original tick completes and schedules
-      // too — two chains from then on, each polling.
+      // Only the current generation may schedule. Otherwise a restart during an in-flight request
+      // forks the loop into two polling chains.
       const loop = ++state.boardLoop;
       const tick = async () => {
         if (!isAuthed() || state.mode !== "overview" || state.boardLoop !== loop) return;
@@ -442,10 +361,6 @@
     }
 
     function renderOverview() {
-      // The tmux-pane cards and copad-panel cards that used to be built here are gone with
-      // the tmux data model; `renderBoard()` below is the overview's content now. Their
-      // computation was removed rather than left unrendered — it walked state that nothing
-      // populates any more and ran on every poll.
       const pushChip = (() => {
         if (state.push.status === "unsupported") return `<button class="chip" id="push-toggle" disabled>push: n/a</button>`;
         if (state.push.status === "denied") return `<button class="chip warn" id="push-toggle">push: denied</button>`;
@@ -502,12 +417,6 @@
       wirePilot();
     }
 
-    // Resolve a "session:window_idx" tmux_target (or bare session name)
-    // to a concrete pane_id from the current snapshot. Preference order:
-    // active pane in the exact window → first pane in the window → any
-    // pane in the session. Null when nothing matches (stale entry whose
-    // session has since died).
-
     function renderAttach() {
       const pane = state.tmuxPanes.find(p => p.pane_id === state.activePane);
       const title = pane ? `${pane.session} : ${pane.window_name || pane.window_index} (${pane.pane_id})` : state.activePane;
@@ -537,44 +446,24 @@
       `;
       document.getElementById("back").addEventListener("click", leaveAttach);
       document.getElementById("presence-toggle").addEventListener("click", togglePresence);
-      // preventDefault on mousedown/touchstart stops the button from
-      // stealing focus away from xterm's hidden textarea. Without
-      // this, every toolbar tap blurs the terminal and the user has
-      // to click the terminal again before the next key works — the
-      // sticky-Ctrl combo becomes "Ctrl, click terminal, type letter"
-      // instead of "Ctrl, letter". After the click fires we still
-      // call term.focus() as a belt-and-braces refocus in case any
-      // platform quirk drained the textarea.
       wireKbdBar();
       openTerminal();
     }
 
-    /* ==== the key bar ====
-     *
-     * Every button in both bars was DEAD on the phone, and had been since the bar was written:
-     * the handlers were `mousedown`+`touchstart` → `preventDefault()` (to stop the tap blurring
-     * the input and dropping the keyboard mid-chord) with the action on `click`. On iOS,
-     * preventing the default of `touchstart` suppresses the synthesized mouse events — mousedown,
-     * mouseup AND click — so the action never ran. A desktop mouse still produces a real click,
-     * which is why every test and every e2e passed.
-     *
-     * So the touch path is explicit now: the action fires on `touchend`, and only for a touch that
-     * stayed put (each bar is one horizontally scrollable row, and dragging it must scroll rather
-     * than type). `preventDefault` there is what keeps the focus, and it also cancels the
-     * synthesized click — but a device that emits one anyway is covered by the suppression window.
-     */
+// Key bar buttons act on `touchend`, not `click`: on iOS, preventDefault on `touchstart`
+// suppresses the synthesized mousedown/mouseup/click, so a click handler never runs. So
+// `touchstart` stays passive and preventDefault happens on `touchend`, which keeps the input
+// focused (no dropped keyboard) and cancels the synthesized click. Only a touch that stayed put
+// counts, since each bar is a horizontally scrollable row. A device that emits a click anyway is
+// covered by the suppression window.
 
-    const TAP_SLOP_PX = 10;        // a touch that moves further than this is a scroll, not a tap
+    const TAP_SLOP_PX = 10;
     const TAP_CLICK_SUPPRESS_MS = 700;
 
-    /// "Did this touch stay still enough to be a tap" as a small machine, so the bookkeeping is
-    /// testable without a browser — which is the only reason the original was wrong twice.
-    ///
-    /// A gesture is OWNED by the identifier it started with. It dies the moment a second finger
-    /// joins (checked on every move, because that finger may land on a different element and this
-    /// listener would never hear its `touchstart`) or the moment it travels past the slop —
-    /// DURING the move, not at the end: a finger that wanders 80px down the bar and comes back
-    /// was scrolling, and comparing only start to end would type a key for it.
+    // Tap detection as a small machine so it is testable without a browser. A gesture is owned by
+    // the identifier it started with and dies when a second finger joins (checked on every move,
+    // since that finger may land elsewhere) or when it travels past the slop during the move, so a
+    // finger that wanders down the bar and back is a scroll, not a key.
     function tapGesture(slop) {
       let id = null, sx = 0, sy = 0, moved = false;
       return {
@@ -588,7 +477,6 @@
           if (t.identifier !== id) return;
           if (Math.abs(t.clientX - sx) > slop || Math.abs(t.clientY - sy) > slop) moved = true;
         },
-        /// `remaining` is how many fingers are still down; a clean tap leaves none.
         end(t, remaining) {
           const fire = id !== null && !moved && remaining === 0 && !!t && t.identifier === id;
           id = null;
@@ -598,22 +486,18 @@
       };
     }
 
-    /// Should a `click` run, given the last touch-driven fire? Both events reaching us would send
-    /// the byte twice — an `Esc` that fires twice is a second Escape the app acts on.
+    // Both a touch fire and a synthesized click would send the byte twice, e.g. a double Escape.
     function shouldFireClick(now, lastTouch) {
       return now - lastTouch >= TAP_CLICK_SUPPRESS_MS;
     }
 
-    /// Bind one activation to an element across both input models.
     function onActivate(el, run) {
       if (!el) return;
-      // A synthesized mousedown's default IS the focus change, and preventing it does NOT cancel
-      // the click — unlike touchstart. That asymmetry is the whole fix.
+      // Preventing a synthesized mousedown keeps focus and, unlike touchstart, does not cancel the
+      // click.
       el.addEventListener("mousedown", (e) => e.preventDefault());
-      // Per element, not shared: a hybrid device (iPad + trackpad) tapping one key and then
-      // clicking another within the window would otherwise swallow the second.
-      // Per element, not shared: a hybrid device (iPad + trackpad) tapping one key and then
-      // clicking another within the window would otherwise swallow the second.
+      // Per element, not shared: tapping one key then clicking another on a hybrid device (iPad +
+      // trackpad) within the window must not swallow the second.
       let lastTouchFire = 0;
       const tap = tapGesture(TAP_SLOP_PX);
       el.addEventListener("touchstart", (e) => tap.start(e.touches[0], e.touches.length), { passive: true });
@@ -631,10 +515,9 @@
       });
     }
 
-    // Shared by both terminal views.
     function wireKbdBar() {
-      // Mode-aware because the two views own input differently: mux has the IME strip, and the
-      // legacy attach view still lets xterm read its own keyboard.
+      // The two views own input differently: mux has the IME strip, attach lets xterm read its
+      // keyboard.
       const refocus = () => {
         try {
           if (state.mode === "mux") imeEl()?.focus({ preventScroll: true });
@@ -644,7 +527,6 @@
       document.querySelectorAll(".kbd-bar button[data-bytes]").forEach(btn => {
         onActivate(btn, () => { sendKbdBytes(btn.dataset.bytes); refocus(); });
       });
-      // Sticky Ctrl goes through the same activation, or it would be the one dead button left.
       onActivate(document.getElementById("ctrl"), () => {
         state.ctrlSticky = !state.ctrlSticky;
         document.getElementById("ctrl")?.classList.toggle("sticky", state.ctrlSticky);
@@ -652,13 +534,8 @@
       });
     }
 
-    // --- Phase 24.6 pilot orchestration cockpit ---
-
     function shortId(id) { return (id || "").replace(/^g-/, "").slice(0, 8); }
 
-    // Build the pilot strip for the overview. Renders the goal queue with
-    // per-goal status pills, the active goal's gate (with answer/approve
-    // controls), a cancel affordance, and an add-goal form.
     function renderPilot() {
       const wrap = state.pilot && state.pilot.pilot ? state.pilot.pilot : null;
       const goals = wrap && Array.isArray(wrap.goals) ? wrap.goals : [];
@@ -742,7 +619,6 @@
         state.pilot = await api("/api/pilot/status");
         state.pilotError = "";
       } catch (e) {
-        // pilot plugin not running / no daemon → show a banner, keep polling.
         state.pilot = null;
         state.pilotError = (e && e.message) || "unavailable";
       }
@@ -792,8 +668,6 @@
     }
 
     function render() {
-      // Tailscale mode never needs a token — go straight to the app.
-      // Bearer mode needs one; otherwise show the setup prompt.
       if (!token) { renderSetup(); return; }
       if (state.mode === "mux") { renderMux(); return; }
       if (state.mode === "attach") { renderAttach(); return; }
@@ -802,27 +676,17 @@
 
     /* ==== comux terminal (the mobile terminal) ==== */
 
-    // The grid is whatever the phone actually fits. There is deliberately NO column floor.
+    // The grid is whatever the phone fits, with no column floor. Flooring at 80 (to stop the phone
+    // reflowing the desktop) left horizontal scrolling on a ~40 column screen, and 80 is comux's
+    // `sidebar_min_cols` default, which keeps its sidebar visible and unreadable. Fitting hides
+    // the sidebar by itself (comux checks `cols >= sidebar_min_cols`) without touching `Ctrl-b s`,
+    // which is shared state. The fleet board is the phone's sidebar.
     //
-    // An earlier build floored it at 80 to stop the phone reflowing the desktop, since comux
-    // composes one frame sized to the smallest attached client. That was the wrong trade twice
-    // over. A phone fits roughly 40 columns, so an 80-column grid meant horizontal scrolling
-    // through content that did not fit — and 80 is exactly comux's `sidebar_min_cols` default,
-    // the one value at which its sidebar stays VISIBLE, so 24 of those 80 columns went to a
-    // sidebar the phone does not need. The result on a real device was a screen with nothing
-    // readable on it.
+    // Cost: the composed frame and the PTYs follow the narrowest client, so if the phone detaches
+    // last the geometry stays narrow until something attaches (decisions #65/#66).
     //
-    // Fitting the viewport hides that sidebar for free — comux checks `cols >= sidebar_min_cols`
-    // itself — without touching `Ctrl-b s`, which is shared state and would hide it on the
-    // desktop too. The fleet board is the phone's sidebar.
-    //
-    // The cost is real and larger than "while attached": the composed frame and the PTYs follow
-    // the narrowest client, and if the phone is the LAST one to detach the geometry stays
-    // narrow until something attaches again. Accepted — the premise of this product is that
-    // nobody is at the desktop. The fix is the per-pane semantic grid (decisions #65/#66).
-    //
-    // The sizing must be the BROWSER's logical grid, not just the PTY: comux probes the terminal
-    // for its true size on focus and sends back what it gets, so a PTY-only clamp is overwritten.
+    // The size must be the browser's logical grid, not only the PTY: comux probes the terminal's
+    // size on focus and sends back what it gets, so a PTY-only clamp is overwritten.
     const MUX_MIN_COLS = 20;   // not a layout choice — just never send a degenerate size
     const MUX_MIN_ROWS = 8;
 
@@ -834,8 +698,7 @@
       return { cols, rows };
     }
 
-    // Apply the floor and tell the PTY the SAME grid the browser is drawing. Every path that
-    // can change the size goes through here, so xterm and the PTY cannot drift apart.
+    // Every size change goes through here so xterm and the PTY cannot drift apart.
     function sendMuxResize() {
       if (!state.term) return;
       const { cols, rows } = muxGrid(state.fit, state.term);
@@ -845,20 +708,13 @@
       }
     }
 
-    // Replace the view's chrome while KEEPING a live terminal's DOM.
-    //
-    // Any async handler that finishes while mux is open calls `render()` — the push
-    // subscribe/unsubscribe completions do, and so would anything added later. A plain
-    // `root.innerHTML = …` throws away xterm's host element, and `openMuxTerminal` then
-    // returns early on its idempotence guard because the Terminal and socket objects still
-    // exist: a blank screen whose toolbar still types into an invisible terminal. Detaching
-    // the live host first and putting it back into the freshly rendered slot preserves the
-    // terminal, its scrollback and its socket, so no caller has to know mux is open.
+    // Replace the view's chrome while keeping a live terminal's DOM. Any async handler finishing
+    // while mux is open calls `render()`; a plain `root.innerHTML = ...` would drop xterm's host
+    // element, and `openMuxTerminal` would then return early on its idempotence guard, leaving a
+    // blank screen whose toolbar types into an invisible terminal.
     function renderPreservingTerminal(html) {
-      // The compose bar is preserved for a second reason beyond the terminal's: it may be in
-      // the middle of a native IME composition, and a composition lives in the ELEMENT. Copying
-      // its string value into a fresh element would drop the half-built syllable and leave the
-      // keyboard in a state the page cannot see.
+      // The compose bar is kept too: a native IME composition lives in the element, and copying its
+      // string into a fresh element would drop the half-built syllable.
       const keep = ["term-host", "ime-wrap"]
         .map((id) => document.getElementById(id))
         .filter(Boolean);
@@ -867,13 +723,10 @@
       for (const el of keep) document.getElementById(el.id)?.replaceWith(el);
     }
 
-    // The mux view is BUILT ONCE and patched thereafter — it is never re-rendered.
-    //
-    // Preserving the compose element across a re-render is not enough, and that was the bug:
-    // `el.remove()` disconnects a focused textarea, which resets focus and ends the native IME
-    // composition. Re-inserting the same node and calling `.focus()` cannot resurrect a
-    // half-built syllable. So nothing removes it: later renders only patch the chrome. This
-    // also stops the event listeners accumulating, one set per render, on the preserved nodes.
+    // The mux view is built once and patched thereafter. `el.remove()` disconnects a focused
+    // textarea, which resets focus and ends the native IME composition, and re-inserting the node
+    // cannot resurrect a half-built syllable. Patching also stops listeners accumulating per
+    // render.
     function renderMux() {
       if (document.getElementById("mux-shell")) {
         patchMuxChrome();
@@ -928,8 +781,7 @@
       patchMuxChrome();
     }
 
-    /// Update everything about the mux view that can change, WITHOUT touching the DOM the
-    /// terminal and the IME live in.
+    // Update the mux chrome without touching the DOM the terminal and the IME live in.
     function patchMuxChrome() {
       const pres = document.getElementById("presence-toggle");
       if (pres) {
@@ -946,18 +798,16 @@
         document.getElementById("mux-reconnect")?.addEventListener("click", () => enterMux(false));
       }
       renderImeNote();
-      // Only once the preflight has answered, and only if it said yes.
       if (!state.muxChecking && !state.muxError) openMuxTerminal();
     }
 
-    // Drop the terminal + socket + listeners WITHOUT changing the mode. Split out because
-    // re-entering mux must also do this: `render()` replaces the host element, and
-    // `openMuxTerminal` would then no-op on its idempotence guard, leaving a blank screen
-    // whose toolbar still types into the old socket.
+    // Drop the terminal, socket and listeners without changing the mode. Re-entering mux needs this
+    // too: `render()` replaces the host element and `openMuxTerminal` would no-op on its
+    // idempotence guard, leaving a blank screen whose toolbar types into the old socket.
     function disposeMuxTerminal() {
-      // Invalidate the input layer FIRST: a settle timer or a queued chord closes over
-      // `state.ws.attach`, which the next entry replaces, so a late drain would type into a
-      // different socket than the one the user was looking at.
+      // Invalidate the input layer first: a settle timer or queued chord closes over
+      // `state.ws.attach`, which the next entry replaces, so a late drain would type into another
+      // socket.
       resetIme();
       state.muxDown = false;
       state.muxNote = "";
@@ -968,10 +818,8 @@
       state.fit = null;
     }
 
-    // Tear down mux WITHOUT touching history — the mirror of `teardownAttach`, so popstate
-    // owns the transition and neither path double-pops. Bumping the epoch is what lets a
-    // Back-then-Forward while a preflight is still in flight open a fresh one instead of
-    // being swallowed by a guard the old request never released.
+    // Tear down mux without touching history (mirror of `teardownAttach`), so popstate owns the
+    // transition. Bumping the epoch lets Back-then-Forward during a preflight open a fresh one.
     function teardownMux() {
       disposeMuxTerminal();
       state.muxEpoch++;
@@ -981,41 +829,27 @@
       startBoardPolling();      // refresh immediately on return, then resume the cadence
     }
 
-    /* ==== direct input ====
-     *
-     * The comux view is a TERMINAL, not a form: a key reaches the PTY the moment it is pressed,
-     * so `Ctrl-b` then `c` is a comux chord and not two characters in a draft. That is the whole
-     * point — the previous design made every keystroke a line you had to submit, which is why
-     * no comux command could be typed at all.
-     *
-     * The ONE thing that cannot work that way is an IME composition. Korean typed into xterm's
-     * own helper textarea arrives DECOMPOSED on iOS — `잘 접근되는데` came off the device as
-     * `ㅈㅏㄹ ㅈㅓㅂㄱㅡㄴㄷㅗㅣㄴㅡㄴㄷㅔ`. That textarea is `opacity: 0; z-index: -5` and xterm moves
-     * it under the cursor on every render; an editing host with no visible layout is the
-     * suspected reason WebKit will not hold marked text there, and I have NOT proved it. What IS
-     * proved on the device: a normal, visible, sized textarea composes Korean correctly.
-     *
-     * So there is exactly one focusable element — a one-row strip under the terminal — and it is
-     * almost always EMPTY. Printable text, Enter, Backspace, arrows, Ctrl chords and pastes are
-     * intercepted and written straight to the PTY; only the syllable the IME is still building
-     * lives in the strip, and it is written the instant the IME commits. No mode toggle, no send
-     * button, no Enter-means-submit.
-     *
-     * ORDERING is the hard part and `withOrder` is its single owner. Nothing may reach the PTY
-     * ahead of text the IME has already shown the user, and nothing that can RETARGET the input
-     * — a comux chord, a tap on another pane — may run before that text lands, or the syllable
-     * is typed into the wrong pane. A native terminal gets this from the OS, which commits marked
-     * text to the old input context before it delivers the click. Three states, one queue:
-     *
-     *   idle       nothing pending: flush the strip, then act.
-     *   composing  the IME owns the strip: queue the action and ask the IME to commit NOW
-     *              (blur+refocus — the only synchronous commit the DOM offers).
-     *   settling   the IME says it finished but the DOM has not settled, so reading the strip
-     *              here is the early read xterm itself defers. A BARRIER: the action queues and
-     *              drains after the read, in arrival order.
-     */
+// ==== direct input ====
+// A key reaches the PTY the moment it is pressed, so `Ctrl-b` then `c` is a comux chord. The
+// exception is IME composition: Korean typed into xterm's own helper textarea arrives
+// decomposed on iOS (that textarea is `opacity: 0; z-index: -5`; the cause is suspected, not
+// proved). A normal, visible, sized textarea composes correctly (proved on device).
+//
+// So the one focusable element is a one-row strip under the terminal, almost always empty.
+// Printable text, Enter, Backspace, arrows, Ctrl chords and pastes are written straight to the
+// PTY; only the syllable the IME is still building lives in the strip, and is written when the
+// IME commits.
+//
+// Ordering: nothing may reach the PTY ahead of text the IME has already shown, and nothing that
+// can retarget the input (a chord, a tap on another pane) may run before that text lands.
+// `withOrder` owns this with three states and one queue:
+//   idle       nothing pending: flush the strip, then act.
+//   composing  the IME owns the strip: queue the action and force a commit (blur + refocus,
+//              the only synchronous commit the DOM offers).
+//   settling   the IME finished but the DOM has not settled; reading the strip now is the early
+//              read xterm itself defers. The action queues and drains after the read.
 
-    const IME_COMMIT_MS = 200;      // how long a forced commit is given before we give up on it
+    const IME_COMMIT_MS = 200;
     const IME_MAX_H = 72;           // the strip grows to ~3 rows, then scrolls
 
     let imeState = "idle";          // "idle" | "composing" | "settling"
@@ -1023,14 +857,13 @@
     let imeQueue = [];              // {run, text} deferred behind a composition, in arrival order
     let imeGen = 0;                 // bumped on dispose; a stale timer checks it and returns
     let imeTimer = null;
-    let imeInAction = false;        // re-entrancy: data produced BY a drained action is not requeued
+    let imeInAction = false;
     let imeWriteFailed = false;     // a write failed inside the action currently running
 
     function imeEl() { return document.getElementById("ime"); }
 
-    /// The only ws.send for input. Returns false rather than dropping the keystroke in silence:
-    /// on a phone this socket dies every time the screen sleeps, and a terminal that quietly
-    /// swallows what you type is worse than one that says it is disconnected.
+    // The only ws.send for input. Returns false rather than dropping the keystroke silently: on a
+    // phone this socket dies whenever the screen sleeps.
     function write(s) {
       if (!s) return true;
       return writeBytes(new TextEncoder().encode(s));
@@ -1044,9 +877,8 @@
       return true;
     }
 
-    /// Staged text → PTY. Cleared only after a write that SUCCEEDED, on the next line,
-    /// synchronously. A deferred clear is what forced the earlier design to carry a
-    /// consumed-length cursor so a racing flush would not send the same syllable twice.
+    // Staged text -> PTY. Cleared only after a successful write, synchronously, so a racing flush
+    // cannot send the same syllable twice.
     function flush() {
       const el = imeEl();
       if (!el || !el.value) return true;
@@ -1056,9 +888,8 @@
       return true;
     }
 
-    /// `text` is the printable payload an action would have written, if it has one. It is what
-    /// lets a DROPPED action still not lose what the user typed: the control part of the action is
-    /// discarded, the characters go back into the strip.
+    // `text` is the printable payload the action would have written, so a dropped action does not
+    // lose it: the control part is discarded and the characters go back into the strip.
     function withOrder(action, text) {
       if (imeInAction) { action(); return; }      // already inside an ordered drain
       if (imeState !== "idle") {
@@ -1066,15 +897,14 @@
         if (imeState === "composing") forceCommit();
         return;
       }
-      // A failed send cancels what came after it — but never the CHARACTERS. Older queued text
-      // goes back first, then this action's own, so the strip reads in the order it was typed.
+      // A failed send cancels what came after it but never the characters: older queued text goes
+      // back first, then this action's own, in typed order.
       if (!flush()) { dropQueue(); if (text) stageText(text); return; }
       runAction(action);
     }
 
-    /// Run one action and report whether its writes got out. An action returns `false` when it
-    /// could not send — that is the ONLY way a failure inside `term.paste()` (which writes through
-    /// `onData` and reports nothing back) reaches the code that decides what to keep.
+    // Run one action and report whether its writes got out. An action returns `false` when it
+    // could not send; that is the only way a failure inside `term.paste()` reaches the caller.
     function runAction(action) {
       imeInAction = true;
       imeWriteFailed = false;
@@ -1088,9 +918,8 @@
 
     const emit = (bytes) => withOrder(() => write(bytes));
 
-    /// Throw the queue away, keeping only the characters. A chord or a mouse report is discarded
-    /// on purpose — replayed later it would act on a screen that has moved on — but text is text,
-    /// and it goes back where unsent text lives, in the strip, in arrival order.
+    // Discard the queue but keep the characters: a chord or mouse report replayed later would act
+    // on a screen that has moved on, while text goes back to the strip.
     function dropQueue() {
       const q = imeQueue;
       imeQueue = [];
@@ -1098,14 +927,11 @@
       if (kept) stageText(kept);
     }
 
-    /// Ask the IME to commit right now. `blur()` is the only synchronous commit the DOM offers,
-    /// and Chrome and WebKit both raise `compositionend` inside the call; the refocus is
-    /// immediate so the phone keyboard never drops.
-    ///
-    /// If an engine defers it anyway, the watchdog DISCARDS the queued action instead of running
-    /// it late — a chord or a tap that fires after an unknown delay acts on a different screen
-    /// than the one the user was looking at, which is worse than not firing. The staged text is
-    /// kept (nothing typed is lost) and the next boundary writes it.
+    // Ask the IME to commit now. `blur()` is the only synchronous commit the DOM offers (Chrome and
+    // WebKit raise `compositionend` inside the call); the refocus keeps the phone keyboard up.
+    // If an engine defers it anyway, the watchdog discards the queued action instead of running it
+    // late, since a chord fired after an unknown delay acts on a different screen. Staged text is
+    // kept.
     function forceCommit() {
       const el = imeEl();
       if (!el) return;
@@ -1113,47 +939,38 @@
       el.focus({ preventScroll: true });
       const gen = imeGen;
       const comp = imeComp;
-      // Armed ONCE per pending queue, never restarted: re-arming on every queued action is how a
-      // 200 ms promise turns into "200 ms after you stop tapping", and the first action in the
-      // queue is the one whose screen goes stale.
+      // Armed once per pending queue, never restarted: re-arming per action turns a 200 ms promise
+      // into "200 ms after you stop tapping", and the first action is the one that goes stale.
       if (imeTimer) return;
       imeTimer = setTimeout(() => {
         imeTimer = null;
         if (gen !== imeGen || !imeQueue.length) return;
         dropQueue();
         showImeNote("조합이 끝나지 않아 키를 보내지 못했습니다");
-        // Only take the state back if nothing newer took over. A composition that started after
-        // this deadline was armed owns the strip now, and is entitled to settle normally — but it
-        // does NOT inherit this queue, which is exactly the hole a composition-owned timer left:
-        // clearing the timer on `compositionstart` let a chord that missed its deadline fire
-        // minutes later, whenever some unrelated syllable happened to commit.
+        // Only take the state back if nothing newer took over. A composition started after this
+        // deadline owns the strip but does not inherit this queue. Clearing the timer on
+        // `compositionstart` once let a missed chord fire minutes later.
         if (comp === imeComp) imeState = "idle";
       }, IME_COMMIT_MS);
     }
 
-    /// One task after `compositionend`, when the DOM has settled. Idempotent.
-    ///
-    /// Known limit: if a NEWER composition both starts and commits before this runs, the queue
-    /// drains after that second syllable — the strip is flushed whole, so `한` + a queued `x` + a
-    /// commit of `글` would reach the PTY as `한글x`. Separating them again needs the consumed-range
-    /// bookkeeping this design deliberately does not carry, and reaching it needs two keystrokes
-    /// inside ONE task: a human types each key in its own, so the settle timer always runs between
-    /// them.
+    // One task after `compositionend`, when the DOM has settled. Idempotent.
+    // Known limit: if a newer composition both starts and commits before this runs, the queue
+    // drains after it (`한` + queued `x` + commit `글` reaches the PTY as `한글x`). That needs two
+    // keystrokes inside one task, and a human types each key in its own.
     function settle(gen) {
       if (gen !== imeGen) return;                // torn down: this strip and socket are gone
       if (imeState === "composing") return;      // a newer composition owns the strip; it settles
       clearTimeout(imeTimer);
       imeTimer = null;
       imeState = "idle";
-      // A queued action is replayed ONCE, and dropped if the socket died meanwhile: unsent TEXT
-      // is worth keeping, a chord or a mouse report is not — replaying it after a reconnect would
-      // act on whatever is on screen by then.
+      // A queued action is replayed once, and dropped if the socket died meanwhile: unsent text is
+      // worth keeping, a chord or mouse report replayed after a reconnect is not.
       if (!flush()) { dropQueue(); return; }
       const q = imeQueue;
       imeQueue = [];
-      // Stop at the first failure: everything behind it was typed later, so sending it would
-      // reorder the user's input around the part that did not get through. Its characters go back
-      // to the strip instead, still in order (the action that failed kept its own).
+      // Stop at the first failure so later input is not reordered around it; its characters go back
+      // to the strip in order.
       for (let i = 0; i < q.length; i++) {
         if (runAction(q[i].run)) continue;
         const rest = q.slice(i + 1).map((a) => a.text || "").join("");
@@ -1162,9 +979,8 @@
       }
     }
 
-    /// Tear the input layer down — on dispose, and therefore on the 재연결 button too. Queued
-    /// CHARACTERS are put back in the strip rather than thrown away with the queue: reconnecting
-    /// is the user trying to recover their typing, which is the worst possible moment to drop it.
+    // Tear the input layer down (dispose, and the reconnect button). Queued characters go back in
+    // the strip, since reconnecting is the user trying to recover their typing.
     function resetIme() {
       imeGen++;
       clearTimeout(imeTimer);
@@ -1174,14 +990,10 @@
       imeInAction = false;
     }
 
-    /// A keydown → the bytes a terminal would send, or null when it is not ours (a ⌘ shortcut
-    /// belongs to the OS; a dead key belongs to the IME).
-    ///
-    /// A plain printable character IS translated here, and preventing that keydown suppresses the
-    /// `beforeinput` that would otherwise follow — so the two paths cannot both fire and there is
-    /// nothing to de-duplicate. Handling it in keydown alone is what a keyboard that reports keys
-    /// but no input events needs: the e2e found exactly that, a Space that arrived as a keydown
-    /// with no text and vanished when only `beforeinput` could deliver a character.
+    // A keydown -> the bytes a terminal would send, or null when it is not ours (a cmd shortcut
+    // belongs to the OS; a dead key to the IME). A plain printable character is translated here and
+    // preventing that keydown suppresses the `beforeinput` that would follow, so the paths cannot
+    // both fire. Some keyboards report keydown with no input events (a Space arrived with no text).
     function keyBytes(e) {
       if (e.metaKey) return null;
       switch (e.key) {
@@ -1209,10 +1021,9 @@
       return e.key;                                                       // printable
     }
 
-    /// Anything the IME might still be composing stays in the strip until a boundary. This is the
-    /// fallback for a WebKit that inserts syllables without ever raising a composition event: a
-    /// real textarea composes them correctly, and they go out in order at the next boundary.
-    /// Deliberately every non-ASCII insertion, not just Hangul — the same is true of any IME.
+    // Anything the IME might still be composing stays in the strip until a boundary: the fallback
+    // for a WebKit that inserts syllables without composition events. Every non-ASCII insertion,
+    // not just Hangul, since the same holds for any IME.
     const NON_ASCII = /[^\x20-\x7e]/;
 
     function clearSticky() {
@@ -1220,24 +1031,19 @@
       document.getElementById("ctrl")?.classList.remove("sticky");
     }
 
-    /// The keyboard's exit. The sticky-Ctrl fold lives HERE and not in `write`, so a mouse report
-    /// or a bracketed-paste byte can never be folded into a control character.
-    ///
-    /// A printable character that cannot be sent is KEPT, in the strip, where unsent text already
-    /// lives — the user gets it back when the socket returns instead of watching their typing
-    /// disappear. A control byte is not kept: a stray Enter or arrow replayed after a reconnect
-    /// would act on a screen that has moved on.
+    // The keyboard's exit. The sticky-Ctrl fold lives here and not in `write`, so a mouse report
+    // or bracketed-paste byte is never folded into a control character. A printable character that
+    // cannot be sent is kept in the strip; a control byte is not, since a stray Enter replayed
+    // after a reconnect would act on a screen that has moved on.
     function sendKey(text) {
       if (state.ctrlSticky && text.length === 1 && text >= " " && text <= "~") {
         text = String.fromCharCode(text.charCodeAt(0) & 0x1f);
         clearSticky();
       }
-      // Length is not the test: dictation and autocorrect deliver whole words, and losing
-      // "hello" to a sleeping phone is the same defect as losing "h".
+      // Length is not the test: dictation and autocorrect deliver whole words.
       if (!isPrintable(text)) { emit(text); return; }
-      // Even with the socket already gone this goes through `withOrder` rather than staging
-      // directly: a character typed while a syllable is still pending belongs AFTER that syllable,
-      // and a direct stage would put it in front of the text it was typed behind.
+      // Goes through `withOrder` even with the socket gone: a character typed while a syllable is
+      // pending belongs after it, and staging directly would put it in front.
       withOrder(() => {
         if (write(text)) return true;
         stageText(text);
@@ -1252,7 +1058,6 @@
       return !!ws && ws.readyState === WebSocket.OPEN;
     }
 
-    /// Put text back into the strip, so nothing typed is lost to a socket that went away.
     function stageText(text) {
       const el = imeEl();
       if (!el) return;
@@ -1262,10 +1067,8 @@
 
     function onImeKeyDown(e) {
       if (state.muxNote) showImeNote("");
-      // Enter first, and always prevented. While the IME owns the key we cannot let the default
-      // run (it would leave a newline in the strip to be flushed later), and preventing it is
-      // also what guarantees no `insertLineBreak` follows — which is why the beforeinput branch
-      // below needs no de-duplication.
+      // Enter first, and always prevented: letting the default run while the IME owns the key would
+      // leave a newline in the strip, and preventing it guarantees no `insertLineBreak` follows.
       if (e.key === "Enter") {
         e.preventDefault();
         emit("\r");
@@ -1273,7 +1076,6 @@
       }
       if (e.isComposing || e.keyCode === 229) return;      // the IME owns this key
       const el = imeEl();
-      // With a syllable staged, Backspace edits it — deleting the composing jamo is the IME's job.
       if ((e.key === "Backspace" || e.key === "Delete") && el && el.value) return;
       const bytes = keyBytes(e);
       if (bytes == null) return;                           // not ours: beforeinput may still own it
@@ -1288,9 +1090,9 @@
       switch (e.inputType) {
         case "insertText":
         case "insertReplacementText": {
-          // Only reachable when the keydown path did not already send this text (it prevents its
-          // own default, which suppresses this event): dictation, an autocorrect replacement, an
-          // emoji picked from the keyboard, or a soft keyboard that reports no usable keydown.
+          // Only reachable when keydown did not already send this text (it prevents its own
+          // default):
+          // dictation, autocorrect, an emoji pick, or a soft keyboard with no usable keydown.
           const data = e.data || "";
           if (!data) return;
           if (NON_ASCII.test(data)) return;                // let it stage; a boundary writes it
@@ -1299,22 +1101,22 @@
           return;
         }
         case "insertFromPaste": {
-          // A plain textarea hands the pasted text over on `e.data` and leaves `dataTransfer`
-          // null; a contenteditable does the opposite. Reading only the latter swallowed every
-          // paste. If NEITHER carries it, do not cancel the insertion — letting the text land in
-          // the strip and go out at the next boundary loses the bracketing, not the paste.
+          // A textarea hands pasted text over on `e.data` with `dataTransfer` null; a
+          // contenteditable does
+          // the opposite. If neither carries it, do not cancel: the text lands in the strip and
+          // goes out
+          // at the next boundary, losing the bracketing but not the paste.
           const text = e.data || e.dataTransfer?.getData("text") || "";
           if (!text) return;
           e.preventDefault();
-          // term.paste, not write: it is what adds the bracketed-paste delimiters when the app
-          // asked for them, so a pasted multi-line command is EDITABLE instead of running itself
-          // line by line. It reports nothing back, so the socket is checked BEFORE handing over —
-          // and `text` rides along as the retention payload, so every drop path keeps it like any
-          // other typing. What is lost on that path is the bracketing, not the paste.
+          // term.paste, not write: it adds the bracketed-paste delimiters when the app asked for
+          // them, so
+          // a multi-line paste is editable instead of running line by line. It reports nothing
+          // back, so
+          // the socket is checked before handing over, and `text` rides along for retention.
           withOrder(() => {
             if (socketOpen()) {
               try { state.term?.paste(text); } catch { imeWriteFailed = true; }
-              // `imeWriteFailed` is what a write inside `onData` sets; `runAction` reads it.
               if (!imeWriteFailed) return true;
             } else {
               showDisconnected();
@@ -1326,9 +1128,8 @@
         }
         case "insertLineBreak":
         case "insertParagraph":
-          // Only reachable when no keydown was delivered for that Return — the keydown path
-          // prevents every Enter, which suppresses this event — so there is nothing to
-          // de-duplicate against and the CR is unambiguously ours to send.
+          // Only reachable when no keydown was delivered for that Return (keydown prevents every
+          // Enter).
           e.preventDefault();
           emit("\r");
           return;
@@ -1347,21 +1148,18 @@
       }
     }
 
-    /// xterm decides whether to draw a live cursor purely from focus/blur events on its own
-    /// textarea, which will never get focus again. Mirror ours so the cursor still blinks where
-    /// the user is typing. A coupling to 5.5.0's handler (index.html pins the version); its only
-    /// other effect is the `ESC [I` focus report an app has to ask for, which is honest here —
-    /// the user really did just focus the terminal.
+    // xterm draws a live cursor only from focus/blur on its own textarea, which never gets focus
+    // again, so mirror ours. Coupled to xterm 5.5.0's handler (index.html pins the version); the
+    // other effect is the `ESC [I` focus report an app must ask for.
     function mirrorXtermFocus(type) {
       const ta = state.term?.textarea;
       if (!ta) return;
       try { ta.dispatchEvent(new FocusEvent(type)); } catch {}
     }
 
-    /// Grow the strip to its content. The regrid that has to follow is driven by the observer in
-    /// `wireIme` rather than from here, because the strip's height is not the only thing that
-    /// moves the terminal's floor — a note appearing does too, and the e2e caught exactly that:
-    /// comux's status bar slid under the fold and stayed there.
+    // Grow the strip to its content. The regrid is driven by the observer in `wireIme`, not here,
+    // because a note appearing also moves the terminal's floor (comux's status bar once slid under
+    // the fold).
     function autoGrowIme(el) {
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, IME_MAX_H)}px`;
@@ -1386,51 +1184,41 @@
       note.textContent = state.muxNote;
     }
 
-    /// The socket is gone. Surfaced in the banner WITH a way out, because the `[disconnected]`
-    /// line xterm prints scrolls away and leaves a terminal that looks alive and types into
-    /// nothing — the exact failure a sleeping phone causes several times a day.
+    // The socket is gone. Shown in the banner with a way out, since the `[disconnected]` line xterm
+    // prints scrolls away and leaves a terminal that looks alive and types into nothing.
     function showDisconnected() {
       if (state.muxDown) return;
       state.muxDown = true;
       patchMuxChrome();
     }
 
-    /* ==== touch scrolling ====
-     *
-     * There is nothing on this page for iOS to scroll. comux paints the whole screen with cursor
-     * addressing, so xterm's own scrollback stays EMPTY and `#term-host` only ever overflows
-     * sideways. Scrolling is comux's job — it forwards a wheel to a mouse-aware pane app (Claude
-     * Code, nvim) and scrolls its own scrollback for a plain shell — and comux hears about a wheel
-     * and nothing else. A one-finger drag produces no wheel event on any touch device, so the
-     * terminal simply could not be scrolled.
-     *
-     * So a vertical drag is translated into wheel events and dispatched at the touch point, and
-     * xterm encodes them with whatever protocol the app negotiated. Encoding SGR here by hand
-     * would duplicate that negotiation AND bypass the classifier that keeps a mouse report ordered
-     * behind a pending composition.
-     */
+// ==== touch scrolling ====
+// comux paints the whole screen with cursor addressing, so xterm's scrollback stays empty and
+// scrolling is comux's job, driven only by wheel events. A one-finger drag produces none on a
+// touch device, so a vertical drag is translated into wheel events dispatched at the touch
+// point and xterm encodes them with whatever protocol the app negotiated. Encoding SGR by hand
+// would duplicate that negotiation and bypass the classifier that keeps a mouse report ordered
+// behind a pending composition.
 
     const TOUCH_AXIS_SLOP_PX = 8;   // movement before the gesture commits to an axis
     const TOUCH_LINE_FALLBACK = 17; // px per line when the grid cannot be measured yet
 
-    /// One row's height in CSS pixels, measured off what xterm actually rendered.
     function rowHeightPx() {
       const rows = document.querySelector("#term-host .xterm-rows");
       const h = rows?.firstElementChild?.getBoundingClientRect().height;
       return h && h > 1 ? h : TOUCH_LINE_FALLBACK;
     }
 
-    /// How many whole lines a drag of `dy` pixels is worth, and what is left over. Pulled out
-    /// because it is the only arithmetic here and the rest is event bookkeeping.
     function wheelSteps(dy, rowH) {
       const steps = Math.trunc(dy / rowH);
       return { steps, rest: dy - steps * rowH };
     }
 
-    /// The drag → lines machine. Same ownership rules as `tapGesture`, plus an axis that latches
-    /// ONCE past the slop: a drag that curves must not switch between scrolling and panning
-    /// mid-gesture. `move` returns the whole-line steps this move is worth, `null` when the move
-    /// is not ours to act on (wrong finger, second finger, still under the slop, horizontal).
+    // A drag -> lines machine. Same ownership rules as `tapGesture`, plus an axis that latches once
+    // past the slop so a curved drag does not switch between scrolling and panning. `move` returns
+    // the whole-line steps, or `null` when the move is not ours (wrong or second finger, under
+    // slop,
+    // horizontal).
     function scrollGesture(slop) {
       let id = null, sx = 0, sy = 0, lastY = 0, rest = 0, axis = "";
       return {
@@ -1446,9 +1234,8 @@
             const dx = Math.abs(t.clientX - sx), dy = Math.abs(t.clientY - sy);
             if (Math.max(dx, dy) < slop) return null;
             axis = dy > dx ? "y" : "x";
-            // `lastY` is deliberately NOT reset here. The movement that latched the axis is real
-            // movement; discarding it made a gesture delivered as one big `touchmove` — which is
-            // what a fast drag or a busy main thread produces — scroll nothing at all.
+              // `lastY` is deliberately not reset: the movement that latched the axis is real, and
+              // discarding it made a gesture delivered as one big `touchmove` scroll nothing.
           }
           if (axis !== "y") return null;
           const { steps, rest: left } = wheelSteps(t.clientY - lastY + rest, rowH);
@@ -1469,7 +1256,6 @@
         e.preventDefault();                                  // ours: stop iOS rubber-banding
         if (!r.steps) return;
         const t = e.touches[0];
-        // Dragging DOWN scrolls BACK, as content does under a finger everywhere else.
         const target = document.elementFromPoint(t.clientX, t.clientY) || host;
         for (let i = 0; i < Math.abs(r.steps); i++) {
           target.dispatchEvent(new WheelEvent("wheel", {
@@ -1499,20 +1285,18 @@
         setTimeout(() => settle(gen), 0);
       });
       el.addEventListener("input", () => autoGrowIme(el));
-      // The strip shares the column with the terminal, so anything that changes its height takes
-      // rows away from the grid — and nothing else notices: the resize listeners watch the window
-      // and the visual viewport, neither of which fires for the box next door.
+      // The strip shares the column with the terminal, so a height change takes rows from the grid,
+      // and the window and visual-viewport resize listeners do not fire for the box next door.
       if (window.ResizeObserver) {
         const wrap = document.getElementById("ime-wrap");
         if (wrap) new ResizeObserver(() => sendMuxResize()).observe(wrap);
       }
       el.addEventListener("focus", () => mirrorXtermFocus("focus"));
       el.addEventListener("blur", () => mirrorXtermFocus("blur"));
-      // A focus that lands anywhere inside the terminal comes back to the strip. Capture phase so
-      // it runs first, but deliberately WITHOUT stopPropagation/preventDefault: the version that
-      // stopped the event is why the terminal could not be tapped at all — no focus, no
-      // selection, and no mouse report, so comux's own clickable chrome (status-bar tab chips,
-      // sidebar rows, pane bodies) was dead on the phone.
+      // A focus landing anywhere inside the terminal comes back to the strip. Capture phase so it
+      // runs first, but without stopPropagation/preventDefault: stopping the event once made the
+      // terminal untappable (no focus, no selection, no mouse report), killing comux's clickable
+      // chrome.
       const host = document.getElementById("term-host");
       host?.addEventListener("focusin", (ev) => {
         if (ev.target === el) return;
@@ -1531,10 +1315,8 @@
       }
     }
 
-    // A WebSocket upgrade cannot tell the page WHY it failed — a refused attach looks exactly
-    // like a dropped connection. So ask over HTTP first and show the real reason.
-    // A WebSocket upgrade cannot tell the page WHY it failed — a refused attach looks exactly
-    // like a dropped connection. So ask over HTTP first and show the real reason.
+    // A WebSocket upgrade cannot tell the page why it failed (a refused attach looks like a dropped
+    // connection), so ask over HTTP first and show the real reason.
     async function muxPreflight() {
       try {
         const j = await api("/api/board/attach-preflight");
@@ -1544,15 +1326,12 @@
       }
     }
 
-    // The ONE way into mux, used by the button and by history navigation alike. Entering
-    // through popstate has to preflight too: otherwise Back-then-Forward with comux stopped
-    // would skip straight to the socket and show a bare "[disconnected]", which is precisely
-    // the diagnostic the preflight exists to replace.
+    // The one way into mux, for the button and history navigation alike. popstate entry must
+    // preflight too, or Back-then-Forward with comux stopped shows a bare "[disconnected]".
     async function enterMux(pushHistory) {
-      // Identity, not a boolean: a second entry (double tap, or Back-then-Forward while the
-      // first request is still out) supersedes the earlier one, and only the CURRENT epoch's
-      // response is allowed to land. A boolean guard could be left set by a teardown that
-      // happened mid-flight, which silently swallowed the next entry.
+      // Epoch identity, not a boolean: a second entry (double tap, Back-then-Forward mid-request)
+      // supersedes the earlier one, and only the current epoch's response may land. A boolean could
+      // be left set by a mid-flight teardown and swallow the next entry.
       disposeMuxTerminal();
       const epoch = ++state.muxEpoch;
       state.muxError = "";
@@ -1560,8 +1339,8 @@
       state.muxChecking = true;
       state.mode = "mux";
       if (pushHistory) {
-        // Same contract as attach: popstate is the single source of truth for terminal-mode
-        // transitions, so the platform back gesture leaves the terminal, not the page.
+        // Same contract as attach: popstate owns terminal-mode transitions, so back leaves the
+        // terminal.
         history.pushState({ mode: "mux" }, "", "#mux");
       }
       stopBoardPolling();
@@ -1573,37 +1352,28 @@
       if (state.mode === "mux") render();
     }
 
-    /// Open the terminal ON the agent that was tapped.
-    ///
-    /// Every row used to call `enterMux()` with no target, so all 27 of them landed on whatever
-    /// comux last focused: the board looked like a switcher and behaved like a single link. The
-    /// jump MOVES THE DESKTOP'S VIEW as well — comux composes one frame for every attached client
-    /// — and that is what "go to this agent" means here, since the person tapping the phone is the
-    /// person sitting at the desk. A per-client view is the per-pane semantic grid (#65/#66).
-    ///
-    /// ONE jump at a time. Two taps would be two independent server-side mutations, and the first
-    /// can land last: the terminal would open on a pane the second tap already moved away from,
-    /// and no response-ordering guard can undo a jump that already happened.
+    // Open the terminal on the agent that was tapped. The jump moves the desktop's view too (comux
+    // composes one frame for all attached clients), which is what "go to this agent" means here; a
+    // per-client view needs the per-pane semantic grid (#65/#66). One jump at a time: two taps are
+    // two server-side mutations, the first can land last, and no response guard can undo a jump
+    // that already happened.
     async function openAgent(el, token) {
-      // A pane from before pane tokens existed has nothing stable to address — `terminal` ids
-      // restart at `term0` each incarnation, so jumping by one risks landing somewhere else
-      // entirely. Open the terminal without moving anything, which is what every row did before.
+      // Without a pane token there is nothing stable to address (`terminal` ids restart at `term0`
+      // each incarnation), so open the terminal without moving anything.
       if (!token) { enterMux(true); return; }
       if (state.jumpBusy) return;
       state.jumpBusy = token;
       el?.classList.add("pending");
-      // Navigation can happen under an in-flight jump — open the terminal from the header, come
-      // back — and a response landing after that must not reopen it and push a second history
-      // entry. `muxEpoch` is already bumped by every entry and every teardown, so it is the
-      // generation to compare against.
+      // Navigation can happen under an in-flight jump, and a late response must not reopen the
+      // terminal and push a second history entry. `muxEpoch` is bumped by every entry and teardown.
       const epoch = state.muxEpoch;
       const superseded = () => state.muxEpoch !== epoch || state.mode !== "overview";
       try {
         await api("/api/board/jump", { method: "POST", body: JSON.stringify({ token }) });
         state.boardNote = "";
       } catch (e) {
-        // A token goes stale on `comux server restart`, and "unknown pane" is exactly the case
-        // where opening the focused session anyway would look like the bug this replaced.
+        // A token goes stale on `comux server restart`; opening the focused session anyway would
+        // look like a wrong jump.
         state.jumpBusy = null;
         el?.classList.remove("pending");
         if (superseded()) return;
@@ -1619,10 +1389,9 @@
       enterMux(true);
     }
 
-    // Paint with WebGL when the browser can (decisions #166): the DOM renderer re-lays-out a
-    // span per cell run on every frame, which is what made the phone terminal feel slow. iOS
-    // drops WebGL contexts when the page is backgrounded, so a lost context disposes the addon
-    // and xterm falls back to its DOM renderer instead of going blank.
+    // Paint with WebGL when possible (decisions #166): the DOM renderer re-lays-out a span per cell
+    // run each frame. iOS drops WebGL contexts when backgrounded, so a lost context disposes the
+    // addon and xterm falls back to the DOM renderer instead of going blank.
     function useGpuRenderer(term) {
       const Webgl = window.WebglAddon?.WebglAddon;
       if (!Webgl) return false;
@@ -1654,22 +1423,20 @@
       useGpuRenderer(term);
       state.term = term;
       state.fit = fit;
-      // Own the keyboard without fighting for it. xterm's own mousedown handler calls
-      // `this.textarea.focus()` unconditionally; redirect that and a tap on the terminal opens the
-      // keyboard for OUR strip, inside the same user gesture, while the very same mousedown still
-      // produces a mouse report. Nothing ever focuses xterm's textarea, so none of its
-      // key/input/composition handlers can run. The primary boundary, not a complete one — the
-      // `focusin` bounce in `wireIme` is the backstop for paths that also call `select()`.
+      // xterm's mousedown calls `this.textarea.focus()` unconditionally; redirecting it opens the
+      // keyboard for our strip within the same gesture while the mousedown still produces a mouse
+      // report, and xterm's key/input/composition handlers never run. The `focusin` bounce in
+      // `wireIme` is the backstop for paths that also call `select()`.
       if (term.textarea) {
         term.textarea.focus = () => imeEl()?.focus({ preventScroll: true });
       }
       muxGrid(fit, term);
-      // repairFontMetrics refits to the raw viewport and sends THAT to the PTY, which would
-      // push the grid below the floor and leave xterm and the PTY disagreeing. Re-apply the
-      // floor and send the corrected size instead.
+      // repairFontMetrics refits to the raw viewport and would send a size below the floor;
+      // re-apply
+      // the floor and send the corrected size.
       whenFontReady(term.options.fontSize, () => { repairFontMetrics({ sendResize: false }); sendMuxResize(); });
-      // The symbol font lands independently and changes no metrics (xterm measures the FIRST
-      // family), but the glyphs it carries only appear once it has. Nudge a repaint.
+      // The symbol font changes no metrics (xterm measures the first family) but its glyphs only
+      // appear once loaded, so nudge a repaint.
       whenFontReady(term.options.fontSize, () => term.refresh(0, term.rows - 1), "CopadSymbols");
 
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -1693,16 +1460,15 @@
       };
       ws.onerror = () => { try { ws.close(); } catch {} };
 
-      // `onData` is not the keyboard any more — it carries MOUSE reports, the paste we ask for,
-      // and protocol REPLIES (DA/DSR, focus reports). Only a mouse report can change which pane
-      // the next keystroke lands in, so only that is ordered behind a pending composition;
-      // holding a reply back could make comux's own terminal probe time out.
+      // `onData` carries mouse reports, the paste we ask for, and protocol replies (DA/DSR, focus
+      // reports). Only a mouse report can retarget the next keystroke, so only it is ordered behind
+      // a pending composition; delaying a reply could time out comux's terminal probe.
       term.onData((d) => {
         if (isMouseReport(d)) withOrder(() => write(d));
         else write(d);
       });
-      // A DEFAULT-encoding (non-SGR) mouse report goes out on this channel instead, one byte per
-      // char. Never through TextEncoder, which would expand a report byte above 0x7f into two.
+      // A default-encoding (non-SGR) mouse report arrives here, one byte per char. Never through
+      // TextEncoder, which would expand a byte above 0x7f into two.
       term.onBinary((d) => {
         const bytes = Uint8Array.from(d, (c) => c.charCodeAt(0) & 0xff);
         withOrder(() => writeBytes(bytes));
@@ -1714,20 +1480,17 @@
       };
       window.addEventListener("resize", onResize);
       window.visualViewport?.addEventListener("resize", onResize);
-      // Without this every visit leaves another live listener behind, and each one refits the
-      // CURRENT terminal and sends its own duplicate resize.
+      // Otherwise every visit leaves a live listener that refits the current terminal and sends a
+      // duplicate resize.
       state.muxResizeOff = () => {
         window.removeEventListener("resize", onResize);
         window.visualViewport?.removeEventListener("resize", onResize);
       };
     }
 
-    /* ==== xterm.js attach mode ==== */
     function openTerminal() {
-      // Idempotent: re-renders triggered by unrelated state changes
-      // (e.g. presence toggle in attach mode) must not spawn a fresh
-      // WS / xterm while the previous one is still live. leaveAttach
-      // is the only legitimate teardown.
+      // Idempotent: unrelated re-renders must not spawn a second WS/xterm. leaveAttach is the only
+      // teardown.
       if (state.term || state.ws.attach) return;
       const host = document.getElementById("term-host");
       const term = new window.Terminal({
@@ -1748,14 +1511,13 @@
       state.term = term;
       state.fit = fit;
 
-      // xterm measures the glyph cell ONCE at open(), so whenever the webfont lands
-      // after that the grid keeps the fallback's cell size and every column sits
-      // wrong. Deliberately NOT awaited before open(): `font-display: swap` already
-      // paints the fallback immediately, so waiting would only buy a blank terminal
-      // for the length of a ~2 MB cellular download — and an await here would open a
-      // window between the idempotence guard above and `state.term` being set, in
-      // which a re-render could spawn a second xterm + WS. Resolves instantly when
-      // the font is already cached (the common case after the first load).
+      // xterm measures the glyph cell once at open(), so a webfont landing later leaves every
+      // column
+      // misplaced. Not awaited before open(): `font-display: swap` already paints the fallback, a
+      // wait
+      // would blank the terminal for a ~2 MB download, and an await would open a window between the
+      // idempotence guard and `state.term` being set in which a re-render spawns a second xterm +
+      // WS.
       whenFontReady(term.options.fontSize, repairFontMetrics);
 
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -1792,7 +1554,6 @@
         if (ws.readyState === WebSocket.OPEN) ws.send(new TextEncoder().encode(data));
       });
 
-      // Resize on viewport change.
       const onResize = () => {
         if (!state.fit || !state.term || !state.ws.attach) return;
         try {
@@ -1804,17 +1565,13 @@
       };
       window.addEventListener("resize", onResize);
 
-      // The on-screen keyboard does NOT fire window.resize on iOS — it shrinks the
-      // *visual* viewport while the layout viewport (and 100vh/100dvh) stay put. So
-      // without this the terminal keeps its full height behind the keyboard and the
-      // PTY never learns its new size. visualViewport is the only signal that sees
-      // the keyboard; `scroll` matters too because iOS pans the visual viewport to
-      // keep the focused element visible.
+      // iOS's on-screen keyboard does not fire window.resize: it shrinks the visual viewport while
+      // the layout viewport stays put, so visualViewport is the only signal. `scroll` matters too
+      // because iOS pans the visual viewport to keep the focused element visible.
       const vv = window.visualViewport;
       let vvRaf = 0;
       const onViewport = () => {
-        // visualViewport fires a burst during the keyboard animation; coalesce to
-        // one refit per frame so we don't spam PTY resizes mid-animation.
+        // Coalesce the burst during the keyboard animation to one refit per frame.
         if (vvRaf) return;
         vvRaf = requestAnimationFrame(() => {
           vvRaf = 0;
@@ -1824,8 +1581,8 @@
       };
       if (vv) {
         vv.addEventListener("resize", onViewport);
-        // passive: the handler never preventDefaults, and a non-passive scroll
-        // listener blocks the compositor during the keyboard animation.
+        // passive: a non-passive scroll listener blocks the compositor during the keyboard
+        // animation.
         vv.addEventListener("scroll", onViewport, { passive: true });
       }
       state._removeResize = () => {
@@ -1841,16 +1598,12 @@
     function sendKbdBytes(escape) {
       const ws = state.ws.attach;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      // unescape sequences typed in the data-bytes attribute
       let bytes = escape.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
                         .replace(/\\t/g, "\t");
-      // A tap mid-syllable must not overtake the syllable: in mux the payload goes through the
-      // ordering owner, so `Ctrl-b n` can never switch panes ahead of the text the IME is holding.
-      // Sticky-Ctrl path: if toolbar Ctrl is armed and the next
-      // toolbar tap is a single printable byte, fold it via the
-      // 0x1f mask (Ctrl-A = 0x01, Ctrl-/ = 0x1f, etc.). Without
-      // this `Ctrl` then `/` sends a literal slash — the intent's
-      // sticky-modifier contract is broken on the toolbar path.
+      // A tap mid-syllable must not overtake it: in mux the payload goes through the ordering
+      // owner,
+      // so `Ctrl-b n` cannot switch panes ahead of the text the IME holds.
+      // Sticky Ctrl: if armed and the next tap is one printable byte, fold it with the 0x1f mask.
       if (state.ctrlSticky && bytes.length === 1 && bytes >= " " && bytes <= "~") {
         bytes = String.fromCharCode(bytes.charCodeAt(0) & 0x1f);
         clearSticky();
@@ -1859,15 +1612,12 @@
       else ws.send(new TextEncoder().encode(bytes));
     }
 
-    /// Which `onData` payloads can retarget the input. SGR reports are `ESC [ < …M/m` and the
-    /// DEFAULT encoding's are `ESC [ M …`; neither prefix can collide with an application reply
-    /// (a device attribute answers `ESC [ ? …c`, a cursor report `ESC [ …R`). xterm 5.5 exposes no
-    /// provenance on that channel, so this classifier is version-specific by necessity.
+    // Which `onData` payloads can retarget the input. SGR reports are `ESC [ < ...M/m`, default
+    // encoding ones `ESC [ M ...`; neither collides with an application reply (`ESC [ ? ...c`,
+    // `ESC [ ...R`). xterm 5.5 exposes no provenance on that channel, so this is version-specific.
     function isMouseReport(d) {
       return typeof d === "string" && (d.startsWith("\x1b[<") || d.startsWith("\x1b[M"));
     }
-
-    /* ==== overview WS ==== */
 
     function openEventStream() {
       if (state.ws.events) { try { state.ws.events.close(); } catch {} }
@@ -1883,8 +1633,7 @@
             const cur = ev.data?.current || ev.payload?.current;
             if (cur) state.presence = cur;
           }
-          // A pilot.* bus event means the queue changed — refresh the
-          // cockpit immediately (loadPilot re-renders on completion).
+          // A pilot.* bus event means the queue changed; refresh the cockpit.
           if ((ev.type || ev.kind || "").startsWith("pilot.")) loadPilot();
           if (state.mode === "overview") render();
         } catch {}
@@ -1893,12 +1642,8 @@
       ws.onerror = () => { try { ws.close(); } catch {} };
     }
 
-    /* ==== push notifications ==== */
     async function initPush() {
-      // iOS Safari pre-16.4 has no Push API. Android Chrome / FF /
-      // Safari 16.4+ / desktop are fine. Plain HTTP (other than
-      // localhost) is also blocked — service worker requires secure
-      // context.
+      // No Push API on iOS Safari before 16.4, and a service worker needs a secure context.
       if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
         state.push.status = "unsupported";
         return;
@@ -1909,8 +1654,8 @@
         const existing = await reg.pushManager.getSubscription();
         if (existing) {
           state.push.status = "on";
-          // Load kinds preference from local storage (sticky across
-          // reloads). Server is source of truth on next mutate.
+          // Kinds preference is sticky in local storage; the server is the source of truth on next
+          // mutate.
           try {
             const k = JSON.parse(localStorage.getItem("copad.push.kinds") || "null");
             if (Array.isArray(k)) state.push.kinds = k;
@@ -1970,8 +1715,8 @@
         const reg = await navigator.serviceWorker.ready;
         const sub = await reg.pushManager.getSubscription();
         if (sub) {
-          // Best-effort server prune by sha256(endpoint) id. The
-          // browser-side unsubscribe is the auth-of-record though.
+          // Best-effort server prune by sha256(endpoint); the browser-side unsubscribe is
+          // authoritative.
           try {
             const enc = new TextEncoder().encode(sub.endpoint);
             const digest = await crypto.subtle.digest("SHA-256", enc);
@@ -1995,8 +1740,7 @@
       if (on) cur.add(kind); else cur.delete(kind);
       state.push.kinds = Array.from(cur);
       localStorage.setItem("copad.push.kinds", JSON.stringify(state.push.kinds));
-      // Re-subscribe with new kinds (server dedupes by sha256(endpoint)
-      // id, so this is idempotent rather than creating a second row).
+      // Re-subscribe with new kinds; the server dedupes by sha256(endpoint), so this is idempotent.
       if (state.push.status !== "on") return;
       try {
         const reg = await navigator.serviceWorker.ready;
@@ -2017,38 +1761,31 @@
       }
     }
 
-    /* ==== actions ==== */
-    /// Run `cb` once the terminal webfont is actually usable. Never runs it if the
-    /// font can't load (e.g. /font/terminal 404s because the workstation has no such
-    /// font installed) — the fallback stack is then simply what you get, as before.
+    // Run `cb` once the terminal webfont is usable; never if it cannot load (e.g. /font/terminal
+    // 404s), leaving the fallback stack.
     function whenFontReady(px, cb, family = "CopadTerminal") {
       if (!document.fonts?.load) return;
       const spec = `${px || 13}px "${family}"`;
       document.fonts
         .load(spec)
         .then(() => {
-          // load() resolves even when nothing matched; check() is what proves the
-          // face is really there.
+          // load() resolves even when nothing matched; check() proves the face is there.
           if (document.fonts.check(spec)) cb();
         })
         .catch(() => {});
     }
 
-    /// Re-measure after a webfont that landed AFTER term.open().
-    ///
-    /// Reassigning fontFamily is what forces xterm to drop its cached glyph metrics;
-    /// without it the grid keeps the fallback's cell size and the columns stay
-    /// misaligned even though the right glyphs are now available. Then refit and tell
-    /// the PTY, since the cell size (and therefore rows/cols) just changed.
+    // Re-measure after a webfont that landed after term.open(). Reassigning fontFamily is what
+    // makes
+    // xterm drop its cached glyph metrics; then refit and tell the PTY, since rows/cols changed.
     function repairFontMetrics(opts = {}) {
       const { sendResize = true } = opts;
       const term = state.term;
       if (!term) return;
       try {
-        // Must assign a DIFFERENT value: xterm's option setter short-circuits when the
-        // value is unchanged, so `x = x` is a no-op and the cached glyph metrics stay.
-        // Round-tripping through a distinct-but-equivalent stack is what actually
-        // triggers the re-measure.
+        // Must assign a different value: xterm's option setter short-circuits on an unchanged
+        // value, so
+        // round-trip through a distinct-but-equivalent stack.
         const ff = term.options.fontFamily;
         term.options.fontFamily = "monospace";
         term.options.fontFamily = ff;
@@ -2060,22 +1797,16 @@
       } catch {}
     }
 
-    /// Publish the VISUAL viewport height as --app-h.
-    ///
-    /// Every full-height view keys off this instead of 100vh/100dvh, because the
-    /// layout viewport does not shrink for the on-screen keyboard — only the visual
-    /// viewport does. Without it the phone keyboard covers the terminal (and the
-    /// pilot composer) with no way to see what you're typing at.
+    // Publish the visual viewport height as --app-h. Full-height views use it instead of
+    // 100vh/100dvh, because only the visual viewport shrinks for the on-screen keyboard.
     function setAppHeight() {
       const vv = window.visualViewport;
       const h = Math.round(vv ? vv.height : window.innerHeight);
       if (h > 0) document.documentElement.style.setProperty("--app-h", h + "px");
     }
 
-    // Global measurement: the overview/pilot views raise the keyboard too (goal
-    // composer). The attach view registers its own handler as well so it can refit
-    // the terminal + resize the PTY; both call setAppHeight so neither depends on
-    // listener registration order.
+    // Global, since the overview/pilot views raise the keyboard too. The attach view registers its
+    // own handler as well; both call setAppHeight so neither depends on registration order.
     (function trackViewport() {
       setAppHeight();
       const vv = window.visualViewport;
@@ -2098,8 +1829,8 @@
         state.presence = "?";
       }
       try {
-        // Called for its failure mode, not its payload: a `no_gui` rejection is how the page
-        // learns the copad GUI is not running. The pane list itself is no longer rendered.
+        // Called for its failure mode: a `no_gui` rejection is how the page learns the copad GUI
+        // is not running.
         await api("/api/panes");
       } catch (e) {
         if (e && e.code === "no_gui") state.noGui = true;
@@ -2107,14 +1838,10 @@
       await initPush();
       render();
       openEventStream();
-      // `/ws/tmux/overview` is deliberately NOT opened any more. It shells out to tmux
-      // server-side every 5 s and pushes a snapshot that triggers a render — pure cost on a
-      // machine whose multiplexer is comux, where every one of those snapshots is empty. The
-      // endpoint itself is left in place for installs that still run tmux.
+      // `/ws/tmux/overview` is deliberately not opened: it shells out to tmux every 5 s and pushes
+      // empty snapshots on a comux machine. The endpoint stays for installs that still run tmux.
       startBoardPolling();
-      // Pilot cockpit: initial load + a slow poll as a backstop (pilot.*
-      // bus events on the event stream drive the responsive refresh; this
-      // catches state the events miss and the first paint).
+      // Initial load plus a slow poll as a backstop; pilot.* events drive the responsive refresh.
       loadPilot();
       if (!state.pilotPoll) {
         state.pilotPoll = setInterval(() => { if (state.mode === "overview") loadPilot(); }, 8000);
@@ -2126,14 +1853,9 @@
       try {
         const r = await api("/api/presence", { method: "POST", body: JSON.stringify({ state: next }) });
         state.presence = r.current || next;
-        // In attach mode, patch the chip in-place rather than calling
-        // render() — full rerender would re-trigger openTerminal and,
-        // even with its idempotent guard, would needlessly thrash the
-        // xterm host element. Overview mode goes through render() as
-        // normal so the chip + downstream UI stay consistent.
-        // Both terminal views patch in place: a full render() tears out xterm's host element,
-        // and openTerminal/openMuxTerminal then no-op on their idempotence guard because
-        // `state.term` still exists — leaving a live socket attached to a terminal with no DOM.
+        // Both terminal views patch in place: a full render() tears out xterm's host element, and
+        // openTerminal/openMuxTerminal then no-op on their idempotence guard because `state.term`
+        // still exists, leaving a live socket attached to a terminal with no DOM.
         if (state.mode === "attach" || state.mode === "mux") {
           const el = document.getElementById("presence-toggle");
           if (el) {
@@ -2151,18 +1873,14 @@
     function enterAttach(paneId) {
       state.activePane = paneId;
       state.mode = "attach";
-      // Push a history entry so the platform back button (Android
-      // gesture / browser ←) detaches instead of leaving the page.
-      // popstate is the single source of truth for transitions —
-      // both this push and the in-app `← overview` button route
-      // through it, so the URL and `state.mode` never diverge.
+      // Push a history entry so the platform back gesture detaches instead of leaving the page.
+      // popstate is the single source of truth for transitions, so URL and `state.mode` never
+      // diverge.
       history.pushState({ mode: "attach", pane: paneId }, "", `#pane/${encodeURIComponent(paneId)}`);
       render();
     }
 
-    // Tear down attach resources without touching history — used both
-    // by user-initiated back and by popstate handler. Caller controls
-    // whether to push/pop the history entry to avoid double-entries.
+    // Tear down attach resources without touching history; the caller controls the history entry.
     function teardownAttach() {
       if (state.ws.attach) { try { state.ws.attach.close(); } catch {} state.ws.attach = null; }
       if (state.term) { try { state.term.dispose(); } catch {} state.term = null; }
@@ -2170,16 +1888,12 @@
       if (state._removeResize) { state._removeResize(); state._removeResize = null; }
       state.activePane = null;
       state.mode = "overview";
-      // The board's poll loop exits whenever the mode is not `overview`, and a `#pane/<id>`
-      // deep link puts the page straight into attach at boot — so without this the fleet would
-      // sit on "loading…" until something else happened to restart it.
+      // The board's poll loop exits when the mode is not `overview`, and a `#pane/<id>` deep link
+      // boots straight into attach, so restart it here.
       startBoardPolling();
     }
 
     function leaveAttach() {
-      // Delegate to platform back so popstate fires + URL pops in
-      // the same path as the OS back gesture. popstate handler
-      // does the actual teardown + render.
       if (history.state && history.state.mode === "attach") {
         history.back();
       } else {
@@ -2188,16 +1902,14 @@
       }
     }
 
-    // Leave whichever terminal mode is live. Both own an xterm + socket, and `render()` drops
-    // the host element, so switching between them without tearing down first leaves a blank
-    // screen whose toolbar still types into the old socket.
+    // Leave whichever terminal mode is live. Both own an xterm + socket and `render()` drops the
+    // host element, so switching without teardown leaves a blank screen typing into the old socket.
     function teardownAnyTerminal() {
       if (state.mode === "attach") teardownAttach();
       else if (state.mode === "mux") teardownMux();
     }
 
-    // Mobile browsers freeze timers in a backgrounded tab, so the cadence alone cannot keep the
-    // board honest — refresh when the page comes back instead.
+    // Mobile browsers freeze timers in a background tab, so refresh when the page comes back.
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible" && state.mode === "overview" && isAuthed()) {
         startBoardPolling();
@@ -2207,8 +1919,6 @@
     window.addEventListener("popstate", (e) => {
       const target = (e.state && e.state.mode) || "overview";
       if (target === "attach" && e.state.pane) {
-        // Forward navigation back into an attach URL — only act if
-        // we're not already attached to the same pane.
         if (state.mode !== "attach" || state.activePane !== e.state.pane) {
           teardownAnyTerminal();
           state.activePane = e.state.pane;
@@ -2226,14 +1936,10 @@
       }
     });
 
-    // Boot path: honor `#pane/<id>` deep-links on first load so a
-    // bookmarked attach URL goes straight to the terminal.
     function bootFromHash() {
       const m = location.hash.match(/^#pane\/(.+)$/);
       if (m) {
         const paneId = decodeURIComponent(m[1]);
-        // Seed history with overview as the anchor so first back
-        // press returns to overview rather than leaving the page.
         history.replaceState({ mode: "overview" }, "", location.pathname + location.search);
         history.pushState({ mode: "attach", pane: paneId }, "", `#pane/${encodeURIComponent(paneId)}`);
         state.activePane = paneId;
@@ -2243,10 +1949,7 @@
       }
     }
 
-    // Bearer only: with a cached token, boot; without one, show the setup page. The
-    // unauthenticated /api/whoami probe that used to precede this is gone with the identity
-    // header path it existed to detect — it now always answers `bearer`, and it is behind the
-    // auth middleware anyway, so an unauthenticated call can only 401.
+    // Bearer only: with a cached token, boot; without one, show the setup page.
     (() => {
       if (token) {
         bootFromHash(); bootstrap();

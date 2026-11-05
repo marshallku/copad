@@ -1,11 +1,8 @@
 //! Plugin runtime configuration sourced from environment variables.
 //!
-//! Atlassian Cloud uses Basic auth with `email:api_token` — there is
-//! no shared OAuth client to embed (which is why we don't have the
-//! "users supply their own client_id" wart that calendar carries).
-//! Each user generates their own API token at
-//! id.atlassian.com/manage-profile/security/api-tokens and pastes
-//! it via env, then `copad-plugin-jira auth` validates and persists.
+//! Atlassian Cloud uses Basic auth with `email:api_token`, so there is no shared OAuth client to
+//! embed. Each user generates an API token at id.atlassian.com/manage-profile/security/api-tokens,
+//! passes it via env, and `copad-plugin-jira auth` validates and persists it.
 
 use std::time::Duration;
 
@@ -17,35 +14,27 @@ pub struct Config {
     pub workspace_label: String,
     pub require_secure_store: bool,
     pub plaintext_path: std::path::PathBuf,
-    /// Polling interval (default 300s — Jira Cloud rate-limits
-    /// aggressively per-user). Range 60..=3600.
+    /// Polling interval (default 300s; Jira Cloud rate-limits per user). Range 60..=3600.
     pub poll_interval: Duration,
     /// JQL `updated > -<n>h` window. Default 24h, range 1..=720.
     pub lookback_hours: u32,
-    /// Optional `project in (X, Y)` allowlist. None = all projects
-    /// the user has access to.
     pub projects: Option<Vec<String>>,
-    /// Default true; set `false` for a status/assignee-only feed (no API
-    /// cost reduction since comments arrive inline in the search response).
+    /// Default true; `false` gives a status/assignee-only feed (no API savings: comments arrive
+    /// inline in the search response).
     pub fetch_comments: bool,
-    /// Set on env-validation failure: RPC starts (so the supervisor
-    /// handshake completes) but every Jira-touching action returns
-    /// `not_authenticated` upfront. Without this gate a stale stored
-    /// token from a previous good run could make one call succeed
-    /// before the next refresh fails confusingly.
+    /// Set on env-validation failure: RPC still starts (so the supervisor handshake completes) but
+    /// every Jira-touching action returns `not_authenticated` upfront. Without this a stale stored
+    /// token could make one call succeed before the next fails confusingly.
     pub fatal_error: Option<String>,
 }
 
 impl Config {
-    /// Credential env vars (`COPAD_JIRA_BASE_URL`/`_EMAIL`/`_API_TOKEN`)
-    /// are OPTIONAL — RPC mode falls back to the keyring-stored TokenSet,
-    /// so a one-time `auth` subcommand is enough. Env wins when set
-    /// (useful for testing against a different site). A malformed value
-    /// on a *present* env var IS still a hard error: silently falling
-    /// back to stored defaults would hide user typos.
+    /// Credential env vars (`COPAD_JIRA_BASE_URL`/`_EMAIL`/`_API_TOKEN`) are OPTIONAL: RPC mode
+    /// falls back to the keyring-stored TokenSet. Env wins when set. A malformed value on a
+    /// *present* env var is still a hard error, since falling back would hide user typos.
     pub fn from_env() -> Result<Self, String> {
-        // Trim before checking presence so a whitespace-only value (typo'd
-        // shell rc) is treated as "not set" rather than shadowing the store.
+        // Trim first so a whitespace-only value (typo'd shell rc) counts as "not set" instead of
+        // shadowing the store.
         let base_url_raw = std::env::var("COPAD_JIRA_BASE_URL").unwrap_or_default();
         let base_url = base_url_raw.trim().trim_end_matches('/').to_string();
         if !base_url.is_empty() {
@@ -89,7 +78,6 @@ impl Config {
         })
     }
 
-    /// Builds a Config in fatal-error state (see `fatal_error` field).
     pub fn minimal_with_error(err: String) -> Self {
         Self {
             base_url: String::new(),
@@ -106,19 +94,16 @@ impl Config {
         }
     }
 
-    /// Env-tokens absent (relying entirely on the store).
     pub fn env_creds_empty(&self) -> bool {
         self.email.is_empty() || self.api_token.is_empty() || self.base_url.is_empty()
     }
 }
 
-/// Restricts `base_url` to `https://<subdomain>.atlassian.net[/]` shape.
-/// Trust-boundary defense: a typo like `https://atlassian.net.evil.example`
-/// would POST the API token to an attacker. Self-hosted Server / Data
-/// Center is rejected because it needs different auth (PAT/cookies, not
-/// Basic) — running Cloud's auth shape there would fail confusingly.
-/// Public so `current_credentials` can apply the same gate to stored
-/// base_urls (hand-edited keyring entries must not bypass env-time check).
+/// Restricts `base_url` to `https://<subdomain>.atlassian.net[/]`. Trust boundary: a typo like
+/// `https://atlassian.net.evil.example` would POST the API token to an attacker. Self-hosted
+/// Server / Data Center is rejected because it needs different auth (PAT/cookies, not Basic).
+/// Public so `current_credentials` applies the same gate to stored base_urls (hand-edited keyring
+/// entries must not bypass the env-time check).
 pub fn validate_base_url(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("COPAD_JIRA_BASE_URL: cannot be empty".to_string());
@@ -132,8 +117,6 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
     if after_scheme.is_empty() || after_scheme.starts_with('/') {
         return Err(format!("COPAD_JIRA_BASE_URL: missing host (got {s:?})"));
     }
-    // Reject embedded whitespace / control chars — they would either
-    // get URL-encoded into garbage or break the request line.
     for c in s.chars() {
         if c.is_control() || c == ' ' || c == '\t' {
             return Err(format!(
@@ -141,14 +124,9 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
             ));
         }
     }
-    // The runtime joins this base with `/rest/api/3/...` paths.
-    // Allowing a path component (like `https://x.atlassian.net/jira`)
-    // would produce `https://x.atlassian.net/jira/rest/api/3/myself`
-    // which is not the intended endpoint and would fail every API
-    // call. Reject any path so the user sees the issue at config
-    // time, not as a confusing runtime 404. A trailing slash with
-    // nothing after it is normalized to "" by from_env's
-    // trim_end_matches and is accepted here.
+    // The runtime joins this base with `/rest/api/3/...`, so a path component would break every
+    // endpoint; reject it at config time instead of a confusing runtime 404. A bare trailing slash
+    // is already normalized to "" by from_env's trim_end_matches.
     let host = match after_scheme.find('/') {
         None => after_scheme,
         Some(i) => {
@@ -162,19 +140,14 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
             &after_scheme[..i]
         }
     };
-    // No userinfo / port — `https://user:pass@host.atlassian.net` is
-    // semantically suspicious (creds in URL) and `host:443` carries
-    // no benefit over the implicit default. Reject both rather than
-    // try to parse around them.
+    // Reject userinfo and port: creds in a URL are suspicious and `host:443` adds nothing.
     if host.contains('@') || host.contains(':') {
         return Err(format!(
             "COPAD_JIRA_BASE_URL: host must not contain userinfo or port (got {host:?})"
         ));
     }
-    // Atlassian Cloud workspaces are always `<subdomain>.atlassian.net`.
-    // Custom domains (Premium/Enterprise) still hit `*.atlassian.net`
-    // for the REST API. Anything else is either a typo or a Server
-    // install we don't support.
+    // Cloud workspaces are always `<subdomain>.atlassian.net` (custom domains still use it for the
+    // REST API); anything else is a typo or an unsupported Server install.
     let lower = host.to_ascii_lowercase();
     if !lower.ends_with(".atlassian.net") {
         return Err(format!(
@@ -189,9 +162,7 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
         ));
     }
     let subdomain = &lower[..subdomain_len];
-    // Workspace subdomains: lowercase letters, digits, hyphens,
-    // dots (for region-prefixed forms like `eu.atlassian.net` -
-    // matches anything Atlassian routes to a Cloud tenant).
+    // Lowercase letters, digits, hyphens and dots (region-prefixed forms like `eu.atlassian.net`).
     for c in subdomain.chars() {
         let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.');
         if !ok {
@@ -203,8 +174,8 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Trust-boundary: the label is interpolated into the keyring entry name
-/// and the plaintext file path. Same charset as calendar/slack/discord.
+/// Trust boundary: the label is interpolated into the keyring entry name and the plaintext file
+/// path. Same charset as calendar/slack/discord.
 fn validate_workspace_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("COPAD_JIRA_WORKSPACE: cannot be empty".to_string());
@@ -237,8 +208,8 @@ fn parse_bool(var: &str, default: bool) -> Result<bool, String> {
     }
 }
 
-/// Empty/unset → default; out-of-range or non-integer → hard error so a
-/// misconfigured shell rc doesn't silently degrade the poller.
+/// Empty/unset -> default; out-of-range or non-integer -> hard error, so a misconfigured shell rc
+/// doesn't silently degrade the poller.
 fn parse_bounded_int<T>(var: &str, default: T, min: T, max: T) -> Result<T, String>
 where
     T: std::str::FromStr + std::fmt::Display + PartialOrd + Copy,
@@ -261,9 +232,8 @@ where
     }
 }
 
-/// Comma-separated allowlist of Jira project keys (`[A-Z][A-Z0-9_]*`).
-/// Strict validation so a typo can't silently steer the polling JQL into
-/// returning everything or fail obscurely at the API boundary.
+/// Comma-separated allowlist of Jira project keys (`[A-Z][A-Z0-9_]*`). Strict, so a typo can't
+/// silently steer the polling JQL into returning everything or failing obscurely.
 fn parse_projects(raw: &str) -> Result<Option<Vec<String>>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -331,11 +301,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Tests that mutate `COPAD_JIRA_*` env vars must serialize against
-    // each other — cargo runs tests in parallel by default, so the
-    // earlier "single-threaded" SAFETY comments were aspirational, not
-    // enforced. Poisoned guard is recovered so a panic in one test
-    // doesn't cascade-fail the rest.
+    // Tests mutating `COPAD_JIRA_*` env vars serialize on this lock because cargo runs tests in
+    // parallel. A poisoned guard is recovered so one panic doesn't cascade.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -347,16 +314,13 @@ mod tests {
         validate_base_url("https://yourcompany.atlassian.net").unwrap();
         validate_base_url("https://x.atlassian.net/").unwrap();
         validate_base_url("https://team-foo.atlassian.net").unwrap();
-        // Mixed-case host is normalized internally.
         validate_base_url("https://Team-Foo.Atlassian.Net").unwrap();
     }
 
     #[test]
     fn validate_base_url_rejects_non_atlassian_hosts() {
-        // Critical security boundary: the plugin sends Basic auth
-        // with the user's API token to whatever host base_url
-        // points at. Allowing arbitrary `https://` would let a
-        // typo exfiltrate credentials.
+        // Security boundary: Basic auth with the user's API token goes to whatever host base_url
+        // points at, so an arbitrary `https://` would let a typo exfiltrate credentials.
         for s in [
             "https://atlassian.net.evil.example",
             "https://jira.company.com",
@@ -373,8 +337,6 @@ mod tests {
 
     #[test]
     fn validate_base_url_rejects_url_with_path() {
-        // Runtime joins this base with `/rest/api/3/...`. A path on
-        // base_url would corrupt every endpoint URL.
         for s in [
             "https://x.atlassian.net/jira",
             "https://x.atlassian.net/wiki",
@@ -453,7 +415,6 @@ mod tests {
             ("OFF", false),
             ("", false),
         ] {
-            // SAFETY: tests run single-threaded for env mutation
             unsafe { std::env::set_var("TEST_JIRA_PARSE_BOOL", s) };
             assert_eq!(
                 parse_bool("TEST_JIRA_PARSE_BOOL", false).unwrap(),
@@ -465,7 +426,6 @@ mod tests {
 
     #[test]
     fn parse_bool_rejects_garbage() {
-        // SAFETY: tests run single-threaded for env mutation
         unsafe { std::env::set_var("TEST_JIRA_PARSE_BOOL_BAD", "maybe") };
         assert!(parse_bool("TEST_JIRA_PARSE_BOOL_BAD", false).is_err());
     }
@@ -494,9 +454,8 @@ mod tests {
 
     #[test]
     fn from_env_succeeds_with_empty_credentials() {
-        // RPC mode must not fail when env credentials are missing —
-        // the plugin falls back to the store. Only `auth` subcommand
-        // requires the env (checked separately in main::run_auth).
+        // RPC mode must not fail on missing env credentials (falls back to the store); only the
+        // `auth` subcommand requires them (checked in main::run_auth).
         let _g = env_lock();
         unsafe {
             std::env::remove_var("COPAD_JIRA_BASE_URL");
@@ -515,11 +474,8 @@ mod tests {
 
     #[test]
     fn from_env_treats_whitespace_only_credentials_as_empty() {
-        // Whitespace-only env vars must NOT shadow the store —
-        // otherwise current_credentials would prefer "env" over
-        // valid stored creds and auth_status would lie about live
-        // state until the first 401. Trimmed → empty → fall through
-        // to store.
+        // Whitespace-only env vars must NOT shadow the store: otherwise current_credentials would
+        // prefer "env" over valid stored creds and auth_status would lie until the first 401.
         let _g = env_lock();
         unsafe {
             std::env::set_var("COPAD_JIRA_BASE_URL", "   ");
@@ -537,7 +493,6 @@ mod tests {
 
     #[test]
     fn parse_bounded_int_accepts_default_and_in_range() {
-        // SAFETY: tests run single-threaded for env mutation
         unsafe { std::env::remove_var("TEST_JIRA_BI_OK") };
         assert_eq!(
             parse_bounded_int::<u64>("TEST_JIRA_BI_OK", 300, 60, 3600).unwrap(),
@@ -552,7 +507,6 @@ mod tests {
 
     #[test]
     fn parse_bounded_int_rejects_out_of_range() {
-        // SAFETY: tests run single-threaded for env mutation
         unsafe { std::env::set_var("TEST_JIRA_BI_LO", "30") };
         assert!(parse_bounded_int::<u64>("TEST_JIRA_BI_LO", 300, 60, 3600).is_err());
         unsafe { std::env::set_var("TEST_JIRA_BI_HI", "9999") };
@@ -564,7 +518,6 @@ mod tests {
     #[test]
     fn parse_projects_accepts_comma_list() {
         let v = parse_projects("PROJ,APP,IOS2").unwrap().unwrap();
-        // Sorted + deduped on output.
         assert_eq!(v, vec!["APP", "IOS2", "PROJ"]);
     }
 
@@ -600,9 +553,7 @@ mod tests {
 
     #[test]
     fn from_env_validates_base_url_format_when_present() {
-        // Even with optional env, a present-but-malformed value is
-        // still a hard error so a typo doesn't silently mask the
-        // stored URL.
+        // A present-but-malformed value is still a hard error, so a typo can't mask the stored URL.
         let _g = env_lock();
         unsafe {
             std::env::set_var("COPAD_JIRA_BASE_URL", "ftp://x.atlassian.net");

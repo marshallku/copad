@@ -1,23 +1,13 @@
 //! First-party Jira (Atlassian Cloud) service plugin for copad.
 //!
-//! Two run modes (selected by `argv[1]`):
-//! - **`auth`** — validates the env-supplied API token via
-//!   `/rest/api/3/myself` and persists `{email, api_token, base_url,
-//!   account_id, display_name}` to the configured store. Exits 0 on
-//!   success.
-//! - **(no args)** — RPC mode. Speaks the copad service-plugin
-//!   protocol over stdio. Slice 16.1 only handles `jira.auth_status`;
-//!   slice 16.2 will add the polling loop + 5 read/write actions.
+//! Run mode is selected by `argv[1]`:
+//! - `auth`: validates the env-supplied API token via `/rest/api/3/myself` and persists
+//!   `{email, api_token, base_url, account_id, display_name}` to the store; exits 0 on success.
+//! - no args: RPC mode over stdio (protocol: `docs/service-plugins.md`).
 //!
-//! If RPC mode starts with no stored credentials AND the env tokens
-//! are missing, the supervisor handshake still completes — actions
-//! return `not_authenticated` until the user runs the `auth`
-//! subcommand or fixes the env.
-//!
-//! See `docs/service-plugins.md` for the protocol contract. Atlassian
-//! Cloud-only (no Server / Data Center). API token + Basic auth — no
-//! OAuth round-trip needed for personal use, matching the env+keyring
-//! posture every other copad plugin uses today.
+//! With no stored credentials and no env tokens the handshake still completes and actions return
+//! `not_authenticated` until `auth` is run or the env is fixed. Atlassian Cloud only, API token
+//! + Basic auth.
 
 #[cfg(not(unix))]
 compile_error!(
@@ -66,9 +56,8 @@ fn run_auth() {
             std::process::exit(1);
         }
     };
-    // `auth` is the one path where the env credentials MUST be
-    // present — RPC mode is allowed to fall through to the store,
-    // but `auth` is what populates the store in the first place.
+    // `auth` is the one path where env credentials must be present: it populates the store RPC
+    // mode falls through to.
     if config.base_url.is_empty() {
         eprintln!(
             "[jira] auth requires COPAD_JIRA_BASE_URL (e.g. https://yourcompany.atlassian.net)"
@@ -104,17 +93,10 @@ fn run_auth() {
             std::process::exit(1);
         }
     };
-    // Cross-check the env email against what Atlassian reports. A
-    // common paste-mismatch is one team member's token + another's
-    // email; that combination passes validate_credentials silently
-    // (Basic auth only checks the secret, not the email field — the
-    // email field is just a username) but later API calls under the
-    // user-confused identity get confusing.
+    // Cross-check the env email against what Atlassian reports. Basic auth only checks the secret,
+    // so one member's token with another's email passes validate_credentials silently.
     if !user.email_address.is_empty() && !user.email_address.eq_ignore_ascii_case(&config.email) {
-        // Fields differ. We still allow the auth to proceed — some
-        // workspaces hide email via privacy controls, returning an
-        // empty string which we already short-circuited. But warn
-        // loudly so the user knows what they got.
+        // Still proceed: some workspaces hide email (empty, already short-circuited). Warn loudly.
         eprintln!(
             "[jira] WARNING: COPAD_JIRA_EMAIL ({:?}) does not match the account's \
              emailAddress ({:?}). Auth succeeded with the API token, but you may have \
@@ -163,9 +145,7 @@ fn run_rpc() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    // Single writer thread funnels all outgoing JSON so init reply,
-    // action replies, and (slice 16.2) event.publish notifications
-    // never interleave.
+    // Single writer thread so init reply, action replies and event.publish never interleave.
     let (tx, rx) = channel::<String>();
     let writer_tx = tx.clone();
     thread::spawn(move || {
@@ -179,11 +159,9 @@ fn run_rpc() {
 
     let initialized = Arc::new(AtomicBool::new(false));
 
-    // Polling daemon runs in a background thread. It waits for the
-    // `initialized` notification before starting ticks and resolves
-    // credentials on every tick (so running `copad-plugin-jira auth`
-    // while copad is already up populates the store and the next
-    // tick picks it up — no plugin restart needed).
+    // Polling runs in a background thread, waiting for `initialized`, and resolves credentials
+    // every
+    // tick, so a later `copad-plugin-jira auth` is picked up without a restart.
     {
         let cfg_for_poller = Arc::new(config.clone());
         let store_for_poller = store.clone();
@@ -274,9 +252,7 @@ fn handle_frame(
                 Err((code, msg)) => send_error(tx, id, &code, &msg),
             }
         }
-        "event.dispatch" => {
-            // jira plugin doesn't subscribe — quietly ignore.
-        }
+        "event.dispatch" => {}
         "shutdown" => std::process::exit(0),
         other if !other.is_empty() && !id.is_empty() => {
             send_error(
@@ -299,11 +275,8 @@ fn handle_action(
     if name == "jira.auth_status" {
         return Ok(auth_status_payload(config, store));
     }
-    // Recognize the action name BEFORE checking credentials so an
-    // unauthenticated call to a typo'd action surfaces as
-    // `action_not_found` (a stable diagnostic) rather than the
-    // state-dependent `not_authenticated` (which would change to
-    // action_not_found later once the user runs `auth`).
+    // Recognize the action name before checking credentials, so a typo'd action gives a stable
+    // `action_not_found` instead of the state-dependent `not_authenticated`.
     let known = matches!(
         name,
         "jira.list_my_tickets"
@@ -318,9 +291,8 @@ fn handle_action(
             format!("jira plugin does not handle {name}"),
         ));
     }
-    // All Jira-touching actions need credentials; short-circuit on
-    // fatal_error so a stale stored token can't make a single call
-    // succeed before breaking confusingly on the next refresh.
+    // Short-circuit on fatal_error so a stale stored token cannot make one call succeed before
+    // breaking on the next refresh.
     if config.fatal_error.is_some() {
         return Err((
             "not_authenticated".to_string(),
@@ -343,7 +315,6 @@ fn handle_action(
         "jira.create_ticket" => handle_create_ticket(creds, params),
         "jira.transition" => handle_transition(creds, params),
         "jira.add_comment" => handle_add_comment(creds, params),
-        // Unreachable — the `known` guard above already filtered.
         other => Err((
             "action_not_found".to_string(),
             format!("jira plugin does not handle {other}"),
@@ -351,15 +322,12 @@ fn handle_action(
     }
 }
 
-/// Promotes `jira::http_*`'s prefix-encoded error string to the
-/// action's `(code, message)` tuple. EXPLICIT allowlist (vs slack's
-/// "any bare snake_case prefix") so internal strings like `"json parse:
-/// ..."`, `"project key: ..."`, `"transition response missing id"`
-/// can't escape as ad-hoc codes (`json`/`project`/`transition`) and
-/// break the trigger-matchable contract. Unknown collapses to `io_error`.
+/// Promotes `jira::http_*`'s prefix-encoded error string to `(code, message)`. An explicit
+/// allowlist (unlike slack's "any bare snake_case prefix") so internal strings such as
+/// `"json parse: ..."` cannot escape as ad-hoc codes; unknown collapses to `io_error`.
 fn map_jira_error(err: String) -> (String, String) {
-    /// Public error-code surface — triggers and `coctl` clients
-    /// pattern-match on these. Adding a new code is a contract change.
+    /// Public error-code surface; triggers and `coctl` match on these, so adding one is a contract
+    /// change.
     const KNOWN_CODES: &[&str] = &[
         "unauthorized",
         "forbidden",
@@ -369,9 +337,9 @@ fn map_jira_error(err: String) -> (String, String) {
         "invalid_params",
         "io_error",
     ];
-    // Split on whitespace, `(`, AND `:` so prefixes like
-    // `"unauthorized HTTP 401:"` and `"rate_limited (Retry-After:..."`
-    // both land as the bare keyword.
+    // Split on whitespace, `(` and `:` so `"unauthorized HTTP 401:"` and `"rate_limited
+    // (Retry-After:..."`
+    // both yield the bare keyword.
     let bare = err
         .split(|c: char| c.is_whitespace() || c == '(' || c == ':')
         .next()
@@ -393,27 +361,19 @@ fn handle_list_my_tickets(creds: jira::Creds, params: &Value) -> Result<Value, (
     }
     let mut clauses = vec!["assignee = currentUser()".to_string()];
     if let Some(s) = &status {
-        // Status names can have spaces; quote them.
         clauses.push(format!("status = \"{}\"", jql_escape(s)));
     }
     if let Some(p) = &project {
         clauses.push(format!("project = {p}"));
     }
     if let Some(since) = &updated_since {
-        // `since` should look like `-2d` / `-1w` / `2026-01-01` —
-        // pass through as-is, JQL will validate.
+        // `since` is e.g. `-2d`, `-1w` or `2026-01-01`; JQL validates it.
         clauses.push(format!("updated > \"{}\"", jql_escape(since)));
     }
     let jql = format!("{} ORDER BY updated DESC", clauses.join(" AND "));
 
-    // Paginate up to MAX_PAGES so a chatty workspace doesn't truncate
-    // silently. Action surface returns the union of pages with an
-    // explicit `truncated` flag so callers (triggers, coctl, future
-    // panel UIs) can detect partial results and surface a user-visible
-    // warning rather than silently acting on an arbitrary prefix of
-    // the result set. The new `/search/jql` endpoint dropped `total`
-    // from responses (cursor-based pagination doesn't need it), so
-    // we no longer report a total count — only `truncated` matters.
+    // Paginate up to MAX_PAGES and return the union with an explicit `truncated` flag, so callers
+    // can warn instead of silently acting on a prefix. The `/search/jql` endpoint has no `total`.
     const MAX_PAGES: u64 = 10;
     let fields = [
         "summary", "status", "assignee", "reporter", "project", "updated",
@@ -446,12 +406,8 @@ fn handle_list_my_tickets(creds: jira::Creds, params: &Value) -> Result<Value, (
 fn handle_get_ticket(creds: jira::Creds, params: &Value) -> Result<Value, (String, String)> {
     let key = required_string(params, "key")?;
     jira::validate_issue_key(&key).map_err(|e| ("invalid_params".to_string(), e))?;
-    // Returns the verbatim Jira response (per the docs contract:
-    // "returns full ticket json"). Triggers / coctl callers who
-    // want the trigger envelope shape can use list_my_tickets which
-    // returns the envelope form. This split lets `get_ticket`
-    // surface fields like custom field values, `changelog`, full
-    // `comment` arrays, etc. that the envelope flattens away.
+    // Returns the verbatim Jira response, keeping custom fields, `changelog` and full `comment`
+    // arrays that the envelope from list_my_tickets flattens away.
     jira::get_issue(creds, &key).map_err(map_jira_error)
 }
 
@@ -462,10 +418,8 @@ fn handle_create_ticket(creds: jira::Creds, params: &Value) -> Result<Value, (St
     let assignee = optional_string(params, "assignee")?;
     let parent = optional_string(params, "parent")?;
     let issue_type = optional_string(params, "issue_type")?;
-    // Validate at handler level so a bad project key surfaces as
-    // `invalid_params` (the public action contract) rather than the
-    // io_error fallback that map_jira_error would assign to the
-    // bubble-up from create_issue's internal validation.
+    // Validate here so a bad project key is `invalid_params`, not the io_error that map_jira_error
+    // would assign to create_issue's internal validation.
     jira::validate_project_key(&project).map_err(|e| ("invalid_params".to_string(), e))?;
     if let Some(p) = &parent {
         jira::validate_issue_key(p).map_err(|e| ("invalid_params".to_string(), e))?;
@@ -546,8 +500,7 @@ fn optional_string(params: &Value, name: &str) -> Result<Option<String>, (String
     }
 }
 
-/// JQL string-literal escape: `\` → `\\`, `"` → `\"`. Other chars pass
-/// through (JQL is permissive about newlines / control chars in literals).
+/// JQL string-literal escape: `\` -> `\\`, `"` -> `\"`.
 fn jql_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -560,11 +513,9 @@ fn jql_escape(s: &str) -> String {
     out
 }
 
-/// `account_id_hint` is captured atomically with the other credential
-/// fields (only set when `source == "store"`). The poller's
-/// my_account_id resolution uses it so a hot re-auth between
-/// `current_credentials` and a follow-up `store.load()` can't produce
-/// a credentials/account_id mismatch.
+/// `account_id_hint` is captured atomically with the other credential fields (only when
+/// `source == "store"`), so a hot re-auth between `current_credentials` and a later
+/// `store.load()` cannot mismatch credentials and account_id.
 pub struct ResolvedCreds {
     pub source: &'static str,
     pub base_url: String,
@@ -580,20 +531,14 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
             base_url: config.base_url.clone(),
             email: config.email.clone(),
             api_token: config.api_token.clone(),
-            // env-supplied creds haven't been validated by /myself
-            // (the `auth` subcommand path is what records account_id);
-            // poller will resolve via /myself on first tick.
+            // Env creds are not validated by /myself; the poller resolves account_id on its first
+            // tick.
             account_id_hint: None,
         });
     }
     let t = store.load()?;
-    // Reject incomplete stored entries — a manually edited keyring
-    // record (or a malformed plaintext file partially overwritten by
-    // a stuck write) with empty fields would otherwise make
-    // `auth_status` report `authenticated=true` and push the
-    // runtime into confusing 401s instead of a clean
-    // `not_authenticated`. Same posture as slack/discord's stored
-    // credential resolvers.
+    // Reject incomplete stored entries (hand-edited keyring, partially overwritten plaintext file),
+    // which would otherwise report `authenticated=true` and then 401 at runtime.
     if t.email.is_empty() || t.api_token.is_empty() || t.base_url.is_empty() {
         eprintln!(
             "[jira] stored credentials are incomplete (email/api_token/base_url empty); \
@@ -601,14 +546,9 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
         );
         return None;
     }
-    // Apply the SAME `*.atlassian.net` host restriction to stored
-    // base_url that env validation enforces. Without this gate a
-    // tampered keyring entry (or a hand-edited plaintext store with
-    // a swapped host) would steer authenticated REST calls to an
-    // arbitrary HTTPS endpoint — defeating the env-time defense
-    // against API-token exfiltration. Treats validation failure as
-    // "stored credentials are unsafe" → not_authenticated; user
-    // re-runs `auth` to overwrite with a clean record.
+    // Apply the same `*.atlassian.net` restriction as env validation. Without it a tampered store
+    // could steer authenticated REST calls to an arbitrary HTTPS host and exfiltrate the API token.
+    // Failure means not_authenticated; the user re-runs `auth`.
     if let Err(e) = config::validate_base_url(&t.base_url) {
         eprintln!(
             "[jira] stored base_url failed Atlassian Cloud host check ({e}); \
@@ -631,14 +571,10 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
     })
 }
 
-/// Shared `jira.auth_status` payload — re-used by the polling loop and
-/// any future client wrapper to keep the shape verbatim.
+/// Shared `jira.auth_status` payload.
 fn auth_status_payload(config: &Config, store: &Arc<dyn TokenStore>) -> Value {
-    // When env validation produced a fatal_error we MUST NOT report
-    // authenticated=true based on a fall-through default-workspace
-    // store load — the runtime would refuse to make any HTTP call
-    // (because handle_action short-circuits on fatal_error in 16.2),
-    // so the status surface would lie about the runtime state.
+    // With a fatal_error, handle_action refuses every HTTP call, so do not report
+    // authenticated=true from a fall-through store load.
     if let Some(err) = &config.fatal_error {
         return json!({
             "configured": false,
@@ -656,18 +592,10 @@ fn auth_status_payload(config: &Config, store: &Arc<dyn TokenStore>) -> Value {
     let stored = store.load();
     let credentials_source = resolved.as_ref().map(|c| c.source).unwrap_or("none");
     let authenticated = resolved.is_some();
-    // Identity (account_id, display_name) is only verified for the
-    // store source — that's the only path where we ran /myself at
-    // auth time. For env-overridden credentials we don't have a
-    // verified identity for THOSE specific tokens, so reporting the
-    // stored identity would be misleading (the env tokens could be
-    // from a different Atlassian account than the store). Surface
-    // them only when consistent with the live source.
+    // Identity (account_id, display_name) is only verified for the store source (/myself ran at
+    // auth time); env tokens may belong to a different account.
     let report_identity = credentials_source == "store";
-    // The base_url field reports the live source's URL — matches
-    // resolved.base_url when authenticated, falls back to env when
-    // env is set but store is empty (handled by current_credentials),
-    // empty when neither is set.
+    // The live source's URL: resolved.base_url when authenticated, else env, else empty.
     let base_url = resolved
         .as_ref()
         .map(|c| c.base_url.clone())
@@ -794,8 +722,7 @@ mod tests {
         assert_eq!(v["authenticated"], false);
         assert_eq!(v["credentials_source"], "none");
         assert_eq!(v["fatal_error"], "missing X");
-        // Identity must NOT leak even though store has tokens — the
-        // runtime won't honor them, so the status must reflect that.
+        // Identity must not leak even though the store has tokens.
         assert_eq!(v["account_id"], Value::Null);
         assert_eq!(v["display_name"], Value::Null);
     }
@@ -816,7 +743,6 @@ mod tests {
     #[test]
     fn auth_status_store_source_reports_identity() {
         let store: Arc<dyn TokenStore> = Arc::new(FixedStore(sample_tokens()));
-        // env empty: store wins.
         let mut cfg = good_config();
         cfg.email = String::new();
         cfg.api_token = String::new();
@@ -882,11 +808,8 @@ mod tests {
 
     #[test]
     fn current_credentials_rejects_incomplete_store_entry() {
-        // A keyring entry hand-edited to drop the api_token (or any
-        // of the three required fields) must NOT surface as
-        // authenticated — that would mask the corruption behind a
-        // confusing 401 at runtime instead of a clean
-        // not_authenticated.
+        // A keyring entry missing any required field must not report authenticated, which would
+        // mask the corruption behind a 401 at runtime.
         let mut tokens = sample_tokens();
         tokens.api_token = String::new();
         let store: Box<dyn TokenStore> = Box::new(FixedStore(tokens));
@@ -937,7 +860,6 @@ mod tests {
 
     #[test]
     fn map_jira_error_promotes_known_codes_only() {
-        // Known codes ride through verbatim.
         let (code, msg) = map_jira_error("unauthorized HTTP 401: bad creds".into());
         assert_eq!(code, "unauthorized");
         assert!(msg.contains("HTTP 401"));
@@ -951,9 +873,7 @@ mod tests {
         assert_eq!(code, "transition_not_available");
         let (code, _) = map_jira_error("io_error Jira HTTP 503: gateway timeout".into());
         assert_eq!(code, "io_error");
-        // Unknown bare-snake prefixes (internal validation error
-        // bubble-ups) MUST collapse to io_error rather than leaking
-        // ad-hoc codes that triggers can't reliably match against.
+        // Unknown bare-snake prefixes (internal validation bubble-ups) collapse to io_error.
         for unknown in [
             "json parse: bad shape",
             "project key: cannot be empty",
@@ -975,7 +895,6 @@ mod tests {
     fn handle_action_create_validates_required_params() {
         let store: Arc<dyn TokenStore> = Arc::new(EmptyStore);
         let cfg = good_config();
-        // Missing project + summary.
         let err = handle_action("jira.create_ticket", &json!({}), &cfg, &store).unwrap_err();
         assert_eq!(err.0, "invalid_params");
     }
@@ -1004,10 +923,9 @@ mod tests {
 
     #[test]
     fn current_credentials_rejects_stored_non_atlassian_base_url() {
-        // Critical security boundary: env-time validation rejects
-        // non-Atlassian hosts to prevent API-token exfiltration. A
-        // hand-edited keyring entry must NOT bypass that check by
-        // injecting an arbitrary HTTPS URL.
+        // Security boundary: env validation rejects non-Atlassian hosts to prevent token
+        // exfiltration,
+        // and a hand-edited keyring entry must not bypass it.
         for bad_host in [
             "https://attacker.example.com",
             "https://atlassian.net.evil.example",

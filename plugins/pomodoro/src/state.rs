@@ -1,35 +1,27 @@
-//! Pure Pomodoro state machine — no I/O, no threads, no wall-clock reads.
+//! Pure Pomodoro state machine: no I/O, no threads, no wall-clock reads.
 //!
-//! Every transition takes an explicit `now_ms` (epoch millis) so the whole
-//! machine is unit-testable without sleeping (the scheduler thread in
-//! `main.rs` is the only place that reads the real clock). The plugin owns
-//! time: a running phase carries an absolute `ends_at_ms`; a paused phase
-//! carries the frozen `remaining_ms`. The GUI never counts seconds off a
-//! per-tick event — it recomputes locally from `ends_at_ms`, so the plugin
-//! only emits on transitions.
+//! Every transition takes an explicit `now_ms` (epoch millis), so the machine is testable without
+//! sleeping; the scheduler thread in `main.rs` is the only reader of the real clock. A running
+//! phase carries an absolute `ends_at_ms`, a paused one the frozen `remaining_ms`. The GUI
+//! recomputes locally from `ends_at_ms`, so the plugin only emits on transitions.
 //!
-//! Loop shape (deliberately NOT an infinite auto-loop — an unattended
-//! todo-triggered start must not fire toasts forever):
-//!   Idle --start--> Work --(expires)--> Break|LongBreak --(expires)--> Idle
-//! Work completion auto-starts the break (the user's "휴식 자동전환"); a break
-//! completion returns to Idle and waits for an explicit start/toggle. So at
-//! most two toasts fire per user-initiated Work.
+//! Loop shape: Idle --start--> Work --(expires)--> Break|LongBreak --(expires)--> Idle. Not an
+//! infinite auto-loop: an unattended todo-triggered start must not fire toasts forever, so at most
+//! two fire per user-initiated Work. Work completion auto-starts the break; break completion waits
+//! for an explicit start/toggle.
 //!
-//! Long-break cadence: `completed_work_rounds` counts Work phases finished
-//! since the last reset (or last long break). The Nth work (N =
-//! `rounds_before_long`) enters a LongBreak, which then resets the counter.
+//! `completed_work_rounds` counts Work phases since the last reset or long break; the Nth work
+//! (N = `rounds_before_long`) enters a LongBreak, which resets the counter.
 
 use serde_json::{Value, json};
 
-/// Duration bounds. Minutes are integer; the upper cap keeps
-/// minute→millis arithmetic far from overflow and rejects nonsense.
+/// Duration bounds in integer minutes; the cap keeps minute->millis arithmetic far from overflow.
 pub const MIN_MINUTES: u32 = 1;
 pub const MAX_MINUTES: u32 = 180;
 pub const MIN_ROUNDS: u32 = 1;
 pub const MAX_ROUNDS: u32 = 12;
 
-/// Label shown next to the timer (e.g. the todo title injected by a
-/// trigger). Capped so a pathological payload can't bloat the status bar.
+/// Label shown next to the timer (e.g. a todo title); capped so a payload cannot bloat the status bar.
 pub const MAX_LABEL_CHARS: usize = 100;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,8 +44,7 @@ impl Phase {
 
     fn glyph(self) -> &'static str {
         match self {
-            // Idle keeps the tomato so the segment reads as "pomodoro"
-            // even when stopped.
+            // Idle keeps the tomato so the segment reads as "pomodoro" when stopped.
             Phase::Idle | Phase::Work => "🍅",
             Phase::Break => "☕",
             Phase::LongBreak => "🛋",
@@ -77,7 +68,6 @@ pub struct Durations {
 
 impl Default for Durations {
     fn default() -> Self {
-        // Classic pomodoro.
         Durations {
             work_min: 25,
             break_min: 5,
@@ -88,8 +78,8 @@ impl Default for Durations {
 }
 
 impl Durations {
-    /// Validate all fields up-front; return `Err` (leaving the caller's
-    /// state untouched) if any is out of range. Never partially applies.
+    /// Validate all fields up front; on `Err` the caller's state is untouched. Never partially
+    /// applies.
     pub fn validated(
         work_min: u32,
         break_min: u32,
@@ -133,39 +123,31 @@ fn check_minutes(field: &str, v: u32) -> Result<(), String> {
     }
 }
 
-/// `u32` minutes → `u64` millis. `MAX_MINUTES * 60_000` is ~10.8M, far
-/// inside `u64`, so the widening multiply cannot overflow.
+/// `u32` minutes -> `u64` millis; `MAX_MINUTES * 60_000` cannot overflow `u64`.
 fn minutes_to_ms(min: u32) -> u64 {
     (min as u64) * 60_000
 }
 
-/// A completed phase that the scheduler should announce (toast) after it
-/// releases the state lock.
+/// A completed phase to announce (toast) after the state lock is released.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transition {
     pub toast_title: String,
     pub toast_body: String,
 }
 
-/// The authoritative timer state. Guarded by a single mutex in `main.rs`;
-/// all mutation flows through these methods so persistence/notify decisions
-/// live in one place.
+/// The authoritative timer state, behind a single mutex in `main.rs`; all mutation goes through these methods.
 pub struct PomodoroState {
     phase: Phase,
-    /// Absolute expiry of the active phase while running. `Some` iff the
-    /// phase is active and NOT paused.
+    /// Absolute expiry while running; `Some` iff active and not paused.
     ends_at_ms: Option<u64>,
-    /// Frozen remaining millis while paused. `Some` iff active and paused.
     paused_remaining_ms: Option<u64>,
     label: String,
     completed_work_rounds: u32,
     durations: Durations,
-    /// Full length of the CURRENTLY active phase, in millis (0 when Idle).
-    /// Stored rather than derived: `start(minutes)` can override the work
-    /// length and `set_durations` only affects future phases, so the
-    /// configured duration is not a reliable denominator for a progress
-    /// ring. Set when a phase begins, preserved across pause/resume, cleared
-    /// on idle/reset.
+    /// Full length of the current phase in millis (0 when Idle). Stored because `start(minutes)`
+    /// can
+    /// override the work length and `set_durations` only affects future phases, so the configured
+    /// duration is no denominator for a progress ring. Preserved across pause/resume.
     current_phase_total_ms: u64,
 }
 
@@ -186,11 +168,10 @@ impl PomodoroState {
         self.durations
     }
 
-    /// Start (or restart) a Work phase. `minutes` overrides the configured
-    /// work length for this session only (validated; `Err` leaves state
-    /// untouched). Does NOT reset the round counter — starting the next
-    /// Work from Idle continues the current set toward the long break;
-    /// only [`PomodoroState::reset`] (or a completed long break) zeroes it.
+    /// Start (or restart) a Work phase. `minutes` overrides the work length for this session only
+    /// (`Err` leaves state untouched). Does not reset the round counter; only
+    /// [`PomodoroState::reset`]
+    /// or a completed long break does.
     pub fn start(
         &mut self,
         now_ms: u64,
@@ -214,13 +195,9 @@ impl PomodoroState {
         Ok(())
     }
 
-    /// Freeze the countdown. Idempotent (pausing a paused/idle timer is a
-    /// no-op). Returns whether anything changed.
-    ///
-    /// A phase that has ALREADY expired is left running so the scheduler can
-    /// complete it — otherwise a pause that wins the mutex race at expiry
-    /// would freeze it at `0` remaining and swallow the transition + toast
-    /// forever.
+    /// Freeze the countdown. Idempotent; returns whether anything changed. A phase that has already
+    /// expired stays running so the scheduler can complete it; otherwise a pause winning the mutex
+    /// race at expiry would swallow the transition and toast.
     pub fn pause(&mut self, now_ms: u64) -> bool {
         if let Some(ends) = self.ends_at_ms {
             if now_ms >= ends {
@@ -234,7 +211,6 @@ impl PomodoroState {
         }
     }
 
-    /// Resume a paused countdown from where it froze. Idempotent.
     pub fn resume(&mut self, now_ms: u64) -> bool {
         if let Some(rem) = self.paused_remaining_ms.take() {
             self.ends_at_ms = Some(now_ms.saturating_add(rem));
@@ -244,12 +220,9 @@ impl PomodoroState {
         }
     }
 
-    /// Click semantics: Idle → start Work (reusing the last label); running
-    /// → pause; paused → resume.
     pub fn toggle(&mut self, now_ms: u64) {
         match self.phase {
             Phase::Idle => {
-                // start() with no label keeps whatever label was last set.
                 let _ = self.start(now_ms, None, None);
             }
             _ if self.paused_remaining_ms.is_some() => {
@@ -261,8 +234,6 @@ impl PomodoroState {
         }
     }
 
-    /// Back to a clean Idle: clears the running/paused session, the label,
-    /// and the round counter (starts a fresh set next time).
     pub fn reset(&mut self) {
         self.phase = Phase::Idle;
         self.ends_at_ms = None;
@@ -272,17 +243,13 @@ impl PomodoroState {
         self.completed_work_rounds = 0;
     }
 
-    /// Apply new durations. Future-phases-only: the currently running phase
-    /// keeps its `ends_at_ms` (no surprising jump); the change takes effect
-    /// at the next transition.
+    /// Apply new durations to future phases only; the running phase keeps its `ends_at_ms`.
     pub fn set_durations(&mut self, durations: Durations) {
         self.durations = durations;
     }
 
-    /// Advance the machine if the active phase has expired. Returns the
-    /// toast to announce (the caller fires it after dropping the lock), or
-    /// `None` if nothing was due. At most one transition per call — the
-    /// freshly-started break is not itself due at `now_ms`.
+    /// Advance the machine if the active phase has expired, returning the toast to fire after the
+    /// lock is dropped. At most one transition per call.
     pub fn tick_if_due(&mut self, now_ms: u64) -> Option<Transition> {
         let ends = self.ends_at_ms?; // None while idle or paused
         if now_ms < ends {
@@ -291,8 +258,6 @@ impl PomodoroState {
         match self.phase {
             Phase::Work => {
                 self.completed_work_rounds = self.completed_work_rounds.saturating_add(1);
-                // rounds_before_long is validated >= 1, so this never divides
-                // by zero.
                 let long = self
                     .completed_work_rounds
                     .is_multiple_of(self.durations.rounds_before_long);
@@ -302,8 +267,8 @@ impl PomodoroState {
                     (Phase::Break, self.durations.break_ms(), "short")
                 };
                 self.phase = next;
-                // Fresh break measured from now — a long scheduler sleep
-                // (laptop suspend) does not double-expire it.
+                // Measured from now, so a long scheduler sleep (laptop suspend) does not
+                // double-expire it.
                 self.ends_at_ms = Some(now_ms.saturating_add(dur_ms));
                 self.paused_remaining_ms = None;
                 self.current_phase_total_ms = dur_ms;
@@ -319,7 +284,6 @@ impl PomodoroState {
                 self.paused_remaining_ms = None;
                 self.current_phase_total_ms = 0;
                 if was_long {
-                    // A long break closes the set.
                     self.completed_work_rounds = 0;
                 }
                 Some(Transition {
@@ -331,8 +295,7 @@ impl PomodoroState {
         }
     }
 
-    /// Absolute instant the scheduler should next wake, or `None` to park
-    /// until an RPC notifies it (idle or paused).
+    /// Instant the scheduler should next wake, or `None` to park until an RPC (idle or paused).
     pub fn next_wake_ms(&self) -> Option<u64> {
         self.ends_at_ms
     }
@@ -351,8 +314,6 @@ impl PomodoroState {
         }
     }
 
-    /// The single-line status-bar string, e.g. `🍅 24:13 · refactor` or
-    /// `☕ 04:30 ⏸ · refactor` (paused) or `🍅 idle`.
     pub fn status_text(&self, now_ms: u64) -> String {
         if !self.phase.is_active() {
             return format!("{} idle", self.phase.glyph());
@@ -372,17 +333,14 @@ impl PomodoroState {
         s
     }
 
-    /// Wire payload for the `pomodoro.state` event and RPC replies. Carries
-    /// `ends_at_ms` (so a GUI can tick locally) AND `remaining_ms` (handy
-    /// for a CLI snapshot) plus the preformatted `text`.
+    /// Wire payload for the `pomodoro.state` event and RPC replies: `ends_at_ms` for local ticking,
+    /// `remaining_ms` for CLI snapshots, and the preformatted `text`.
     pub fn event_payload(&self, now_ms: u64) -> Value {
         json!({
             "phase": self.phase.as_str(),
             "ends_at_ms": self.ends_at_ms,
             "paused": self.is_paused(),
             "remaining_ms": self.remaining_ms(now_ms),
-            // Full length of the active phase (0 when idle) — the GUI ring's
-            // denominator for its progress fraction.
             "phase_total_ms": self.current_phase_total_ms,
             "label": self.label,
             "round": self.completed_work_rounds,
@@ -392,8 +350,7 @@ impl PomodoroState {
     }
 }
 
-/// Strip control characters (newlines included — a toast/status line is
-/// single-line) and cap to [`MAX_LABEL_CHARS`] characters.
+/// Strip control characters (newlines too, since a toast/status line is single-line) and cap length.
 fn sanitize_label(raw: &str) -> String {
     raw.chars()
         .filter(|c| !c.is_control())
@@ -411,9 +368,7 @@ fn with_label(base: &str, label: &str) -> String {
     }
 }
 
-/// Millis → `MM:SS`, rounding up so a timer started at 25:00 shows 25:00
-/// (not 24:59) for the first tick. Minutes are not zero-padded past two
-/// digits but the cap keeps them ≤ 180.
+/// Millis -> `MM:SS`, rounding up so a timer started at 25:00 shows 25:00, not 24:59.
 fn fmt_mmss(ms: u64) -> String {
     let total_secs = ms.div_ceil(1000);
     let mm = total_secs / 60;
@@ -425,7 +380,7 @@ fn fmt_mmss(ms: u64) -> String {
 mod tests {
     use super::*;
 
-    const T0: u64 = 1_000_000_000_000; // arbitrary epoch base
+    const T0: u64 = 1_000_000_000_000;
 
     fn state() -> PomodoroState {
         PomodoroState::new(Durations::default())
@@ -454,7 +409,6 @@ mod tests {
         let mut s = state();
         assert!(s.start(T0, Some(0), None).is_err());
         assert!(s.start(T0, Some(MAX_MINUTES + 1), None).is_err());
-        // Still idle — a rejected start must not mutate.
         assert_eq!(s.phase, Phase::Idle);
         s.start(T0, Some(1), None).unwrap();
         assert_eq!(s.remaining_ms(T0), 60_000);
@@ -464,15 +418,12 @@ mod tests {
     fn pause_then_resume_preserves_remaining() {
         let mut s = state();
         s.start(T0, Some(25), None).unwrap();
-        // 10 min in.
         let t1 = T0 + 10 * 60_000;
         assert!(s.pause(t1));
         assert!(s.is_paused());
         assert_eq!(s.remaining_ms(t1), 15 * 60_000);
-        // Time passes while paused — remaining is frozen.
         let t2 = t1 + 3 * 60_000;
         assert_eq!(s.remaining_ms(t2), 15 * 60_000);
-        // Resume: expiry is now + frozen remaining.
         assert!(s.resume(t2));
         assert!(!s.is_paused());
         assert_eq!(s.remaining_ms(t2), 15 * 60_000);
@@ -481,14 +432,12 @@ mod tests {
 
     #[test]
     fn pause_at_or_after_expiry_is_declined() {
-        // Pausing exactly at (or past) expiry must NOT freeze the phase —
-        // the scheduler has to be able to complete it.
+        // Pausing at or past expiry must not freeze the phase; the scheduler has to complete it.
         let mut s = state();
         s.start(T0, Some(25), None).unwrap();
         let end = T0 + 25 * 60_000;
         assert!(!s.pause(end), "pause at expiry declined");
         assert!(!s.is_paused());
-        // Still due, so the scheduler completes it.
         assert!(s.tick_if_due(end).is_some());
         assert_eq!(s.phase, Phase::Break);
     }
@@ -519,9 +468,7 @@ mod tests {
         let t = s.tick_if_due(end).expect("work should complete");
         assert!(t.toast_body.contains("short"));
         assert_eq!(s.phase, Phase::Break);
-        // Break measured from expiry instant, full length.
         assert_eq!(s.remaining_ms(end), 5 * 60_000);
-        // Not immediately due again.
         assert!(s.tick_if_due(end).is_none());
     }
 
@@ -540,7 +487,6 @@ mod tests {
 
     #[test]
     fn long_break_every_nth_round_then_resets_counter() {
-        // rounds_before_long = 4: the 4th completed work → long break.
         let mut s = state();
         let mut now = T0;
         for round in 1..=4 {
@@ -558,7 +504,6 @@ mod tests {
             }
             s.tick_if_due(now).unwrap(); // break -> idle
         }
-        // Counter reset after the long break — next cycle starts fresh.
         assert_eq!(s.completed_work_rounds, 0);
     }
 
@@ -579,9 +524,7 @@ mod tests {
         s.start(T0, None, None).unwrap(); // 25 min work running
         let d = Durations::validated(50, 10, 30, 4).unwrap();
         s.set_durations(d);
-        // Running phase unchanged.
         assert_eq!(s.remaining_ms(T0), 25 * 60_000);
-        // But the next work uses the new length.
         s.start(T0, None, None).unwrap();
         assert_eq!(s.remaining_ms(T0), 50 * 60_000);
     }
@@ -594,7 +537,6 @@ mod tests {
         let text = s.status_text(T0);
         assert!(!text.contains('\n'));
         assert!(!text.contains('\t'));
-        // label portion capped
         assert!(
             s.event_payload(T0)["label"]
                 .as_str()
@@ -619,17 +561,13 @@ mod tests {
     #[test]
     fn phase_total_ms_tracks_actual_phase_length() {
         let mut s = state();
-        // Overridden work length is the stored total, not the configured 25.
         s.start(T0, Some(10), None).unwrap();
         assert_eq!(s.event_payload(T0)["phase_total_ms"], 10 * 60_000);
-        // Transition to a short break: total becomes the break length.
         let end = T0 + 10 * 60_000;
         s.tick_if_due(end).unwrap();
         assert_eq!(s.event_payload(end)["phase_total_ms"], 5 * 60_000);
-        // Preserved across pause.
         s.pause(end + 60_000);
         assert_eq!(s.event_payload(end + 60_000)["phase_total_ms"], 5 * 60_000);
-        // Cleared on idle after the break completes.
         s.resume(end + 60_000);
         let be = end + 60_000 + s.remaining_ms(end + 60_000);
         s.tick_if_due(be).unwrap();
