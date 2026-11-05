@@ -1,5 +1,4 @@
-# Example triggers that enqueue autonomous goals via the pilot plugin
-# (Phase 24.4 — event-triggered enqueue).
+# Example triggers that enqueue autonomous goals via the pilot plugin (event-triggered enqueue).
 #
 # pilot exposes one enqueue action:
 #
@@ -76,6 +75,5 @@ repo = "yourrepo"          # payload_match: only fire when event payload `repo` 
 [triggers.security]
 accept_external = true     # required: ci.failed is injected over the socket (External origin)
 
-# Time-based enqueue (e.g. a nightly research goal) lands once the cron
-# trigger source (roadmap Phase 21 Step 11) ships — it will publish a
-# scheduled event that a block like #2 can match.
+# Time-based enqueue (e.g. a nightly research goal): use a `cron` trigger (see
+# examples/triggers/cron-example.toml) with a literal `pilot.add` params block like #2.

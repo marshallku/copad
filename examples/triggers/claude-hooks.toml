@@ -5,8 +5,7 @@
 # `~/.claude/scripts/*.sh` hooks to a `notify.show` toast (always) and
 # `discord.send_message` (only when `coctl presence away` is set, so
 # you don't get Discord-spammed while sitting at the keyboard).
-# Demonstrates the documented Option A flow from
-# `docs/harness-integration.md`.
+# See `docs/harness-integration.md`.
 #
 # How to use:
 #

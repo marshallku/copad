@@ -1,83 +1,56 @@
-# Vision Flow 3 — the killer demo: clicking "start" on a Todo
-# pops a copad tab with claude-code running inside a tmux session
-# in a fresh git worktree, with a layered prompt pre-seeded into
-# claude. Implemented as a chain of three triggers via Phase 14.1's
-# auto-published `<action>.completed` events.
+# Todo "start" → claude in a fresh worktree. Clicking "start" on a Todo pops a copad tab with
+# claude-code running inside a tmux session in a fresh git worktree, with a layered prompt
+# pre-seeded into claude. A chain of three triggers, linked by the auto-published
+# `<action>.completed` events.
 #
-# Drop this whole file's `[[triggers]]` blocks into your
-# ~/.config/copad/config.toml.
+# Drop this whole file's `[[triggers]]` blocks into your ~/.config/copad/config.toml.
 #
-# Prereqs (already shipped):
-# - Phase 15.1+: copad-plugin-todo registered. `todo.start` action
-#   emits `todo.start_requested` with both `prompt` (raw per-Todo
-#   frontmatter field, may be null) AND `assembled_prompt` (the
-#   LAYERED string built at start time from `~/docs/claude/global.md`
-#   + `~/docs/claude/workspaces/<ws>.md` + the Todo's `prompt`
-#   (or title+body) + linked_kb markdown contents). Other fields:
-#   id, workspace, title, body, status, priority, due, linked_jira,
-#   linked_slack, linked_kb, tags. The trigger chain below feeds
-#   `assembled_prompt` forward — that's the agent-facing string.
-# - Phase 17.1: copad-plugin-git registered. `git.worktree_add`
-#   creates the branch+dir; Phase 14.1 auto-emits
-#   `git.worktree_add.completed {workspace, path, branch, base, prompt?}`.
-#   `prompt` only appears when the upstream trigger forwards it via
-#   the optional `prompt` passthrough param (used below).
-# - Phase 18.1+18.2: claude.start spawns a copad tab with
-#   cwd=workspace_path, runs `tmux new-session -A -s <name> claude`,
-#   and (when `prompt` supplied) pastes the prompt into claude's
-#   REPL once it becomes interactive — guarded by claude-specific
-#   capture-pane markers AND `pane_current_command` so the prompt
-#   never lands in a shell pane.
+# Prereqs:
+# - copad-plugin-todo registered. `todo.start` emits `todo.start_requested` with both `prompt`
+#   (raw per-Todo frontmatter field, may be null) AND `assembled_prompt` (the LAYERED string
+#   built at start time from `~/docs/claude/global.md` + `~/docs/claude/workspaces/<ws>.md` +
+#   the Todo's `prompt` (or title+body) + linked_kb markdown contents). Other fields: id,
+#   workspace, title, body, status, priority, due, linked_jira, linked_slack, linked_kb, tags.
+#   The chain below feeds `assembled_prompt` forward; that is the agent-facing string.
+# - copad-plugin-git registered. `git.worktree_add` creates the branch+dir and auto-emits
+#   `git.worktree_add.completed {workspace, path, branch, base, prompt?}`. `prompt` only appears
+#   when the upstream trigger forwards it via the optional `prompt` passthrough param.
+# - `claude.start` spawns a copad tab with cwd=workspace_path, runs
+#   `tmux new-session -A -s <name> claude`, and (when `prompt` is supplied) pastes the prompt
+#   into claude's REPL once it is interactive, guarded by claude-specific capture-pane markers
+#   AND `pane_current_command` so the prompt never lands in a shell pane.
 #
 # Layered prompt management:
-# - `~/docs/claude/global.md` — common preamble for every agent
-#   session (coding rules, language conventions, etc.). The empty
-#   stub is created by `scripts/install-plugins.sh` so vim picks it
-#   up immediately.
-# - `~/docs/claude/workspaces/<workspace>.md` — per-workspace
-#   context. The Todo's `workspace` field selects which file gets
-#   layered in.
-# - Per-Todo: `prompt` frontmatter (when set) is the explicit
-#   instruction; otherwise `title + body`.
-# - `linked_kb` paths get their full markdown content fanned in
-#   under `## Reference: <path>` headings.
-# Edit any of these between Todo creation and `start` — the assembly
-# is late-bound to start-time, so changes apply on the next click.
+# - `~/docs/claude/global.md`: common preamble for every agent session (coding rules, language
+#   conventions, etc.). `scripts/install-plugins.sh` creates an empty stub.
+# - `~/docs/claude/workspaces/<workspace>.md`: per-workspace context, selected by the Todo's
+#   `workspace` field.
+# - Per-Todo: `prompt` frontmatter (when set) is the explicit instruction; otherwise
+#   `title + body`.
+# - `linked_kb` paths get their full markdown content fanned in under `## Reference: <path>`.
+# The assembly is late-bound to start time, so edits to any of these apply on the next click.
 #
-# Open limitations:
-# - **Jira summary enrichment is NOT included** — needs Phase 16
-#   (Jira plugin) + Phase 14.2 (async correlation) to join a fresh
-#   `jira.get_ticket {key=linked_jira}` result back into the
-#   prompt. Until then `linked_jira` shows up only as the raw key.
-# - **Re-clicking Start on the same Todo IS supported.**
-#   `git.worktree_add` is idempotent — it scans existing worktrees
-#   for the target branch first and echoes the recorded path
-#   without re-running `git worktree add`. The chain proceeds to
-#   claude.start as usual; tmux re-attaches the existing session;
-#   if a `prompt` is supplied it gets re-pasted (claude treats the
-#   second paste as a new turn, useful when re-starting a Todo to
-#   ask claude to redo something).
+# Limitations:
+# - Jira summary enrichment is not included: `linked_jira` shows up only as the raw key.
+# - Re-clicking Start on the same Todo is supported. `git.worktree_add` is idempotent (it scans
+#   existing worktrees for the target branch and echoes the recorded path), tmux re-attaches
+#   the existing session, and a supplied `prompt` is re-pasted as a new turn.
 #
-# What you get end-to-end today:
+# Flow:
 #   click Start in Todo panel
-#     → copad-plugin-todo emits todo.start_requested with both raw
-#       `prompt` and layered `assembled_prompt` fields
-#     → trigger-1 or trigger-2 fires git.worktree_add (sanitize_jira
-#       branch from linked_jira, or todo-<id>); the layered string
-#       is forwarded via git.worktree_add's `prompt` passthrough so
-#       trigger-3 can see it
-#     → registry auto-emits git.worktree_add.completed (carries
-#       `prompt` — the passthrough field, NOT to be confused with
-#       todo.start_requested's `prompt`)
-#     → trigger-3 fires claude.start with workspace_path + prompt
-#     → new copad tab, fresh worktree, tmux session, claude REPL
-#       opens with the layered prompt already pasted + submitted.
+#     → copad-plugin-todo emits todo.start_requested (raw `prompt` and `assembled_prompt`)
+#     → trigger 1 or 2 fires git.worktree_add (branch from linked_jira, or todo-<id>); the
+#       layered string is forwarded via its `prompt` passthrough so trigger 3 can see it
+#     → registry auto-emits git.worktree_add.completed (its `prompt` is the passthrough field,
+#       not todo.start_requested's `prompt`)
+#     → trigger 3 fires claude.start with workspace_path + prompt
+#     → new copad tab, fresh worktree, tmux session, claude REPL with the layered prompt
+#       already pasted + submitted.
 #
-# Convention: the Todo plugin's `workspace` label and the git
-# plugin's workspace `name` are assumed to coincide (e.g.
-# todo.workspace = "copad" maps to a `[[workspace]] name = "copad"`
-# entry in workspaces.toml). If you want them to differ, hardcode
-# `workspace = "<git-name>"` instead of `{event.workspace}`.
+# Convention: the Todo plugin's `workspace` label and the git plugin's workspace `name` are
+# assumed to coincide (todo.workspace = "copad" maps to `[[workspace]] name = "copad"` in
+# workspaces.toml). To differ, hardcode `workspace = "<git-name>"` instead of
+# `{event.workspace}`.
 
 # ---------------------------------------------------------------------
 # Trigger 1 — Todo with linked_jira → branch from sanitized Jira key.
@@ -136,13 +109,6 @@ event_kind = "git.worktree_add.completed"
 # have a trail of what you kicked off. Hooks the SAME
 # `git.worktree_add.completed` event the chain uses, so it fires
 # alongside (not after) trigger 3. Uncomment if you want it.
-#
-# Note: hooking on `claude.start.completed` would be more natural
-# but doesn't work today — `claude.start` is a copad-internal
-# socket action that lives in the legacy match arm of
-# `socket::dispatch`, not the ActionRegistry, so Phase 14.1
-# fan-out doesn't apply. Migrating claude.start into the registry
-# would close that gap; tracked as a small follow-up.
 # ---------------------------------------------------------------------
 # [[triggers]]
 # name = "vision3-log-worktree-creates"
@@ -152,14 +118,12 @@ event_kind = "git.worktree_add.completed"
 # event_kind = "git.worktree_add.completed"
 
 # ---------------------------------------------------------------------
-# Phase 14.2 example — Slack ask + wait pattern.
+# Slack ask + wait pattern.
 #
-# When a Todo without `linked_jira` starts, DM the user asking for the
-# Jira key, then wait up to 5 min for a reply. On reply, fire a
-# synthesized event so a downstream trigger can use the answer as the
-# branch name. Copy this block + uncomment if you want this flow.
-# Requires `copad-plugin-slack` registered with `slack.post_message`
-# action and `slack.dm` event (Phase 11.2).
+# When a Todo without `linked_jira` starts, DM the user asking for the Jira key, then wait up to
+# 5 min for a reply. On reply, fire a synthesized event so a downstream trigger can use the
+# answer as the branch name. Copy this block + uncomment if you want this flow. Requires
+# `copad-plugin-slack` registered with the `slack.post_message` action and `slack.dm` event.
 # ---------------------------------------------------------------------
 # [[triggers]]
 # name = "vision3-ask-jira-on-todo-start"

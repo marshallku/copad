@@ -1,11 +1,8 @@
 # Claude Code agent-status → desktop toast (+ presence-gated Discord).
 #
-# Slice 1 of the "agent lifecycle" feature (see docs/orca-feature-analysis.md
-# Tier-1 #1): notify when an AI agent spawned in a copad pane finishes a
-# turn or needs your input. This is notification-only — the per-tab
-# attention badge is Slice 2.
+# Notifies when an AI agent spawned in a copad pane finishes a turn or needs your input.
 #
-# Pipeline (all pieces already exist in copad):
+# Pipeline:
 #
 #   Claude Stop/Notification hook
 #     → scripts/hooks/claude-agent-status.sh publishes claude.<event>

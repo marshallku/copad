@@ -8,10 +8,8 @@ repository.workspace = true
 
 [lib]
 name = "copad_term"
-# staticlib so libcopad_term.a embeds into Copad.app at link time
-# alongside the existing libcopad_ffi.a — proven not to collide by
-# the Phase 0 spike. `rlib` lets Rust integration tests link the
-# crate normally (without it, tests can't `use copad_term::*`).
+# staticlib so libcopad_term.a embeds into Copad.app next to libcopad_ffi.a. `rlib` lets Rust
+# integration tests `use copad_term::*`.
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
@@ -29,8 +27,5 @@ copad-keys = { path = "../copad-keys" }
 copad-graphics = { path = "../copad-graphics" }
 
 # macOS-only `proc_pidinfo` bindings for `copad_term_child_cwd`.
-# Already a transitive dep via alacritty_terminal; declared
-# explicitly here so the dependency surface is visible. Linux gates
-# the syscall behind `#[cfg(target_os = "macos")]`.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

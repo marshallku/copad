@@ -1,4 +1,4 @@
-# Example triggers driven by the Discord plugin (slice 2 + 2.5).
+# Example triggers driven by the Discord plugin.
 #
 # The plugin emits FIVE event kinds:
 #   - `discord.mention`  — MESSAGE_CREATE @-mentioning the bot or
@@ -86,8 +86,8 @@ condition = "!event.mention_everyone"
 event_kind = "discord.mention"
 
 # ---------------------------------------------------------------------
-# 3. DM auto-reply (write action; Phase 14.2 await pattern)
-#    On every DM, send an LLM-generated reply. Uses the Phase 14.2
+# 3. DM auto-reply (write action; await pattern)
+#    On every DM, send an LLM-generated reply. Uses the
 #    `await` clause to chain: kick off llm.complete with the DM content,
 #    wait for `llm.complete.completed`, then post the reply back.
 #    Mirrors the Slack ask-and-wait sketch in slack/triggers.example.toml.
@@ -141,7 +141,7 @@ event_kind = "discord.mention"
 # 6. Emoji-react → Todo capture  ★ ACTIVE BY DEFAULT ★
 # ====================================================================
 # React with 📝 on a Discord message → copad fetches the body and
-# creates a Todo with the message URL + content. Uses Phase 14.2
+# creates a Todo with the message URL + content. Uses
 # `await` so the get_message reply is correlated to THIS specific
 # reaction (without correlation, every successful get_message
 # anywhere would fire a Todo).

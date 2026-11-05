@@ -13,7 +13,7 @@
 # `llm.usage` output and your current per-model rates.
 
 # ---------------------------------------------------------------------
-# Result handling (Phase 14.2 chains)
+# Result handling (chains)
 # ---------------------------------------------------------------------
 # A trigger-fired `llm.complete` publishes `llm.complete.completed`
 # with the result payload when it finishes (registry-level fan-out).
@@ -23,7 +23,7 @@
 # the awaited result under `await:` — a second trigger consumes that
 # and reads `{event.await.text}`.
 #
-# Correlation caveat (14.2 slice-1 limit): in-flight awaits on the
+# Correlation caveat: in-flight awaits on the
 # same action correlate FIFO per action name. Two `llm.complete`
 # calls completing out of dispatch order can mis-pair. Fine for
 # human-rate flows (DMs, reactions); for high-rate order-sensitive
@@ -43,15 +43,14 @@
 #    coctl call llm.usage --params '{"by_model":"claude-sonnet-4-6"}'
 #
 #    Slice by trigger source: aggregator doesn't filter by `source`
-#    in v1 (just `model` + time). Use the JSONL file directly:
+#    (just `model` + time). Use the JSONL file directly:
 #    jq -s 'group_by(.source) | map({source: .[0].source, calls: length})' \
 #       ~/.local/share/copad/llm-usage-default.jsonl
 # ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
-# 2. Auto-summarize Slack DMs into a derived KB note (Phase 14.3)
-#    The real chain the old "fire-and-forget" limitation note used to
-#    rule out: summarize each DM, append the summary to a per-sender
+# 2. Auto-summarize Slack DMs into a derived KB note
+#    Summarize each DM, append the summary to a per-sender
 #    derived markdown file under the KB.
 #
 #    💸 COST: one LLM call per DM received. This file is NOT loaded
@@ -84,8 +83,8 @@ params = { id = "threads/derived/slack-dm-{event.user}.md", content = """
 event_kind = "slack-dm-summarize.awaited"
 
 # ---------------------------------------------------------------------
-# 3. (Commented) Raw-archive distillation — the Phase 11.3 / 12.3
-#    derived-markdown shape: distill each archived `slack.raw` message
+# 3. (Commented) Raw-archive distillation — the derived-markdown shape:
+#    distill each archived `slack.raw` message
 #    frame into searchable markdown under threads/. `kb.ensure` (not
 #    append) so a Slack re-delivery of the same event_id is a no-op —
 #    same dedup posture as the slack-archive-raw trigger.

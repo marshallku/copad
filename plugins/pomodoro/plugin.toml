@@ -32,8 +32,7 @@ subscribes = []
 
 # A status-bar module so the countdown shows with zero GUI code. The exec
 # prints the current status line (e.g. "🍅 24:13 · refactor"); the host
-# polls it once a second. A richer event-driven / circular renderer that
-# consumes `pomodoro.state` is a platform-specific follow-up (Phase 2).
+# polls it once a second.
 [[modules]]
 name = "timer"
 exec = "coctl pomodoro status"

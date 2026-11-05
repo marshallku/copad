@@ -1,7 +1,7 @@
 # Example triggers for the Todo plugin.
 #
 # Drop relevant pieces into `~/.config/copad/config.toml` once the
-# plugin is enabled. The todo plugin emits four event kinds:
+# plugin is enabled. The todo plugin emits five event kinds:
 #   - todo.created          full Todo payload
 #   - todo.changed          full Todo payload (mtime delta detected)
 #   - todo.completed        full Todo payload (status transitioned * → done)
@@ -12,9 +12,8 @@
 # created, workspace, title, body, priority, due, linked_jira,
 # linked_slack, linked_kb, tags.
 #
-# Phase 15.1 ships single-step triggers only. The composite
-# todo.start → git.worktree_add → claude.start chain is Phase 15.2,
-# blocked on Phase 14.1's chained `<action>.completed` events.
+# The composite todo.start → git.worktree_add → claude.start chain is in
+# examples/triggers/vision-flow-3.toml.
 
 # ---------------------------------------------------------------------
 # 1. Inbox channel: when a meeting is 10 min out, create a prep todo
@@ -59,8 +58,8 @@ lead_minutes = 10
 # event_kind = "todo.completed"
 
 # ---------------------------------------------------------------------
-# 4. Phase 16 sketch: when Jira assigns you a ticket, file a linked
-#    todo. (Uncomment after the Jira plugin lands.)
+# 4. When Jira assigns you a ticket, file a linked todo (the jira plugin's
+#    triggers.example.toml has the same block).
 # ---------------------------------------------------------------------
 # [[triggers]]
 # name = "jira-assigned-to-todo"

@@ -13,7 +13,7 @@
 # trigger destinations and you compose them however you want.
 #
 # ---------------------------------------------------------------------
-# Trigger language quick reference (Phase 10.2)
+# Trigger language quick reference
 # ---------------------------------------------------------------------
 # `[triggers.when]`     — required positive match: `event_kind` glob
 #                          plus key=value payload equality.
@@ -32,9 +32,7 @@
 # ---------------------------------------------------------------------
 # 1. Common pre-meeting prep: ensure a per-event meeting note in KB.
 #    Skips events you declined AND skips the weekly 1:1 (handled by
-#    rule 2). With Phase 10.2 these exclusions are written directly
-#    in the `condition` field — no longer requires multi-rule
-#    workarounds.
+#    rule 2). The exclusions are written directly in the `condition` field.
 # ---------------------------------------------------------------------
 [[triggers]]
 name = "meeting-prep-common"
@@ -119,7 +117,7 @@ lead_minutes = 10
 # lead_minutes = 1
 
 # ---------------------------------------------------------------------
-# 6. Meeting-prep auto-open (Phase 14.3 — deferred since Phase 10).
+# 6. Meeting-prep auto-open.
 #    The chained version of rule 1: ensure the per-event note, then
 #    open THAT note in a webview tab once `kb.ensure` reports its
 #    absolute path. The await scopes the open to this trigger's

@@ -98,7 +98,7 @@ event_kind = "jira.mention"
 # event_kind = "jira.ticket_assigned"
 
 # ---------------------------------------------------------------------
-# Trigger language quick reference (Phase 10.2 / Phase 14)
+# Trigger language quick reference
 # ---------------------------------------------------------------------
 # `[triggers.when]`     — required positive match: `event_kind` glob
 #                          plus key=value payload equality.
@@ -107,8 +107,8 @@ event_kind = "jira.mention"
 #                          Operators: == != < <= > >= && || !
 #                          References: event.X.Y / context.X
 #                          Literals: "string", numbers, true/false/null
-# `[triggers.await]`    — optional Phase 14.2 correlation primitive
+# `[triggers.await]`    — optional correlation primitive
 #                          (event_kind + payload_match + timeout) for
 #                          chained ask-and-wait flows. Not used in the
 #                          examples above; see vision-flow-3.toml for
-#                          a worked example with discord.get_message.
+#                          a worked example (a Slack ask-and-wait).

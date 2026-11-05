@@ -1,66 +1,39 @@
-# Hyprland WebKit panel-freeze automatic cure — see
-# docs/troubleshooting.md "Plugin/webview panel frozen on last frame
-# after Hyprland workspace switch" for the full upstream-bug write-up.
+# Hyprland WebKit panel-freeze automatic cure. See docs/troubleshooting.md "Plugin/webview panel
+# frozen on last frame after Hyprland workspace switch" for the upstream-bug write-up.
 #
 # Drop this `[[triggers]]` block into your ~/.config/copad/config.toml.
 #
 # What it does
 # ------------
-# Hyprland's WebKitGTK 6.0 ↔ wayland interaction leaves WebView
-# panels stuck on their last frame after a same-monitor workspace
-# cycle (verified upstream — reproduces with the official
-# MiniBrowser, zero copad code involved). On the dual-monitor
-# setup we tested, cross-monitor workspace switches did NOT trigger
-# the freeze; behavior on other multi-monitor configurations isn't
-# characterized. Empirical mitigation: a 1px window resize
-# round-trip via two separate `hyprctl dispatch resizewindowpixel`
-# calls (targeting copad by `class:` so it works regardless of
-# which window has focus on the returning workspace) unfreezes
-# rendering. The precise mechanism by which two separate dispatches
-# cure where `--batch` does not is not fully characterized — the
-# behavior is reproducible, the explanation is conjecture.
+# Hyprland's WebKitGTK 6.0 / wayland interaction leaves WebView panels stuck on their last frame
+# after a same-monitor workspace cycle (reproduces with the official MiniBrowser). Cross-monitor
+# switches did not trigger it on the dual-monitor setup we tested; other setups are not
+# characterized. Mitigation: a 1px window resize round-trip via two separate
+# `hyprctl dispatch resizewindowpixel` calls, targeting copad by `class:` so it works whatever
+# window has focus on the returning workspace.
 #
-# copad Phase WR-1 publishes `window.restored` whenever the toplevel's
-# `GDK_TOPLEVEL_STATE_SUSPENDED` bit clears (compositor told us we're
-# visible/active again). copad Phase WR-2 added `system.spawn` —
-# trigger-only argv exec, intercepted at `LiveTriggerSink` and NOT
-# registered in `ActionRegistry` so `coctl call system.spawn` from
-# any process holding COPAD_SOCKET still gets `unknown_method`. Same
-# trust posture as `[keybindings]` `spawn:`: the user-supplied
-# `[[triggers]]` config is the trust boundary.
+# The trigger fires on `window.restored`, published when the toplevel's
+# `GDK_TOPLEVEL_STATE_SUSPENDED` bit clears. `system.spawn` is trigger-only argv exec: it is
+# intercepted at `LiveTriggerSink` and not registered in `ActionRegistry`, so
+# `coctl call system.spawn` from a process holding COPAD_SOCKET gets `unknown_method`. The
+# user-supplied `[[triggers]]` config is the trust boundary, as for `[keybindings]` `spawn:`.
 #
-# Why a user-config trigger and not a hardcoded fix
-# -------------------------------------------------
-# - Compositor-agnostic: copad doesn't ship Hyprland-specific code.
-#   Other Wayland compositors don't toggle SUSPENDED on workspace
-#   switch the same way, so this trigger is a no-op for them.
-# - Reversible: when WebKit/Hyprland publishes a real fix, you delete
-#   this snippet from your config — no copad release needed.
+# This is a user-config trigger, not a hardcoded fix, so copad ships no Hyprland-specific code
+# (other compositors don't toggle SUSPENDED the same way, making it a no-op there) and you can
+# delete it when WebKit/Hyprland fix the bug.
 #
-# Why this specific snippet is safe to use `sh -c`
-# ------------------------------------------------
-# `system.spawn` doesn't auto-wrap argv in a shell — by default
-# every `{event.*}` and `{context.*}` interpolation lands as a
-# literal argv element where shell metacharacters can't be
-# re-parsed. That default safety is what protects the bare-argv
-# form. Choosing `["sh", "-c", "<string>"]` opts out: every
-# interpolated value spliced into that string IS shell-evaluated.
+# Why `sh -c` is safe here
+# ------------------------
+# `system.spawn` does not wrap argv in a shell: each `{event.*}` / `{context.*}` interpolation
+# lands as a literal argv element that shell metacharacters cannot re-parse. `["sh", "-c", ...]`
+# opts out: every interpolated value in that string IS shell-evaluated.
 #
-# THIS snippet is safe only because it satisfies BOTH:
-#   (a) every argv element is a LITERAL — no `{event.X}` and no
-#       `{context.X}` substitutions inside the shell string; AND
-#   (b) `window.restored` itself emits an empty `{}` payload, so
-#       even an accidental `{event.X}` would resolve to a literal
-#       token rather than attacker-controlled data.
+# This snippet is safe only because (a) every argv element is a literal, with no `{event.X}` or
+# `{context.X}` inside the shell string, and (b) `window.restored` emits an empty `{}` payload.
 #
-# DO NOT cargo-cult this `sh -c` pattern to triggers that
-# interpolate ANY field — event payload OR context fields. A
-# trigger on `slack.mention` carrying a user-controlled `text`
-# field, or one substituting `{context.active_cwd}` (a directory
-# name an attacker can craft), would let a single message or a
-# malicious dir name run arbitrary code. Use the bare argv form
-# (`argv = ["program", "arg1", ...]`) for anything with
-# interpolation.
+# Do NOT copy this `sh -c` pattern to a trigger that interpolates ANY field. A `slack.mention`
+# `text` or a `{context.active_cwd}` directory name can be attacker-controlled and would run
+# arbitrary code. Use the bare argv form (`argv = ["program", "arg1", ...]`) there.
 
 [[triggers]]
 name = "hyprland-webkit-cure"
@@ -77,42 +50,20 @@ event_kind = "window.restored"
 allow_privileged = true
 
 [triggers.params]
-# Two cure shape decisions, both empirical (observed reliably,
-# mechanism for #2 not fully characterized):
+# Two empirical choices (observed reliably; the mechanism of #2 is not characterized):
 #
-# 1. `resizewindowpixel` with `class:com.marshall.copad` selector
-#    (NOT `resizeactive`). The trigger fires on workspace return
-#    regardless of which window has focus on that workspace — at
-#    fire time the active window is often whatever the user was
-#    last using on this workspace, not copad. `resizeactive`
-#    would resize that other window instead, and the freeze stays
-#    on the unrelated copad panel. `resizewindowpixel,class:` is
-#    focus-agnostic.
+# 1. `resizewindowpixel` with a `class:com.marshall.copad` selector, NOT `resizeactive`. The
+#    trigger fires on workspace return regardless of focus, so the active window is often not
+#    copad, and `resizeactive` would resize that other window and leave copad frozen.
 #
-# 2. Two SEPARATE `hyprctl dispatch` calls chained with `&&` (NOT
-#    `hyprctl --batch "...; ..."`). `--batch` consistently fails
-#    to cure across many trials; two separate IPC calls
-#    consistently do. We have hypotheses (configure-event
-#    coalescing on the wayland client side, batched dispatch
-#    bypassing the per-frame scheduler) but none are verified.
+# 2. Two SEPARATE `hyprctl dispatch` calls chained with `&&`, NOT `hyprctl --batch "...; ..."`.
+#    `--batch` consistently fails to cure; two separate IPC calls consistently do.
 #
-# The second `hyprctl` line uses `dispatch -- resize...` because
-# `-1 0,...` starts with `-` and hyprctl's CLI parser would
-# otherwise treat `-1` as a flag.
+# The second call uses `dispatch -- resize...` because `-1 0,...` starts with `-` and hyprctl
+# would otherwise parse it as a flag.
 #
-# `&&` is a shell operator, so we wrap in `sh -c`. `system.spawn`
-# is argv-only by design so `{event.*}` and `{context.*}`
-# interpolations land as literal argv elements where shell
-# metacharacters can't be re-parsed. That default safety is what
-# the bare-argv form gives you. Wrapping in `sh -c` opts out:
-# every value spliced into the shell string is shell-evaluated.
-# THIS snippet stays safe only because (a) it has zero
-# `{event.X}` / `{context.X}` substitutions and (b)
-# `window.restored` emits an empty `{}` payload anyway. Don't
-# cargo-cult `sh -c` onto triggers that interpolate ANY field —
-# a `slack.mention` text field or a `{context.active_cwd}`
-# directory path can be attacker-controlled and would run
-# arbitrary code through the shell.
+# `&&` needs `sh -c`, which opts out of the argv-only safety of `system.spawn` (see the safety
+# note at the top of this file).
 argv = [
     "sh",
     "-c",

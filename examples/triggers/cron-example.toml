@@ -4,7 +4,7 @@
 # Schedule grammar: 6-field cron, `sec min hr dom mon dow [year]`,
 # evaluated in the user's local timezone. Examples below.
 #
-# v1 limits (see `validate_source_invariants` in copad-core/src/trigger.rs):
+# Limits (see `validate_source_invariants` in copad-core/src/trigger.rs):
 #   - Each trigger sets exactly one of `[when]` or `cron`.
 #   - Cron triggers cannot use `condition` or `[await]` (no originating
 #     event to evaluate against).

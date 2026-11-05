@@ -24,9 +24,9 @@ tokio = { version = "1", features = [
     "net",
     "io-util",
     "time",
-    # `tokio::process` — the comux CLI shell-out needs a child it can KILL on a
-    # deadline. `std::process::Command::output()` has no timeout, so a wedged
-    # comux server would park a blocking task and leak a child per poll (codex C1).
+    # `tokio::process`: the comux CLI shell-out needs a child it can kill on a deadline;
+    # `std::process::Command::output()` has no timeout, so a wedged comux server would leak a
+    # child per poll.
     "process",
 ] }
 axum = { version = "0.7", features = ["ws"] }
@@ -36,11 +36,8 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
 ] }
 portable-pty = "0.9"
-# `dirs::home_dir` for the push subscriptions JSONL path.
 dirs = "5"
-# Web Push (RFC 8030) for the PWA notification path. Server holds the
-# VAPID key pair from env, fans out to stored subscriptions when an
-# attention-queue entry matches the subscription's `kinds` filter.
+# Web Push (RFC 8030) for the PWA notification path.
 web-push = "0.11"
 sha2 = "0.10"
 

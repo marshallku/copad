@@ -1,8 +1,8 @@
 # Example triggers driven by the git plugin.
 #
-# The git plugin's actions all auto-publish completion events
-# via the Phase 14.1 `ActionRegistry::with_completion_bus`
-# fan-out. Every successful `git.*` dispatch surfaces as
+# The git plugin's actions all auto-publish completion events via
+# `ActionRegistry::with_completion_bus`.
+# Every successful `git.*` dispatch surfaces as
 # `<name>.completed` on the bus with the action's return payload;
 # every failure surfaces as `<name>.failed` with `{code, message}`.
 # So the chained trigger below lights up automatically — no plugin-
@@ -10,7 +10,7 @@
 #
 # Filesystem-driven events (`git.worktree_created`,
 # `git.worktree_removed`, `git.branch_created`, `git.branch_deleted`,
-# `git.checkout`) ship in Phase 17 slice 2 and are now published by
+# `git.checkout`) are published by
 # the per-workspace polling watcher (`COPAD_GIT_POLL_MS` tunable,
 # default 2000 ms). Payload: `{workspace, head}` for checkout,
 # `{workspace, name}` otherwise.
@@ -18,7 +18,7 @@
 # ---------------------------------------------------------------------
 # 1. Vision Flow 3 (the killer demo): when `git.worktree_add`
 #    succeeds, drop a Claude session in the new worktree.
-#    Auto-emitted by the Phase 14.1 fan-out — no plugin-side
+#    Auto-emitted by the completion-bus fan-out — no plugin-side
 #    code needed. Combine with `todo.start_requested →
 #    git.worktree_add` upstream to get the full chain
 #    `Todo start → worktree → claude tab`.

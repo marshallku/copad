@@ -94,7 +94,7 @@ usage_layout = "paged"    # how the readout is laid out:
                           #   paged (default) — ONE window at a time as a wheel/click-paged
                           #     carousel WITH a reset countdown + `n/N` indicator (scroll or
                           #     click the readout to page). The only layout that shows resets.
-                          #   inline — the legacy single row of every window (no reset shown)
+                          #   inline — the single row of every window (no reset shown)
 usage_page_unit = "window"  # carousel page granularity (usage_layout = "paged"):
                           #   window (default) — one rate-limit window per page (3 pages)
                           #   provider — all of a provider's windows on one page (2 pages)
@@ -116,9 +116,8 @@ reconcile_secs = 3        # how often the server has each attached client SILENT
                           #   drift from what your terminal actually shows (an outer
                           #   emulator with its own damage tracking, a lossy link). Once
                           #   drifted, the stale cell counts as "unchanged" forever and only
-                          #   a full repaint clears it — which used to mean noticing and
-                          #   pressing Ctrl-b r. This is the worst-case time you look at
-                          #   residue before it clears itself.
+                          #   a full repaint clears it. This is the worst-case time you look
+                          #   at residue before it clears itself.
 tab_labels = "number"     # what each status-bar tab chip shows:
                           #   number (default) — the 1-based index: ` 1 ` ` 2 `
                           #   name  — the tab's focused-pane process: ` claude ` ` nvim `
@@ -171,8 +170,8 @@ restore_agent_sessions = true
 # doesn't keep them either) and never from an attaching client. That distinction matters:
 # `CLAUDE_CODE_CHILD_SESSION=1` marks a process Claude Code launched, and an interactive
 # `claude` carrying it is treated as a nested session — its transcript is never written and it
-# never shows up in `claude --resume`. So a comux server first started from inside Claude Code
-# used to silently eat every conversation held in its panes. Putting these in
+# never shows up in `claude --resume`. So a server first started from inside Claude Code would
+# silently lose every conversation held in its panes. Putting these in
 # `update_environment` would NOT fix it: attaching from inside Claude Code would refresh the
 # marker straight back into new panes.
 # Your list is ADDED to the built-in one (below) rather than replacing it, so adding a marker
@@ -216,7 +215,7 @@ restore_agent_sessions = true
 # prev-session = "("
 # notification-center = "a"
 # jump-attention = "!"
-# detach = "d"            # (tmux's q now numbers the panes — `detach = ["d", "q"]` for the old way)
+# detach = "d"            # (q numbers the panes; `detach = ["d", "q"]` also detaches on q)
 # close-pane = "x"
 # toggle-sidebar = "s"
 # redraw = "r"            # force a full repaint (tmux refresh-client) — clears any ghosting
@@ -277,9 +276,7 @@ restore_agent_sessions = true
 # jump hosts, ports and multiplexing are whatever your ~/.ssh/config already says. The
 # destination is anything `ssh` accepts — `host`, `user@host`, or a Host alias.
 #
-# Declarative on purpose: there is no `comux machine add`. comux has never written to this
-# file, and a rewriter would have to either preserve your comments and ordering or quietly
-# destroy them.
+# Declarative on purpose: there is no `comux machine add`, because comux never writes to this file.
 #
 #   comux machines                 # what is configured
 #   comux list-agents --fleet      # every machine's agents, side by side
