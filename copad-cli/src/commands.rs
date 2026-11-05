@@ -139,7 +139,7 @@ pub enum Command {
     #[command(subcommand)]
     Workflow(WorkflowCommand),
 
-    /// Runledger replay (`events.replay`). Phase 22.6.
+    /// Runledger replay (`events.replay`).
     #[command(subcommand)]
     Runledger(RunledgerCommand),
 

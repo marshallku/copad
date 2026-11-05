@@ -98,7 +98,7 @@ pub enum TodoCommand {
         #[arg(long)]
         workspace: Option<String>,
     },
-    /// Trigger the todo.start workflow (vision-flow-3 chain)
+    /// Trigger the todo.start workflow
     Start {
         /// Todo id (full id or unique prefix)
         id: String,

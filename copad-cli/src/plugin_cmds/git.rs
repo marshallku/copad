@@ -52,7 +52,6 @@ pub enum WtCommand {
         #[arg(long)]
         workspace: Option<String>,
         /// Lowercase + slash-preserve sanitize before validation
-        /// (matches the Phase 15.2 vision-flow-3 trigger contract)
         #[arg(long = "sanitize-jira")]
         sanitize_jira: bool,
     },
