@@ -6,7 +6,6 @@ import SwiftUI
 /// One live connection to a comux server: an L0 channel (lists, status, notifications) and a
 /// render channel (the composed screen + input), over ONE SSH connection.
 ///
-/// The contract, from the plan's codex rounds (§ iOS native client):
 /// * L0 first; the render attach names the incarnation L0 saw, so a restart in between is
 ///   refused before it can resize the shared view.
 /// * Chrome is claimed only once the `clients` topic lists our attachment WITH our tag (the
@@ -27,13 +26,10 @@ final class MuxSession: ObservableObject, KeySink {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var model = L0Model()
     @Published private(set) var title = ""
-    /// The latest outcome line (`flash`), shown briefly by the status strip.
     @Published private(set) var flash: L0Flash?
-    /// The newest notification announced since connecting (for an in-app banner).
     @Published private(set) var lastNotify: L0Notification?
     /// Overlays comux handed this app (decisions #170), oldest first; the first is shown.
     @Published private(set) var overlays: [L0Overlay] = []
-    /// Unknown host key awaiting the user's confirmation (TOFU).
     @Published var pendingHostKey: String?
     /// Pane previews by owner (`overlay`, `drawer`; decisions #180/#181): each view reads and
     /// clears only its own, so a picker arriving over the drawer cannot take its preview.
@@ -45,11 +41,10 @@ final class MuxSession: ObservableObject, KeySink {
     @Published private(set) var welcomes = 0
 
     /// The mirror grid. Not @Published: the terminal view redraws on `onGrid`, capped to the
-    /// display — every frame is still APPLIED here (codex C3).
+    /// display; every frame is still APPLIED here.
     private(set) var grid = Grid()
     var onGrid: (() -> Void)?
 
-    /// Rows the view must repaint since it last asked; `nil` = all.
     func takeDirtyRows() -> IndexSet? {
         grid.takeDirtyRows()
     }
@@ -77,7 +72,6 @@ final class MuxSession: ObservableObject, KeySink {
     private var previous: UInt64?
     /// Overlays answered for good: a same-id update still on its way must not bring one back.
     private var closedOverlays: Set<UInt64> = []
-    /// What each owner wants previewed, its one `pane-preview` in flight, and its cadence.
     private var previewWants: [String: PreviewWant] = [:]
     private var previewInflight: [String: (id: String, at: Date)] = [:]
     private var previewLastSent: [String: Date] = [:]
@@ -105,7 +99,6 @@ final class MuxSession: ObservableObject, KeySink {
     }
 
     #if DEBUG
-    /// A disconnected session holding `grid`, for tests that draw it.
     static func previewForTests(grid: Grid) -> MuxSession {
         let session = MuxSession(host: MuxHost(name: "test", host: "localhost", user: "test"))
         session.grid = grid
@@ -115,19 +108,16 @@ final class MuxSession: ObservableObject, KeySink {
 
     init(host: MuxHost) {
         self.host = host
-        // A token that arrives (or changes) while connected is registered at once (codex C4).
+        // A token that arrives (or changes) while connected is registered at once.
         pushSub = PushRegistry.shared.$token.sink { [weak self] _ in
             Task { @MainActor in self?.whenReady() }
         }
     }
 
     private var pushSub: AnyCancellable?
-    /// The token this connection last registered with comux.
     private var pushSent: String?
-    /// A tapped notification's pane, jumped to once the session is ready.
     var pendingJump: String?
 
-    /// Once input works: register for pushes, and take a pending notification jump.
     private func whenReady() {
         guard inputEnabled else { return }
         PushRegistry.shared.enable()
@@ -172,7 +162,6 @@ final class MuxSession: ObservableObject, KeySink {
         }
     }
 
-    /// The user confirmed the host key shown in `pendingHostKey`.
     func trustPendingKey() -> MuxHost? {
         guard let k = pendingHostKey else { return nil }
         host.hostKey = k
@@ -180,7 +169,6 @@ final class MuxSession: ObservableObject, KeySink {
         return host
     }
 
-    /// App backgrounded: say goodbye (best effort) and drop everything.
     func suspend() {
         if let r = render { r.write(ClientMsg.detach.line) }
         previous = attachment
@@ -202,7 +190,6 @@ final class MuxSession: ObservableObject, KeySink {
         guard gen == generation else { conn.close(); return }
         ssh = conn
 
-        // L0 first.
         var l0Lines = LineSplitter()
         let l0ch = try await conn.exec(host.command, onData: { [weak self] d in
             let lines = l0Lines.feed(d)
@@ -269,9 +256,7 @@ final class MuxSession: ObservableObject, KeySink {
 
     static let overlayOwner = "overlay"
 
-    /// Keep `owner`'s preview of `pane` (rows × cols) fresh while it is shown; nil stops it.
     func setPreview(owner: String, _ pane: String?, rows: Int, cols: Int) {
-        // A late request from a picker that is already gone.
         if pane != nil, owner == Self.overlayOwner, overlays.isEmpty { return }
         guard let pane else {
             // Nothing to stop: leave the published state alone (a view's onDisappear runs on
@@ -459,7 +444,6 @@ final class MuxSession: ObservableObject, KeySink {
         }
     }
 
-    /// Claim the chrome once `clients` lists our attachment with our tag (codex C1).
     private func maybeClaim() {
         guard !claimed, let a = attachment, model.lists(attachment: a, tag: Self.tag) else { return }
         claimed = true
@@ -529,7 +513,7 @@ final class MuxSession: ObservableObject, KeySink {
     }
 
     /// Run a control request on the render channel, ordered after everything typed so far.
-    /// The caller commits (or cancels) any IME composition FIRST (codex C2).
+    /// The caller commits (or cancels) any IME composition FIRST.
     func command(_ req: [String: Any], done: (([String: Any]) -> Void)? = nil) {
         guard inputEnabled, let r = render else { return }
         let id = "i\(nextCmd)"
@@ -554,7 +538,6 @@ final class MuxSession: ObservableObject, KeySink {
         }
     }
 
-    /// Remove one notification, or all of them.
     func dismissNotification(_ id: UInt64?) {
         var req: [String: Any] = ["cmd": "notif-dismiss"]
         if let id { req["id"] = id }

@@ -24,17 +24,13 @@ struct RGBColor {
     }
 }
 
-/// UI-side model. Field layout mirrors `copad_core::theme::Theme` exactly.
-/// Palette data lives in Rust; this struct is populated by decoding the JSON
-/// returned by `copad_ffi_theme_get`.
+/// Field layout mirrors `copad_core::theme::Theme` exactly; decoded from `copad_ffi_theme_get`.
 struct CopadTheme {
     let name: String
     let foreground: RGBColor
     let background: RGBColor
-    /// 16-color ANSI palette (8 normal + 8 bright)
     let palette: [RGBColor]
 
-    // UI semantic colors
     let surface0: RGBColor // Darker bg (tab bar, panels)
     let surface1: RGBColor // Hover bg
     let surface2: RGBColor // Active/selected bg
@@ -45,19 +41,15 @@ struct CopadTheme {
     let accent: RGBColor // Focus rings, active indicators
     let red: RGBColor // Destructive/error (close hover)
 
-    /// Look up a built-in theme by name. Returns nil on unknown name —
-    /// `copad_ffi_theme_get` returns NULL and the caller (currently
-    /// `AppDelegate.applyConfig`) falls back to `.default`.
+    /// `nil` on an unknown name.
     static func byName(_ name: String) -> CopadTheme? {
         guard let cstr = name.withCString({ copad_ffi_theme_get($0) }) else { return nil }
         defer { copad_ffi_free_string(cstr) }
         return decode(jsonCString: cstr)
     }
 
-    /// Matches `copad_core::theme::Theme::default()` ("catppuccin-mocha").
-    /// Force-unwrap is intentional: a missing default means the FFI link
-    /// or `copad_core::theme` is broken and the app cannot render — fail
-    /// loud rather than silently substitute black-on-black.
+    /// Force-unwrap is intentional: a missing default means the FFI link or `copad_core::theme`
+    /// is broken, so fail loud rather than render black-on-black.
     static var `default`: CopadTheme {
         guard let theme = byName("catppuccin-mocha") else {
             preconditionFailure("copad-core failed to return catppuccin-mocha theme — FFI broken")
@@ -65,9 +57,7 @@ struct CopadTheme {
         return theme
     }
 
-    /// JSON wire DTO. Decoder reads hex strings; `from(wire:)` maps to
-    /// the UI model. Kept private — outside callers always go through
-    /// `byName`.
+    /// JSON wire DTO; outside callers go through `byName`.
     private struct Wire: Decodable {
         let name: String
         let foreground: String

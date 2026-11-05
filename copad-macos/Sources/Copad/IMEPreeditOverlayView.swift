@@ -1,19 +1,9 @@
 import AppKit
 import CoreText
 
-/// IME composition overlay for GPU-mode panes (plan D2). The Metal
-/// layer can't host the CoreText preedit drawing, so this transparent
-/// child view sits above it and paints the marked text with the same
-/// visual contract as the CPU painter's `paintMarkedText`: opaque
-/// theme.background fill under the composition (legibility against
-/// arbitrary content), accent single underline across the whole
-/// composition, double+thick underline on the IME-highlighted
-/// sub-range.
-///
-/// State flows one way: `AlacrittyRenderView` pushes marked-text /
-/// cursor / metric changes via `update*` setters; this view never
-/// reads back. Hit testing is disabled so every mouse event lands on
-/// the render view beneath.
+/// IME composition overlay for GPU-mode panes: the Metal layer can't host the CoreText preedit
+/// drawing. Same visual contract as the CPU painter's `paintMarkedText`. Hit testing is
+/// disabled so mouse events reach the render view beneath.
 @MainActor
 final class IMEPreeditOverlayView: NSView {
     private var theme: CopadTheme
@@ -27,8 +17,6 @@ final class IMEPreeditOverlayView: NSView {
     private var cursorRow = 0
     private var cursorCol = 0
 
-    /// Cascade-fallback resolver borrowed from the parent render view
-    /// so CJK preedit clusters reuse the same fallback cache.
     var resolveFont: ((String, NSFont) -> NSFont)?
 
     init(theme: CopadTheme, font: NSFont) {
@@ -49,7 +37,6 @@ final class IMEPreeditOverlayView: NSView {
         true
     }
 
-    /// Mouse-transparent: the overlay only ever paints.
     override func hitTest(_: NSPoint) -> NSView? {
         nil
     }
@@ -67,9 +54,6 @@ final class IMEPreeditOverlayView: NSView {
         needsDisplay = true
     }
 
-    /// Composition state push. Hides the overlay entirely between
-    /// compositions so the window server composites nothing while the
-    /// user isn't typing through an IME.
     func updateComposition(markedText: String?, selectedRange: NSRange, cursorRow: Int, cursorCol: Int) {
         self.markedText = markedText
         markedSelectedRange = selectedRange
@@ -85,9 +69,7 @@ final class IMEPreeditOverlayView: NSView {
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
 
-        // Same textMatrix flip the render view's draw(_:) applies —
-        // this view is flipped too, and CTLineDraw expects y-up glyph
-        // orientation.
+        // The view is flipped; CTLineDraw expects y-up glyphs.
         ctx.saveGState()
         ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         defer { ctx.restoreGState() }
@@ -99,9 +81,7 @@ final class IMEPreeditOverlayView: NSView {
             .underlineColor: NSColor(cgColor: theme.accent.nsColor.cgColor) ?? .yellow,
         ]
         let attr = NSMutableAttributedString(string: marked, attributes: baseAttrs)
-        // Preedit is overwhelmingly CJK — walk composed character
-        // sequences and swap `.font` per cluster when cascade picks a
-        // different face (same loop as the CPU painter).
+        // Preedit is mostly CJK: swap `.font` per cluster when cascade picks another face.
         var loc = 0
         marked.enumerateSubstrings(
             in: marked.startIndex ..< marked.endIndex,

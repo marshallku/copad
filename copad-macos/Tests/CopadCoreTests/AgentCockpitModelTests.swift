@@ -1,11 +1,6 @@
 @testable import CopadCore
 import XCTest
 
-/// Parity tests for the Swift `AgentCockpitModel`, mirroring the Rust reference
-/// in `copad-core/src/agent_cockpit.rs` (search "mod tests"). Same semantics so
-/// the two ports can't silently diverge: arrival-order last-write-wins, empty /
-/// missing `panel_id` ignored, empty `session` → nil, acknowledge clears only
-/// attention states, the change-flag covers session-only changes.
 @MainActor
 final class AgentCockpitModelTests: XCTestCase {
     private func ev(_ panel: String, _ session: String) -> [String: Any] {

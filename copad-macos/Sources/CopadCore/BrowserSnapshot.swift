@@ -2,19 +2,12 @@ import Foundation
 
 // MARK: - Mirror types
 
-/// Swift mirror of `copad_core::browser::tabs::BrowserPaneSnap`.
+/// Swift mirror of `copad_core::browser::tabs::BrowserPaneSnap`. Rust owns the schema; this lives
+/// in `CopadCore` so the test bundle can reach it.
 ///
-/// The Rust side is the schema owner; this is a hand-written mirror in the same
-/// spirit as `Session.swift`, and it lives in `CopadCore` rather than the
-/// executable so the test bundle can reach it (`Package.swift`: "new pure-logic
-/// types should land here").
-///
-/// **A schema change updates the shared fixture in the same commit.** The
-/// round-trip test below pins today's schema on both sides, but it cannot catch
-/// a future Rust field that is `#[serde(default)]` and omitted when empty — such
-/// a field leaves the fixture's output unchanged while Swift silently drops it
-/// on every save. The fixture rule is what closes that gap; there is no
-/// automatic guard for it.
+/// A schema change must update the shared fixture in the same commit. The round-trip test cannot
+/// catch a future Rust `#[serde(default)]` field omitted when empty: the fixture output stays the
+/// same while Swift silently drops the field on every save. No automatic guard exists.
 public struct BrowserPaneSnap: Codable, Equatable, Sendable {
     public var tabs: [BrowserTabSnap]
     public var active: Int
@@ -26,23 +19,18 @@ public struct BrowserPaneSnap: Codable, Equatable, Sendable {
         self.profile = profile
     }
 
-    /// Mirrors `copad_core::browser::profile::DEFAULT_PROFILE`. Maps onto the
-    /// platform's PRE-EXISTING data store — never a freshly identified one, or
-    /// every existing user is signed out of every site.
+    /// Mirrors `copad_core::browser::profile::DEFAULT_PROFILE`. Maps onto the platform's
+    /// pre-existing data store, never a freshly identified one, or every user is signed out.
     public static let defaultProfile = "default"
 
     private enum CodingKeys: String, CodingKey {
         case tabs, active, profile
     }
 
-    /// Hand-written because synthesized decoding would make `active` and
-    /// `profile` REQUIRED, while Rust marks both `#[serde(default)]`.
-    ///
-    /// The mismatch is not theoretical: a pane written by any other producer of
-    /// this schema — a hand-edited file, a future Rust version that omits a
-    /// default, a normalizer response — would fail to decode here, `Session`
-    /// would discard the whole pane, and restore would mint a NEW tab id,
-    /// silently losing the tab's identity and its history blob with it.
+    /// Hand-written because synthesized decoding would make `active` and `profile` required while
+    /// Rust marks both `#[serde(default)]`. A pane from another producer (hand-edited file, newer
+    /// Rust omitting a default) would fail to decode, `Session` would drop the pane, and restore
+    /// would mint a new tab id, losing the tab's identity and history blob.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         tabs = try c.decodeIfPresent([BrowserTabSnap].self, forKey: .tabs) ?? []
@@ -59,7 +47,6 @@ public struct BrowserPaneSnap: Codable, Equatable, Sendable {
     }
 }
 
-/// Swift mirror of `copad_core::browser::tabs::BrowserTabSnap`.
 public struct BrowserTabSnap: Codable, Equatable, Sendable {
     public var id: String
     public var url: String
@@ -110,9 +97,8 @@ public struct BrowserTabSnap: Codable, Equatable, Sendable {
         lastActive = try c.decodeIfPresent(UInt64.self, forKey: .lastActive) ?? 0
     }
 
-    /// Omissions mirror serde's `skip_serializing_if` exactly, so a pane with no
-    /// browser state serializes byte-identically to what the pre-Workbench
-    /// binary wrote — which is what lets an older binary keep reading the file.
+    /// Omissions mirror serde's `skip_serializing_if`, so a pane with no browser state encodes
+    /// byte-identically to what the older binary wrote and stays readable by it.
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
@@ -126,8 +112,7 @@ public struct BrowserTabSnap: Codable, Equatable, Sendable {
     }
 }
 
-/// Transport for a refusal, so `CopadCore` need not know the executable's
-/// `RPCError` type.
+/// Transport for a refusal, so `CopadCore` need not know the executable's `RPCError` type.
 public struct RPCErrorShape: Equatable, Sendable {
     public let code: String
     public let message: String
@@ -137,17 +122,14 @@ public struct RPCErrorShape: Equatable, Sendable {
     }
 }
 
-/// Swift mirror of `copad_core::browser::secrets::CredentialRef`.
-///
-/// **Metadata only.** This is what crosses the RPC boundary, and therefore what
-/// an agent can see. It has no field that can hold secret material, and adding
-/// one would silently undo the entire design — the test suite asserts that.
+/// Swift mirror of `copad_core::browser::secrets::CredentialRef`. Metadata only: it crosses the
+/// RPC boundary and so is what an agent can see, and has no field that can hold secret material.
+/// Adding one would undo the design; the test suite asserts it.
 public struct CredentialRef: Codable, Equatable, Sendable {
     public let id: String
     public let origin: String
     public let username: String
     public let label: String?
-    /// `"username"` or `"password"` — which field of a login form this fills.
     public let slot: String
     public let createdAt: UInt64
     public let lastUsed: UInt64?
@@ -198,8 +180,8 @@ public struct CredentialRef: Codable, Equatable, Sendable {
         try c.encodeIfPresent(lastUsed, forKey: .lastUsed)
     }
 
-    /// Dictionary form for the RPC wire. Explicit rather than derived so a
-    /// field added to the type does not silently start crossing the boundary.
+    /// Explicit rather than derived, so a field added to the type does not start crossing the
+    /// boundary.
     public var wire: [String: Any] {
         var out: [String: Any] = [
             "id": id, "origin": origin, "username": username,
@@ -213,30 +195,19 @@ public struct CredentialRef: Codable, Equatable, Sendable {
 
 // MARK: - Snapshot lifecycle
 
-/// How a browser pane turns itself back into a persistable snapshot.
-///
-/// The macOS save path does not keep the document it loaded — `PaneManager`
-/// rebuilds `PaneContent` from the **live panel** on every autosave. A restored
-/// pane therefore has to regenerate its snapshot rather than carry one, or the
-/// carried copy goes stale the moment the user navigates.
+/// How a browser pane turns itself back into a persistable snapshot. `PaneManager` rebuilds
+/// `PaneContent` from the live panel on every autosave, so a restored pane must regenerate its
+/// snapshot rather than carry one that goes stale on navigation.
 public enum BrowserSnapshot {
-    /// Which URL a snapshot should record.
+    /// Which URL a snapshot should record. A pending URL (set between a navigation being asked
+    /// for and committed) wins over live, as it is the newer intent:
     ///
-    /// **Pending wins over live.** A pending URL exists only between a
-    /// navigation being *asked for* and the main frame *committing* it, and the
-    /// caller clears it on commit — so whenever one is set, it is the newer
-    /// intent by construction. Two failures follow from getting this backwards:
+    /// - `WKWebView.url` is nil until WebKit has one, so autosave during a restored pane's load
+    ///   would persist `""` and erase the pane (seen in a real session.json).
+    /// - After loading A and navigating to an unreachable B, WebKit keeps reporting A, which would
+    ///   discard the navigation the user asked for.
     ///
-    /// - `WKWebView.url` is nil until WebKit has one, so autosave firing while a
-    ///   restored pane is still loading would persist `""` and erase the pane
-    ///   before it ever opened. (This happened: a session.json in the wild held
-    ///   `{"kind":"webview","url":""}` for a pane the user had open.)
-    /// - After loading page A and navigating to an unreachable B, WebKit keeps
-    ///   reporting A. Preferring live would persist A and silently discard the
-    ///   navigation the user actually asked for.
-    ///
-    /// A pane whose load FAILS therefore also survives to be retried next
-    /// launch, because nothing ever clears its pending URL.
+    /// A pane whose load fails survives to be retried, as nothing clears its pending URL.
     public static func resolveURL(live: String?, pending: String?) -> String {
         if let pending, !pending.isEmpty {
             return pending
@@ -247,10 +218,8 @@ public enum BrowserSnapshot {
         return ""
     }
 
-    /// Build the single-tab snapshot a pane persists before the tab strip
-    /// exists (work unit B3 makes this N tabs). `tabID` is reused across
-    /// restarts so a tab keeps its identity — and therefore its future history
-    /// blob — rather than being reissued on every launch.
+    /// The single-tab snapshot a pane persists before the tab strip exists. `tabID` is reused
+    /// across restarts so a tab keeps its identity and future history blob.
     public static func pane(
         tabID: String,
         url: String,
@@ -264,13 +233,9 @@ public enum BrowserSnapshot {
         )
     }
 
-    /// Every `(tab id, generation)` a pane still references.
-    ///
-    /// What GC needs: anything in the history directory NOT in this set is a
-    /// superseded generation and can be reclaimed. Collected from the snapshot
-    /// that was just committed, never from the live views — reclaiming against
-    /// a set gathered before the write would delete the blob the new session
-    /// document points at.
+    /// Every `(tab id, generation)` a pane still references; GC reclaims anything not in this set.
+    /// Collect from the snapshot just committed, never the live views, or the blob the new
+    /// session document points at could be deleted.
     public static func liveGenerations(_ panes: [BrowserPaneSnap]) -> [(String, UInt64)] {
         panes.flatMap { pane in
             pane.tabs.compactMap { tab in
@@ -279,16 +244,11 @@ public enum BrowserSnapshot {
         }
     }
 
-    /// A fresh id in the accepted charset.
-
-    // NOTE: there is deliberately no `isValidTabID` here. Tab-id validation is
-    // the rule that keeps a session document from becoming a filesystem path,
-    // and it is enforced once, in Rust — a restored pane reaches a controller
-    // only through `BrowserFFI.normalize`, which has already dropped every id
-    // that fails it. A second validator in Swift would be exactly the duplicated
-    // security rule this whole layer exists to remove (it is how
-    // `canonicalWebviewURL` drifted). `UUID().uuidString` is hex + dashes,
-    /// so it already qualifies; lowercased for tidiness only.
+    /// A fresh tab id. There is deliberately no `isValidTabID` in Swift: the rule that keeps a
+    /// session document from becoming a filesystem path is enforced once, in Rust, and restored
+    /// panes reach a controller only through `BrowserFFI.normalize`. A second validator is the
+    /// duplicated security rule this layer exists to remove. `UUID().uuidString` already
+    /// qualifies; lowercased for tidiness.
     public static func freshTabID() -> String {
         UUID().uuidString.lowercased()
     }
@@ -310,11 +270,8 @@ public struct BrowserAuthorization: Equatable, Sendable {
         self.message = message
     }
 
-    /// What a caller gets when the rule could not be consulted at all.
-    ///
-    /// A dispatcher that cannot ask whether a call is allowed must not run it —
-    /// the alternative is that an FFI failure silently becomes "permit
-    /// everything", which is the one outcome this whole layer exists to prevent.
+    /// Used when the rule could not be consulted: a dispatcher that cannot ask must not run the
+    /// call, or an FFI failure would silently become "permit everything".
     public static let refused = BrowserAuthorization(
         allowed: false,
         opaqueWrite: true,
@@ -323,16 +280,11 @@ public struct BrowserAuthorization: Equatable, Sendable {
     )
 }
 
-/// What `canonicalize` decided about a URL.
 public struct BrowserCanonicalURL: Equatable, Sendable {
     public let url: String
-    /// Whether the active restore policy permits persisting the page TITLE.
-    ///
-    /// Decided in Rust, never re-derived here by comparing the raw policy
-    /// string: `"ORIGIN"`, `" origin "` and a typo all resolve to origin-only on
-    /// that side, and a second interpretation in Swift got them wrong — leaking
-    /// titles like "Reset password for …" under a policy the user believed was
-    /// origin-only.
+    /// Whether the restore policy permits persisting the page title. Decided in Rust, never
+    /// re-derived from the raw policy string: `"ORIGIN"`, `" origin "` and a typo all mean
+    /// origin-only there, and a Swift reading once leaked titles like "Reset password for ...".
     public let persistTitle: Bool
 
     public init(url: String, persistTitle: Bool) {
@@ -340,20 +292,14 @@ public struct BrowserCanonicalURL: Equatable, Sendable {
         self.persistTitle = persistTitle
     }
 
-    /// Fail-closed: no URL, and no title either.
     public static let unavailable = BrowserCanonicalURL(url: "", persistTitle: false)
 }
 
-/// Decoders for the three FFI responses.
-///
-/// These live here, apart from the C marshalling, because the interesting part
-/// is not the call — it is which value gets chosen when the call fails. That
-/// choice is fail-closed in every case and is what the tests exercise.
+/// Decoders for the three FFI responses, apart from the C marshalling because what matters is
+/// which value is chosen when a call fails. Every choice is fail-closed.
 public enum BrowserFFIDecode {
-    /// `{ url, persist_title }` → the decision. Any failure yields
-    /// `.unavailable` — an empty URL (restore the blank placeholder) and no
-    /// title. Never the raw input: an FFI failure must not silently become
-    /// "persist the whole URL, tokens and all".
+    /// `{ url, persist_title }` to the decision. Any failure yields `.unavailable`, never the raw
+    /// input: an FFI failure must not become "persist the whole URL, tokens and all".
     public static func canonical(_ raw: String?) -> BrowserCanonicalURL {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -362,31 +308,26 @@ public enum BrowserFFIDecode {
         else { return .unavailable }
         return BrowserCanonicalURL(
             url: url,
-            // Missing reads as "do not persist" — the restrictive direction.
+            // Missing reads as "do not persist".
             persistTitle: obj["persist_title"] as? Bool ?? false,
         )
     }
 
-    /// `{ pane, repairs }` → the repaired pane. Any failure yields nil, and the
-    /// caller falls back to single-URL restore rather than trusting an
-    /// unvalidated pane.
+    /// `{ pane, repairs }` to the repaired pane; any failure is nil and the caller falls back to
+    /// single-URL restore.
     public static func normalized(_ raw: String?) -> BrowserPaneSnap? {
         guard let raw,
               let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              // Must be a DICTIONARY, not merely present: `dataWithJSONObject`
-              // raises an ObjC exception on a bare scalar top level, which no
-              // `try?` in Swift can catch. Type-checking first is the only way
-              // to keep a malformed response from crashing the app.
+              // Must be a dictionary: `dataWithJSONObject` raises an uncatchable ObjC exception on
+              // a bare scalar top level.
               let paneObj = obj["pane"] as? [String: Any],
               let paneData = try? JSONSerialization.data(withJSONObject: paneObj)
         else { return nil }
         return try? JSONDecoder().decode(BrowserPaneSnap.self, from: paneData)
     }
 
-    /// `{ keeps_history }` → may the opaque history blob be written at all?
-    /// Missing reads as `false`: the restrictive direction, matching every
-    /// other decode here.
+    /// `{ keeps_history }`: may the opaque history blob be written? Missing reads as `false`.
     public static func keepsHistory(_ raw: String?) -> Bool {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -395,11 +336,8 @@ public enum BrowserFFIDecode {
         return obj["keeps_history"] as? Bool ?? false
     }
 
-    /// `{ ok }` → did the blob actually reach disk?
-    ///
-    /// Fail-closed as `false`: recording a generation whose blob was never
-    /// written would turn a write failure now into a silent restore failure
-    /// later, which is far harder to diagnose.
+    /// `{ ok }`: did the blob reach disk? Fail-closed `false`, since recording a generation whose
+    /// blob was never written would turn a write failure into a silent restore failure later.
     public static func wroteHistory(_ raw: String?) -> Bool {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -408,8 +346,8 @@ public enum BrowserFFIDecode {
         return obj["ok"] as? Bool ?? false
     }
 
-    /// `{ data_hex }` → the blob. `nil` for every failure shape, which the
-    /// caller treats uniformly as "restore the URL plainly".
+    /// `{ data_hex }` to the blob; nil for every failure, which the caller treats as "restore the
+    /// URL plainly".
     public static func historyBlob(_ raw: String?) -> Data? {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -419,8 +357,8 @@ public enum BrowserFFIDecode {
         return hexDecode(hex)
     }
 
-    /// `{ written }` → did the record reach the log? `false` means core shed it
-    /// entirely; missing reads as `false`, the honest direction.
+    /// `{ written }`: did the record reach the log? `false` means core shed it; missing reads as
+    /// `false`.
     public static func wroteLog(_ raw: String?) -> Bool {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -429,11 +367,8 @@ public enum BrowserFFIDecode {
         return obj["written"] as? Bool ?? false
     }
 
-    /// `{ records, coverage }` → the slice plus what the capture can see.
-    ///
-    /// A failed read yields an empty list with the coverage string still set,
-    /// so a caller can never accidentally present "no records" as if it meant
-    /// "nothing happened" without the caveat attached.
+    /// `{ records, coverage }` to the slice plus what the capture can see. A failed read yields an
+    /// empty list with coverage still set, so "no records" never loses its caveat.
     public static func logRecords(_ raw: String?) -> (records: [Any], coverage: String) {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -445,15 +380,12 @@ public enum BrowserFFIDecode {
         )
     }
 
-    /// What a read reports when the coverage could not be established. Never a
-    /// blank string: an agent must not be able to read "" as "everything".
+    /// What a read reports when coverage is unknown; never "", which an agent could read as
+    /// "everything".
     public static let unknownCoverage = "unknown"
 
-    /// `{ ok, code?, message? }` → nil when the fill may proceed, an error
-    /// otherwise.
-    ///
-    /// A response that cannot be read is a REFUSAL, not a pass: a dispatcher
-    /// that could not ask whether a password may be written must not write it.
+    /// `{ ok, code?, message? }` to nil when the fill may proceed, else an error. An unreadable
+    /// response is a refusal: a dispatcher that cannot ask must not write a password.
     public static func fillVerdict(_ raw: String?) -> RPCErrorShape? {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -472,9 +404,8 @@ public enum BrowserFFIDecode {
         )
     }
 
-    /// `{ credentials }` → the index. An unreadable response yields an EMPTY
-    /// list, never a partial one: offering a credential that may not exist is
-    /// worse than offering none.
+    /// `{ credentials }` to the index. An unreadable response yields an empty list, never a
+    /// partial one.
     public static func credentials(_ raw: String?) -> [CredentialRef] {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -485,7 +416,6 @@ public enum BrowserFFIDecode {
         return (try? JSONDecoder().decode([CredentialRef].self, from: listData)) ?? []
     }
 
-    /// `{ removed }` → was an index entry actually there?
     public static func removedCredential(_ raw: String?) -> Bool {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -494,7 +424,6 @@ public enum BrowserFFIDecode {
         return obj["removed"] as? Bool ?? false
     }
 
-    /// `{ removed }` → how many superseded blobs were reclaimed.
     public static func gcRemoved(_ raw: String?) -> Int {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -503,17 +432,15 @@ public enum BrowserFFIDecode {
         return obj["removed"] as? Int ?? 0
     }
 
-    /// Mirrors `copad_core::browser::history::hex_decode`. Rejects odd lengths
-    /// and non-hex digits rather than dropping them, so a corrupted payload
-    /// surfaces as "no history" instead of as a shorter, plausible-looking one.
+    /// Mirrors `copad_core::browser::history::hex_decode`. Rejects odd lengths and non-hex digits
+    /// so a corrupted payload surfaces as "no history", not a shorter plausible one.
     public static func hexDecode(_ hex: String) -> Data? {
         guard hex.count % 2 == 0 else { return nil }
         var out = Data(capacity: hex.count / 2)
         var high: UInt8?
         for ch in hex {
-            // `isASCII` matters: `hexDigitValue` also accepts full-width and
-            // other Unicode digit forms, which the Rust decoder rejects. The
-            // two must agree or a payload could decode differently on each side.
+            // `isASCII` matters: `hexDigitValue` also accepts full-width and other Unicode digits,
+            // which the Rust decoder rejects. The two sides must agree.
             guard ch.isASCII, let value = ch.hexDigitValue, let v = UInt8(exactly: value) else {
                 return nil
             }
@@ -527,8 +454,7 @@ public enum BrowserFFIDecode {
         return high == nil ? out : nil
     }
 
-    /// `{ allowed, opaque_write, code?, message? }` → the decision. Any failure
-    /// yields `.refused`.
+    /// `{ allowed, opaque_write, code?, message? }` to the decision; any failure is `.refused`.
     public static func authorization(_ raw: String?) -> BrowserAuthorization {
         guard let raw,
               let data = raw.data(using: .utf8),
@@ -537,8 +463,7 @@ public enum BrowserFFIDecode {
         else { return .refused }
         return BrowserAuthorization(
             allowed: allowed,
-            // A missing flag reads as "replace the result" — the restrictive
-            // direction, matching the unknown-mode rule on the Rust side.
+            // Missing reads as "replace the result", the restrictive direction.
             opaqueWrite: obj["opaque_write"] as? Bool ?? true,
             code: obj["code"] as? String,
             message: obj["message"] as? String,

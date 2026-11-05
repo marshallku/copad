@@ -13,7 +13,6 @@ import SwiftUI
 final class ComuxHost: ObservableObject {
     static let shared = ComuxHost()
 
-    /// Decoded `MuxHost::state_json`.
     struct State: Decodable {
         var connected: Bool
         var error: String?
@@ -51,11 +50,9 @@ final class ComuxHost: ObservableObject {
         deinit { copad_muxhost_destroy(handle) }
     }
 
-    /// Every host's latest state, by key.
     @Published private(set) var states: [String: State] = [:]
     private var links: [String: Link] = [:]
     private var timer: Timer?
-    /// window id → the terminal panels it shows.
     private var served: [ObjectIdentifier: [String]] = [:]
 
     /// This GUI's control socket — the `COPAD_SOCKET` every tab's shell carries, and so half of
@@ -80,14 +77,12 @@ final class ComuxHost: ObservableObject {
         }
     }
 
-    /// The binding tag of `panel` (one definition, in Rust).
     func tag(for panel: String) -> String {
         guard let p = copad_muxhost_copad_tag(panel, guiSocket) else { return "" }
         defer { copad_ffi_free_string(p) }
         return String(cString: p)
     }
 
-    /// A window now shows `panels` (every terminal split of its visible tab).
     func serve(window: ObjectIdentifier, panels: [String]) {
         if let local = links[""] {
             for p in panels { copad_muxhost_bind(local.handle, p, tag(for: p)) }
@@ -111,20 +106,17 @@ final class ComuxHost: ObservableObject {
         }
     }
 
-    /// Whether `panel`'s comux client pressed `Ctrl-b e` (decisions #181); true once.
     func takeFocus(key: String, panel: String) -> Bool {
         guard let link = links[key] else { return false }
         return copad_muxhost_take_focus(link.handle, panel) != 0
     }
 
-    /// A window's name for its pane preview.
     nonisolated static func consumer(_ window: ObjectIdentifier) -> String { "w\(UInt(bitPattern: window.hashValue))" }
 
     func panelClosed(_ panel: String) {
         for link in links.values { copad_muxhost_unbind(link.handle, panel) }
     }
 
-    /// The host whose comux client runs in one of `panels` with its chrome claimed.
     func key(for panels: [String]) -> String? {
         states.first { _, s in
             panels.contains { p in s.bound[p].map { s.claimed.contains($0) } ?? false }
@@ -150,7 +142,6 @@ final class ComuxHost: ObservableObject {
         return String(cString: c)
     }
 
-    /// Answer a delegated overlay (comux runs the action).
     func answer(key: String, _ overlay: UInt64, choice: String?, text: String?) {
         guard let link = links[key] else { return }
         copad_muxhost_answer(link.handle, overlay, choice, text)
@@ -163,26 +154,22 @@ final class ComuxHost: ObservableObject {
         copad_muxhost_open(link.handle, panel, what, target)
     }
 
-    /// Answer with a staying choice (the overlay stays until comux re-sends it).
     func act(key: String, _ overlay: UInt64, choice: String) {
         guard let link = links[key] else { return }
         copad_muxhost_act(link.handle, overlay, choice)
     }
 
-    /// Keep `consumer`'s preview of `pane` fresh; nil stops it.
     func preview(key: String, consumer: String, pane: String?, rows: Int, cols: Int) {
         guard let link = links[key] else { return }
         copad_muxhost_preview(link.handle, consumer, pane, UInt16(clamping: rows), UInt16(clamping: cols))
     }
 
-    /// What `consumer`'s graph page needs (decisions #204), as the raw JSON.
     func graphJSON(key: String, consumer: String) -> String? {
         guard let link = links[key], let p = copad_muxhost_graph_json(link.handle, consumer) else { return nil }
         defer { copad_ffi_free_string(p) }
         return String(cString: p)
     }
 
-    /// Ask for a page of `token`'s work-graph history for `consumer`.
     func graphHistory(key: String, consumer: String, token: String, before: Int64, limit: Int64) {
         guard let link = links[key] else { return }
         copad_muxhost_graph_history(link.handle, consumer, token, before, limit)
@@ -205,7 +192,6 @@ final class ComuxWindow: ObservableObject {
     /// The work-graph panel is open, and what it shows (`agent` / `all`), decisions #204.
     @Published var graphOpen = false
     @Published var graphMode = "agent"
-    /// The notification dropdown under the top bar's bell is open.
     @Published var notificationsShown = false
     private(set) var key: String?
     /// This window's name for its pane preview (decisions #180).
@@ -280,7 +266,6 @@ final class ComuxWindow: ObservableObject {
     }
 
     @Published var hoverCard: HoverCard?
-    /// Called when keyboard mode ends: the pane gets the keys back.
     var onSidebarExit: (() -> Void)?
 
     func exitSidebarFocus() {
@@ -295,7 +280,6 @@ final class ComuxWindow: ObservableObject {
 struct ComuxOverlayHost: View {
     @ObservedObject var host: ComuxWindow
     let id: UInt64
-    /// The overlay is gone here (answered or cancelled).
     let closed: () -> Void
 
     var body: some View {
@@ -379,7 +363,6 @@ struct ComuxStyle: Equatable {
 
     var body: Font { Font(font) }
     var strong: Font { Font(bold) }
-    /// A two-line row (name + subtitle), with its padding.
     var entryHeight: CGFloat { lineHeight * 2 + 6 }
     var oneLineHeight: CGFloat { lineHeight + 4 }
     var statusHeight: CGFloat { ceil(lineHeight) + 8 }
@@ -414,7 +397,6 @@ func comuxSplit(total: CGFloat, spaces: CGFloat, agents: CGFloat, floor: CGFloat
     return min(max(top, floor), max(total - floor, floor))
 }
 
-/// A row that highlights under the pointer, like a TUI selection but quieter.
 private struct HoverRow: ViewModifier {
     var style: ComuxStyle
     @State private var over = false
@@ -526,12 +508,10 @@ struct ComuxHoverCard: View {
     }
 }
 
-/// A hosting view that is never the target of a click (the hover card).
 final class PassThroughHostingView<Content: View>: NSHostingView<Content> {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
-/// `  spaces ───` / `  agents ⚑2 ───`: a section header in the TUI's dim bold.
 private struct SectionHeader: View {
     var style: ComuxStyle
     var title: String
@@ -614,7 +594,6 @@ struct ComuxSidebar: View {
             }
         }
         .overlay(alignment: .trailing) { Rectangle().fill(st.rule).frame(width: 1) }
-        // `Ctrl-b e` (decisions #181): the TUI sidebar's keyboard mode, natively.
         .focusable(host.sidebarFocus != nil)
         .focused($keyboard)
         .focusEffectDisabled()
@@ -802,7 +781,6 @@ struct ComuxSidebar: View {
         var agents: [L0Agent]
     }
 
-    /// Agents under their space, in the order comux lists them.
     private func agentGroups(_ agents: [L0Agent]) -> [AgentGroup] {
         var out: [AgentGroup] = []
         for a in agents {
@@ -816,13 +794,12 @@ struct ComuxSidebar: View {
     }
 }
 
-/// The notification center, newest first, dropping down from the top bar's bell (decisions
-/// #204; it was a right panel). A click opens the notification — its pane comes up and that
-/// pane's notifications leave the list; ✕ dismisses one.
+/// The notification center, newest first, dropping down from the top bar's bell (decisions #204).
+/// A click opens the notification: its pane comes up and that pane's notifications leave the
+/// list; the cross dismisses one.
 struct ComuxNotifications: View {
     @ObservedObject var host: ComuxWindow
     var settle: () -> Void
-    /// Close the panel: opening a notification goes to its pane, which is what the panel was for.
     var close: () -> Void = {}
 
     var body: some View {
@@ -919,7 +896,6 @@ struct ComuxStatusStrip: View {
         let session = s?.tree?.sessions.first { $0.active }
         HStack(spacing: 8) {
             if let session { pill(session, st) }
-            // Every tab as a list with previews (comux's `Ctrl-b f`).
             Button { host.open("tabs") } label: {
                 Image(systemName: "square.grid.2x2").font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(st.subtext)

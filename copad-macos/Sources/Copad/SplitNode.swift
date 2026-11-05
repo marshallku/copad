@@ -1,16 +1,10 @@
 import AppKit
 
 enum SplitOrientation {
-    /// Vertical divider — panes side by side (Cmd+D)
     case horizontal
-    /// Horizontal divider — panes stacked (Cmd+Shift+D)
     case vertical
 }
 
-/// N-ary recursive split tree for a single tab.
-/// Leaves hold any CopadPanel (terminal or webview).
-/// Does NOT store NSSplitView references — the view hierarchy is rebuilt from
-/// scratch on every split/close operation.
 indirect enum SplitNode {
     case leaf(any CopadPanel)
     case branch(SplitOrientation, [SplitNode])
@@ -26,9 +20,6 @@ indirect enum SplitNode {
 
     // MARK: - Tree mutations
 
-    /// Replaces `panel`'s leaf with a new two-child branch containing the
-    /// original leaf and `newNode`. Only the focused pane's space is halved;
-    /// all other panes are completely unchanged.
     func splitting(
         _ panel: any CopadPanel,
         with newNode: SplitNode,
@@ -44,7 +35,6 @@ indirect enum SplitNode {
         }
     }
 
-    /// Returns a new tree with `panel` removed, or nil if this was the only leaf.
     func removing(_ panel: any CopadPanel) -> SplitNode? {
         switch self {
         case let .leaf(p):
@@ -53,7 +43,7 @@ indirect enum SplitNode {
         case let .branch(o, children):
             let remaining = children.compactMap { $0.removing(panel) }
             if remaining.isEmpty { return nil }
-            if remaining.count == 1 { return remaining[0] } // collapse single-child branch
+            if remaining.count == 1 { return remaining[0] }
             return .branch(o, remaining)
         }
     }

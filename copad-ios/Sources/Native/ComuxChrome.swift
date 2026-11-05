@@ -9,7 +9,6 @@ enum ComuxLook {
     static let body = Font.custom("JetBrainsMonoNFM-Regular", size: size)
     static let strong = Font.custom("JetBrainsMonoNFM-Bold", size: size)
     static let lineHeight: CGFloat = 17
-    /// A two-line entry, tall enough to tap.
     static let entryHeight: CGFloat = 46
     static let oneLineHeight: CGFloat = 30
 
@@ -85,7 +84,6 @@ func comuxSplit(total: CGFloat, spaces: CGFloat, agents: CGFloat, floor: CGFloat
     return max(min(max(top, floor), max(total - floor, header)), min(header, total))
 }
 
-/// `2h13m` / `5d19h` until `at` (unix seconds).
 func untilLabel(_ at: Int64, now: Date = Date()) -> String {
     let m = max(0, at - Int64(now.timeIntervalSince1970)) / 60
     if m < 60 { return "\(m)m" }
@@ -94,7 +92,6 @@ func untilLabel(_ at: Int64, now: Date = Date()) -> String {
     return "\(h / 24)d\(h % 24)h"
 }
 
-/// `  spaces ───` / `  agents ⚑2 ───`.
 private struct SectionHeader: View {
     var title: String
     var badge: String? = nil
@@ -296,7 +293,6 @@ struct SpacesDrawer: View {
         var agents: [L0Agent]
     }
 
-    /// Agents under their space, in the order comux lists them.
     private func agentGroups(_ agents: [L0Agent]) -> [AgentGroup] {
         var out: [AgentGroup] = []
         for a in agents {
@@ -382,7 +378,6 @@ struct NotificationsDrawer: View {
     }
 }
 
-/// The current session's tabs, as the TUI's chips; the active one is scrolled into view.
 struct TabStrip: View {
     @ObservedObject var session: MuxSession
     var select: (L0Tab) -> Void

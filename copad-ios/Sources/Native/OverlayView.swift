@@ -6,7 +6,6 @@ import SwiftUI
 /// Filtering happens here, so it is instant even when comux is far away; only opening, the
 /// answer and the pane preview cross the network.
 
-/// The look a host gives its overlays: its terminal font and theme, in the TUI's roles.
 struct OverlayLook {
     var body: Font
     var strong: Font
@@ -25,7 +24,6 @@ struct OverlayLook {
     var yellow: Color
     var blue: Color
     var red: Color
-    /// The terminal's default foreground and its 16 ANSI colours, for the preview.
     var fg: Color
     var ansi: [Color]
 
@@ -69,7 +67,6 @@ struct OverlayContext {
     /// A phone held upright: the panel docks to the bottom and previews on long-press.
     var compact = false
 
-    /// The live tab a tab-overview row (`t:<session>/<tab>`) names.
     func tab(for row: L0PickerRow) -> L0Tab? {
         guard row.id.hasPrefix("t:") else { return nil }
         let parts = row.id.dropFirst(2).split(separator: "/", maxSplits: 1).map(String.init)
@@ -78,13 +75,11 @@ struct OverlayContext {
     }
 }
 
-/// The host's side of an overlay.
 struct OverlayHandlers {
     /// (choice, text): both nil = cancelled. Closes the overlay.
     var answer: (String?, String?) -> Void
     /// A staying choice: the overlay stays until comux re-sends it.
     var act: (String) -> Void
-    /// Keep the preview of a pane (rows × cols) fresh; nil stops it.
     var preview: (String?, Int, Int) -> Void
 }
 
@@ -116,7 +111,6 @@ struct ComuxOverlayLayer: View {
         }
     }
 
-    /// A frame big enough for the large picker card, which splits into list and preview.
     private static func large(_ s: CGSize) -> Bool { s.width >= 820 && s.height >= 420 }
 
     /// A picker takes most of a wide frame whatever its rows are, so loading, filtering or
@@ -202,7 +196,6 @@ func comuxKeyName(_ press: KeyPress) -> String? {
     return press.characters.count == 1 ? press.characters : nil
 }
 
-/// What a key does in a picker (pure, so it is unit-tested).
 enum PickerKeyOutcome: Equatable {
     case cancel
     case answer(String)
@@ -530,7 +523,6 @@ private struct PickerOverlay: View {
     }
 }
 
-/// `C-r` → `^R`, `Right` → `→`.
 private func keyLabel(_ k: String) -> String {
     if k.hasPrefix("C-") { return "^" + k.dropFirst(2).uppercased() }
     switch k {
@@ -604,8 +596,6 @@ private struct PickerCard: View {
         }
     }
 
-    /// A tab as its chip reads (`2 api`), with each pane's program and, for an agent, its
-    /// status as it is now.
     private func tab(_ t: L0Tab) -> some View {
         let agents = t.panes.compactMap { p in context.agents.first { $0.token == p.token } }
         let glyph = t.bell ? ("!", look.red) : !agents.isEmpty ? ("●", look.yellow) : ("▪", t.active ? look.mauve : look.dim)
@@ -663,10 +653,8 @@ struct PanePreview: View {
     let look: OverlayLook
     let state: L0PreviewState?
     let handlers: OverlayHandlers
-    /// The previewed pane's agent, whose readout goes under the header as in the TUI.
     var agent: L0Agent? = nil
 
-    /// Lines the agent readout takes: the context gauge, and what it is doing.
     private var readoutLines: Int {
         (agent?.context == nil ? 0 : 1) + (agent?.compactQueued == true ? 1 : 0)
             + ((agent?.detail ?? "").isEmpty ? 0 : 1)
@@ -828,7 +816,6 @@ private struct ConfirmOverlay: View {
         .focusable()
         .focused($focused)
         .focusEffectDisabled()
-        // The TUI's y/n.
         .onKeyPress(phases: .down) { press in
             switch comuxKeyName(press) {
             case "y", "Y": answer("yes", nil); return .handled
@@ -926,9 +913,7 @@ struct ComuxContextGauge: View {
     var tone: (Double) -> Color
     var width: CGFloat = 40
     var height: CGFloat = 4
-    /// Extra text after the percentage (`· $1.20`).
     var suffix: String = ""
-    /// A compaction is queued: `⇣` leads the label.
     var queued: Bool = false
 
     var body: some View {
@@ -1036,7 +1021,6 @@ struct ComuxUsageView: View {
         .fixedSize()
     }
 
-    /// Inline but no room for all: one window, clicked through locally.
     @State private var local = 0
     private var single: some View {
         let w = windows[local % windows.count]

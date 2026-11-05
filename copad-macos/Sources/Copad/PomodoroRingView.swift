@@ -2,26 +2,13 @@ import AppKit
 import CopadCore
 import Foundation
 
-/// Native circular progress ring for the Pomodoro timer (Phase 2). Rendered
-/// in the macOS status bar IN PLACE OF the pomodoro plugin's poll-text
-/// `[[modules]]` entry — the visual the user asked for ("동그란 형태", not
-/// numbers). Exact time lives in the tooltip.
-///
-/// Data flow: the Phase-1 plugin emits `pomodoro.state` on every transition
-/// (start / pause / resume / reset / phase-complete). This view subscribes to
-/// that event and ticks LOCALLY at 1 Hz off the absolute `ends_at_ms`, so the
-/// arc depletes smoothly with no per-second IPC. On launch it also fetches
-/// `pomodoro.status` once to seed the current state (an already-running timer
-/// would otherwise show nothing until the next mutation).
-///
-/// Interaction: left-click → `pomodoro.toggle`; right-click → an NSMenu of
-/// duration presets → `pomodoro.set_durations`.
+/// Native circular progress ring for the Pomodoro timer, shown in the status bar in place of
+/// the plugin's poll-text module. Subscribes to `pomodoro.state` and ticks locally at 1 Hz off
+/// the absolute `ends_at_ms`; seeds once from `pomodoro.status` for an already-running timer.
+/// Left-click toggles, right-click offers duration presets.
 @MainActor
 final class PomodoroRingView: NSView {
-    // Last authoritative state (from a `pomodoro.state` event or the initial
-    // `pomodoro.status` seed).
     private var phase: String = "idle"
-    /// Absolute expiry while running; `nil` when paused or idle.
     private var endsAtMs: UInt64?
     private var paused = false
     /// Frozen remaining used while paused (`ends_at_ms` is null then).
@@ -38,7 +25,6 @@ final class PomodoroRingView: NSView {
     /// Once a live event has been applied, a late initial `pomodoro.status`
     /// response must not clobber it (ordering guard).
     private var appliedEvent = false
-    /// Set on teardown; guards main-hop closures that outlive `stop()`.
     private var stopped = false
 
     private static let diameter: CGFloat = 16
@@ -71,8 +57,7 @@ final class PomodoroRingView: NSView {
     private func subscribe(to eventBus: EventBus) {
         let channel = eventBus.subscribeTyped(kinds: ["pomodoro.state"])
         self.channel = channel
-        // `receive()` blocks; loop on a background thread and hop each payload
-        // to main in arrival order (mirrors AppDelegate's agent-event feed).
+        // `receive()` blocks; hop each payload to main in arrival order.
         Thread.detachNewThread {
             while let event = channel.receive() {
                 let payload = event.data as? [String: Any] ?? [:]
@@ -85,20 +70,14 @@ final class PomodoroRingView: NSView {
         }
     }
 
-    /// Retry budget: seeding must survive a slow daemon startup ("retry until
-    /// connected"), not just the ~first few seconds. 1 s × 120 ≈ 2 minutes —
-    /// far longer than any realistic `copadd` boot, while still bounded so a
-    /// permanently-absent daemon (plugin uninstalled) can't poll forever. The
-    /// loop stops the instant a seed succeeds or a live event arrives, so the
-    /// budget is only ever reached when there's genuinely nothing to talk to.
+    /// 1 s x 120: outlasts any realistic `copadd` boot, yet bounded so a permanently absent
+    /// daemon can't poll forever.
     private nonisolated static let seedAttempts = 120
     private nonisolated static let seedInterval: TimeInterval = 1.0
 
-    /// Seed from `pomodoro.status` so a ring that starts while a timer is
-    /// ALREADY running shows the live state immediately (no event fires until
-    /// the next transition). Retries because `loadModules` runs before the
-    /// daemon connection is up, so the first `forward` returns
-    /// `daemon_unavailable`. Stops once seeded or a live event has arrived.
+    /// Seed from `pomodoro.status` so a ring started while a timer is already running shows it
+    /// immediately. Retries because `loadModules` runs before the daemon connection is up
+    /// (`daemon_unavailable`).
     private func seedInitialState(attemptsLeft: Int = seedAttempts) {
         guard !stopped, !appliedEvent, attemptsLeft > 0 else { return }
         daemonClient?.forward(method: "pomodoro.status", params: [:]) { [weak self] result in
@@ -106,11 +85,9 @@ final class PomodoroRingView: NSView {
                 MainActor.assumeIsolated {
                     guard let self, !self.stopped, !self.appliedEvent else { return }
                     if let payload = result as? [String: Any] {
-                        // A valid snapshot — seed and stop retrying.
                         self.apply(payload, fromEvent: false)
                         return
                     }
-                    // RPCError / nil (daemon not connected yet) → retry.
                     DispatchQueue.main.asyncAfter(deadline: .now() + Self.seedInterval) {
                         self.seedInitialState(attemptsLeft: attemptsLeft - 1)
                     }
@@ -133,12 +110,9 @@ final class PomodoroRingView: NSView {
         needsDisplay = true
     }
 
-    /// Read a millis field defensively: `NSNumber.uint64Value` WRAPS a
-    /// negative (`-1` → `UInt64.max`), which would blow up downstream time
-    /// math. Parse through `Double`, rejecting non-finite / negative / absurd
-    /// values (a malformed or mixed-version payload) so they degrade to nil →
-    /// idle/track-only rather than crash. The cap (~285k years in ms) is far
-    /// above any real epoch/remaining value.
+    /// `NSNumber.uint64Value` WRAPS a negative (`-1` -> `UInt64.max`), which would break
+    /// downstream time math. Parse through `Double` and reject non-finite, negative or absurd
+    /// values (malformed or mixed-version payload) so they degrade to nil.
     private static func msField(_ p: [String: Any], _ key: String) -> UInt64? {
         guard let n = p[key] as? NSNumber else { return nil }
         let d = n.doubleValue
@@ -151,8 +125,7 @@ final class PomodoroRingView: NSView {
     private func restartTick() {
         tick?.cancel()
         tick = nil
-        // Only a running (non-paused, non-idle) phase needs a per-second
-        // redraw; a paused or idle ring is static.
+        // Only a running phase needs a per-second redraw.
         guard !paused, endsAtMs != nil, phase != "idle" else { return }
         let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(deadline: .now() + 1, repeating: 1)
@@ -165,8 +138,7 @@ final class PomodoroRingView: NSView {
         if stopped { return }
         needsDisplay = true
         updateTooltip()
-        // Stop churning once we hit zero; the plugin's transition event will
-        // move us to the next phase.
+        // The plugin's transition event moves us to the next phase.
         if let ends = endsAtMs, nowMs() >= ends {
             tick?.cancel()
             tick = nil
@@ -202,13 +174,11 @@ final class PomodoroRingView: NSView {
         ctx.setLineWidth(Self.lineWidth)
         ctx.setLineCap(.round)
 
-        // Background track (full circle).
         ctx.setStrokeColor(theme.overlay0.nsColor.cgColor)
         ctx.beginPath()
         ctx.addArc(center: center, radius: radius, startAngle: 0, endAngle: .pi * 2, clockwise: false)
         ctx.strokePath()
 
-        // Progress arc: remaining fraction, from 12 o'clock sweeping clockwise.
         let frac = PomodoroProgress.fraction(
             remainingMs: Double(currentRemainingMs()),
             totalMs: Double(phaseTotalMs),
@@ -229,8 +199,7 @@ final class PomodoroRingView: NSView {
         invoke("pomodoro.toggle", params: [:])
     }
 
-    /// Right-click context menu (the app's first — no prior precedent). Built
-    /// fresh per click so the toggle label reflects current state.
+    /// Built fresh per click so the toggle label reflects current state.
     override func menu(for _: NSEvent) -> NSMenu? {
         let menu = NSMenu()
         let toggleTitle = (endsAtMs != nil && !paused) ? "Pause" : (paused ? "Resume" : "Start")
@@ -258,8 +227,7 @@ final class PomodoroRingView: NSView {
 
     @objc private func menuPreset(_ sender: NSMenuItem) {
         guard let pair = sender.representedObject as? [Int], pair.count == 2 else { return }
-        // Only work/break are sent; long_break_min & rounds_before_long are
-        // intentionally left unchanged (the plugin keeps current on absent).
+        // long_break_min and rounds_before_long are left unchanged (absent keeps the current).
         invoke("pomodoro.set_durations", params: ["work_min": pair[0], "break_min": pair[1]])
     }
 
@@ -278,7 +246,6 @@ final class PomodoroRingView: NSView {
         needsDisplay = true
     }
 
-    /// Stop the tick timer and unblock the receive() thread. Idempotent.
     func stop() {
         stopped = true
         tick?.cancel()

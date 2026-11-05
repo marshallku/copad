@@ -50,7 +50,6 @@ if [[ "${E2E_DEMO:-}" == 1 ]]; then
     rc=$?
     set -e
     grep -E "Test Case .*(passed|failed)|error:" "$W/xcodebuild.log" | head -10 >&2
-    # The demo really ran it, and logged the app in by password.
     CAP="$(docker exec -u review "$NAME" sh -c '. /usr/local/lib/review-demo/env.sh; comux capture-pane --index 0 -S 50' 2>/dev/null || true)"
     grep -q "Hello from comux on the copad demo host." <<<"$CAP" || { log "FAIL: hello.sh never ran in the demo pane"; rc=1; }
     docker logs "$NAME" 2>&1 | grep -q "Accepted password for review" || { log "FAIL: sshd never accepted the password"; rc=1; }
@@ -74,7 +73,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- the SSH server ---------------------------------------------------------------------
 ssh-keygen -q -t ed25519 -N '' -f "$W/hostkey"
 # The client key (decisions #173). Default `enclave`: the app makes a REAL Secure Enclave key
 # (the Simulator has one on Apple silicon) and the UI test appends its public line to

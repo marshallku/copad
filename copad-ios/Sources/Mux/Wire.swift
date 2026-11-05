@@ -106,7 +106,6 @@ enum ServerMsg {
                 attachment: (obj["attachment"] as? NSNumber)?.uint64Value ?? 0,
                 commands: obj["commands"] as? Bool ?? false))
         case "frame":
-            // Frames are the hot path: decode with Codable straight from the bytes.
             guard let f = try? JSONDecoder().decode(FrameEnvelope.self, from: line) else { return nil }
             return .frame(f.frame)
         case "bell": return .bell
@@ -129,12 +128,10 @@ private struct FrameEnvelope: Decodable {
     init(from d: Decoder) throws { frame = try FrameMsg(from: d) }
 }
 
-/// Mouse actions comux understands (`MouseKind`, kebab-case).
 enum MouseKind: String {
     case scrollUp = "scroll-up", scrollDown = "scroll-down", click, drag, up
 }
 
-/// Client → server messages, as JSON lines.
 enum ClientMsg {
     case attach(cols: Int, rows: Int, expectIncarnation: String?, replaces: (UInt64, String)?)
     case env(hostTag: String)
@@ -168,7 +165,6 @@ enum ClientMsg {
         }
     }
 
-    /// One wire line, newline-terminated.
     var line: Data {
         var d = (try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])) ?? Data()
         d.append(0x0A)

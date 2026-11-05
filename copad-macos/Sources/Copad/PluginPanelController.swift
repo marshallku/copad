@@ -2,13 +2,10 @@ import AppKit
 import Foundation
 @preconcurrency import WebKit
 
-/// Tier 4.1 — host-rendered plugin panel. Mirrors `copad-linux/src/plugin_panel.rs`:
-/// loads the plugin's `panel.html` in a WKWebView, injects a `window.copad` JS
-/// API at document-start so panel code can call back into copad via a Promise-based
-/// bridge AND subscribe to the EventBus.
+/// Host-rendered plugin panel mirroring `copad-linux/src/plugin_panel.rs`: loads the plugin's
+/// `panel.html` in a WKWebView and injects `window.copad` at document start.
 ///
-/// JS contract (must match Linux byte-for-byte so plugin authors can ship one
-/// `panel.html` for both platforms):
+/// The JS contract must match Linux byte-for-byte so one `panel.html` serves both platforms:
 ///
 /// ```js
 /// window.copad = {
@@ -20,28 +17,18 @@ import Foundation
 /// }
 /// ```
 ///
-/// Bridge transport: `WKScriptMessageHandlerWithReply` (macOS 11+; we target
-/// macOS 14). Each `window.copad.call(...)` becomes a `postMessage(JSON)` →
-/// `replyHandler(jsonStr, errorMsg)` round-trip. We dispatch through
-/// `ActionRegistry.tryDispatch`, so plugin actions and the same first-party
-/// surface that `coctl call` reaches are both available from panel JS.
-///
-/// Event delivery: subscribe to `EventBus`, and on each event push
-/// `copad._handleEvent(type, data)` into the webview via `evaluateJavaScript`.
-/// Same pattern as Linux's `event_bus.subscribe("*")` + glib timer poll, but
-/// we use the SwiftEventBus subscriber API which already runs on a worker
-/// thread that we hop to main from.
+/// `call` goes through `WKScriptMessageHandlerWithReply` into `ActionRegistry.tryDispatch`, so
+/// plugin actions and the `coctl call` surface are available. EventBus events are pushed back via
+/// `copad._handleEvent(type, data)` on `evaluateJavaScript`.
 @MainActor
 final class PluginPanelController: NSViewController, CopadPanel {
     let panelID: String
     private(set) var currentTitle: String
 
-    /// Exposed so session snapshot can persist which plugin this panel hosts
-    /// (decision #61 slice 6) — restore reopens it by name via the registry.
+    /// Persisted in the session snapshot (decision #61) so restore reopens the plugin by name.
     let pluginName: String
     private let panelName: String
-    /// The specific panel of a multi-panel plugin — persisted so restore reopens
-    /// the same one (not just the plugin's default panel).
+    /// The panel of a multi-panel plugin, persisted so restore reopens the same one.
     var currentPanelName: String { panelName }
     private let panelFileURL: URL
     private let theme: CopadTheme
@@ -51,8 +38,7 @@ final class PluginPanelController: NSViewController, CopadPanel {
     private var webView: WKWebView!
     private var started = false
     private var eventChannel: EventChannel?
-    /// Guards the bridge handler against retain cycles (WKWebView's content
-    /// controller holds the handler strongly; we hand it a weak proxy).
+    /// WKWebView's content controller holds the handler strongly; it gets a weak proxy.
     private var bridgeHandler: BridgeHandler?
 
     init(
@@ -83,8 +69,6 @@ final class PluginPanelController: NSViewController, CopadPanel {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
 
-        // Bridge handler: receives JSON {method, params}, dispatches via
-        // ActionRegistry, replies with JSON {ok, result|error}.
         let handler = BridgeHandler(controller: self)
         bridgeHandler = handler
         config.userContentController.addScriptMessageHandler(
@@ -93,9 +77,8 @@ final class PluginPanelController: NSViewController, CopadPanel {
             name: "copad",
         )
 
-        // Inject the JS bridge at document start so panel scripts can use
-        // window.copad immediately on first run. Identical contract to Linux's
-        // build_bridge_js — keep the two in sync if either side evolves.
+        // Injected at document start so panel scripts can use window.copad immediately. Keep in
+        // sync with Linux's build_bridge_js.
         let bridgeJS = Self.buildBridgeJS(
             pluginName: pluginName,
             panelName: panelName,
@@ -108,11 +91,8 @@ final class PluginPanelController: NSViewController, CopadPanel {
         )
         config.userContentController.addUserScript(userScript)
 
-        // Inject theme CSS (--copad-* variables + base font) at document
-        // start. Without this, panel.html's `var(--copad-bg)` and friends
-        // resolve to nothing — modal/columns render transparent and the
-        // browser default font (Times on WKWebView) is used. Mirrors
-        // copad-linux's `build_theme_css` + UserStyleSheet path.
+        // Without the theme CSS, `var(--copad-bg)` resolves to nothing and WKWebView falls back to
+        // its default font.
         let themeCSS = Self.buildThemeCSS(theme: theme)
         let themeJS = Self.buildStyleInjectionJS(css: themeCSS)
         let themeScript = WKUserScript(
@@ -124,9 +104,8 @@ final class PluginPanelController: NSViewController, CopadPanel {
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.translatesAutoresizingMaskIntoConstraints = false
-        // Transparent so window-level background image shows through (matches
-        // Linux's `set_background_color(rgba(0, 0, 0, 0))`). Plugins that
-        // want an opaque card style apply background CSS to inner elements.
+        // Transparent so the window background image shows through; plugins wanting an opaque card
+        // style set a background on inner elements.
         wv.setValue(false, forKey: "drawsBackground")
         webView = wv
         view = wv
@@ -136,10 +115,8 @@ final class PluginPanelController: NSViewController, CopadPanel {
         guard !started else { return }
         started = true
 
-        // Load via loadFileURL so relative resources (CSS, JS, images alongside
-        // panel.html) resolve against the plugin directory. Allow read access
-        // to the plugin dir too — by default loadFileURL grants only the file
-        // itself, blocking sibling assets.
+        // loadFileURL grants read access to the file only; allow the plugin dir so sibling assets
+        // resolve.
         webView.loadFileURL(
             panelFileURL,
             allowingReadAccessTo: panelFileURL.deletingLastPathComponent(),
@@ -156,20 +133,15 @@ final class PluginPanelController: NSViewController, CopadPanel {
 
     // MARK: - Event forwarding
 
-    /// Subscribe to the bus and forward events into the webview. Mirrors
-    /// Linux's `EventBus.subscribe("*")` + JS `copad._handleEvent` push.
     private func startEventForwarding() {
         guard let bus = eventBus else { return }
         let channel = bus.subscribe()
         eventChannel = channel
-        // EventChannel.receive() blocks; run on a background thread, hop
-        // to main for the WKWebView call. Same pattern as SocketServer.
+        // EventChannel.receive() blocks, so run it on a background thread and hop to main.
         Thread.detachNewThread { [weak self] in
             while let json = channel.receive() {
-                // EventBus serializes as `{"event": "<kind>", "data": {...}}`.
-                // Plugin contract takes (type, data) separately, so re-parse
-                // and project — keeps the wire format symmetric across panels
-                // + socket subscribers.
+                // EventBus serializes `{"event": kind, "data": {...}}`; the plugin contract takes
+                // (type, data) separately.
                 guard let data = json.data(using: .utf8),
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let type = obj["event"] as? String
@@ -242,9 +214,7 @@ final class PluginPanelController: NSViewController, CopadPanel {
     }
 
     private static func buildStyleInjectionJS(css: String) -> String {
-        // Inject a <style> element at documentStart. document.head may not
-        // exist yet, so fall back to documentElement (always present once
-        // <html> is created, which is before user scripts fire).
+        // document.head may not exist yet at documentStart, so fall back to documentElement.
         let cssJSON = jsonString(css) ?? "\"\""
         return """
         (() => {
@@ -337,14 +307,10 @@ final class PluginPanelController: NSViewController, CopadPanel {
 
 // MARK: - Bridge handler
 
-/// Bridges `window.webkit.messageHandlers.copad.postMessage(json)` from JS into
-/// `PluginPanelController.handleBridgeMessage`. Held weakly so the WKWebView's
-/// strong reference doesn't keep the controller alive past panel close.
-/// Conforms to `WKScriptMessageHandlerWithReply` (macOS 14 SDK marks the
-/// replyHandler as `@MainActor @Sendable`). The class itself is `@MainActor`
-/// so the protocol method runs on main and can touch the controller without
-/// hopping. We deliberately use `@unchecked Sendable` because the controller
-/// reference is weak and only read on main.
+/// Bridges `window.webkit.messageHandlers.copad.postMessage(json)` into
+/// `PluginPanelController.handleBridgeMessage`. Held weakly so the WKWebView's strong reference
+/// does not keep the controller alive past panel close. `@unchecked Sendable` because the
+/// controller reference is weak and only read on main.
 private final class BridgeHandler: NSObject, WKScriptMessageHandlerWithReply, @unchecked Sendable {
     weak var controller: PluginPanelController?
 
@@ -370,10 +336,8 @@ private final class BridgeHandler: NSObject, WKScriptMessageHandlerWithReply, @u
             replyHandler(nil, "PluginPanelController gone")
             return
         }
-        // handleBridgeMessage's completion can fire from any thread (action
-        // handlers in the registry don't promise main-actor invocation).
-        // Bounce the reply back onto main where the WKWebView reply handler
-        // wants it. SendableBox carries the closure across the @Sendable hop.
+        // handleBridgeMessage's completion may fire on any thread; reply on main, as WKWebView
+        // wants. SendableBox carries the closure across the @Sendable hop.
         let replyBox = SendableBox(replyHandler)
         controller.handleBridgeMessage(dict) { replyJson in
             DispatchQueue.main.async {

@@ -1,19 +1,12 @@
 @testable import CopadCore
 import XCTest
 
-/// The Swift half of the cross-language schema check. The Rust half is
-/// `copad_core::browser::tabs::tests::the_shared_swift_fixture_round_trips`,
-/// and **the literal below must stay byte-identical to the one there.**
-///
-/// It is fully populated on purpose: a fixture with default values would decode
-/// and re-encode unchanged even if one side gained a field the other never
-/// learned, so it would prove nothing. Keys are sorted on both sides so
-/// byte-equality is well defined.
-///
-/// This pins TODAY's schema. It cannot detect a future `#[serde(default)]`
-/// Rust field that is omitted when empty — the rule that closes that gap is
-/// procedural and stated in `BrowserSnapshot.swift`: a schema change updates
-/// this fixture in the same commit.
+/// The Swift half of the cross-language schema check; the Rust half is
+/// `copad_core::browser::tabs::tests::the_shared_swift_fixture_round_trips`, and the literal
+/// below must stay byte-identical to the one there. It is fully populated on purpose: defaults
+/// would round-trip even if one side gained a field the other never learned. It pins today's
+/// schema only; a schema change updates this fixture in the same commit (see
+/// `BrowserSnapshot.swift`).
 let sharedPaneFixture = """
 {"active":1,"profile":"work","tabs":[{"history_depth":3,"history_generation":7,"id":"tab-a","last_active":1725840000,"pinned":true,"scroll_y":412.5,"title":"Pull Request #42","url":"https://github.com/o/r/pull/42"},{"id":"tab-b","last_active":1725840001,"url":"https://example.com"}]}
 """
@@ -53,15 +46,13 @@ final class BrowserSnapshotTests: XCTestCase {
         XCTAssertEqual(pane.profile, BrowserPaneSnap.defaultProfile)
         XCTAssertEqual(pane.tabs.first?.id, "tab-a")
 
-        // And an entirely empty object is "no browser state", not an error.
         let empty = try JSONDecoder().decode(BrowserPaneSnap.self, from: Data("{}".utf8))
         XCTAssertTrue(empty.tabs.isEmpty)
         XCTAssertEqual(empty.active, 0)
     }
 
     func testAnEmptyTabOmitsEveryOptionalFieldLikeSerdeDoes() throws {
-        // A pane with no browser state must serialize the way the pre-Workbench
-        // binary wrote it, or an older copad can no longer read the file.
+        // An empty tab must serialize without optional fields, or an older copad can't read it.
         let tab = BrowserTabSnap(id: "t1", url: "https://e.com")
         let json = String(decoding: try sortedEncoder().encode(tab), as: UTF8.self)
         XCTAssertEqual(json, #"{"id":"t1","last_active":0,"url":"https://e.com"}"#)
@@ -81,7 +72,6 @@ final class BrowserSnapshotTests: XCTestCase {
             BrowserSnapshot.resolveURL(live: "", pending: "https://github.com"),
             "https://github.com",
         )
-        // The blank placeholder page must not win over a pending restore either.
         XCTAssertEqual(
             BrowserSnapshot.resolveURL(live: "about:blank", pending: "https://github.com"),
             "https://github.com",
@@ -123,7 +113,6 @@ final class BrowserSnapshotTests: XCTestCase {
         XCTAssertEqual(pane.active, 1)
         XCTAssertEqual(pane.tabs[pane.active].id, "tab-b")
         XCTAssertEqual(pane.tabs[pane.active].url, "https://example.com")
-        // ...and it differs from the first tab, so the distinction is real.
         XCTAssertNotEqual(pane.tabs[0].id, pane.tabs[pane.active].id)
     }
 
@@ -136,10 +125,8 @@ final class BrowserSnapshotTests: XCTestCase {
     }
 
     func testAFreshTabIdIsAcceptableToTheRustCharsetRule() {
-        // Swift deliberately has NO id validator — that rule is enforced once,
-        // in Rust, and a restored pane only reaches a controller through
-        // `normalize`. What Swift must still guarantee is that the ids it MINTS
-        // would survive that rule.
+        // Swift has no id validator (the rule is enforced once, in Rust); it must only mint ids
+        // that would survive it.
         let id = BrowserSnapshot.freshTabID()
         XCTAssertFalse(id.isEmpty)
         XCTAssertLessThanOrEqual(id.count, 64)
@@ -158,9 +145,6 @@ final class BrowserSnapshotTests: XCTestCase {
     }
 
     func testAMissingPersistTitleFlagMeansDoNotPersistIt() {
-        // Restrictive direction: a page title carries the same exposure as a
-        // URL, so an FFI response that omits the flag must not be read as
-        // permission.
         let d = BrowserFFIDecode.canonical(#"{"url":"https://e.com"}"#)
         XCTAssertEqual(d.url, "https://e.com")
         XCTAssertFalse(d.persistTitle)
@@ -179,7 +163,6 @@ final class BrowserSnapshotTests: XCTestCase {
     }
 
     func testAuthorizationDecodeRefusesWhenItCannotBeEvaluated() {
-        // The whole point: an FFI failure must not become "permit everything".
         for bad in [nil, "{not json", "{}", #"{"allowed":"yes"}"#] as [String?] {
             let decision = BrowserFFIDecode.authorization(bad)
             XCTAssertFalse(decision.allowed, "input: \(bad ?? "nil")")
@@ -207,15 +190,13 @@ final class BrowserSnapshotTests: XCTestCase {
     // MARK: - History blobs (B2)
 
     func testHexDecodeMirrorsTheRustDecoder() {
-        XCTAssertEqual(BrowserSnapshot.self is Any.Type, true) // keep the type referenced
+        XCTAssertEqual(BrowserSnapshot.self is Any.Type, true)
         XCTAssertEqual(BrowserFFIDecode.hexDecode("0001feff"), Data([0x00, 0x01, 0xfe, 0xff]))
         XCTAssertEqual(BrowserFFIDecode.hexDecode("FF"), Data([0xff]))
         XCTAssertEqual(BrowserFFIDecode.hexDecode(""), Data())
     }
 
     func testHexDecodeRejectsMalformedInputRatherThanDroppingBytes() {
-        // A corrupted payload must surface as "no history", not as a shorter
-        // history that looks plausible.
         XCTAssertNil(BrowserFFIDecode.hexDecode("abc"))
         XCTAssertNil(BrowserFFIDecode.hexDecode("zz"))
         XCTAssertNil(BrowserFFIDecode.hexDecode("00 11"))

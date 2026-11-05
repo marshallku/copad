@@ -1,22 +1,15 @@
 import Foundation
 
-// Pure-logic building blocks for the Metal render path
-// (docs/macos-gpu-renderer-plan.md slice 1). Everything here is
-// CPU-only math with no AppKit/Metal/CoreText dependency so the
-// decision tables stay unit-testable from `CopadCoreTests` — the
-// executable target can't be imported by the test bundle.
+// Pure-logic building blocks for the Metal render path (docs/macos-gpu-renderer-plan.md). No
+// AppKit/Metal/CoreText dependency, so the tables are testable from `CopadCoreTests` (the
+// executable target can't be imported by the test bundle).
 //
-// Color convention: RGBA32 packed as `(r << 24) | (g << 16) |
-// (b << 8) | a`, matching the executable's `cgColorToRGBA32`.
+// Color convention: RGBA32 packed as `(r << 24) | (g << 16) | (b << 8) | a`, matching the
+// executable's `cgColorToRGBA32`.
 
 // MARK: - Cell flags (copad-term wire format)
 
-/// Flag bits mirror `copad_term::flags` (copad-term/src/lib.rs).
-/// Third declaration of these bits in the codebase (Rust FFI +
-/// drawRow's locals) — lifted here so the GPU path and its tests
-/// share one Swift source of truth. Folding drawRow onto these
-/// constants is deliberately out of scope for slice 1 (the CPU
-/// painter stays untouched).
+/// Flag bits mirror `copad_term::flags` (copad-term/src/lib.rs); `drawRow` keeps its own copies.
 public enum CopadCellFlags {
     public static let bold: UInt16 = 1 << 0
     public static let italic: UInt16 = 1 << 1
@@ -29,11 +22,8 @@ public enum CopadCellFlags {
 // MARK: - Color resolution
 
 public enum GPUCellColor {
-    /// Decode the fg/bg encoding from `copad_term::color_to_rgba`.
-    /// High byte is a tag: 0x00 = default, 0x01 = indexed (low byte
-    /// holds the index), 0xFF = direct RGB in the low 24 bits.
-    /// Mirrors the CPU painter's `resolveColor`, but over packed
-    /// RGBA32 instead of CGColor so it stays testable here.
+    /// Decode `copad_term::color_to_rgba`: high byte is a tag (0x00 default, 0x01 indexed with
+    /// the index in the low byte, 0xFF direct RGB in the low 24 bits).
     public static func resolve(_ packed: UInt32, palette: [UInt32], defaultColor: UInt32) -> UInt32 {
         let tag = (packed >> 24) & 0xFF
         switch tag {
@@ -43,8 +33,6 @@ public enum GPUCellColor {
             let idx = Int(packed & 0xFF)
             return idx < palette.count ? palette[idx] : defaultColor
         case 0xFF:
-            // Direct RGB: shift the 24-bit payload up and force alpha
-            // opaque.
             return ((packed & 0x00FF_FFFF) << 8) | 0xFF
         default:
             return defaultColor
@@ -62,9 +50,7 @@ public enum GPUCellColor {
 
 // MARK: - Per-cell quad decision table
 
-/// Port of `drawRow`'s color-resolve decision table as a pure
-/// function: default-sentinel provenance, inverse swap, dim alpha,
-/// and the bg-fill skip rules for both opaque and transparent modes.
+/// Port of `drawRow`'s color-resolve decision table as a pure function.
 public enum CellQuadResolver {
     public struct Resolved: Equatable, Sendable {
         public let fg: UInt32
@@ -116,11 +102,8 @@ public enum CellQuadResolver {
 
 // MARK: - Atlas shelf packer
 
-/// Minimal shelf (row) packer for the glyph atlas. Shelves grow
-/// downward; each shelf advances a cursor rightward. A glyph opens a
-/// new shelf when no existing shelf fits its height+width. Returns
-/// `nil` on overflow — the renderer's policy (flush-all + rebuild) is
-/// the caller's concern.
+/// Minimal shelf packer for the glyph atlas. Returns `nil` on overflow; the flush-and-rebuild
+/// policy is the caller's concern.
 public struct AtlasShelfPacker: Sendable {
     public struct Placement: Equatable, Sendable {
         public let x: Int
@@ -153,19 +136,15 @@ public struct AtlasShelfPacker: Sendable {
         self.padding = padding
     }
 
-    /// Place a `w`×`h` rect. The returned origin is the rect's
-    /// top-left; the padded extent (`w+padding`, `h+padding`) is what
-    /// gets reserved. Zero/negative dimensions clamp to 1 so callers
-    /// don't have to special-case empty glyph bounds.
+    /// The returned origin is the rect's top-left; the padded extent is what gets reserved.
+    /// Zero/negative dimensions clamp to 1.
     public mutating func place(width w: Int, height h: Int) -> Placement? {
         let pw = max(1, w) + padding
         let ph = max(1, h) + padding
         guard pw <= width else { return nil }
 
-        // First shelf the rect fits in. Shelves are reused only for
-        // rects no taller than the shelf — terminal glyph heights
-        // cluster around the cell height, so waste stays low without
-        // a best-fit scan.
+        // First shelf the rect fits in. Terminal glyph heights cluster around the cell height,
+        // so reusing shelves without a best-fit scan wastes little.
         for i in shelves.indices where ph <= shelves[i].height && shelves[i].cursorX + pw <= width {
             let p = Placement(x: shelves[i].cursorX, y: shelves[i].y)
             shelves[i].cursorX += pw
@@ -204,7 +183,6 @@ public struct GPUQuad: Equatable, Sendable {
 }
 
 public enum GridQuadGeometry {
-    /// One row's contiguous cell span, in inclusive column indices.
     public struct CellSpan: Equatable, Sendable {
         public let row: Int
         public let firstCol: Int
@@ -217,13 +195,10 @@ public enum GridQuadGeometry {
         }
     }
 
-    /// Expand an inclusive (start, end) grid range into per-row cell
-    /// spans — the shared shape behind `paintSelection` and
-    /// `paintSearchMatch`. Block mode paints the same column span on
-    /// every row (column-major rectangle); row-wrapped mode covers
-    /// start_col→lastCol on the first row, 0→end_col on the last, and
-    /// full width in between. Spans with `firstCol > finalCol` are
-    /// dropped (mirrors the CPU painter's guard).
+    /// Expand an inclusive (start, end) grid range into per-row spans, shared by
+    /// `paintSelection` and `paintSearchMatch`. Block mode paints the same column span on every
+    /// row; row-wrapped mode covers start_col...lastCol, then full rows, then 0...end_col.
+    /// Spans with `firstCol > finalCol` are dropped (as in the CPU painter).
     public static func spanRows(
         startRow: Int,
         startCol: Int,
@@ -267,11 +242,8 @@ public enum GridQuadGeometry {
         return out
     }
 
-    /// Decompose a rect's 1-unit-inset border into four thin quads —
-    /// the Metal stand-in for `CGContext.stroke(insetBy: 0.5)` with
-    /// line width 1: the stroke straddles the inset path, so the
-    /// painted band is exactly the outermost `thickness` ring inside
-    /// the rect.
+    /// Four thin quads for a 1-unit-inset border: the Metal stand-in for
+    /// `CGContext.stroke(insetBy: 0.5)` at line width 1.
     public static func outlineQuads(of q: GPUQuad, thickness: Double = 1) -> [GPUQuad] {
         let t = min(thickness, min(q.width, q.height) / 2)
         guard t > 0 else { return [] }
@@ -303,11 +275,9 @@ public enum GridQuadGeometry {
         public static let none = CursorQuads(accent: [], outline: [], redrawGlyphInverted: false)
     }
 
-    /// Port of `drawCursor`'s geometry: style 0 = hidden; 1 = block
-    /// (filled when key, hollow accent outline when not); 2 = 2-px
-    /// beam at the leading edge; 3 = 2-px underline at the bottom.
-    /// Blink: a TUI-requested blinking cursor (blink == 1) skips the
-    /// draw entirely on the OFF phase.
+    /// Port of `drawCursor`'s geometry: style 0 hidden, 1 block (hollow outline when not key),
+    /// 2 two-px beam, 3 two-px underline. A TUI-requested blinking cursor (blink == 1) draws
+    /// nothing on the OFF phase.
     public static func cursorQuads(
         style: UInt8,
         blink: UInt8,
@@ -338,8 +308,6 @@ public enum GridQuadGeometry {
                 redrawGlyphInverted: true,
             )
         case 1:
-            // Non-key window: hollow accent outline, no bg frame —
-            // the accent stroke is already its own contrast.
             return CursorQuads(accent: outlineQuads(of: cell), outline: [], redrawGlyphInverted: false)
         case 2:
             let bar = GPUQuad(x: cell.x, y: cell.y, width: 2, height: cellHeight)

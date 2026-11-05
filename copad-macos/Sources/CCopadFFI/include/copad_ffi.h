@@ -1,10 +1,7 @@
 // copad_ffi.h — C declarations for symbols exported by the copad-ffi staticlib.
 //
-// Hand-maintained to match copad-ffi/src/lib.rs. The crate has no cbindgen
-// step yet because the surface is small and the spike doesn't justify the
-// build-system overhead. Keep this file in lockstep with the Rust source —
-// any new `extern "C"` symbol there needs a declaration here, with the same
-// ownership/safety contract documented.
+// Hand-maintained to match copad-ffi/src/lib.rs (no cbindgen step). Every new `extern "C"`
+// symbol there needs a declaration here with the same ownership/safety contract.
 
 #ifndef COPAD_FFI_H
 #define COPAD_FFI_H
@@ -31,11 +28,10 @@ void copad_ffi_free_string(char *s);
 const char *copad_ffi_last_error(void);
 
 // ---------------------------------------------------------------------------
-// PR 5c — Engine FFI
+// Engine FFI
 //
-// Wraps copad_core::trigger::TriggerEngine. Hand-maintained mirror of the
-// `extern "C"` symbols in copad-ffi/src/lib.rs's "PR 5c" block. Add a
-// declaration here when adding a Rust symbol; both files must stay in sync.
+// Wraps copad_core::trigger::TriggerEngine; mirrors the `extern "C"` symbols in
+// copad-ffi/src/lib.rs's engine block, and both files must stay in sync.
 // ---------------------------------------------------------------------------
 
 /// Opaque engine handle. Created by copad_engine_create, freed by

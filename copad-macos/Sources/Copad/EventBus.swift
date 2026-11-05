@@ -1,55 +1,40 @@
 import Foundation
 
-/// Mirror of `copad-core::event_bus::Origin`. Trust-boundary provenance.
-/// `external` is set on events that crossed the daemon's `events.publish`
-/// trust-boundary chokepoint; the trigger engine's `[security]
-/// accept_external` gate runs on this field. Default `internal` matches
-/// serde's `#[default]` so wire frames lacking the field deserialize as
-/// the safe default. See decisions.md #37.
+/// Mirror of `copad-core::event_bus::Origin` (decisions #37). `external` marks events that
+/// crossed the daemon's `events.publish` trust boundary. Defaults to `internal` like serde's
+/// `#[default]`, so frames lacking the field get the safe value.
 enum Origin: String, Codable {
     case `internal`
     case external
 }
 
-/// Mirror of `copad-core::event_bus::Event`. `data` is `serde_json::Value`-
-/// shaped — object, array, scalar, or null all valid.
+/// Mirror of `copad-core::event_bus::Event`. `data` is `serde_json::Value`-shaped.
 struct BusEvent {
     let type: String
     let source: String
     let data: Any?
     let timestampMs: UInt64
-    /// nil for native broadcasts; non-nil for events republished from the
-    /// daemon side. Outbound forwarders (PR 4b) skip events with bridgeId
-    /// set to break echo loops.
+    /// Non-nil for events republished from the daemon side; outbound forwarders skip them to
+    /// break echo loops.
     let bridgeId: String?
-    /// Trust-boundary tag — `external` for events that came through the
-    /// daemon's `events.publish` ingest; `internal` for everything else.
-    /// Surfaces to subscribers (e.g. trigger engine) that gate on
-    /// `[security] accept_external`. See `Origin` above.
+    /// `external` for events that came through the daemon's `events.publish` ingest, which
+    /// `[security] accept_external` gates on.
     let origin: Origin
 }
 
-/// Local broadcast hub. Subscribers fall into two flavors:
-/// - JSON-string channels for legacy consumers (`SocketServer` wire output,
-///   `PluginPanelController` JS bridge) — wire shape `{"event", "data"}`.
-/// - Typed `BusEvent` channels for consumers that need metadata (PR 4b
-///   outbound forwarder gates on `bridgeId`).
-///
-/// Per-subscriber FIFO; cross-channel order undefined because `onBroadcast`
-/// fires synchronously and subscribers may chain reentrant broadcasts.
+/// Local broadcast hub with JSON-string channels (`SocketServer` wire output,
+/// `PluginPanelController` JS bridge) and typed `BusEvent` channels. Per-subscriber FIFO;
+/// cross-channel order is undefined because `onBroadcast` fires synchronously and subscribers
+/// may broadcast reentrantly.
 final class EventBus: @unchecked Sendable {
     private let lock = NSLock()
     private var jsonChannels: [EventChannel] = []
     private var typedChannels: [TypedEventChannel] = []
 
-    /// Synchronous fan-out hook. Set by AppDelegate to forward every event
-    /// into the trigger engine without making EventBus aware of `CopadEngine`.
-    /// `source` carries the trust stamp the engine's
-    /// `try_promote_or_drop_preflight` gates on (`COMPLETION_EVENT_SOURCE` =
-    /// `"copad.action"`); `origin` carries the trust-boundary tag the
-    /// engine's `[security] accept_external` gate consumes. Both MUST be
-    /// forwarded — defaulting `origin` to `.internal` here would launder
-    /// daemon-forwarded `External` events into trusted local triggers.
+    /// Synchronous fan-out hook set by AppDelegate to feed the trigger engine. Both `source`
+    /// (the trust stamp `try_promote_or_drop_preflight` gates on) and `origin` (consumed by
+    /// `[security] accept_external`) MUST be forwarded: defaulting `origin` to `.internal` would
+    /// launder daemon-forwarded `External` events into trusted local triggers.
     nonisolated(unsafe) var onBroadcast: (@Sendable (
         _ kind: String,
         _ source: String,
@@ -63,24 +48,17 @@ final class EventBus: @unchecked Sendable {
         return ch
     }
 
-    /// `kinds == nil` accepts every event; otherwise only events whose
-    /// `type` is in the allowlist enqueue. Mirror of Linux's per-kind
-    /// `subscribe_unbounded`. `EventBus.broadcast` pre-checks the allowlist
-    /// to avoid lock churn for filtered drops; the channel internal also
-    /// re-checks as a backstop against direct callers.
+    /// `kinds == nil` accepts every event. `broadcast` pre-checks the allowlist to avoid lock
+    /// churn; the channel re-checks as a backstop for direct callers.
     func subscribeTyped(kinds: Set<String>? = nil) -> TypedEventChannel {
         let ch = TypedEventChannel(allowlist: kinds)
         lock.withLock { typedChannels.append(ch) }
         return ch
     }
 
-    /// Broadcast an event to all live subscribers.
-    ///
-    /// `bridgeId` is nil for native broadcasts; only set by inbound
-    /// daemon-event republish so PR 4b's forwarder can skip echoes.
-    /// `timestampMs` defaults to `now`. Daemon wire `Event` does not carry
-    /// a timestamp, so republished events also use the local observation
-    /// time.
+    /// `bridgeId` is set only by inbound daemon-event republish so the outbound forwarder can
+    /// skip echoes. The daemon wire `Event` carries no timestamp, so republished events use the
+    /// local observation time.
     func broadcast(
         event: String,
         source: String = "macos.eventbus",
@@ -99,8 +77,6 @@ final class EventBus: @unchecked Sendable {
             origin: origin,
         )
 
-        // Engine hop first so a chained broadcast from a trigger callback
-        // lands in the same logical tick.
         onBroadcast?(event, source, data, origin)
 
         // Snapshot under lock so subscribers can reentrantly broadcast
@@ -121,8 +97,6 @@ final class EventBus: @unchecked Sendable {
 
         var deadTyped: [ObjectIdentifier] = []
         for ch in typedSnap {
-            // Pre-check skips enqueue + lock for filtered events (e.g.
-            // forwarder channel that excludes terminal.output).
             guard ch.accepts(busEvent.type) else { continue }
             if !ch.send(busEvent) { deadTyped.append(ObjectIdentifier(ch)) }
         }
@@ -141,9 +115,8 @@ final class EventBus: @unchecked Sendable {
         }
     }
 
-    /// `{"event", "data"}` wire (local format). `.fragmentsAllowed` so
-    /// scalar / null payloads serialize. Daemon wire uses `type`/`data`;
-    /// translation happens at the DaemonClient boundary.
+    /// Local `{"event", "data"}` wire; `.fragmentsAllowed` so scalar/null payloads serialize. The
+    /// daemon wire uses `type`/`data`, translated at the DaemonClient boundary.
     private func serializeWire(_ event: BusEvent) -> String? {
         let payload: [String: Any] = ["event": event.type, "data": event.data ?? NSNull()]
         guard
@@ -154,7 +127,6 @@ final class EventBus: @unchecked Sendable {
     }
 }
 
-/// Single-subscriber FIFO queue for serialized JSON.
 final class EventChannel: @unchecked Sendable {
     private var queue: [String] = []
     private let sema = DispatchSemaphore(value: 0)
@@ -184,10 +156,9 @@ final class EventChannel: @unchecked Sendable {
     }
 }
 
-/// Single-subscriber FIFO queue for typed `BusEvent` with optional kind
-/// allowlist. Allowlist-filtered events return `true` from `send` (silent
-/// drop) — `false` is reserved for `closed` so EventBus doesn't prune a
-/// channel just because the event didn't match its filter.
+/// Single-subscriber FIFO queue for typed `BusEvent` with optional kind allowlist. A filtered
+/// event returns `true` from `send` (silent drop); `false` means `closed`, so EventBus doesn't
+/// prune a channel just because an event didn't match its filter.
 final class TypedEventChannel: @unchecked Sendable {
     let allowlist: Set<String>?
 
@@ -222,9 +193,7 @@ final class TypedEventChannel: @unchecked Sendable {
         }
     }
 
-    /// Drops queued backlog and signals receive() to return nil. Drop guard
-    /// for forwarder shutdown — stale events at disconnect are conceptually
-    /// dead, daemon will see the next event after reconnect.
+    /// Drops queued backlog and makes receive() return nil; events stale at disconnect are dead.
     func close() {
         lock.lock()
         closed = true

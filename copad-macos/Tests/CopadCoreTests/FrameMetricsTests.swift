@@ -33,7 +33,6 @@ final class FrameMetricsRecorderTests: XCTestCase {
 
     func testNearestRankPercentiles() throws {
         var r = FrameMetricsRecorder()
-        // 1...100 → p50 = 50th value (50), p95 = 95, p99 = 99, max 100.
         for v in 1 ... 100 {
             r.record(UInt64(v))
         }
@@ -65,7 +64,6 @@ final class FrameMetricsRecorderTests: XCTestCase {
         let s = try XCTUnwrap(r.stats())
         XCTAssertEqual(s.count, 3)
         XCTAssertEqual(s.maxNs, 4)
-        // Window is {2,3,4}; mean 3, the 1 is gone.
         XCTAssertEqual(s.meanNs, 3)
     }
 
@@ -76,7 +74,6 @@ final class FrameMetricsRecorderTests: XCTestCase {
         }
         XCTAssertEqual(r.sampleCount, 5)
         let s = try XCTUnwrap(r.stats())
-        // Last 5 recorded are 96...100.
         XCTAssertEqual(s.maxNs, 100)
         XCTAssertEqual(s.meanNs, 98)
     }
@@ -88,7 +85,6 @@ final class FrameMetricsRecorderTests: XCTestCase {
         r.reset()
         XCTAssertNil(r.stats())
         XCTAssertEqual(r.sampleCount, 0)
-        // Reusable after reset, write index back at 0.
         r.record(5)
         XCTAssertEqual(r.stats()?.meanNs, 5)
     }
@@ -103,8 +99,7 @@ final class FrameMetricsRecorderTests: XCTestCase {
 
     func testNoOverflowOnLargeSamples() throws {
         var r = FrameMetricsRecorder(capacity: 4)
-        // Values near UInt64 max — sum would trap with checked `+`,
-        // `&+` must keep the path crash-free.
+// `&+` in the recorder: a checked `+` would trap on this sum.
         let big = UInt64.max - 1
         for _ in 0 ..< 4 {
             r.record(big)

@@ -1,40 +1,27 @@
 import AppKit
 import Foundation
 
-/// PR 8 — `claude.start` socket action, macOS port. 1:1 functional mirror of
-/// `copad-linux/src/socket.rs::handle_claude_start` plus its `_seeder` helper.
-/// Spawns a tab whose terminal cwd is `workspace_path` and feeds
-/// `tmux new-session -A -s <name> 'claude [--resume <id>]'` so the user
-/// lands in either a freshly-created or already-attached tmux session
-/// running claude. Optional `prompt` gets pasted into the REPL via
-/// tmux's load-buffer + paste-buffer dance once the pane crosses two
-/// readiness checks.
+/// `claude.start` socket action, mirroring `copad-linux/src/socket.rs::handle_claude_start`.
+/// Spawns a tab at `workspace_path` running `tmux new-session -A -s <name> 'claude [--resume
+/// <id>]'`. An optional `prompt` is pasted into the REPL via tmux load-buffer/paste-buffer.
+/// `prompt` and `resume_session` are mutually exclusive: seeding text on top of a resumed
+/// context would confuse claude.
 ///
-/// Why two readiness checks (matches Linux's design):
-/// `tmux new-session -A` ATTACHES if the named session already exists,
-/// ignoring our trailing `claude` command — a pre-existing shell session
-/// that happens to share the name would receive the prompt as raw shell
-/// input and execute it. Both gates below have to pass before paste:
+/// `new-session -A` attaches if the session already exists and ignores the trailing `claude`
+/// command, so a pre-existing shell session of the same name would execute the prompt as shell
+/// input. Both gates must pass before pasting:
 ///
-/// 1. `tmux capture-pane` returns text containing claude-specific markers
-///    (`Anthropic`, `Try "`, `claude --`, or "claude code"). Generic
-///    `> ` / box-drawing markers are NOT enough — shells emit those too.
-/// 2. `tmux display-message #{pane_current_command}` returns `claude` or
-///    `node` (the binary claude-code is built on). The kernel's view —
-///    survives capture-pane scrollback wraparound.
+/// 1. `tmux capture-pane` contains claude-specific markers (`Anthropic`, `Try "`, `claude --`,
+///    "claude code"). Generic `> ` or box-drawing markers are not enough; shells emit those.
+/// 2. `#{pane_current_command}` is `claude` or `node`.
 ///
-/// On either failure: stderr log, no paste. The `claude.start` reply has
-/// already returned success at this point; the prompt is post-action
-/// best-effort and any retry is the user's call.
+/// On failure it logs to stderr and does not paste; `claude.start` has already replied.
 enum ClaudeStart {
     // MARK: - Public entry — dispatched from AppDelegate.handleCommand
 
-    /// Run synchronously on the main actor. Validates params, derives
-    /// session name, builds the tmux command, asks `TabViewController`
-    /// for a new terminal tab with `cwd` + `initialInput`, then kicks
-    /// off the prompt seeder if a prompt was provided. Reply payload
-    /// matches Linux byte-for-byte: `{panel_id, tab, tmux_session,
-    /// workspace_path}`.
+    /// Validates params, builds the tmux command, opens a terminal tab with `cwd` +
+    /// `initialInput`, and starts the prompt seeder if a prompt was given. The reply matches Linux
+    /// byte-for-byte: `{panel_id, tab, tmux_session, workspace_path}`.
     @MainActor
     static func dispatch(
         params: [String: Any],
@@ -46,8 +33,6 @@ enum ClaudeStart {
             return
         }
 
-        // workspace_path: required, non-empty string, must canonicalize
-        // to an existing directory.
         guard let raw = params["workspace_path"] as? String, !raw.isEmpty else {
             if params["workspace_path"] != nil {
                 completion(RPCError(code: "invalid_params", message: "'workspace_path' must be a non-empty string"))
@@ -58,9 +43,8 @@ enum ClaudeStart {
         }
         let canonURL: URL
         do {
-            // resolvingSymlinksInPath + standardizedFileURL approximates
-            // realpath(3); we then check `.isDirectory` separately so
-            // symlinks-to-files surface as `invalid_params` like Linux.
+            // Not realpath(3): `.isDirectory` is checked separately so a symlink to a file is
+            // `invalid_params`, as on Linux.
             let resolved = URL(fileURLWithPath: raw).resolvingSymlinksInPath().standardizedFileURL
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir) else {
@@ -74,8 +58,6 @@ enum ClaudeStart {
             canonURL = resolved
         }
 
-        // session_name: explicit (validated) or derived from canonURL's
-        // last 1-2 path components.
         let sessionName: String
         switch params["session_name"] {
         case let s as String where !s.isEmpty:
@@ -94,7 +76,6 @@ enum ClaudeStart {
             return
         }
 
-        // resume_session: optional non-empty string with no control chars.
         let resumeSession: String?
         switch params["resume_session"] {
         case let s as String where !s.isEmpty:
@@ -109,7 +90,6 @@ enum ClaudeStart {
             }
             resumeSession = s
         case nil, is NSNull, is String:
-            // Empty string falls in here too — treat as absent like Linux.
             resumeSession = nil
         case let other:
             completion(RPCError(
@@ -119,9 +99,6 @@ enum ClaudeStart {
             return
         }
 
-        // prompt: optional non-empty string. Mutually exclusive with
-        // resume_session — `--resume` restores existing context, seeding
-        // new text on top would just confuse claude.
         let promptToSeed: String?
         switch params["prompt"] {
         case let s as String where !s.isEmpty:
@@ -144,7 +121,6 @@ enum ClaudeStart {
             return
         }
 
-        // Build the tmux command we feed into the new terminal.
         let claudeCmd = if let id = resumeSession {
             "claude --resume \(shellSingleQuote(id))"
         } else {
@@ -153,15 +129,11 @@ enum ClaudeStart {
         let tmuxCommand = "tmux new-session -A -s \(shellSingleQuote(sessionName)) "
             + "\(shellSingleQuote(claudeCmd))\n"
 
-        // Spawn the tab. Returns (panelID, tabIndex) atomically so we
-        // can reply with both before the seeder background work fires.
         let (panelID, tabIndex) = tabVC.newTerminalTab(
             cwd: canonURL.path,
             initialInput: tmuxCommand,
         )
 
-        // Seeder runs on a background thread so claude.start returns
-        // immediately — caller isn't blocked on capture-pane polling.
         if let prompt = promptToSeed {
             spawnPromptSeeder(sessionName: sessionName, prompt: prompt)
         }
@@ -176,9 +148,7 @@ enum ClaudeStart {
 
     // MARK: - Helpers (1:1 ports of Linux versions)
 
-    /// POSIX-safe single-quote escape: wrap in `'…'`, replace embedded
-    /// `'` with `'\''`. Result is a single shell token. Mirrors Linux's
-    /// `shell_single_quote` byte-for-byte.
+    /// POSIX-safe single-quote escape: wrap in `'...'`, replacing embedded `'` with `'\''`.
     static func shellSingleQuote(_ s: String) -> String {
         var out = "'"
         out.reserveCapacity(s.count + 2)
@@ -193,23 +163,18 @@ enum ClaudeStart {
         return out
     }
 
-    /// Last 1-2 path components, joined with `-`, lowercased + sanitized.
-    /// Two components rather than one because layouts like
-    /// `<worktree_root>/feature/foo` would otherwise collapse to `foo`,
-    /// colliding with sibling worktrees on the same leaf name.
+    /// Last 1-2 path components joined with `-`, lowercased and sanitized. Two, because
+    /// `<worktree_root>/feature/foo` would otherwise collapse to `foo` and collide with siblings.
     static func deriveSessionName(from url: URL) -> String {
-        // `pathComponents` includes "/" as the first element on absolute
-        // paths plus a trailing "/" placeholder for directories — filter
-        // both out, then take the last 2.
+        // pathComponents includes "/" first (and a trailing "/" for directories); drop both.
         let parts = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
         let tail = parts.suffix(2)
         let joined = tail.joined(separator: "-")
         return sanitizeSessionName(joined)
     }
 
-    /// ASCII alphanumeric + `-_` only, lowercased. Anything else becomes
-    /// `-`. Trim leading/trailing `-`. Empty result falls back to
-    /// `"claude"`. Same shape as Linux `sanitize_session_name`.
+    /// ASCII alphanumerics and `-_`, lowercased; anything else becomes `-`, trimmed at the ends.
+    /// An empty result falls back to `"claude"`.
     static func sanitizeSessionName(_ s: String) -> String {
         var out = ""
         out.reserveCapacity(s.count)
@@ -225,8 +190,7 @@ enum ClaudeStart {
         return trimmed.isEmpty ? "claude" : trimmed
     }
 
-    /// Returns nil on valid name, error message otherwise. Mirrors Linux's
-    /// `validate_tmux_session_name`.
+    /// Nil on a valid name, the error message otherwise.
     static func validateTmuxSessionName(_ s: String) -> String? {
         if s.isEmpty { return "cannot be empty" }
         if s.hasPrefix("-") { return "cannot start with '-' (would look like a flag)" }
@@ -241,14 +205,10 @@ enum ClaudeStart {
 
     // MARK: - Prompt seeder (background thread)
 
-    /// Two-stage readiness check + tmux load-buffer/paste-buffer/double-Enter
-    /// to deliver `prompt` to claude's REPL once the pane has crossed both
-    /// gates. Failures log to stderr but never propagate — `claude.start`
-    /// has already returned success. See file-level docs for the gate
-    /// rationale.
+    /// Waits for both readiness gates, then delivers `prompt` via tmux load-buffer/paste-buffer
+    /// and Enter. Failures log to stderr and never propagate. See the file header.
     static func spawnPromptSeeder(sessionName: String, prompt: String) {
         DispatchQueue.global(qos: .userInitiated).async {
-            // Initial settle so capture-pane has SOMETHING to inspect.
             Thread.sleep(forTimeInterval: 0.4)
 
             let deadline = Date().addingTimeInterval(8.0)
@@ -268,8 +228,7 @@ enum ClaudeStart {
                 Thread.sleep(forTimeInterval: 0.2)
             }
 
-            // Cross-check: kernel-side foreground command in the pane.
-            // Survives even if claude's banner has scrolled off.
+            // Kernel-side foreground command; survives claude's banner scrolling off.
             let rawCmd = runTmux([
                 "display-message", "-p", "-t", sessionName, "#{pane_current_command}",
             ]) ?? ""
@@ -288,10 +247,7 @@ enum ClaudeStart {
                 return
             }
 
-            // Write prompt to a temp file → load-buffer → paste-buffer.
-            // Going through a buffer is what makes multi-line + special-char
-            // payloads safe; send-keys -l would also work but each special
-            // character needs care.
+            // Going through a buffer keeps multi-line and special-character prompts safe.
             let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent(
                 "copad-claude-\(UUID().uuidString).txt",
             )
@@ -312,20 +268,8 @@ enum ClaudeStart {
                 ))
                 return
             }
-            // `-p` activates bracketed-paste mode — wraps the paste in
-            // ESC [ 200 ~ … ESC [ 201 ~ so claude's terminal sees the
-            // entire buffer as one paste rather than treating each
-            // embedded `\n` as a separate Enter. Without `-p`, a
-            // multi-line prompt arrives at claude as N separate user
-            // turns (each Line gets its own ⏺ echo). Linux's path
-            // works either because of differing tmux defaults or
-            // because the Linux desktop terminal happens to forward
-            // bracketed-paste through VTE+claude — adding `-p`
-            // explicitly here matches the documented intent without
-            // depending on environment quirks.
-            //
-            // `-d` drops the buffer after pasting (cleanup, not
-            // semantically required).
+            // `-p` pastes as bracketed paste, so a multi-line prompt arrives as one paste instead
+            // of one user turn per `\n`. `-d` drops the buffer afterwards.
             guard runTmuxStatus(["paste-buffer", "-t", sessionName, "-b", bufName, "-p", "-d"]) else {
                 FileHandle.standardError.write(Data(
                     "[claude.start] tmux paste-buffer failed\n".utf8,
@@ -333,25 +277,17 @@ enum ClaudeStart {
                 return
             }
 
-            // Submit. claude's REPL needs TWO Enters for long pastes:
-            // bracketed-paste-collapse mode renders the input as
-            // `[Pasted text #1 +N lines]` once a paste exceeds claude's
-            // inline threshold, so the first Enter commits/expands the
-            // paste placeholder and the second sends it to the model.
-            // Short pastes that don't collapse get submitted by the
-            // first Enter; the second hits an already-empty input and
-            // claude no-ops on it. Two-Enter covers both cases without
-            // inspecting claude's UI state.
+            // Long pastes collapse to `[Pasted text #1 +N lines]`: the first Enter expands the
+            // placeholder and the second submits. A short paste is submitted by the first, and the
+            // second is a no-op on an empty input.
             _ = runTmuxStatus(["send-keys", "-t", sessionName, "Enter"])
             Thread.sleep(forTimeInterval: 0.2)
             _ = runTmuxStatus(["send-keys", "-t", sessionName, "Enter"])
         }
     }
 
-    /// Run `tmux <args>`, return stdout as String. nil on launch error or
-    /// non-zero exit. PATH lookup goes through `/usr/bin/env` so a
-    /// homebrew-installed tmux at `/opt/homebrew/bin/tmux` works without
-    /// hard-coding the path.
+    /// Run `tmux <args>` and return stdout; nil on launch error or non-zero exit. Resolved via
+    /// `/usr/bin/env` so a Homebrew tmux works without a hard-coded path.
     private static func runTmux(_ args: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -370,8 +306,7 @@ enum ClaudeStart {
         return String(data: data, encoding: .utf8)
     }
 
-    /// Same as `runTmux` but only reports success/failure — used for
-    /// fire-and-forget commands like load-buffer / paste-buffer / send-keys.
+    /// Like `runTmux` but reports only success; for load-buffer / paste-buffer / send-keys.
     private static func runTmuxStatus(_ args: [String]) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")

@@ -3,20 +3,10 @@ import Foundation
 
 /// Mirrors `copad-core::plugin::PluginManifest` for macOS.
 ///
-/// Discovery walks the single macOS plugin root that `copadd` also reads
-/// (`dirs::config_dir()/copad/plugins` = `~/Library/Application Support/
-/// copad/plugins` on macOS). Same root on both sides means daemon
-/// `_module.run` and macOS-side panel/statusbar lookups agree on which
-/// plugin wins.
-///
-/// Winner rule on duplicate plugin names: sort by `(name, dir.path)` then
-/// take the sorted-last entry. Mirrors `copad-core::plugin::
-/// discover_sorted_plugins` + `resolve_by_name`. With a single root the
-/// tie-break is trivial; the rule still must match for futureproofing.
+/// Discovery reads the same root as `copadd` (`~/Library/Application Support/copad/plugins`) so
+/// the daemon and GUI agree on which plugin wins a duplicate name: sort by `(name, dir.path)`
+/// and take the last, as `copad-core::plugin::discover_sorted_plugins` + `resolve_by_name` do.
 enum PluginManifestStore {
-    /// Top-level macOS plugin directory. Created lazily by the installer.
-    /// Same path as `dirs::config_dir()/copad/plugins` on macOS — keeps
-    /// daemon and GUI on the same plugin universe.
     static var macOSRoot: URL {
         FileManager.default
             .homeDirectoryForCurrentUser
@@ -26,10 +16,8 @@ enum PluginManifestStore {
             .appendingPathComponent("plugins")
     }
 
-    /// Walk the plugin root, parse every `plugin.toml`, dedupe by plugin
-    /// name using the sort-by-(name, dir-path) + sorted-last rule. Returns
-    /// winners in their sorted order so panel/statusbar traversal stays
-    /// stable across runs. Parse errors are logged to stderr and skipped.
+    /// Parses every `plugin.toml` under the root and dedupes by plugin name, returning winners in
+    /// sorted order. Parse errors are logged to stderr and skipped.
     static func discover() -> [LoadedPluginManifest] {
         var entries: [(LoadedPluginManifest, URL)] = []
         for entry in directories(in: macOSRoot) {
@@ -42,8 +30,7 @@ enum PluginManifestStore {
             if lname != rname { return lname < rname }
             return lhs.1.path < rhs.1.path
         }
-        // Build winners from the sorted array so traversal order is
-        // deterministic + stable. `byName` overwrite gives sorted-last.
+        // Iterate the sorted array; the `byName` overwrite leaves the sorted-last winner.
         var byName: [String: LoadedPluginManifest] = [:]
         var order: [String] = []
         for (loaded, _) in entries {
@@ -65,17 +52,10 @@ enum PluginManifestStore {
         }
     }
 
-    /// TOML parse + validation runs in `copad-core::plugin` via FFI;
-    /// Swift only decodes the returned JSON into the local model. Keeps
-    /// the manifest schema, default values, and enum-string syntax
-    /// (`onAction:kb.*` / `on-crash`) as the single source of truth on
-    /// the Rust side.
+    /// TOML parse and validation run in `copad-core::plugin` via FFI, so the manifest schema and
+    /// defaults have a single source of truth in Rust; Swift only decodes the returned JSON.
     private static func parse(at dir: URL) -> LoadedPluginManifest? {
         let manifestURL = dir.appendingPathComponent("plugin.toml")
-        // Skip subdirectories that aren't plugins — same pre-check Linux
-        // `discover_plugins` uses (`manifest_path.exists()`). Without
-        // this, every non-plugin dir under the plugin root would trigger
-        // a `failed to read … No such file` log line from `validate_toml`.
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
             return nil
         }
@@ -92,9 +72,8 @@ enum PluginManifestStore {
             let manifest = try JSONDecoder().decode(PluginManifest.self, from: data)
             return LoadedPluginManifest(manifest: manifest, dir: dir)
         } catch {
-            // Should not happen — core just emitted this JSON. If it
-            // does, Swift's Codable and serde's `PluginManifest`
-            // diverged.
+            // Core just emitted this JSON, so Swift's Codable and serde's `PluginManifest`
+            // have diverged.
             let msg = "[copad] plugin manifest decode (from core JSON) failed for \(manifestURL.path): \(error)\n"
             FileHandle.standardError.write(Data(msg.utf8))
             return nil
@@ -102,9 +81,8 @@ enum PluginManifestStore {
     }
 }
 
-/// Discovered manifest + the directory it lives in. `dir` is needed to
-/// resolve relative `services.exec` paths against the plugin folder
-/// (the install layout symlinks the binary into `<dir>/<exec>`).
+/// Discovered manifest plus its directory, which resolves relative `services.exec` paths (the
+/// install layout symlinks the binary into `<dir>/<exec>`).
 struct LoadedPluginManifest {
     let manifest: PluginManifest
     let dir: URL
@@ -112,25 +90,16 @@ struct LoadedPluginManifest {
 
 // MARK: - TOML decode types
 
-// IMPORTANT: TOMLKit's Decoder (like Swift's JSONDecoder) does NOT honor
-// `var foo: T = default` syntax — that's a Swift-init feature, not a
-// Decodable feature. A missing key throws keyNotFound regardless of the
-// default. We mirror serde's `#[serde(default)]` behavior with explicit
-// `decodeIfPresent ?? <default>` in the inits below.
+// TOMLKit's Decoder ignores `var foo: T = default`, so a missing key throws keyNotFound. The
+// inits below use explicit `decodeIfPresent ?? <default>` to mirror serde's `#[serde(default)]`.
 
 struct PluginManifest: Decodable {
     let plugin: PluginMeta
     let services: [PluginServiceDef]
-    /// PR Tier 4.1 — `[[panels]]` declarations. Each panel maps a `name`
-    /// (used by `plugin.open`) to a relative HTML `file` plus a display
-    /// `title`. Empty when the plugin doesn't ship any panels (echo, git).
+    /// `[[panels]]` declarations: `name` (used by `plugin.open`), relative HTML `file`, `title`.
     let panels: [PluginPanelDef]
-    /// PR Tier 4.2 — `[[modules]]` declarations. Each module is a status-bar
-    /// widget that runs a shell command on a timer and renders the stdout
-    /// (plain text or JSON `{text, tooltip}`). Empty when the plugin
-    /// doesn't ship a status bar widget.
+    /// `[[modules]]` declarations: status-bar widgets that run a shell command on a timer.
     let modules: [PluginModuleDef]
-    // commands deferred (no current macOS user).
 
     enum CodingKeys: String, CodingKey {
         case plugin, services, panels, modules
@@ -172,8 +141,6 @@ struct PluginModuleDef: Decodable {
 struct PluginPanelDef: Decodable {
     let name: String
     let title: String
-    /// Relative path under the plugin directory, e.g. `panel.html`. Resolved
-    /// to an absolute file URL by `PluginPanelController` at load time.
     let file: String
     let icon: String?
 
@@ -201,9 +168,7 @@ struct PluginServiceDef: Decodable {
     let name: String
     let exec: String
     let args: [String]
-    /// Raw activation string from the manifest. Parsed lazily because
-    /// PR 3 only handles `onStartup` — the `onAction:<glob>` and
-    /// `onEvent:<glob>` variants land in PR 5 with the trigger engine.
+    /// Raw activation string; only `onStartup` is handled here.
     let activation: String
     let restart: String
     let provides: [String]

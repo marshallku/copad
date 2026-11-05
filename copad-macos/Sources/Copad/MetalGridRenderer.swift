@@ -5,22 +5,14 @@ import CoreText
 import Metal
 import QuartzCore
 
-/// Metal painter for `AlacrittyRenderView`'s GPU mode
-/// (docs/macos-gpu-renderer-plan.md slice 1, `[renderer] gpu = true`).
+/// Metal painter for `AlacrittyRenderView`'s GPU mode (docs/macos-gpu-renderer-plan.md,
+/// `[renderer] gpu = true`).
 ///
-/// Division of labor: the render view keeps ALL input / IME / damage /
-/// snapshot logic and decides *when* to render; this class owns *how*
-/// — CoreText shapes text, glyphs land in a texture atlas, and every
-/// visual element (cell bg, glyph, decoration, cursor, selection,
-/// search highlight) becomes an instanced quad in a single ordered
-/// draw call. Instance order in the buffer IS the z-order: Metal
-/// rasterizes instances in order, so the buffer is laid out exactly
-/// like the CPU painter's paint sequence.
-///
-/// Coordinates: quads are computed in device pixels with origin
-/// top-left / y-down (the flipped convention the view already uses);
-/// the vertex shader maps pixels → NDC, so none of the grid math
-/// changes between the two painters.
+/// The render view keeps ALL input / IME / damage / snapshot logic and decides when to render;
+/// this class owns how: every visual element becomes an instanced quad in a single ordered draw
+/// call, and instance order in the buffer IS the z-order, laid out like the CPU painter's paint
+/// sequence. Quads are in device pixels, origin top-left / y-down, mapped to NDC by the vertex
+/// shader, so grid math is shared with the CPU painter.
 @MainActor
 final class MetalGridRenderer {
     // MARK: - Shaders
@@ -170,7 +162,6 @@ final class MetalGridRenderer {
         case underline = 4
     }
 
-    /// Instances drawn with one texture, in order.
     private struct Segment {
         let range: Range<Int>
         let texture: MTLTexture
@@ -210,7 +201,6 @@ final class MetalGridRenderer {
         let smoothFonts: Bool
     }
 
-    /// Theme-derived colors packed RGBA32 (the CopadCore convention).
     struct ThemeColors {
         let defaultFg: UInt32
         let defaultBg: UInt32
@@ -219,7 +209,6 @@ final class MetalGridRenderer {
         let palette: [UInt32]
     }
 
-    /// Everything about *this* frame that isn't grid content.
     struct FrameState {
         let viewSizePoints: CGSize
         let transparentMode: Bool
@@ -242,22 +231,16 @@ final class MetalGridRenderer {
     private var metrics: Metrics
     private var atlas: GlyphAtlas
 
-    /// Last frame's timing breakdown (ns), populated only when
-    /// `render(measure:)` is called with `measure == true` (the perf
-    /// harness path). Split so the report can separate real render WORK
-    /// (instance assembly + command encoding) from `nextDrawable`'s
-    /// vsync back-pressure — the latter is the main thread parking until
-    /// the display can hand out a drawable, NOT cost, and conflating the
-    /// two inflates the GPU number to ~half a frame whenever the app
-    /// outruns the display. The CPU painter has no equivalent wait, so
-    /// only `lastEncodeNanos` is comparable across painters.
+    /// Last frame's timing (ns), populated only when `render(measure:)` is true (perf harness).
+    /// Split so the report separates real render WORK (instance assembly + encoding) from
+    /// `nextDrawable`'s vsync back-pressure, which is the main thread parked, not cost, and
+    /// would inflate the GPU number to ~half a frame. The CPU painter has no such wait, so only
+    /// `lastEncodeNanos` is comparable across painters.
     private(set) var lastEncodeNanos: UInt64 = 0
     private(set) var lastDrawableWaitNanos: UInt64 = 0
 
-    /// (text, base font) → shaped glyph list. Tint lives per-instance,
-    /// so unlike the CPU painter's CTLine cache this survives theme
-    /// changes untouched. Flush-all when the (rare) cap is hit —
-    /// terminal working sets stay far below it.
+    /// (text, base font) -> shaped glyph list. Tint is per-instance, so unlike the CPU painter's
+    /// CTLine cache this survives theme changes. Flushed whole when the cap is hit.
     private var shapeCache: [ShapeKey: [PositionedGlyph]] = [:]
     private static let shapeCacheMax = 2048
 
@@ -402,8 +385,7 @@ final class MetalGridRenderer {
         }
 
         // An atlas overflow mid-build invalidates every uv already emitted this frame: the atlas
-        // grows (or, at its largest, flushes) and the frame is rebuilt from the current working
-        // set (plan D4 overflow policy).
+        // grows (or, at its largest, flushes) and the frame is rebuilt.
         let buildStart = measure ? DispatchTime.now().uptimeNanoseconds : 0
         var instances: [QuadInstance] = []
         var backgroundEnd = 0
@@ -423,10 +405,8 @@ final class MetalGridRenderer {
         let (below, above) = appendImages(&instances, snap: snap)
         let buildNanos = measure ? DispatchTime.now().uptimeNanoseconds - buildStart : 0
 
-        // `nextDrawable` can park the main thread waiting for the
-        // display to free a drawable (vsync back-pressure when the app
-        // outruns the refresh). Time it separately so it doesn't masquerade
-        // as render cost.
+        // `nextDrawable` can park the main thread (vsync back-pressure); time it separately so
+        // it doesn't masquerade as render cost.
         let drawableStart = measure ? DispatchTime.now().uptimeNanoseconds : 0
         guard let drawable = layer.nextDrawable() else { return false }
         if measure { lastDrawableWaitNanos = DispatchTime.now().uptimeNanoseconds - drawableStart }
@@ -456,7 +436,6 @@ final class MetalGridRenderer {
             encoder.setFragmentBytes(&linearFlag, length: MemoryLayout<UInt32>.size, index: 0)
             encoder.setVertexBuffer(buffer, offset: 0, index: 0)
             encoder.setVertexBytes(&viewport, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
-            // Backgrounds, images under the text, text and overlays, images over the text.
             let atlasTexture = atlas.texture
             let segments = [Segment(range: 0 ..< backgroundEnd, texture: atlasTexture)] + below
                 + [Segment(range: backgroundEnd ..< textEnd, texture: atlasTexture)] + above
@@ -476,8 +455,6 @@ final class MetalGridRenderer {
         cmd.present(drawable)
         cmd.commit()
         if measure {
-            // Render WORK = instance assembly + command encoding, with
-            // the drawable wait excluded (tracked separately above).
             lastEncodeNanos = buildNanos + (DispatchTime.now().uptimeNanoseconds - encodeStart)
         }
         return true
@@ -581,8 +558,8 @@ final class MetalGridRenderer {
 
     // MARK: - Frame assembly
 
-    /// Append the full frame's instances in z-order. Returns false on
-    /// atlas overflow (caller flushes + retries the whole frame).
+    /// Append the full frame's instances in z-order. Returns false on atlas overflow (the
+    /// caller flushes and retries the whole frame).
     private func buildFrame(
         snap: CopadTermFFI.Snapshot,
         theme: ThemeColors,
@@ -625,7 +602,6 @@ final class MetalGridRenderer {
 
         backgroundEnd = instances.count
 
-        // 2. Glyphs + per-run decorations.
         for row in 0 ..< rows {
             let runs = snap.rowRuns(row)
             let utf8 = snap.rowUtf8(row)
@@ -654,7 +630,6 @@ final class MetalGridRenderer {
         // 3. Cursor (on top of glyphs, same as the CPU painter).
         guard appendCursor(&instances, snap: snap, theme: theme, state: state) else { return false }
 
-        // 4. Selection tint.
         let sel = snap.selection
         if sel.present == 1 {
             appendSpanQuads(
@@ -668,7 +643,6 @@ final class MetalGridRenderer {
             )
         }
 
-        // 5. Search-match tint.
         let match = snap.searchMatch
         if match.present == 1 {
             appendSpanQuads(
@@ -684,8 +658,6 @@ final class MetalGridRenderer {
         return true
     }
 
-    /// Glyph + underline/strike instances for one run. Returns false
-    /// on atlas overflow.
     private func appendRunGlyphs(
         _ instances: inout [QuadInstance],
         run: CopadRun,
@@ -741,9 +713,8 @@ final class MetalGridRenderer {
             ) else { return false }
         }
 
-        // Decorations: single-fold underline + strike as quads from
-        // font metrics. Spans the whole run, including spaces — same
-        // as the CPU painter's CTLine attribute rendering.
+        // Single-fold underline + strike quads from font metrics, spanning the whole run
+        // including spaces, as the CPU painter's CTLine attributes do.
         let runWidth = Double(span) * cellW
         if run.underline_style != 0 {
             let ulColor = run.underline_color_rgba == 0
@@ -793,8 +764,6 @@ final class MetalGridRenderer {
         return true
     }
 
-    /// Emit the textured quads for one shaped string at a pen
-    /// position. Returns false on atlas overflow.
     private func appendShapedGlyphs(
         _ instances: inout [QuadInstance],
         shaped: [PositionedGlyph],
@@ -803,12 +772,10 @@ final class MetalGridRenderer {
         tint: UInt32,
     ) -> Bool {
         let scale = Double(metrics.scale)
-        // One integer baseline for the whole row. The atlas quad is exactly
-        // the glyph bitmap's pixel size and the fragment sampler is
-        // nearest-neighbor, so origins MUST be whole device pixels or the
-        // bitmap resamples (blur) and shifts per glyph. Because bearingTopPx
-        // is a whole-pixel baseline→top distance, `baselinePx - bearingTopPx`
-        // keeps every cell's baseline identical instead of jittering.
+        // One integer baseline for the whole row. The atlas quad is exactly the bitmap's pixel
+        // size and the sampler is nearest-neighbor, so origins MUST be whole device pixels or the
+        // bitmap resamples (blur) and shifts per glyph; `baselinePx - bearingTopPx` keeps every
+        // cell's baseline identical.
         let baselinePx = (baselineY * scale).rounded()
         for pg in shaped {
             guard let entry = atlas.entry(glyph: pg.glyph, font: pg.font, isColor: pg.isColor) else {
@@ -831,8 +798,6 @@ final class MetalGridRenderer {
         return true
     }
 
-    /// Cursor quads + inverted cursor-cell glyph (block style).
-    /// Returns false on atlas overflow.
     private func appendCursor(
         _ instances: inout [QuadInstance],
         snap: CopadTermFFI.Snapshot,
@@ -861,9 +826,8 @@ final class MetalGridRenderer {
         return appendInvertedCursorGlyph(&instances, snap: snap, theme: theme)
     }
 
-    /// Port of the CPU painter's `redrawCursorGlyph`: re-render the
-    /// cell glyph under a filled block cursor tinted theme.background
-    /// so the character stays legible.
+    /// Port of the CPU painter's `redrawCursorGlyph`: the glyph under a filled block cursor is
+    /// re-rendered tinted theme.background.
     private func appendInvertedCursorGlyph(
         _ instances: inout [QuadInstance],
         snap: CopadTermFFI.Snapshot,
@@ -919,8 +883,6 @@ final class MetalGridRenderer {
         )
     }
 
-    /// Selection / search-match tint quads via the shared span
-    /// geometry.
     private func appendSpanQuads(
         _ instances: inout [QuadInstance],
         startRow: Int,
@@ -1079,9 +1041,8 @@ private final class GlyphAtlas {
         }
     }
 
-    /// One atlas per device, backing scale and smoothing, shared by every pane's renderer: a
-    /// pane used to own a 16 MiB atlas of its own, mostly holding the same glyphs as every other
-    /// pane (decisions #190). Held weakly — it goes with the last renderer using it.
+    /// One atlas per device, backing scale and smoothing, shared by every pane's renderer
+    /// (decisions #190). Held weakly: it goes with the last renderer using it.
     private static var registry: [RegistryKey: Weak] = [:]
 
     static func shared(device: MTLDevice, scale: CGFloat, smooth: Bool) -> GlyphAtlas? {
@@ -1096,19 +1057,13 @@ private final class GlyphAtlas {
     struct Entry {
         let uvOrigin: SIMD2<Float>
         let uvSize: SIMD2<Float>
-        /// Quad extent in device pixels (the bitmap is 1:1).
         let pixelSize: CGSize
-        /// Bitmap left edge relative to the pen, **whole device pixels**
-        /// (negative for glyphs with left overhang — italics, combining
-        /// marks). Integer-valued so the quad lands on the pixel grid.
+        /// Bitmap left edge relative to the pen, whole device pixels (negative for left overhang).
         let bearingXPx: CGFloat
-        /// Bitmap top edge above the baseline, **whole device pixels**
-        /// (y-up). The flipped-view quad top is
-        /// `round(baseline*scale) - bearingTopPx` — both integers, and
-        /// `round(baseline*scale)` is shared across the row, so every
-        /// cell's baseline aligns exactly.
+        /// Bitmap top edge above the baseline, whole device pixels (y-up). The flipped-view quad
+        /// top is `round(baseline*scale) - bearingTopPx`; both integers, and the rounded baseline
+        /// is shared across the row, so every cell's baseline aligns.
         let bearingTopPx: CGFloat
-        /// Zero-coverage glyph (space): no quad to emit.
         let isEmpty: Bool
     }
 
@@ -1182,9 +1137,6 @@ private final class GlyphAtlas {
         }
     }
 
-    /// Drop every entry and reset packing. Old texels stay in the
-    /// texture (harmless — nothing references them) and get
-    /// overwritten as new glyphs land.
     func flush(scale newScale: CGFloat, smooth newSmooth: Bool) {
         entries.removeAll(keepingCapacity: true)
         packer.reset()
@@ -1192,8 +1144,6 @@ private final class GlyphAtlas {
         smooth = newSmooth
     }
 
-    /// Look up or rasterize. Returns nil on atlas overflow — caller
-    /// flushes and rebuilds the frame.
     func entry(glyph: CGGlyph, font: CTFont, isColor: Bool) -> Entry? {
         let key = Key(font: FontKey(font: font), glyph: glyph)
         if let cached = entries[key] { return cached }
@@ -1210,13 +1160,10 @@ private final class GlyphAtlas {
             return empty
         }
 
-        // Pixel-snap the glyph to the device grid: bitmap bounds and
-        // bearings are whole device pixels, and the pen is placed so the
-        // baseline (glyph-space y=0) and ink-left land on integer pixels.
-        // This is what keeps every cell on one baseline — a fractional
-        // ink-top-to-baseline distance would round differently per glyph
-        // and jitter the baseline. 1px guard band on every side for AA
-        // bleed.
+        // Pixel-snap to the device grid: bitmap bounds and bearings are whole device pixels and
+        // the pen lands the baseline and ink-left on integers. A fractional ink-top-to-baseline
+        // distance would round differently per glyph and jitter the baseline. 1px guard band on
+        // every side for AA bleed.
         let padPx: CGFloat = 1
         let inkLeft = rect.minX * scale
         let inkRight = rect.maxX * scale
@@ -1245,11 +1192,9 @@ private final class GlyphAtlas {
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue,
             ) else { return false }
             ctx.scaleBy(x: scale, y: scale)
-            // Font smoothing per `[terminal] font_thicken` (see FontThicken):
-            // at 1x it keeps thin stems uniform instead of each glyph rounding
-            // to a random 1px-crisp / 2px-gray weight; on Retina it only
-            // thickens and blurs our white-on-transparent, alpha-recolored,
-            // non-gamma-blended glyphs, so `auto` turns it off there.
+            // `font_thicken` (see FontThicken): at 1x it keeps thin stems uniform instead of each
+            // rounding to a random 1px-crisp / 2px-gray weight; on Retina it only thickens and
+            // blurs our white-on-transparent, alpha-recolored glyphs, so `auto` turns it off.
             ctx.setShouldAntialias(true)
             ctx.setAllowsFontSmoothing(smooth)
             ctx.setShouldSmoothFonts(smooth)

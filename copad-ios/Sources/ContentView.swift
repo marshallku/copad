@@ -61,8 +61,6 @@ struct ContentView: View {
     }
 }
 
-/// Server URL entry + a notification-permission scaffold. No token field —
-/// the web-bridge PWA owns auth.
 struct SettingsScreen: View {
     @ObservedObject var model: AppModel
     @Binding var isPresented: Bool
@@ -93,13 +91,10 @@ struct SettingsScreen: View {
                             .font(.caption).foregroundStyle(.red)
                     }
                     Button("Connect") {
-                        // Order matters for the token-origin guarantee: (1) reject
-                        // a bad URL before touching anything; (2) persist the token
-                        // and only proceed if that SUCCEEDED — otherwise switching
-                        // origins would seed a stale token into the new one; (3)
-                        // apply the URL. Both model mutations run synchronously so
-                        // SwiftUI coalesces them into one reload carrying (new URL,
-                        // new token).
+                        // Order matters for the token-origin guarantee: reject a bad URL first;
+                        // persist the token and proceed only if that SUCCEEDED (switching origins
+                        // would seed a stale token into the new one); then apply the URL. Both
+                        // mutations run synchronously so SwiftUI coalesces them into one reload.
                         guard AppModel.validate(input) != nil else { invalid = true; return }
                         guard model.applyToken(tokenInput) else { tokenError = true; return }
                         tokenError = false

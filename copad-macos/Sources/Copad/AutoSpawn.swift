@@ -1,22 +1,12 @@
 import Darwin
 import Foundation
 
-/// Single-flight `copadd` auto-spawn helper. Copad.app-only;
-/// `coctl` does not auto-spawn (matches Linux UX).
+/// Single-flight `copadd` auto-spawn, Copad.app only (`coctl` does not auto-spawn).
 ///
-/// Flow:
-///   1. `lockf(F_TLOCK)` `~/Library/Caches/copad/.spawn.lock` — held → bail.
-///   2. Live socket probe — another process may have won the race between
-///      our failed connect and lock acquisition.
-///   3. Locate `copadd` binary (PATH, then `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`).
-///   4. Detached spawn via `nohup copadd … &`.
-///   5. `system.ping` probe with 3s budget — bind happens before plugin
-///      activation but manifest discovery + command registration happen
-///      before bind, so the daemon may need a moment to listen.
-///
-/// Returns true only when the daemon answers `system.ping` ok. False keeps
-/// `DaemonClient` in disconnected state; `ActionRegistry` fallback then
-/// surfaces `daemon_unavailable`.
+/// Takes `lockf` on `~/Library/Caches/copad/.spawn.lock`, re-probes the socket (another process
+/// may have won the race), locates `copadd` (PATH, `~/.local/bin`, `~/.cargo/bin`,
+/// `/opt/homebrew/bin`), spawns it detached, then probes `system.ping` for 3s since the daemon
+/// may need a moment to listen. Returns true only when the daemon answers ok.
 enum AutoSpawn {
     static func ensureRunning() -> Bool {
         do {
@@ -35,8 +25,6 @@ enum AutoSpawn {
         }
 
         do {
-            // Don't wait under the lock — caller's reconnect loop polls;
-            // the other spawner will either succeed or release.
             if try !lock.tryAcquire() {
                 log("spawn lock held by another process — caller should retry connect")
                 return false
@@ -52,14 +40,10 @@ enum AutoSpawn {
             return true
         }
 
-        // If a copadd LaunchAgent is loaded, launchd owns the daemon lifecycle
-        // (RunAtLoad + KeepAlive). Spawning our own copadd here would race the
-        // socket bind and send the launchd-managed one into a crash loop
-        // ("socket … already bound by another copadd; refusing to start"). So
-        // when launchd is in charge, DEFER: wait for it to (re)start copadd
-        // instead of creating a competitor. Only fall through to a self-spawn
-        // when no LaunchAgent manages copadd (Homebrew cask / manual run, or a
-        // failed bootstrap) — there, the GUI is the only thing that will.
+        // If a copadd LaunchAgent is loaded, launchd owns the daemon (RunAtLoad + KeepAlive).
+        // Self-spawning would race the socket bind and crash-loop the launchd one ("socket
+        // already bound by another copadd"), so defer to it. Self-spawn only when no LaunchAgent
+        // manages copadd (Homebrew cask, manual run, failed bootstrap).
         if launchAgentLoaded() {
             log("copadd LaunchAgent loaded — deferring to launchd instead of self-spawning")
             return waitForPing(budget: 5.0, perAttempt: 0.3)
@@ -77,12 +61,8 @@ enum AutoSpawn {
 
     // MARK: - Helpers
 
-    /// True when the copadd LaunchAgent is loaded in this GUI login session, so
-    /// launchd — not us — is responsible for keeping copadd running. Uses
-    /// `launchctl print` (exit 0 iff the service is registered in the domain);
-    /// output is discarded. A missing/never-bootstrapped agent (e.g. a failed
-    /// `launchctl bootstrap`, or a cask install without the plist) returns
-    /// false, so the caller self-spawns as before.
+    /// True when the copadd LaunchAgent is loaded (`launchctl print` exits 0), so launchd owns
+    /// the daemon lifecycle.
     private static func launchAgentLoaded() -> Bool {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
@@ -103,15 +83,9 @@ enum AutoSpawn {
         let env = ProcessInfo.processInfo.environment
         let pathString = env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin"
         var dirs = pathString.split(separator: ":").map { String($0) }
-        // Augment with the install dirs that a Finder-launched .app does
-        // NOT inherit from the user's shell env:
-        // - `~/.local/bin` for the prebuilt-release `install.sh` path (the
-        //   default download-and-run install location).
-        // - `~/.cargo/bin` for the `scripts/install-macos.sh` path
-        //   (cargo install --path copad-daemon).
-        // - `/opt/homebrew/bin` for the Homebrew cask path. Intel Macs use
-        //   `/usr/local/bin`, which is already in the `pathString` fallback
-        //   above, so this only needs to add the arm64 prefix.
+        // A Finder-launched .app does not inherit the shell PATH: add `~/.local/bin` (install.sh),
+        // `~/.cargo/bin` (scripts/install-macos.sh) and `/opt/homebrew/bin` (Homebrew cask;
+        // `/usr/local/bin` is already in the fallback).
         for extra in ["\(NSHomeDirectory())/.local/bin", "\(NSHomeDirectory())/.cargo/bin", "/opt/homebrew/bin"] {
             if !dirs.contains(extra) { dirs.append(extra) }
         }
@@ -123,13 +97,9 @@ enum AutoSpawn {
         return nil
     }
 
-    /// Detached spawn so the child outlives Copad.app.
-    ///
-    /// `copadd` honors inherited `COPAD_SOCKET` for its bind path, but
-    /// `CopadPaths.daemonSocket()` ignores legacy per-GUI overrides — so
-    /// the env we inherit could send the daemon to a different path than
-    /// the client probes. Explicitly set the child's env to our resolved
-    /// daemon socket to keep the two in sync.
+    /// Detached spawn so the child outlives Copad.app. The child's `COPAD_SOCKET` is set to our
+    /// resolved daemon socket, because `CopadPaths.daemonSocket()` ignores legacy per-GUI
+    /// overrides and an inherited value could bind a different path than the client probes.
     private static func spawnDetached(path: URL) -> Bool {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -148,7 +118,6 @@ enum AutoSpawn {
         return proc.terminationStatus == 0
     }
 
-    /// Connect-only probe (no protocol traffic). Closes the fd on success.
     private static func probeSocket(timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -191,8 +160,7 @@ enum AutoSpawn {
         }
         if sent <= 0 { return false }
 
-        // SO_RCVTIMEO so a wedged daemon doesn't block — caller's loop
-        // owns the per-attempt budget.
+        // SO_RCVTIMEO so a wedged daemon cannot block; the caller's loop owns the attempt budget.
         var tv = timeval(tv_sec: 0, tv_usec: 500_000)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 

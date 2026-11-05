@@ -19,7 +19,6 @@ final class PomodoroProgressTests: XCTestCase {
     }
 
     func testFractionClampsAboveOne() {
-        // Clock jump: remaining > total must not overdraw the ring.
         XCTAssertEqual(PomodoroProgress.fraction(remainingMs: 2000, totalMs: 1000), 1.0)
     }
 
@@ -35,8 +34,7 @@ final class PomodoroProgressTests: XCTestCase {
     }
 
     func testMmssHugeValueDoesNotOverflow() {
-        // A malformed payload could yield a near-max value; must not trap on
-        // `ms + 999`. Just assert it returns without crashing.
+        // Must not trap on `ms + 999`.
         _ = PomodoroProgress.mmss(UInt64.max)
         _ = PomodoroProgress.mmss(UInt64.max - 500)
     }

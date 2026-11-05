@@ -158,8 +158,8 @@ final class TransportTests: XCTestCase {
     }
 }
 
-/// The keyboard contract (#122, codex C2): marked text is never sent; a commit sends it once;
-/// settling before navigation commits it FIRST.
+/// The keyboard contract (#122): marked text is never sent; a commit sends it once; settling
+/// before navigation commits it FIRST.
 @MainActor
 final class InputProxyTests: XCTestCase {
     final class Recorder: KeySink {
@@ -315,7 +315,6 @@ final class DeviceKeyTests: XCTestCase {
         XCTAssertTrue(try DeviceKey.publicLine().hasPrefix("ssh-ed25519 "))
     }
 
-    /// The Simulator on Apple silicon has an enclave, so the real path runs here too.
     func testANewEnclaveKeyIsOfferedAsECDSA() throws {
         try XCTSkipUnless(DeviceKey.secureEnclaveAvailable, "no Secure Enclave")
         try DeviceKey.useNewSecureEnclaveKey()

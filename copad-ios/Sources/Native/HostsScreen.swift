@@ -1,6 +1,5 @@
 import SwiftUI
 
-/// Saved comux hosts, this device's public key, and the way into a session.
 struct HostsScreen: View {
     @State private var hosts = HostStore.load()
     @State private var editing: MuxHost?
@@ -11,7 +10,6 @@ struct HostsScreen: View {
     @State private var confirmNewKey = false
     @State private var copied = false
     @ObservedObject private var push = PushRegistry.shared
-    /// The web-bridge shell; nil in store builds.
     var openWeb: (() -> Void)?
 
     var body: some View {
@@ -127,7 +125,6 @@ struct HostsScreen: View {
 
     private func open(_ h: MuxHost) { session = MuxSession(host: h) }
 
-    /// The pasteboard gives no sign of its own, so the button says it worked for a moment.
     private func copyKey() {
         UIPasteboard.general.string = publicKey
         UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -195,7 +192,6 @@ struct HostEditor: View {
     /// Typed as text: a number-bound field keeps the last valid value when cleared, so an empty
     /// field would save the old port.
     @State private var portText: String
-    /// A new password; empty keeps the saved one.
     @State private var password = ""
     @State private var passwordError = ""
     private let hasPassword: Bool
@@ -211,7 +207,6 @@ struct HostEditor: View {
     private var usesPassword: Binding<Bool> {
         Binding(get: { host.usesPassword }, set: { host.auth = $0 ? .password : nil })
     }
-    /// A password host needs one saved or typed.
     private var passwordReady: Bool { !host.usesPassword || hasPassword || !password.isEmpty }
 
     var body: some View {

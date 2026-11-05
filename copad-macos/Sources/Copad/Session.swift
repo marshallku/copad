@@ -2,19 +2,12 @@ import CCopadFFI
 import CopadCore
 import Foundation
 
-/// Persisted tab/split layout (v3 — decision #64). Wire shape mirrors
-/// `copad_core::session::Session` exactly: a flat tab list, each tab a split
-/// tree of TYPED panes (`type`-tagged `SplitSnap`, `kind`-tagged `PaneContent`,
-/// lowercase orientation, normalized `ratio`). Persistence is LAYOUT-ONLY:
-/// terminals persist only their cwd and restore as fresh shells — process
-/// persistence is the user's own tmux. Load / save / clear are owned by core and
-/// reached through `copad-ffi`; this file only encodes / decodes JSON and walks
-/// the in-memory tree (`leftmostCwd`).
+/// Persisted tab/split layout (v3, decision #64). Wire shape mirrors
+/// `copad_core::session::Session` exactly. Layout-only: terminals persist their cwd and restore
+/// as fresh shells. Load/save/clear live in core, reached through `copad-ffi`.
 enum Session {
     static let version: Int = 3
 
-    /// Returns nil on absence, parse failure, version mismatch, or
-    /// empty-tabs payload — core decides and logs the reason to stderr.
     static func load() -> Snapshot? {
         guard let cstr = copad_ffi_session_load() else { return nil }
         defer { copad_ffi_free_string(cstr) }
@@ -23,8 +16,7 @@ enum Session {
         do {
             return try JSONDecoder().decode(Snapshot.self, from: data)
         } catch {
-            // Should not happen — core just produced this JSON. Surfacing
-            // here means Swift's Codable and serde's `Session` drifted.
+            // Core just produced this JSON, so a failure means Codable and serde's `Session` drifted.
             FileHandle.standardError.write(
                 Data("[copad] session decode (from core JSON) failed: \(error)\n".utf8),
             )
@@ -32,12 +24,9 @@ enum Session {
         }
     }
 
-    /// Returns whether the snapshot actually reached disk.
-    ///
-    /// The caller needs to know: history-blob GC runs against the COMMITTED
-    /// session, and running it after a failed save would delete generations the
-    /// previously committed session still references — destroying recoverable
-    /// history rather than reclaiming dead files.
+    /// Returns whether the snapshot reached disk. The caller needs it: history-blob GC runs
+    /// against the COMMITTED session, so running it after a failed save would delete generations
+    /// the previous session still references.
     @discardableResult
     static func save(_ snap: Snapshot) -> Bool {
         let encoder = JSONEncoder()
@@ -69,12 +58,6 @@ enum Session {
 
 // MARK: - Wire model
 
-//
-// PaneManager / TabViewController construct + consume these types in-
-// process. The FFI surface only ever crosses serialized JSON, so the
-// Swift types stay as the canonical in-memory shape for the rest of the
-// macOS codebase.
-
 extension Session {
     struct Snapshot: Codable, Equatable {
         let version: Int
@@ -98,23 +81,17 @@ extension Session {
         }
     }
 
-    /// Wire-compatible with serde's `#[serde(tag = "type", rename_all =
-    /// "snake_case")]` SplitSnap enum. A leaf carries typed `PaneContent`; a
-    /// branch carries a normalized `ratio` (0..1). Manual Codable because
-    /// Swift's auto-derived enum Codable picks a different on-disk layout.
+    /// Wire-compatible with serde's `#[serde(tag = "type", rename_all = "snake_case")]`.
+    /// Manual Codable because Swift's auto-derived enum Codable picks a different layout.
     indirect enum SplitSnap: Equatable {
         case leaf(content: PaneContent)
         case branch(orientation: SplitOrientation, ratio: Float, first: SplitSnap, second: SplitSnap)
     }
 
-    /// Wire-compatible with serde's `#[serde(tag = "kind", rename_all =
-    /// "snake_case")]` PaneContent enum. Terminals persist only their cwd.
     enum PaneContent: Equatable {
         case terminal(cwd: String?)
-        /// `pane` is the full browser state (tab list, active index, profile).
-        /// Additive and omitted when nil, so a file this binary writes stays
-        /// readable by an older one — which degrades to the single URL rather
-        /// than failing (decision #100 / plan r2-I4).
+        /// `pane` is omitted when nil, so a file this binary writes stays readable by an older
+        /// one, which degrades to the single URL (decision #100).
         case webview(url: String, pane: BrowserPaneSnap?)
         case plugin(name: String, panelName: String?, version: String?)
         case cockpit
@@ -176,8 +153,7 @@ extension Session.PaneContent: Codable {
         case "webview":
             self = .webview(
                 url: try c.decode(String.self, forKey: .url),
-                // A malformed `pane` must not fail the whole session load — the
-                // rest of the layout is still good, and losing one pane's tab
+                // A malformed `pane` must not fail the whole session load: losing one pane's tab
                 // list beats starting from an empty window.
                 pane: try? c.decodeIfPresent(BrowserPaneSnap.self, forKey: .pane),
             )
@@ -201,7 +177,6 @@ extension Session.PaneContent: Codable {
         switch self {
         case let .terminal(cwd):
             try c.encode("terminal", forKey: .kind)
-            // Omit when nil to match serde's `skip_serializing_if = "Option::is_none"`.
             try c.encodeIfPresent(cwd, forKey: .cwd)
         case let .webview(url, pane):
             try c.encode("webview", forKey: .kind)
@@ -219,9 +194,8 @@ extension Session.PaneContent: Codable {
 }
 
 extension Session {
-    /// Wire-facing orientation (the one in `SplitNode.swift` is
-    /// renderer-facing). Both share the `"horizontal"`/`"vertical"`
-    /// strings serde's `rename_all="lowercase"` produces.
+    /// Wire-facing; the one in `SplitNode.swift` is renderer-facing. Both use serde's lowercase
+    /// strings.
     enum SplitOrientation: String, Codable, Equatable {
         case horizontal
         case vertical

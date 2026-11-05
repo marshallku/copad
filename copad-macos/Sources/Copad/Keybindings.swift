@@ -1,68 +1,36 @@
 import AppKit
 import Foundation
 
-/// Tier 1.2 — custom keybindings parsed from `[keybindings]` in `config.toml`.
-///
-/// TOML shape (matches Linux verbatim):
+/// Custom keybindings parsed from `[keybindings]` in `config.toml`, same shape as Linux:
 ///
 /// ```toml
 /// [keybindings]
 /// "cmd+shift+g" = "spawn:~/scripts/grep-something.sh"
-/// "ctrl+shift+m" = "spawn:~/scripts/toggle-mute.sh"
 /// "cmd+e" = "action:webview.open url=https://example.com"
 /// ```
 ///
-/// Two value syntaxes:
+/// - `spawn:<cmd>` runs `<cmd>` via `sh -c` in a detached `Process` with `COPAD_SOCKET` injected.
+/// - `action:<method> [k=v ...]` dispatches through `ActionRegistry` with string params.
 ///
-/// - **`spawn:<cmd>`** — runs `<cmd>` via `sh -c` in a detached background
-///   `Process` with `COPAD_SOCKET` injected so the script can call back via
-///   `coctl`. Mirrors Linux's `spawn_command`.
-/// - **`action:<method> [k=v ...]`** — dispatches `<method>` through the
-///   `ActionRegistry` with `params` parsed from the `k=v` tail. Lets the
-///   user wire keybindings into the same surface plugins + triggers
-///   already use (`webview.open`, `git.list_workspaces`, etc.). Plain
-///   strings only — no nested params; serializes to JSON via `[String: Any]`.
-///
-/// Modifier syntax supports both Linux convention (`ctrl`) and macOS-native
-/// (`cmd`), plus `shift`/`alt`/`option`. Order doesn't matter (`cmd+shift+g`
-/// == `shift+cmd+g`). Key is the unshifted character (e.g. `g`, not `G`).
-///
-/// Resolution order at keyDown time: built-in shortcuts (Cmd+T, Cmd+W, etc.)
-/// fire FIRST via the menu bar, then this monitor sees the key event. So a
-/// user binding `cmd+t` to a custom action gets shadowed by the built-in
-/// "New Tab" — that's intentional (don't let users break the standard menu).
-/// To override, change the menu's keyEquivalent or use a different combo.
+/// Modifiers are `ctrl`/`cmd`/`shift`/`alt`/`option` in any order; the key is the unshifted
+/// character. Built-in menu shortcuts (Cmd+T, Cmd+W) fire first, so a binding on one of them is
+/// shadowed on purpose.
 enum Keybindings {
-    /// Compiled binding ready to match against `NSEvent`.
     struct Binding {
         let modifiers: NSEvent.ModifierFlags
         let key: String // lowercased character, e.g. "g"
-        /// Layout-position keyCode resolved from `key` at parse time when
-        /// the name is in `nameToKeyCode`. `matches` prefers this so
-        /// non-Latin IMEs (Korean, JP, …) — which translate `p` to `ㅖ`
-        /// before the event reaches us — don't shadow the binding. nil
-        /// for keys not in the table; falls back to char comparison.
+        /// Layout-position keyCode resolved from `key` at parse time. `matches` prefers it so
+        /// non-Latin IMEs (which turn `p` into `ㅖ`) cannot shadow the binding; nil falls back to
+        /// character comparison.
         let keyCode: UInt16?
         let command: String // raw value from config: "spawn:..." or "action:..."
     }
 
-    /// gdk-style key name → macOS `kVK_*` constant. Covers letters,
-    /// digits, common punctuation, brackets, function keys, and the
-    /// keys copad itself binds (Cmd+Shift+P palette, Cmd+T tab, …).
-    /// Names are kept consistent with the Linux config schema so a
-    /// shared `[keybindings]` block parses identically on both.
+    /// gdk-style key name to macOS `kVK_*` constant, with names consistent with the Linux config
+    /// schema. Hardcoded rather than importing `Carbon` for the enum (`<HIToolbox/Events.h>`).
     ///
-    /// Constants come from `<HIToolbox/Events.h>`; hardcoding them is
-    /// stable across macOS versions (Apple's commit to ANSI keycode
-    /// values predates OS X) and avoids pulling in `Carbon` solely for
-    /// the kVK_* enum.
-    ///
-    /// **Naming nuances vs Linux**:
-    /// - `backspace` → `kVK_Delete` (0x33) — the key labeled Delete on
-    ///   mac keyboards. Mirrors gdk `BackSpace`.
-    /// - `delete` → `kVK_ForwardDelete` (0x75) — the standalone Forward
-    ///   Delete key. Mirrors gdk `Delete`.
-    /// - `return` / `enter` both alias 0x24 (gdk uses `Return`).
+    /// `backspace` is `kVK_Delete` (0x33, gdk `BackSpace`); `delete` is `kVK_ForwardDelete`
+    /// (0x75, gdk `Delete`); `return` and `enter` both alias 0x24.
     static let nameToKeyCode: [String: UInt16] = [
         "a": 0x00, "s": 0x01, "d": 0x02, "f": 0x03, "h": 0x04, "g": 0x05,
         "z": 0x06, "x": 0x07, "c": 0x08, "v": 0x09, "b": 0x0B, "q": 0x0C,
@@ -86,9 +54,8 @@ enum Keybindings {
         "f11": 0x67, "f12": 0x6F,
     ]
 
-    /// Parse the raw TOML dict into compiled bindings. Invalid combos
-    /// (unknown modifier, empty key) are dropped with a stderr warning so
-    /// one typo doesn't disable the whole map.
+    /// Parse the raw TOML dict into bindings. An invalid combo is dropped with a stderr warning
+    /// so one typo does not disable the map.
     static func compile(_ raw: [String: String]) -> [Binding] {
         var out: [Binding] = []
         for (combo, command) in raw {
@@ -133,16 +100,11 @@ enum Keybindings {
         return Binding(modifiers: mods, key: key, keyCode: nameToKeyCode[key], command: command)
     }
 
-    /// Compare an NSEvent against a binding. Modifiers must match exactly
-    /// (so `cmd+g` doesn't fire on `cmd+shift+g` — that'd be surprising).
-    /// When `binding.keyCode` is set (parsed key name was in
-    /// `nameToKeyCode`), match on layout-position keyCode — this is
-    /// IME-immune. For names outside the table, fall back to the
-    /// historical `charactersIgnoringModifiers` comparison so unusual
-    /// key names still work (with the IME caveat).
+    /// Modifiers must match exactly (`cmd+g` must not fire on `cmd+shift+g`). Uses the
+    /// layout-position keyCode when set (immune to IMEs); otherwise falls back to
+    /// `charactersIgnoringModifiers`.
     static func matches(_ event: NSEvent, _ binding: Binding) -> Bool {
-        // Mask out caps lock / numpad noise — only the four real modifier
-        // flags are part of the binding contract.
+        // Mask out caps lock / numpad noise.
         let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
         let actualMods = event.modifierFlags.intersection(interesting)
         guard actualMods == binding.modifiers else { return false }
@@ -153,9 +115,7 @@ enum Keybindings {
         return keyChar == binding.key
     }
 
-    /// Dispatch a binding's command. Called from the NSEvent local monitor
-    /// after a match; runs on the main thread so action dispatch can hit
-    /// the @MainActor `ActionRegistry` without hopping.
+    /// Dispatch a binding's command on the main thread, where the @MainActor registry lives.
     @MainActor
     static func dispatch(_ binding: Binding, registry: ActionRegistry, socketPath: String) {
         let cmd = binding.command
@@ -169,11 +129,8 @@ enum Keybindings {
         }
     }
 
-    /// `spawn:` handler — mirrors Linux's `spawn_command`. Tilde-expand,
-    /// run through `sh -c` so users can use shell features (pipes,
-    /// redirects) without quoting headaches, detach (no stdin/out),
-    /// inject `COPAD_SOCKET` so the spawned process can call back via
-    /// `coctl --socket $COPAD_SOCKET ...`.
+    /// `spawn:` handler, mirroring Linux's `spawn_command`: tilde-expands, runs through `sh -c`,
+    /// detaches, and injects `COPAD_SOCKET` so the process can call back via `coctl`.
     private static func spawn(_ rawCmd: String, socketPath: String) {
         let cmd = rawCmd.replacingOccurrences(of: "~", with: NSHomeDirectory(), options: .anchored)
         let process = Process()
@@ -182,11 +139,8 @@ enum Keybindings {
         var env = ProcessInfo.processInfo.environment
         env["COPAD_SOCKET"] = socketPath
         process.environment = env
-        // Detach from our stdio so the child doesn't pipe to our terminal.
-        // FileHandle(forUpdatingAtPath: "/dev/null") would be the fully
-        // correct equivalent of Linux's Stdio::null, but Process accepts nil
-        // and treats it as "inherit", which means the child inherits our
-        // stderr — cheap visibility into spawn failures during dev.
+        // Process treats nil stdio as "inherit", so the child shares our stderr, which keeps spawn
+        // failures visible.
         do {
             try process.run()
         } catch {
@@ -195,11 +149,8 @@ enum Keybindings {
         }
     }
 
-    /// `action:` handler — parses `<method> [k=v ...]` and dispatches via
-    /// the registry. Plain string values only; the syntax is intentionally
-    /// minimal because keybindings are a quick-launch surface, not a
-    /// general-purpose RPC client. For complex calls users should
-    /// `spawn:coctl call <method> --params '<json>'` instead.
+    /// `action:` handler: parses `<method> [k=v ...]` with plain string values and dispatches via
+    /// the registry. Complex calls should use `spawn:coctl call <method> --params '<json>'`.
     @MainActor
     private static func invokeAction(_ tail: String, registry: ActionRegistry) {
         let trimmed = tail.trimmingCharacters(in: .whitespaces)
@@ -225,8 +176,7 @@ enum Keybindings {
 }
 
 private extension String {
-    /// Like `removingPrefix` but returns nil when the prefix doesn't match —
-    /// lets `spawn:`/`action:` dispatch use a single guard ladder.
+    /// Like `removingPrefix` but nil when the prefix does not match.
     func stripPrefixIfMatches(_ prefix: String) -> String? {
         guard hasPrefix(prefix) else { return nil }
         return String(dropFirst(prefix.count))

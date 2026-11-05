@@ -200,7 +200,7 @@ struct SessionScreen: View {
         }
     }
 
-    /// Every navigation settles input first (codex C2), then goes over the render channel.
+    /// Every navigation settles input first, then goes over the render channel.
     private func navigate(_ action: () -> Void) {
         term.settleInput()
         action()

@@ -4,11 +4,7 @@ import Foundation
 @main
 struct CopadApp {
     static func main() {
-        // CLI flag handling — must run BEFORE NSApplication.shared so
-        // `copad --config-path` (and friends) print and exit instead
-        // of accidentally launching the GUI. Mirrors copad-linux's
-        // src/main.rs surface so users get the same commands across
-        // platforms.
+// Must run before NSApplication.shared so these flags print and exit instead of launching the GUI.
         let args = CommandLine.arguments
         if handleCLIFlags(args) {
             return
@@ -20,16 +16,8 @@ struct CopadApp {
         app.run()
     }
 
-    /// Returns true when a flag was consumed and the process should
-    /// exit (caller `return`s from `main`). Returns false when no
-    /// recognized flag is present — the caller proceeds to launch
-    /// the GUI as usual.
     private static func handleCLIFlags(_ args: [String]) -> Bool {
         if args.contains("--version") || args.contains("-V") {
-            // Bundle short version matches the SwiftPM package version
-            // baked into Info.plist at build time. Fallback to a
-            // placeholder so a debug/dev launch without Info.plist
-            // still prints something useful.
             let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
             print("copad \(v)")
             return true
@@ -52,10 +40,6 @@ struct CopadApp {
         return false
     }
 
-    /// Write the default config TOML to `configPath()` if no file
-    /// exists yet. Matches `copad_core::CopadConfig::write_default`'s
-    /// contract — refuses to overwrite an existing file so a user
-    /// can't lose customizations by typing the wrong flag.
     private static func runInitConfig() -> Bool {
         let target = CopadConfig.configPath()
         let fm = FileManager.default
@@ -70,11 +54,7 @@ struct CopadApp {
                 at: target.deletingLastPathComponent(),
                 withIntermediateDirectories: true,
             )
-            // Swift `"""…"""` strips the newline before the closing
-            // delimiter; copad-core's `write_default` includes a
-            // trailing `\n`, so append one to keep the two files
-            // byte-identical (the only thing diff would otherwise
-            // complain about).
+// Swift `"""` strips the final newline; copad-core's template ends with one.
             try (defaultConfigTOML + "\n").write(to: target, atomically: true, encoding: .utf8)
             print("Config written to: \(target.path)")
         } catch {
@@ -104,10 +84,7 @@ struct CopadApp {
         print(usage)
     }
 
-    /// Verbatim copy of copad-core's `write_default` template. Kept
-    /// in sync by hand — drift means macOS init writes a different
-    /// file than Linux. If this grows past a screen, switch to an
-    /// FFI call into `CopadConfig::write_default()`.
+/// Copy of copad-core's `write_default` template, kept in sync by hand.
     private static let defaultConfigTOML = """
     [terminal]
     # shell = "/bin/zsh"

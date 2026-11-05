@@ -34,7 +34,6 @@ enum PushKeys {
         return SymmetricKey(data: data)
     }
 
-    /// This host's key (base64), made on first use.
     static func ensure(host: String) throws -> String {
         if let k = key(host: host) { return k.withUnsafeBytes { Data($0) }.base64EncodedString() }
         let data = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
@@ -53,7 +52,6 @@ enum PushKeys {
 }
 
 enum PushEnvelope {
-    /// What a push says once opened: authenticated by the host's key.
     struct Opened: Equatable {
         var host: String
         var title: String

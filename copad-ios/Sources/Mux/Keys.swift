@@ -21,7 +21,6 @@ struct KeyEvent: Equatable {
     var code: Code
     var mods: Mods = []
 
-    /// crossterm's bitflags order, joined with `" | "`; empty = `""`.
     var modsString: String {
         var parts: [String] = []
         if mods.contains(.shift) { parts.append("SHIFT") }
@@ -77,6 +76,5 @@ struct KeyEvent: Equatable {
         return out
     }
 
-    /// `Ctrl-<c>` — the prefix (`^b`) and every control chord.
     static func ctrl(_ c: Character) -> KeyEvent { KeyEvent(code: .char(c), mods: .control) }
 }

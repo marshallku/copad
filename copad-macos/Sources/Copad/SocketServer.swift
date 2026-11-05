@@ -1,40 +1,22 @@
 import Darwin
 import Foundation
 
-/// Sentinel completion value: handlers that need to surface a JSON-RPC error
-/// envelope (`{ok:false, error:{code, message}}`) instead of a success result
-/// pass an instance of this struct to their `completion` closure. SocketServer
-/// detects it in `dispatch()` and emits the proper error frame.
-///
-/// Why a sentinel rather than a typed `Result`-style completion: the existing
-/// command handler signature is `(_ value: Any?) -> Void` and is used by ~30
-/// handlers. Sending an `RPCError` through the same channel keeps the
-/// signature stable while letting webview commands report `not_found` /
-/// `wrong_panel_type` / `invalid_params` matching the Linux `socket.rs` shape.
+/// Completion value for handlers that must return a JSON-RPC error envelope. Handlers share one
+/// `(Any?) -> Void` completion, so `dispatch()` detects this type and emits the error frame.
 struct RPCError: Error {
     let code: String
     let message: String
 }
 
-/// Unix socket server that accepts coctl connections.
-/// Mirrors the role of socket.rs in copad-linux.
-///
-/// Threading model:
-///   - Accept loop runs on a dedicated Thread (POSIX blocking)
-///   - Each client gets its own Thread
-///   - Command handler is dispatched via DispatchQueue.main.async
-///   - Socket thread blocks on a DispatchSemaphore until the handler calls its completion
-///   - Async commands (e.g. webview.execute_js) call completion from within a WKWebView callback
+/// Unix socket server for coctl connections. Each client has its own thread, which blocks on a
+/// semaphore while the handler runs on the main queue and calls `completion`.
 final class SocketServer: @unchecked Sendable {
     private let socketPath: String
     private var serverFd: Int32 = -1
 
-    /// Called on the main thread to dispatch a command.
-    /// Must call `completion` with the result (or nil for unknown method) — may be called
-    /// asynchronously (e.g. after a WKWebView JS evaluation completes).
+/// Called on the main thread; `completion` may fire later (e.g. after a WKWebView callback).
     var commandHandler: ((_ method: String, _ params: [String: Any], _ completion: @escaping (Any?) -> Void) -> Void)?
 
-    /// Event bus for streaming events to subscribed clients.
     var eventBus: EventBus?
 
     init() {
@@ -102,9 +84,8 @@ final class SocketServer: @unchecked Sendable {
         }
     }
 
-    /// 1 MiB matches `copad-daemon::socket::read_line_capped` and the
-    /// `DaemonClient` cap. Single-frame ceiling guards against unbounded
-    /// growth on a buggy or malicious client that never sends a newline.
+/// 1 MiB, matching `copad-daemon::socket::read_line_capped` and the `DaemonClient` cap; bounds a
+/// client that never sends a newline.
     private static let maxFrameBytes = 1024 * 1024
 
     private func handleClient(_ fd: Int32) {
@@ -128,7 +109,6 @@ final class SocketServer: @unchecked Sendable {
                     let line = Data(buffer[..<nlIdx])
                     buffer = Data(buffer[buffer.index(after: nlIdx)...])
 
-                    // event.subscribe: stay connected and stream events
                     if let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                        let id = json["id"] as? String,
                        (json["method"] as? String) == "event.subscribe"
@@ -144,8 +124,6 @@ final class SocketServer: @unchecked Sendable {
                     response.append(UInt8(ascii: "\n"))
                     _ = response.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
                 } else {
-                    // No newline yet. Reject if accumulated buffer would
-                    // never assemble a valid frame.
                     if buffer.count > Self.maxFrameBytes {
                         FileHandle.standardError.write(Data("[copad-socket] partial frame exceeds cap (\(buffer.count) > \(Self.maxFrameBytes)) — closing client\n".utf8))
                         break outer
@@ -167,8 +145,7 @@ final class SocketServer: @unchecked Sendable {
         }
     }
 
-    /// Box for passing the handler result from main-actor context to socket thread.
-    /// @unchecked Sendable is safe here: access is serialized by the semaphore.
+/// Access is serialized by the semaphore.
     private final class ResultBox: @unchecked Sendable {
         var value: Any?
     }
@@ -184,9 +161,6 @@ final class SocketServer: @unchecked Sendable {
 
         let params = json["params"] as? [String: Any] ?? [:]
 
-        // Dispatch to main thread asynchronously; block socket thread on semaphore.
-        // Supports both sync commands (completion called immediately) and async
-        // commands like webview.execute_js (completion called from WKWebView callback).
         let sema = DispatchSemaphore(value: 0)
         let box = ResultBox()
 

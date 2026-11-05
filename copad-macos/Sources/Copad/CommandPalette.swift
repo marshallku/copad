@@ -1,29 +1,16 @@
 import AppKit
 import Foundation
 
-/// Cmd+Shift+P modal palette mirroring Linux's Ctrl+Shift+P
-/// (`copad-linux/src/command_palette.rs`, commit f8a77c8). Macro shape:
-/// `NSSearchField` over a filtered `NSTableView`, Enter dispatches the
-/// selected action through `AppDelegate.handleCommand` so registered +
-/// legacy + daemon-fallback methods all reach the same pump.
+/// Cmd+Shift+P palette mirroring Linux's (`copad-linux/src/command_palette.rs`): Enter dispatches
+/// through `AppDelegate.handleCommand`.
 ///
-/// **AppKit lifetime**: `NSTableView` data source / delegate are unowned
-/// references. The closing window cannot also own the controller — the
-/// controller must be retained externally for the entire sheet lifetime.
-/// `AppDelegate` holds `commandPaletteController` while the sheet is
-/// attached and clears it from the `endSheet` completion. Without that
-/// the table goes blank or stops responding the moment `open` returns.
+/// `NSTableView` holds its data source and delegate unowned, so `AppDelegate` retains this
+/// controller (`commandPaletteController`) until the `endSheet` completion; otherwise the table
+/// goes blank once `open` returns.
 ///
-/// **v1 limitations** (mirror of `docs/decisions.md` decision 29):
-///
-/// - **Empty params only.** Actions that need params (`terminal.exec`,
-///   `webview.navigate`, `tab.rename`, …) surface their normal
-///   `invalid_params` error to stderr. v2 can wire a second-stage form.
-/// - **Focus restore on Esc/Cancel only.** Post-dispatch leaves focus to
-///   the action — `tab.close` removes the captured pane, `tab.new` /
-///   `webview.open` / split commands intentionally change the active
-///   view, so restoring the pre-palette responder would either crash
-///   (gone view) or fight the new focus.
+/// Limits (decisions 29): actions that need params (`terminal.exec`, `tab.rename`, ...) surface
+/// `invalid_params` on stderr. Focus is restored only on Esc/Cancel: after a dispatch the action
+/// owns focus (`tab.close` removes the captured pane, `tab.new` changes the active view).
 @MainActor
 final class CommandPaletteController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private let palette: NSWindow
@@ -37,8 +24,8 @@ final class CommandPaletteController: NSObject, NSTableViewDataSource, NSTableVi
     private let dispatch: (String) -> Void
     private let onClose: () -> Void
 
-    /// Empty-param dispatch on these would silently destroy live work.
-    /// Mirrors `command_palette::DESTRUCTIVE_ACTIONS` on Linux.
+    /// Empty-param dispatch on these would destroy live work; mirrors Linux
+    /// `command_palette::DESTRUCTIVE_ACTIONS`.
     static let destructiveActions: Set<String> = ["tab.close"]
 
     init(
@@ -67,15 +54,12 @@ final class CommandPaletteController: NSObject, NSTableViewDataSource, NSTableVi
         buildContent()
     }
 
-    /// Open as window-modal sheet. Caller owns the controller's lifetime —
-    /// hold the reference until `onClose` fires.
     func open() {
         installLocalKeyMonitor()
         parentWindow.beginSheet(palette) { [weak self] _ in
             self?.onClose()
         }
-        // `beginSheet` makes `palette` key but does not focus the
-        // search field automatically.
+        // `beginSheet` makes `palette` key but does not focus the search field.
         palette.makeFirstResponder(search)
     }
 
@@ -131,10 +115,8 @@ final class CommandPaletteController: NSObject, NSTableViewDataSource, NSTableVi
         selectFirstRow()
     }
 
-    /// Up/Down + Esc handled at panel scope so NSSearchField keeps focus
-    /// while the user navigates rows. AppKit doesn't expose a closure-based
-    /// key handler on the panel itself; a local NSEvent monitor scoped to
-    /// the controller's lifetime is the cleanest path.
+    /// Up/Down/Esc are handled at panel scope so the search field keeps focus; a local NSEvent
+    /// monitor is the only way to get them there.
     private func installLocalKeyMonitor() {
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard
@@ -217,15 +199,11 @@ final class CommandPaletteController: NSObject, NSTableViewDataSource, NSTableVi
         }
     }
 
-    /// Cancel is the default + cancel button so a stray Enter (after the
-    /// palette's Enter closes the sheet) won't fall through into the
-    /// destructive action. Mirrors Linux's `confirm_then_dispatch`
-    /// alert dialog button ordering.
+    /// Cancel is the default and cancel button so a stray Enter after the palette's Enter cannot
+    /// fall through into the destructive action.
     private func confirmThenDispatch(action: String) {
-        // Capture strongly BEFORE closeSheet — endSheet completion clears
-        // AppDelegate's controller ivar (the only strong owner), so a
-        // `[weak self]` closure here would no-op on Confirm and skip
-        // focus restore on Cancel by the time the alert dismisses.
+        // Captured strongly before closeSheet: the endSheet completion clears AppDelegate's
+        // controller ivar (the only strong owner), so `[weak self]` would no-op on Confirm.
         let dispatch = dispatch
         let restoreFocus = restoreFocus
         let parentWindow = parentWindow
@@ -270,16 +248,12 @@ final class CommandPaletteController: NSObject, NSTableViewDataSource, NSTableVi
     }
 }
 
-/// Stateless filter helpers + action-surface assembly. Matches Linux
-/// `command_palette::filter_actions` semantics: case-insensitive substring,
-/// whitespace-trimmed; empty query returns every entry.
+/// Case-insensitive, whitespace-trimmed substring filter; an empty query returns every entry.
 enum CommandPalette {
-    /// macOS-side handlers in `AppDelegate.handleCommand`. Hand-kept in
-    /// sync with the switch arms — `LEGACY_DISPATCH_METHODS` in
-    /// `copad-daemon::socket` is similar but not identical (daemon list
-    /// omits `tab.switch`, `pane.focus_next`, `pane.focus_prev`,
-    /// `terminal.shell_precmd`, `terminal.shell_preexec`, `webview.state`).
-    /// Source-of-truth: case arms in `AppDelegate.swift` `handleCommand`.
+    /// macOS handlers in `AppDelegate.handleCommand`, kept in sync with its switch arms by hand.
+    /// `LEGACY_DISPATCH_METHODS` in `copad-daemon::socket` differs (it omits `tab.switch`,
+    /// `pane.focus_next`, `pane.focus_prev`, `terminal.shell_precmd`, `terminal.shell_preexec`,
+    /// `webview.state`).
     static let macOSLegacyMethods: [String] = [
         "agent.approve",
         "background.clear",

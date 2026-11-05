@@ -2,29 +2,20 @@ import CCopadFFI
 import CopadCore
 import Foundation
 
-/// C marshalling for the three browser rules that live in `copad-core`.
+/// C marshalling for the three browser rules in `copad-core`. Decisions such as the fallback when
+/// a call fails live in `CopadCore.BrowserFFIDecode`, since `swift test` cannot reach the C
+/// symbols (the linker flags are on the executable target).
 ///
-/// Only the marshalling is here. Every *decision* — which value to fall back to
-/// when a call fails — lives in `CopadCore.BrowserFFIDecode`, where the test
-/// bundle can reach it (`CCopadFFI`'s linker flags are on the executable target,
-/// so anything touching the C symbols cannot be unit-tested by `swift test`).
-///
-/// The rules are not mirrored in Swift on purpose. `PaneManager` used to carry
-/// its own `canonicalWebviewURL`, and every bug the Rust implementation has
-/// since fixed — a backslash smuggling a whole path into what looked like an
-/// origin, a percent-encoded `%63ode=` slipping past the token denylist — was
-/// still live in that copy. One implementation, two callers.
+/// The rules are not mirrored in Swift: an earlier Swift copy of the URL canonicalizer kept bugs
+/// the Rust version had fixed (a backslash smuggling a path into an origin, a percent-encoded
+/// `%63ode=` slipping past the token denylist).
 enum BrowserFFI {
-    /// Apply the `[browser] restore` policy to a live URL, and learn whether the
-    /// page title may be persisted alongside it.
+    /// Apply the `[browser] restore` policy to a live URL, and learn whether the page title may
+    /// be persisted with it. Both answers come from Rust, which normalizes the policy string
+    /// (`"ORIGIN"`, `" origin "`).
     ///
-    /// Both answers come from Rust. Re-deriving the title rule here by comparing
-    /// the policy string would reintroduce the drift this layer exists to
-    /// remove — `"ORIGIN"` and `" origin "` resolve to origin-only on that side.
-    ///
-    /// Returns `.unavailable` when the rule could not be consulted, which
-    /// restores the blank URL-entry placeholder. Never the raw URL: a failed
-    /// call must not silently become "persist everything, tokens included".
+    /// `.unavailable` (rule not consulted) restores the blank URL-entry placeholder, never the raw
+    /// URL: a failed call must not become "persist everything, tokens included".
     static func canonicalize(_ url: String, policy: String) -> BrowserCanonicalURL {
         BrowserFFIDecode.canonical(call(
             copad_ffi_browser_canonicalize,
@@ -33,9 +24,8 @@ enum BrowserFFI {
         ))
     }
 
-    /// Repair an untrusted pane snapshot read off disk.
-    /// Returns nil when the rule could not be consulted; the caller then falls
-    /// back to single-URL restore rather than trusting an unvalidated pane.
+    /// Repair an untrusted pane snapshot read off disk. Nil means the rule could not be consulted;
+    /// the caller falls back to single-URL restore.
     static func normalize(_ pane: BrowserPaneSnap) -> BrowserPaneSnap? {
         guard let encoded = try? JSONEncoder().encode(pane),
               let paneObj = try? JSONSerialization.jsonObject(with: encoded)
@@ -47,14 +37,12 @@ enum BrowserFFI {
         ))
     }
 
-    /// May this browser RPC run against a tab in `mode`, and must its result be
-    /// replaced with a page-independent one?
+    /// May this browser RPC run against a tab in `mode`, and must its result be replaced with a
+    /// page-independent one?
     ///
-    /// Ask at dispatch, again before delivering a result, and again before any
-    /// side effect that leaves the process (the `--path` screenshot write). A
-    /// read already in flight when a tab entered `protected` has to be
-    /// suppressed, and a file already written cannot be unwritten by refusing
-    /// the response.
+    /// Ask at dispatch, again before delivering a result, and again before any side effect that
+    /// leaves the process (the `--path` screenshot write): a read in flight when a tab entered
+    /// `protected` must be suppressed, and a written file cannot be unwritten.
     static func authorize(
         method: String,
         mode: String,
@@ -67,12 +55,8 @@ enum BrowserFFI {
         ))
     }
 
-    /// Does this restore policy keep the opaque history blob?
-    ///
-    /// Asked of Rust rather than compared here, for the same reason
-    /// `persistTitle` is: `"FULL"` and `" full "` resolve on that side, and a
-    /// second reading of the raw string in Swift is exactly the drift this
-    /// layer exists to remove.
+    /// Does this restore policy keep the opaque history blob? Asked of Rust, as `persistTitle` is,
+    /// because Rust normalizes the policy string (`" full "`).
     static func keepsHistory(policy: String) -> Bool {
         BrowserFFIDecode.keepsHistory(call(
             copad_ffi_browser_canonicalize,
@@ -83,10 +67,8 @@ enum BrowserFFI {
 
     // MARK: - History blobs
 
-    /// Persist a tab's opaque back/forward + scroll blob as a new generation.
-    /// Returns false when the rule refused it, in which case the caller must
-    /// NOT record the generation in the session — a reference to a blob that
-    /// was never written would restore as a silent failure later.
+    /// Persist a tab's opaque back/forward + scroll blob as a new generation. On false the caller
+    /// must not record the generation in the session.
     static func writeHistory(tabID: String, generation: UInt64, data: Data) -> Bool {
         let raw = call(
             copad_ffi_browser_history_write,
@@ -100,9 +82,8 @@ enum BrowserFFI {
         return BrowserFFIDecode.wroteHistory(raw)
     }
 
-    /// Read a blob back. `nil` covers absent, unreadable, oversize, and
-    /// symlinked — all of which mean the same thing to the caller: restore the
-    /// URL plainly rather than a history it cannot trust.
+    /// Read a blob back. `nil` covers absent, unreadable, oversize and symlinked; the caller
+    /// restores the plain URL.
     static func readHistory(tabID: String, generation: UInt64) -> Data? {
         BrowserFFIDecode.historyBlob(call(
             copad_ffi_browser_history_read,
@@ -111,8 +92,8 @@ enum BrowserFFI {
         ))
     }
 
-    /// Reclaim superseded generations. Called AFTER the session has committed,
-    /// so the generation it references is never the one being removed.
+    /// Reclaim superseded generations. Call after the session has committed, so the generation it
+    /// references is never removed.
     @discardableResult
     static func gcHistory(live: [(String, UInt64)]) -> Int {
         BrowserFFIDecode.gcRemoved(call(
@@ -124,9 +105,8 @@ enum BrowserFFI {
 
     // MARK: - Network + console log
 
-    /// Append one captured record. Returns false when core DROPPED it for
-    /// exceeding the per-record cap — surfaced rather than swallowed so a
-    /// silent under-report is at least visible in the logs.
+    /// Append one captured record. Returns false when core dropped it for exceeding the
+    /// per-record cap.
     @discardableResult
     static func appendLog(
         panelID: String,
@@ -146,7 +126,6 @@ enum BrowserFFI {
         ))
     }
 
-    /// Read back matching records plus the declared capture coverage.
     static func readLog(panelID: String, query: [String: Any]) -> (records: [Any], coverage: String) {
         var payload = query
         payload["panel_id"] = panelID
@@ -165,13 +144,9 @@ enum BrowserFFI {
         ))
     }
 
-    /// Ask core whether this fill may proceed.
-    ///
-    /// Not re-implemented in Swift. These are the checks that decide whether a
-    /// password is written into a page, so a second implementation is a second
-    /// thing that can be subtly wrong on its own — and a first draft of this
-    /// file did exactly that, checking origin and input type here while never
-    /// consulting core's document-generation and profile binding at all.
+    /// Ask core whether this fill may proceed. Deliberately not re-implemented in Swift: these
+    /// checks gate whether a password is written into a page, and a Swift copy once skipped core's
+    /// document-generation and profile binding.
     static func validateFill(
         request: [String: Any],
         credential: CredentialRef,
@@ -224,9 +199,7 @@ enum BrowserFFI {
 
     // MARK: - Private
 
-    /// Copy-then-free, the same lifecycle `CopadFFI.callJSON` uses: the Rust
-    /// allocation is turned into a Swift String and released immediately, so no
-    /// caller ever holds a raw pointer.
+    /// Copy-then-free, as `CopadFFI.callJSON` does: no caller holds a raw pointer.
     private static func call(
         _ fn: (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?,
         _ payload: [String: Any],

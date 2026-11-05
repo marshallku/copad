@@ -12,7 +12,6 @@ struct MuxHost: Codable, Equatable, Identifiable {
     var host: String
     var port: Int = 22
     var user: String
-    /// The OpenSSH host key the user confirmed (TOFU). nil = never connected.
     var hostKey: String?
     /// What runs on the host for each channel. The default goes through a login shell so a
     /// comux in `~/.local/bin` / `~/.cargo/bin` is found on a non-interactive exec channel.
@@ -62,7 +61,6 @@ enum HostPassword {
     static func delete(_ host: UUID) { SecItemDelete(query(host) as CFDictionary) }
 }
 
-/// Saved hosts, in UserDefaults (no secrets in them).
 enum HostStore {
     private static let key = "copad.muxHosts"
 
@@ -131,7 +129,6 @@ enum DeviceKey {
         String(openSSHPublicKey: try nioKey().publicKey) + " copad-ios"
     }
 
-    /// Replace this device's key with a new Secure Enclave key (hosts then need the new line).
     static func useNewSecureEnclaveKey() throws {
         guard secureEnclaveAvailable else { throw KeyError.noEnclave }
         delete(.secureEnclave)

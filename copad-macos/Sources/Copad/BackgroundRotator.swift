@@ -1,28 +1,20 @@
 import CCopadFFI
 import Foundation
 
-/// Random wallpaper rotation. Wire-equivalent to Linux's
-/// `socket.rs::select_random_image` / `is_bg_active` / `toggle_bg_mode`,
-/// both backed by the shared `copad_core::background` primitives reached
-/// through FFI. This file owns macOS-specific path resolution
-/// (`~/Library/Caches/copad/...` primary, `~/.cache/...` XDG fallback);
-/// the actual file IO + entropy + write happen in Rust.
+/// Random wallpaper rotation over the shared `copad_core::background` primitives; this file owns
+/// the macOS path resolution.
 enum BackgroundRotator {
-    /// macOS-native cache path: `~/Library/Caches/copad/wallpapers.txt`.
     static var primaryListURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Caches/copad/wallpapers.txt")
     }
 
-    /// XDG-style fallback so users sharing dotfiles across Linux + macOS
-    /// keep one wallpapers list. macOS-native wins on conflict (checked
-    /// first inside `copad_core::background::pick_random`).
+/// XDG-style fallback so dotfiles shared with Linux keep one list; the macOS-native list wins.
     static var fallbackListURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".cache/terminal-wallpapers.txt")
     }
 
-    /// Mode file: `~/Library/Caches/copad/bg-mode`. Missing = active.
     static var modeFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Caches/copad/bg-mode")
@@ -30,9 +22,8 @@ enum BackgroundRotator {
 
     static var isActive: Bool {
         let rc = modeFileURL.path.withCString { copad_ffi_background_is_active($0) }
-        // -1 (NULL / invalid UTF-8) is treated as active to match the
-        // Linux default-on-missing behavior — failing closed here would
-        // silently disable rotation if FFI rejected the path.
+// -1 (NULL / invalid UTF-8) counts as active, as on Linux; failing closed would silently
+// disable rotation if FFI rejected the path.
         return rc != 0
     }
 
@@ -42,11 +33,8 @@ enum BackgroundRotator {
         return rc == 1
     }
 
-    /// Delete `entry` from both the macOS-native and XDG-fallback list
-    /// files (temp-file + rename in core). A rotation pick can come from
-    /// either list, so we drop it from both — idempotent, a missing entry
-    /// is a no-op. Returns true if any list actually changed. Backs
-    /// `background.delete_current`.
+/// Delete `entry` from both the macOS-native and XDG-fallback lists, since a rotation pick can
+/// come from either. A missing entry is a no-op; returns true if any list changed.
     @discardableResult
     static func removeFromList(_ entry: String) -> Bool {
         var removed = false
@@ -61,9 +49,6 @@ enum BackgroundRotator {
         return removed
     }
 
-    /// Pick a random wallpaper path. Returns nil if no list exists or
-    /// every line is blank. Caller decides whether to suppress on
-    /// deactive mode (`background.next` socket handler chooses no-op).
     static func nextRandomImage() -> String? {
         let primary = primaryListURL.path
         let fallback = fallbackListURL.path

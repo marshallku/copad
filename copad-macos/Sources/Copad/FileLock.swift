@@ -1,13 +1,8 @@
 import Darwin
 import Foundation
 
-/// `lockf(F_TLOCK)` wrapper for single-flight gating.
-///
-/// `lockf` rather than `flock` because Swift's Darwin module exports
-/// `struct flock` (the fcntl byte-range descriptor), which shadows the
-/// `flock(_:_:)` function name and breaks the call site. `lockf` has no
-/// such collision; for our single-byte lock file the per-fd advisory
-/// semantics are equivalent.
+/// `lockf` rather than `flock`: Swift's Darwin module exports `struct flock`, which shadows the
+/// `flock(_:_:)` function and breaks the call site.
 final class FileLock {
     private let fd: Int32
     private(set) var holding = false
@@ -27,8 +22,6 @@ final class FileLock {
         Darwin.close(fd)
     }
 
-    /// Non-blocking. Returns `false` when another process holds it
-    /// (`EAGAIN`/`EACCES` per POSIX); throws on real errors.
     func tryAcquire() throws -> Bool {
         let rc = Darwin.lockf(fd, F_TLOCK, 0)
         if rc == 0 {
@@ -41,7 +34,6 @@ final class FileLock {
         throw FileLockError.lockfFailed(message: String(cString: strerror(errno)))
     }
 
-    /// Idempotent.
     func release() {
         guard holding else { return }
         _ = Darwin.lockf(fd, F_ULOCK, 0)

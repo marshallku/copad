@@ -22,7 +22,6 @@ final class TerminalView: UIView {
     /// Marked (IME) text, drawn at the cursor until the IME commits it.
     var marked: String = "" { didSet { setNeedsDisplay() } }
 
-    // Wheel inertia.
     private var panCarry: CGFloat = 0
     private var velocity: CGFloat = 0
     private var inertiaLink: CADisplayLink?
@@ -65,7 +64,6 @@ final class TerminalView: UIView {
         link = l
     }
 
-    /// The session applied a frame.
     func gridChanged() { dirty = true }
 
     @objc private func tick() {
@@ -145,7 +143,6 @@ final class TerminalView: UIView {
 
     private func drawRow(_ g: Grid, _ y: Int, _ ctx: CGContext) {
         let top = CGFloat(y) * cellH
-        // Backgrounds first, merged into runs.
         var x = 0
         while x < g.cols {
             let bg = colors(g[x, y]).bg
@@ -222,7 +219,6 @@ final class TerminalView: UIView {
         return entry
     }
 
-    /// One style run of ASCII glyphs at their cell positions, plus its decorations.
     private func drawGlyphs(
         _ glyphs: [CGGlyph], _ positions: [CGPoint], cell c: Cell, from x0: Int, to x1: Int,
         top: CGFloat, _ ctx: CGContext,
@@ -282,7 +278,6 @@ final class TerminalView: UIView {
         guard let (cx, cy) = g.cursor, cx < g.cols, cy < g.rows else { return }
         let origin = CGPoint(x: CGFloat(cx) * cellW, y: CGFloat(cy) * cellH)
         if !marked.isEmpty {
-            // The IME's in-progress syllable, drawn where it will land.
             let a: [NSAttributedString.Key: Any] = [
                 .font: font, .foregroundColor: UIColor(rgb: Palette.defaultFG),
                 .backgroundColor: UIColor(rgb: RGB(hex: 0x45475A)),
@@ -318,7 +313,6 @@ final class TerminalView: UIView {
         stopInertia()
         if !input.isFirstResponder { input.becomeFirstResponder() }
         guard let (x, y) = cell(at: r.location(in: self)) else { return }
-        // A tap is a click comux already understands: focus a pane, switch a tab chip, …
         input.commitComposition()
         session?.send(.mouse(x: x, y: y, kind: .click))
         session?.send(.mouse(x: x, y: y, kind: .up))
@@ -381,7 +375,6 @@ final class TerminalView: UIView {
         if abs(velocity) < 60 { stopInertia() }
     }
 
-    /// Cancel inertia — on navigation, layout changes, backgrounding.
     func stopInertia() {
         inertiaLink?.invalidate()
         inertiaLink = nil
@@ -425,7 +418,7 @@ final class TerminalController: ObservableObject {
     }
 
     /// Commit the IME's syllable and stop scrolling BEFORE anything that changes where input
-    /// goes (codex C2): a drawer tap must not deliver a half-typed syllable to the new pane.
+    /// goes: a drawer tap must not deliver a half-typed syllable to the new pane.
     func settleInput() {
         view.input.commitComposition()
         view.stopInertia()

@@ -1,6 +1,5 @@
 import Foundation
 
-/// An sRGB colour, 0…1 components.
 struct RGB: Equatable, Hashable {
     var r: Double, g: Double, b: Double
 
@@ -20,7 +19,6 @@ enum Palette {
     static let defaultFG = RGB(hex: 0xCDD6F4)
     static let defaultBG = RGB(hex: 0x11111B)
 
-    /// ANSI 0–15 in ratatui's naming order.
     static let ansi: [RGB] = [
         0x45475A, 0xF38BA8, 0xA6E3A1, 0xF9E2AF, 0x89B4FA, 0xF5C2E7, 0x94E2D5, 0xBAC2DE,
         0x585B70, 0xF38BA8, 0xA6E3A1, 0xF9E2AF, 0x89B4FA, 0xF5C2E7, 0x94E2D5, 0xA6ADC8,
@@ -53,7 +51,6 @@ enum Palette {
         return nil
     }
 
-    /// The xterm 256-colour cube.
     static func indexed(_ i: Int) -> RGB {
         if i < 16 { return ansi[i] }
         if i < 232 {
@@ -66,7 +63,6 @@ enum Palette {
     }
 }
 
-/// Modifier bits from the wire's bitflag string (`"BOLD | DIM"`).
 struct Mods: OptionSet, Hashable {
     let rawValue: UInt16
     static let bold = Mods(rawValue: 1 << 0)
@@ -105,7 +101,6 @@ struct Mods: OptionSet, Hashable {
     }
 }
 
-/// One cell of the mirror grid.
 struct Cell: Equatable {
     var sym: String = " "
     var fg: RGB? = nil
@@ -117,9 +112,9 @@ struct Cell: Equatable {
 
 /// The client's mirror of the server's composed screen.
 ///
-/// EVERY frame is applied here as it arrives — only presentation is rate-limited — because
-/// the server advances its diff baseline the moment a frame is queued: a skipped delta would
-/// leave cells stale forever (plan § iOS native client, codex C3).
+/// EVERY frame is applied here as it arrives; only presentation is rate-limited. The server
+/// advances its diff baseline the moment a frame is queued, so a skipped delta would leave cells
+/// stale forever.
 struct Grid {
     private(set) var cols = 0
     private(set) var rows = 0
@@ -136,19 +131,16 @@ struct Grid {
         set { cells[y * cols + x] = newValue }
     }
 
-    /// Forget everything (reconnect): wait for a fresh `full` frame.
     mutating func reset() {
         cols = 0; rows = 0; cells = []; cursor = nil; hasBaseline = false
         dirtyRows = nil
     }
 
-    /// The rows to repaint since the last call — `nil` for everything — and start over.
     mutating func takeDirtyRows() -> IndexSet? {
         defer { dirtyRows = IndexSet() }
         return dirtyRows
     }
 
-    /// Apply one frame. Returns whether the grid changed.
     @discardableResult
     mutating func apply(_ f: FrameMsg) -> Bool {
         var touched = IndexSet()
@@ -200,7 +192,6 @@ struct Grid {
         }
     }
 
-    /// Row `y` as plain text (spacers dropped) — for tests and accessibility.
     func text(row y: Int) -> String {
         guard y < rows else { return "" }
         return (0..<cols).compactMap { x in self[x, y].skip ? nil : self[x, y].sym }.joined()
@@ -211,7 +202,6 @@ struct Grid {
 /// presentation, which is what decides a 2-column cell in comux's grid.
 enum CellWidth {
     static func of(_ s: String) -> Int {
-        // ASCII — nearly every cell — without touching Unicode properties.
         if s.utf8.count == 1 { return 1 }
         guard let u = s.unicodeScalars.first else { return 1 }
         if s.unicodeScalars.contains(where: { $0.value == 0xFE0F }) { return 2 }

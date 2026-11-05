@@ -1,11 +1,8 @@
 import AppKit
 import CopadCore
 
-/// The agent cockpit panel: a native list of terminal panes with their AI-agent
-/// status, attention-sorted, click-to-focus. A view/observer over the
-/// app-lifetime `AgentCockpitModel` — it owns no event subscription (the app
-/// pump does), just an observer token it releases when the panel goes away.
-/// See `docs/agent-cockpit.md`.
+/// The agent cockpit panel: an observer of the app-lifetime `AgentCockpitModel`. See
+/// `docs/agent-cockpit.md`.
 @MainActor
 final class CockpitViewController: NSViewController, CopadPanel {
     let panelID: String = UUID().uuidString
@@ -37,7 +34,6 @@ final class CockpitViewController: NSViewController, CopadPanel {
     override func loadView() {
         let root = NSView()
 
-        // Header: title + Refresh / Reset.
         let titleLabel = NSTextField(labelWithString: "Agent cockpit")
         titleLabel.font = .boldSystemFont(ofSize: 13)
         let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshTapped))
@@ -49,7 +45,6 @@ final class CockpitViewController: NSViewController, CopadPanel {
         header.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
         header.translatesAutoresizingMaskIntoConstraints = false
 
-        // Table.
         let table = NSTableView()
         table.headerView = nil
         table.rowHeight = 40
@@ -87,8 +82,7 @@ final class CockpitViewController: NSViewController, CopadPanel {
     func startIfNeeded() {
         guard observerToken == nil else { return }
         observerToken = model.addObserver { [weak self] in self?.reloadRows() }
-        // Terminal renames post `.terminalTitleChanged` (a UI notification, not a
-        // bus event), so refresh the row titles off it too.
+// Terminal renames post `.terminalTitleChanged`, not a bus event.
         titleObserver = NotificationCenter.default.addObserver(
             forName: .terminalTitleChanged, object: nil, queue: .main
         ) { [weak self] _ in
@@ -97,8 +91,6 @@ final class CockpitViewController: NSViewController, CopadPanel {
         reloadRows()
     }
 
-    /// Rebuild the row list from the live pane snapshot + the model overlay,
-    /// attention-first. Called on any model/pane-lifecycle change.
     private func reloadRows() {
         guard let tabVC else { rows = []; tableView?.reloadData(); return }
         rows = tabVC.terminalPaneSnapshot()

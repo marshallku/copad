@@ -4,7 +4,6 @@ import NIOCore
 import NIOPosix
 import NIOSSH
 
-/// Why an SSH connection did not come up, in words the host screen can show.
 enum SSHError: LocalizedError {
     /// First connection to this host: the user must confirm the key (TOFU).
     case unknownHostKey(String)
@@ -26,7 +25,6 @@ enum SSHError: LocalizedError {
     }
 }
 
-/// An SSH client connection; each `exec` opens one channel (one `comux proxy --stdio`).
 final class SSHConnection {
     static let setupTimeout = TimeAmount.seconds(20)
     private let group: MultiThreadedEventLoopGroup
@@ -123,7 +121,6 @@ final class SSHConnection {
     }
 }
 
-/// Write side of an exec channel.
 final class ExecChannel {
     private let channel: Channel
 
@@ -289,7 +286,6 @@ final class HostKeyCheck: NIOSSHClientServerAuthenticationDelegate {
     }
 }
 
-/// SHA256 fingerprint of an OpenSSH public key line, as `ssh-keygen -l` prints it.
 func sshFingerprint(_ openSSH: String) -> String {
     let parts = openSSH.split(separator: " ")
     guard parts.count >= 2, let blob = Data(base64Encoded: String(parts[1])) else { return openSSH }

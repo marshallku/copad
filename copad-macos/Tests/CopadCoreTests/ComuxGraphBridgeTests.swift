@@ -6,7 +6,6 @@ final class ComuxGraphBridgeTests: XCTestCase {
         XCTAssertEqual(ComuxGraphMessage.parse(["type": "ready"], epoch: "k#1"), .ready)
         XCTAssertEqual(ComuxGraphMessage.parse(["type": "jump", "token": "a1-2", "epoch": "k#1"], epoch: "k#1"),
                        .jump(token: "a1-2"))
-        // Stamped for a connection the window has left.
         XCTAssertNil(ComuxGraphMessage.parse(["type": "jump", "token": "a1-2", "epoch": "k#0"], epoch: "k#1"))
         XCTAssertNil(ComuxGraphMessage.parse(["type": "jump", "token": "a1-2"], epoch: "k#1"))
         XCTAssertNil(ComuxGraphMessage.parse(["type": "nope", "epoch": "k#1"], epoch: "k#1"))

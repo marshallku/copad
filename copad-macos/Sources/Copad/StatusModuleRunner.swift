@@ -1,19 +1,12 @@
 import AppKit
 import Foundation
 
-/// Status-bar module timer that fires `_module.run` against the daemon
-/// instead of spawning the module's `exec` directly. Daemon owns shell
-/// spawn + env injection (`COPAD_SOCKET`, `COPAD_PLUGIN_DIR`) so macOS
-/// and Linux observe the same module behavior.
+/// Status-bar module timer that fires `_module.run` against the daemon, which owns shell spawn
+/// and env injection so macOS and Linux behave the same.
 ///
-/// **In-flight gate**: a slow daemon RPC (or wedged plugin shell) must
-/// not let timer ticks pile up — overlapping `_module.run` calls would
-/// see stale responses overwrite newer label values. `runOnce` skips
-/// silently when the previous tick is still in-flight.
-///
-/// `@unchecked Sendable` because the timer fires on a background queue
-/// and the daemon-forward completion may fire from any thread; label
-/// writes hop to main explicitly via `DispatchQueue.main.async`.
+/// `runOnce` skips a tick while the previous RPC is in flight, so overlapping calls cannot let a
+/// stale response overwrite a newer label. `@unchecked Sendable`: the timer and the daemon
+/// completion run off-main; label writes hop to main explicitly.
 final class StatusModuleRunner: @unchecked Sendable {
     private nonisolated(unsafe) weak var label: NSTextField?
     private let pluginName: String
@@ -58,9 +51,6 @@ final class StatusModuleRunner: @unchecked Sendable {
         timer = nil
     }
 
-    /// Skip-on-busy: the previous RPC's completion clears the gate. A
-    /// long-running module won't queue ticks — stale labels are worse
-    /// than missed updates.
     private func runOnce() {
         if stopped { return }
         inFlightLock.lock()
@@ -80,8 +70,6 @@ final class StatusModuleRunner: @unchecked Sendable {
                 self?.inFlight = false
                 self?.inFlightLock.unlock()
             }
-            // RPCError → log + keep last label value (transient failures
-            // shouldn't flicker the bar).
             if let err = result as? RPCError {
                 FileHandle.standardError.write(Data("[copad] statusbar \(plugin).\(module) daemon-forward failed: \(err.code) — \(err.message)\n".utf8))
                 return
@@ -98,8 +86,6 @@ final class StatusModuleRunner: @unchecked Sendable {
         }
     }
 
-    /// `{text, tooltip}` JSON or plain text. Matches
-    /// `copad-linux/src/statusbar.rs::parse_output`.
     static func parseOutput(_ raw: String) -> (String, String?) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("{"),

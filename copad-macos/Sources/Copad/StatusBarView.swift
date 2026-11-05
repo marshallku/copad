@@ -1,53 +1,29 @@
 import AppKit
 import Foundation
 
-/// Tier 4.2 — Waybar-style status bar that mirrors `copad-linux/src/statusbar.rs`
-/// in shape:
+/// Waybar-style status bar mirroring `copad-linux/src/statusbar.rs`: left/center/right zones of
+/// per-module labels sorted by `order`, each module running a shell command on a timer whose
+/// stdout is plain text or JSON `{text, tooltip}`.
 ///
-/// - 3 zones (left/center/right) laid out horizontally
-/// - per-module `NSTextField` label, sorted by `order` within zone
-/// - each module runs a shell command on a `DispatchSourceTimer`
-/// - stdout parsed as either plain text or JSON `{text, tooltip}`
-///
-/// macOS-specific simplifications vs Linux:
-///
-/// - No CSS hot-reload primitive. Theme colors are applied imperatively
-///   via `applyTheme(_:)` from the config-reload path. `applyTheme` updates
-///   the bar bg, the 1px separator, and every module label's text color.
-///   Module-level CSS classes still ignored (see below).
-/// - Module CSS class (`module.class`) ignored — on BOTH platforms. It is parsed
-///   into the manifest (`copad-core/src/plugin.rs`) but nothing consumes it:
-///   Linux's statusbar only ever adds `copad-statusbar` to the whole bar, never
-///   a per-module class. (This comment used to claim Linux scoped per-module
-///   styling and that macOS was the laggard — it never did.) A macOS equivalent
-///   would need `NSAttributedString` per module. Module authors that want color
-///   cues today should JSON-emit the text with markup or unicode indicators.
+/// Theme colors are applied imperatively via `applyTheme`. `module.class` is parsed into the
+/// manifest (`copad-core/src/plugin.rs`) but unused on both platforms; module authors wanting
+/// color cues should emit markup or unicode indicators.
 @MainActor
 final class StatusBarView: NSView {
     private let leftStack = NSStackView()
     private let centerStack = NSStackView()
     private let rightStack = NSStackView()
     private var runners: [StatusModuleRunner] = []
-    /// Map from `<plugin>.<module>` → label so future event-driven updates
-    /// (push from plugin instead of poll) can target a specific module.
-    /// Not used yet; kept so the API doesn't have to change later.
     private var labels: [String: NSTextField] = [:]
-    /// The pomodoro plugin's `timer` module is rendered as a native
-    /// event-driven ring (Phase 2) instead of the poll-text label, so it's
-    /// held separately for theme re-color + teardown.
+    /// The pomodoro `timer` module, rendered as a native ring; held for re-color and teardown.
     private var pomodoroRing: PomodoroRingView?
-    /// Retained so `applyTheme` can re-color it. Without this we'd have to
-    /// walk `subviews` and identify the separator by frame/size — fragile.
     private let separator = NSView()
 
-    /// Backing store for `isHidden` so `statusbar.show/hide/toggle` reads
-    /// stay consistent with what we set, even if AppKit's accessor races
-    /// across animation states.
+    /// Backing store for `isHidden`, so `statusbar.show/hide/toggle` reads do not depend on
+    /// AppKit's accessor across animation states.
     private(set) var isShown: Bool = true
 
     private var theme: CopadTheme
-    /// `[window] opacity` mirrored here so the bar bg blends with the
-    /// transparent window. Updated via `applyWindowOpacity` on hot-reload.
     private var windowOpacity: Double
 
     init(theme: CopadTheme, windowOpacity: Double = 1.0) {
@@ -57,9 +33,7 @@ final class StatusBarView: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.backgroundColor = Self.barBg(theme: theme, opacity: windowOpacity)
-        // 1px top edge so the bar visibly separates from the content above
-        // even when the surface0/background contrast is low (Catppuccin
-        // Mocha they're nearly the same shade).
+        // 1px top edge: surface0 and the background are nearly the same shade in Catppuccin Mocha.
         separator.translatesAutoresizingMaskIntoConstraints = false
         separator.wantsLayer = true
         separator.layer?.backgroundColor = theme.overlay0.nsColor.cgColor
@@ -78,9 +52,7 @@ final class StatusBarView: NSView {
             addSubview(stack)
         }
 
-        // Three zones laid out in a row: left flush-left, center centered,
-        // right flush-right. CenterX anchor on the center stack pins it
-        // even as the side stacks grow/shrink with content.
+        // Center stack is pinned by centerX so it stays put as the side stacks resize.
         NSLayoutConstraint.activate([
             leftStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             leftStack.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -96,9 +68,6 @@ final class StatusBarView: NSView {
         fatalError()
     }
 
-    /// Build module labels + start their runners. Called once at app launch
-    /// from `TabViewController.loadView`. Each `LoadedPluginManifest` may
-    /// contribute zero or more modules.
     func loadModules(
         _ plugins: [LoadedPluginManifest],
         daemonClient: DaemonClient,
@@ -117,10 +86,8 @@ final class StatusBarView: NSView {
             let entries = byZone[zone, default: []].sorted { $0.module.order < $1.module.order }
             let stack = stackForZone(zone)
             for (plugin, module) in entries {
-                // The pomodoro `timer` module gets a native ring, not a
-                // poll-text label — this REPLACES the module's text segment
-                // on macOS (Linux keeps the poll text). Match on both plugin
-                // AND module name so other pomodoro modules aren't captured.
+                // The pomodoro `timer` module gets a native ring instead of the poll-text label
+                // (Linux keeps the poll text); match both plugin and module name.
                 if plugin.manifest.plugin.name == "pomodoro", module.name == "timer" {
                     let ring = PomodoroRingView(
                         theme: theme,
@@ -155,9 +122,8 @@ final class StatusBarView: NSView {
         }
     }
 
-    /// Stop every running module timer. Idempotent. Called from
-    /// `applicationWillTerminate` so we don't leave child processes orphaned
-    /// for the brief window between quit and process exit.
+    /// Stop every module timer. Idempotent; called from `applicationWillTerminate` so no child
+    /// process is orphaned.
     func shutdown() {
         for r in runners {
             r.stop()
@@ -167,8 +133,6 @@ final class StatusBarView: NSView {
         pomodoroRing = nil
     }
 
-    /// `statusbar.show/hide/toggle` socket commands route through this.
-    /// Returns the post-call visibility state.
     @discardableResult
     func setShown(_ shown: Bool) -> Bool {
         isShown = shown
@@ -184,24 +148,14 @@ final class StatusBarView: NSView {
         }
     }
 
-    /// Hot-reload: `[window] opacity` and/or theme change. Recolors
-    /// the bar bg with the alpha-tinted surface so the bar still reads
-    /// as chrome but lets the desktop / blur bleed through. Routes
-    /// through `applyTheme` so the separator and module labels also
-    /// pick up the new colors.
+    /// Hot-reload of `[window] opacity` and/or theme; goes through `applyTheme`.
     func applyWindowOpacity(_ opacity: Double, theme: CopadTheme) {
         windowOpacity = opacity
         applyTheme(theme)
     }
 
-    /// Hot-reload theme. Refreshes everything color-derived:
-    ///   - bar bg layer (respects current `windowOpacity`)
-    ///   - 1px separator
-    ///   - every module label's text color
-    /// Module label *contents* are owned by `StatusModuleRunner` and
-    /// the next poll/event overwrites whatever's there; only the
-    /// color attribute is sticky from `loadModules`, so that's what
-    /// we need to re-stamp here.
+    /// Hot-reload theme: re-colors the bar bg (at the current `windowOpacity`), the separator and
+    /// every module label's text color. Label contents belong to `StatusModuleRunner`.
     func applyTheme(_ newTheme: CopadTheme) {
         theme = newTheme
         layer?.backgroundColor = Self.barBg(theme: newTheme, opacity: windowOpacity)

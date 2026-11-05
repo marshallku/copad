@@ -2,8 +2,7 @@ import Darwin
 import Foundation
 
 enum UnixSocket {
-    /// Returns a connected SOCK_STREAM fd, or nil on any failure (path too
-    /// long, socket()/connect() error). Caller owns the fd and must close().
+    /// Caller owns the returned fd and must close() it.
     static func connect(path: String) -> Int32? {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }

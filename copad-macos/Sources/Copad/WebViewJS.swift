@@ -1,20 +1,10 @@
 import Foundation
 
-/// Tier 4.3 — JavaScript snippets injected into a WKWebView for the
-/// webview-interaction socket commands. Mirrors `copad-linux/src/webview.rs::js`
-/// snippet-for-snippet so the wire result shape is identical across platforms.
-///
-/// Each helper returns the JS source as a String. Caller passes that to
-/// `WKWebView.evaluateJavaScript(...)` (via `WebViewController.executeJS`),
-/// receives back a JSON-encoded result string, and decodes via
-/// `JSONSerialization.jsonObject(with:)` before handing the parsed value
-/// off to the socket completion. Returning JSON-as-string from the JS side
-/// (rather than the `Any?` that WKWebView would otherwise produce) keeps
-/// types stable across the bridge — no surprise `NSNumber` vs `NSString`
-/// coercion the way `getElementById(...).className` would otherwise hit.
+/// JavaScript snippets for the webview-interaction socket commands. Mirrors
+/// `copad-linux/src/webview.rs::js` snippet-for-snippet so the wire result shape is identical.
+/// Snippets return JSON-as-string to keep types stable across the bridge (no NSNumber/NSString
+/// coercion).
 enum WebViewJS {
-    /// Find one element. Returns null when not found, an object with
-    /// tag/text/value/href/src/class/id/rect/visible otherwise.
     static func querySelector(_ selector: String) -> String {
         let sel = jsString(selector)
         return """
@@ -37,8 +27,6 @@ enum WebViewJS {
         """
     }
 
-    /// Find all matching elements (capped at `limit`, default 50). Returns
-    /// an array of element summaries with index/tag/text/value/href/class/id/rect.
     static func querySelectorAll(_ selector: String, limit: Int) -> String {
         let sel = jsString(selector)
         return """
@@ -61,7 +49,6 @@ enum WebViewJS {
         """
     }
 
-    /// Get computed CSS values for the listed properties on the first match.
     static func getStyles(_ selector: String, properties: [String]) -> String {
         let sel = jsString(selector)
         let propsJSON = jsArray(properties)
@@ -78,7 +65,6 @@ enum WebViewJS {
         """
     }
 
-    /// Programmatically click() the first matching element.
     static func click(_ selector: String) -> String {
         let sel = jsString(selector)
         return """
@@ -91,8 +77,7 @@ enum WebViewJS {
         """
     }
 
-    /// Set `.value` on the first match + dispatch `input` and `change`
-    /// events so React-style listeners pick up the change.
+    /// Dispatches `input` and `change` so React-style listeners see the value.
     static func fill(_ selector: String, value: String) -> String {
         let sel = jsString(selector)
         let val = jsString(value)
@@ -109,8 +94,6 @@ enum WebViewJS {
         """
     }
 
-    /// Scroll into view by selector, OR scroll the viewport to (x,y) when
-    /// selector is nil. Smooth + center on element-mode.
     static func scroll(selector: String?, x: Int, y: Int) -> String {
         if let sel = selector {
             let s = jsString(sel)
@@ -132,7 +115,6 @@ enum WebViewJS {
         }
     }
 
-    /// Page metadata: title, url, dimensions, form/link/input/button counts.
     static func pageInfo() -> String {
         """
         (() => {
@@ -157,11 +139,8 @@ enum WebViewJS {
 
     // MARK: - Helpers
 
-    /// JSON-encode a string so it can be embedded literally in JS source.
-    /// `JSONSerialization` with `.fragmentsAllowed` quotes it the same way
-    /// `serde_json::to_string` does on Linux. Defensive: any failure falls
-    /// back to an empty quoted string so a single bad selector doesn't
-    /// crash the whole webview command.
+    /// JSON-encode a string for embedding in JS source. A failure falls back to `""` so one bad
+    /// selector doesn't crash the whole webview command.
     private static func jsString(_ s: String) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed]),
               let str = String(data: data, encoding: .utf8)

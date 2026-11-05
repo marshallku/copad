@@ -1,15 +1,11 @@
 import Foundation
 
-/// Swift mirror of `copad_core::context::PaneContext` (the Phase 22.1 local
-/// context-bridge payload). All fields are non-optional `String` — missing
-/// or undeterminable values are empty strings `""`, matching the Rust
-/// `#[serde(default)]` per-field behavior so round-trips are clean.
+/// Swift mirror of `copad_core::context::PaneContext`. Missing values are empty strings,
+/// matching Rust's per-field `#[serde(default)]`.
 ///
-/// Trust note (decision #46): payloads originate from
-/// `coctl event publish pane.context_changed '<json>'` and are stamped
-/// `Origin::External` by the daemon. Any same-UID process on the
-/// workstation can publish with an arbitrary `panel_id`; treat as
-/// best-effort display data, not authoritative state.
+/// Trust (decision #46): payloads come from `coctl event publish pane.context_changed` and are
+/// stamped `Origin::External`. Any same-UID process can publish with an arbitrary `panel_id`;
+/// treat as best-effort display data.
 public struct PaneContext: Equatable, Sendable {
     public let panelID: String
     public let host: String
@@ -21,12 +17,9 @@ public struct PaneContext: Equatable, Sendable {
     public let timestampMs: Int64
     public let version: UInt32
 
-    /// Parse a `serde_json::Value`-shaped dict. Forward-compatible:
-    /// unknown fields are ignored, missing fields default to empty /
-    /// zero (matches Rust `#[serde(default)]`). Returns `nil` when the
-    /// payload is structurally unusable; an empty `panel_id` parses to
-    /// a non-nil PaneContext (the caller is responsible for dropping it
-    /// — see `ContextService.apply` `pane.context_changed` arm).
+    /// Forward-compatible: unknown fields are ignored, missing ones default to empty/zero
+    /// (Rust `#[serde(default)]`). `nil` when structurally unusable. An empty `panel_id` still
+    /// parses; `ContextService.apply` drops it.
     public init?(payload: [String: Any]) {
         panelID = (payload["panel_id"] as? String) ?? ""
         host = (payload["host"] as? String) ?? ""
@@ -35,16 +28,12 @@ public struct PaneContext: Equatable, Sendable {
         branch = (payload["branch"] as? String) ?? ""
         tmuxSession = (payload["tmux_session"] as? String) ?? ""
         paneCmd = (payload["pane_cmd"] as? String) ?? ""
-        // JSONSerialization decodes JSON numbers as NSNumber — accept
-        // any numeric form (`Int`, `Int64`, `NSNumber`, `Double`); cast
-        // to Int64. Missing or non-numeric → 0 (parity with Rust default).
+        // JSONSerialization yields NSNumber; accept any numeric form, missing or non-numeric is 0.
         timestampMs = (payload["timestamp_ms"] as? NSNumber)?.int64Value ?? 0
         version = (payload["v"] as? NSNumber)?.uint32Value ?? 0
     }
 
-    /// JSON-friendly form used in `ContextService.snapshot()`. Mirrors
-    /// the `PaneContext` serde shape so consumers serializing the
-    /// snapshot get the same wire bytes as Linux.
+    /// JSON-friendly form for `ContextService.snapshot()`, same wire bytes as Linux.
     public var asDictionary: [String: Any] {
         [
             "panel_id": panelID,
@@ -60,64 +49,26 @@ public struct PaneContext: Equatable, Sendable {
     }
 }
 
-/// PR 9 / parity-plan Tier 2.2 — Swift mirror of `copad_core::context::ContextService`.
-/// Tracks the user's currently-focused panel + that panel's cwd so trigger
-/// interpolation `{context.active_panel}` / `{context.active_cwd}` resolves
-/// to live values on macOS the way it already does on Linux.
-///
-/// Wire-shape parity with Linux's `Context` struct (`copad-core/src/context.rs`):
-/// `snapshot()` returns `["active_panel": String?, "active_cwd": String?,
-/// "pane_context": [...]?]`. `active_cwd` and `pane_context` are *derived*
-/// from per-panel caches keyed by `activePanel`, not stored on Context;
-/// that means a `terminal.cwd_changed` / `pane.context_changed` for a
-/// non-active panel caches silently and surfaces only when that panel
-/// becomes active. Same semantics as Linux.
-///
-/// Update rules (mirror of `apply_event` in `copad-core/src/context.rs:147`):
-/// - `panel.focused` (payload `panel_id`) → set `activePanel`
-/// - `panel.exited` (payload `panel_id`) → drop cwd + pane_context entries;
-///   if it matched `activePanel`, null that out too
-/// - `terminal.cwd_changed` (payload `panel_id`, `cwd`) → cache cwd
-///   keyed by `panel_id`
-/// - `pane.context_changed` (payload `PaneContext`-shaped dict) → cache
-///   the full payload keyed by `panel_id`. Empty / missing `panel_id`
-///   drops the event. Trust note: events stamped `Origin::External`
-///   (see decision #46) — any same-UID process can publish, so
-///   consumers should treat `pane_context` as best-effort display data.
-///
-/// **Apply-before-dispatch ordering** (codex pressure-test finding): macOS's
-/// `EventBus.onBroadcast` fires synchronously per broadcast, BEFORE channel
-/// fan-out. If `ContextService` were itself an `EventBus` subscriber, a
-/// `panel.focused` trigger condition checking `{context.active_panel}` would
-/// resolve to the *previous* panel because the channel hasn't been read yet.
-/// Solution: `AppDelegate.onBroadcast` calls `contextService.apply` BEFORE
-/// `copadEngine.dispatchEvent`, taking the post-apply snapshot to pass through
-/// FFI. This mirrors Linux's `Pump::pump_all` (`copad-linux/src/window.rs:589`)
-/// which explicitly "drain context first, then dispatch."
-///
-/// **No timer.** Linux uses a 100ms GTK timer to drain bounded event-bus
-/// channels into ContextService — that's a Linux bus constraint. macOS's
-/// `onBroadcast` already fires synchronously per event; polling would be
-/// pure cost with no semantic benefit.
-///
-/// Concurrency: `@unchecked Sendable` + internal NSLock. `onBroadcast` may
-/// fire from any thread (plugin reader thread, main, etc.); both `apply` and
-/// `snapshot` need to be safe from anywhere. Same posture as `EventBus.swift`.
-/// Mirror of `copad_core::context::Presence` — workstation-presence tag
-/// surfaced through `Context.presence`. v1 macOS has no idle-detection
-/// signal so the value is always `.active`, but the field is tracked +
-/// emitted in `snapshot()` so the wire shape matches Rust's. When an
-/// idle-detection source (e.g., a future plugin observing
-/// `NSWorkspaceWillSleepNotification`) needs to flip it, call
-/// `setPresence(_:)`.
+// ContextService is the Swift mirror of `copad_core::context::ContextService`. `active_cwd` and
+// `pane_context` are derived from per-panel caches keyed by `activePanel`, so an event for a
+// non-active panel caches silently until that panel becomes active. Update rules mirror
+// `apply_event` in `copad-core/src/context.rs`.
+//
+// `AppDelegate.onBroadcast` MUST call `apply` BEFORE `copadEngine.dispatchEvent`: `onBroadcast`
+// fires before channel fan-out, so a `panel.focused` trigger reading `{context.active_panel}`
+// would otherwise see the previous panel. No timer is needed (Linux polls only because of its
+// bus). Thread-safe via NSLock because `onBroadcast` may fire from any thread.
+
+/// Mirror of `copad_core::context::Presence`. macOS has no idle-detection source, so the value
+/// stays `.active` unless a caller flips it with `setPresence(_:)`; it is still emitted in
+/// `snapshot()` to match Rust's wire shape.
 public enum Presence: String, Sendable {
     case active
     case away
 }
 
-/// Phase 22.3 — Swift mirror of `copad_core::context::ActiveDoc`. Published
-/// from the shell's preexec hook when `nvim <path>` is invoked. `path` is
-/// relative to the KB root so it can be passed directly to `kb.read`.
+/// Mirror of `copad_core::context::ActiveDoc`, published by the shell's preexec hook when
+/// `nvim <path>` runs. `path` is relative to the KB root so it can go straight to `kb.read`.
 public struct ActiveDoc: Equatable, Sendable {
     public let panelID: String
     public let path: String
@@ -151,9 +102,7 @@ public final class ContextService: @unchecked Sendable {
 
     public init() {}
 
-    /// Apply one bus event to the context. Idempotent. Non-context kinds
-    /// and non-dict payloads are silently ignored — bus carries
-    /// `serde_json::Value`-shaped payloads (object/array/scalar/null).
+    /// Idempotent. Non-context kinds and non-dict payloads are ignored.
     public func apply(eventKind: String, data: Any?) {
         guard let data = data as? [String: Any] else { return }
         switch eventKind {
@@ -201,16 +150,13 @@ public final class ContextService: @unchecked Sendable {
         return activeDocs[panel]
     }
 
-    /// Cached pane_context for a specific panel id, if any.
     public func paneContext(panelID: String) -> PaneContext? {
         lock.lock()
         defer { lock.unlock() }
         return paneContexts[panelID]
     }
 
-    /// Pane_context of the currently active panel, derived from
-    /// `activePanel`. Returns nil when no panel is active OR when the
-    /// active panel has not emitted a `pane.context_changed` event yet.
+    /// Nil when no panel is active or it has not emitted `pane.context_changed` yet.
     public func activePaneContext() -> PaneContext? {
         lock.lock()
         defer { lock.unlock() }
@@ -218,17 +164,13 @@ public final class ContextService: @unchecked Sendable {
         return paneContexts[panel]
     }
 
-    /// Current workstation-presence value. Always `.active` until a
-    /// future caller flips it via `setPresence`.
     public func currentPresence() -> Presence {
         lock.lock()
         defer { lock.unlock() }
         return presence
     }
 
-    /// Returns the previous value so callers can decide whether to
-    /// broadcast a `presence.changed` event (avoid emitting on no-op,
-    /// mirroring Rust `ContextService::set_presence`).
+    /// Returns the previous value so callers can skip broadcasting `presence.changed` on a no-op.
     @discardableResult
     public func setPresence(_ next: Presence) -> Presence {
         lock.lock()
@@ -238,27 +180,17 @@ public final class ContextService: @unchecked Sendable {
         return prev
     }
 
-    /// Point-in-time snapshot for trigger interpolation + the
-    /// `context.snapshot` socket command. Wire-shape parity with Rust
-    /// `Context` (`copad-core/src/context.rs:53`):
-    /// `{active_panel?, active_cwd?, pane_context?}`. `[String: Any]`
-    /// can't carry nil, so missing keys round-trip to `null` via serde
-    /// the same way Linux serializes `Option::None`.
+    /// Point-in-time snapshot for trigger interpolation and `context.snapshot`; wire-shape parity
+    /// with Rust `Context` (`copad-core/src/context.rs`). Missing keys round-trip to `null`
+    /// via serde, as Linux serializes `Option::None`.
     public func snapshot() -> [String: Any] {
         lock.lock()
         defer { lock.unlock() }
-        // `presence` always emits — matches Rust `Context.presence` which
-        // is `#[serde(default)]` `Presence::Active`, so the wire bytes
-        // are identical regardless of whether a setter ever fired. The
-        // engine's `Context` deserializer falls back to `Active` for a
-        // missing key, but emitting the value keeps the macOS shape in
-        // lockstep with Linux for any consumer that introspects it.
+        // `presence` always emits so the wire bytes match Rust's `Context` whether or not a
+        // setter ever fired.
         var out: [String: Any] = ["presence": presence.rawValue]
         if let panel = activePanel {
             out["active_panel"] = panel
-            // `active_cwd` + `pane_context` are derived from the active
-            // panel's per-panel cache. Same semantics as Linux's
-            // `ContextService::snapshot`.
             if let cwd = panelCwds[panel] {
                 out["active_cwd"] = cwd
             }

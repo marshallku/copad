@@ -5,11 +5,7 @@ import AppKit
 enum AddPanelType {
     case terminal
     case webview
-    /// Open a plugin-provided panel (e.g. Slack, Discord, Todos). Selected
-    /// via the dynamic rows in `AddPanelPopoverController` built from
-    /// `PluginManifestStore.discover()`. `panelName` is the `[[panels]]`
-    /// entry's `name` (default "main"); routed through
-    /// `AppDelegate.openPluginPanel` which mirrors the `plugin.open` RPC.
+    /// Plugin-provided panel; `panelName` is the `[[panels]]` entry's `name`.
     case plugin(name: String, panelName: String, label: String, icon: String?)
 }
 
@@ -36,7 +32,6 @@ enum TabPanelType {
 private final class TabButton: NSView, NSTextFieldDelegate {
     var onSelect: (() -> Void)?
     var onClose: (() -> Void)?
-    /// Called when the user commits an inline rename. Argument is the new title.
     var onRename: ((String) -> Void)?
 
     private let titleLabel = NSTextField(labelWithString: "")
@@ -50,7 +45,6 @@ private final class TabButton: NSView, NSTextFieldDelegate {
     private var panelType: TabPanelType = .terminal
     private var isCollapsedState = false
 
-    /// Active inline editor, present only during a rename session.
     private var editingField: NSTextField?
     /// Guards against double-commit when both doCommandBy and controlTextDidEndEditing fire.
     private var isCommitting = false
@@ -82,7 +76,6 @@ private final class TabButton: NSView, NSTextFieldDelegate {
         wantsLayer = true
         layer?.cornerRadius = 4
 
-        // Icon (visible only in collapsed mode)
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.isHidden = true
         addSubview(iconView)
@@ -102,19 +95,16 @@ private final class TabButton: NSView, NSTextFieldDelegate {
         addSubview(closeBtn)
 
         NSLayoutConstraint.activate([
-            // Icon (centered, used in collapsed mode)
             iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconView.widthAnchor.constraint(equalToConstant: 14),
             iconView.heightAnchor.constraint(equalToConstant: 14),
 
-            // Close button (right side, expanded mode)
             closeBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             closeBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeBtn.widthAnchor.constraint(equalToConstant: 16),
             closeBtn.heightAnchor.constraint(equalToConstant: 16),
 
-            // Title (between left edge and close button, expanded mode)
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             titleLabel.trailingAnchor.constraint(equalTo: closeBtn.leadingAnchor, constant: -4),
@@ -124,13 +114,11 @@ private final class TabButton: NSView, NSTextFieldDelegate {
         doubleClick.numberOfClicksRequired = 2
         addGestureRecognizer(doubleClick)
 
-        // Single-click for tab selection.
-        // Note: AppKit NSGestureRecognizer does not support require(toFail:) (UIKit only).
-        // On a double-click of an already-active tab, selectTapped fires first but
-        // switchTab() is a no-op (same index guard), so no refreshTabBar() happens and
-        // the TabButton survives for the double-click gesture to call beginEditing().
-        // Double-clicking an inactive tab selects it on the first click (rebuilds buttons)
-        // and does not trigger rename — the user must double-click again after selecting.
+        // AppKit gesture recognizers have no require(toFail:). Double-clicking an active tab:
+        // selectTapped fires first but switchTab() is a no-op (same-index guard), so no
+        // refreshTabBar() happens and the button survives for the double-click to call
+        // beginEditing(). Double-clicking an inactive tab selects it (rebuilding buttons) and
+        // does not rename.
         let click = NSClickGestureRecognizer(target: self, action: #selector(selectTapped))
         click.numberOfClicksRequired = 1
         addGestureRecognizer(click)
@@ -183,7 +171,6 @@ private final class TabButton: NSView, NSTextFieldDelegate {
             field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
         ])
         editingField = field
-        // selectText both starts editing and selects all content
         field.selectText(nil)
     }
 
@@ -302,8 +289,6 @@ private final class TabButton: NSView, NSTextFieldDelegate {
 
 // MARK: - AddPanelPopover
 
-/// Popover content: a grid of panel types × placement modes (Tab / Split→ / Split↓).
-/// Linux equivalent: the GTK Popover shown when clicking the "+" MenuButton.
 private final class AddPanelPopoverController: NSViewController {
     var onSelect: ((AddPanelType, AddPanelMode) -> Void)?
     private let theme: CopadTheme
@@ -335,7 +320,6 @@ private final class AddPanelPopoverController: NSViewController {
             stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
         ])
 
-        // Header row
         let header = makeHeaderRow()
         stack.addArrangedSubview(header)
 
@@ -343,17 +327,11 @@ private final class AddPanelPopoverController: NSViewController {
         divider.boxType = .separator
         stack.addArrangedSubview(divider)
 
-        // Panel rows — builtin first.
         stack.addArrangedSubview(makeRow(type: .terminal, icon: "terminal", label: "Terminal"))
         stack.addArrangedSubview(makeRow(type: .webview, icon: "globe", label: "Browser"))
 
-        // Plugin-provided panels. Discovery walks
-        // `~/Library/Application Support/copad/plugins/` (mirror of the
-        // path `copadd` reads + the `plugin.open` RPC handler at
-        // `AppDelegate.swift`'s `case "plugin.open"`). Only manifests
-        // that declare `[[panels]]` show up — service-only plugins
-        // (echo, calendar, git, etc.) stay out. Discovery is sorted
-        // by plugin name so row order is stable across launches.
+        // Only manifests declaring `[[panels]]` show up (service-only plugins stay out), sorted
+        // by plugin name so row order is stable.
         let pluginRows = pluginPanelRows()
         if !pluginRows.isEmpty {
             let pluginDivider = NSBox()
@@ -367,11 +345,8 @@ private final class AddPanelPopoverController: NSViewController {
         view = container
     }
 
-    /// One row per discovered plugin panel. Multi-panel plugins emit
-    /// a row per panel so the dispatch target (`panel.name`) is
-    /// click-resolvable. Default SF Symbol `puzzlepiece.extension` is
-    /// used when the manifest didn't set `[[panels]].icon` — every
-    /// shipping plugin today is in that bucket.
+    /// One row per discovered plugin panel; the default SF Symbol `puzzlepiece.extension` is
+    /// used when `[[panels]].icon` is unset.
     private func pluginPanelRows() -> [NSView] {
         var rows: [NSView] = []
         for loaded in PluginManifestStore.discover() {
@@ -391,7 +366,6 @@ private final class AddPanelPopoverController: NSViewController {
         return rows
     }
 
-    /// Column header: blank | Tab | Split→ | Split↓
     private func makeHeaderRow() -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -418,13 +392,11 @@ private final class AddPanelPopoverController: NSViewController {
         return row
     }
 
-    /// Panel row: [icon label] [tab btn] [split→ btn] [split↓ btn]
     private func makeRow(type: AddPanelType, icon: String, label: String) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.spacing = 6
 
-        // Left: icon + label
         let labelStack = NSStackView()
         labelStack.orientation = .horizontal
         labelStack.spacing = 6
@@ -441,7 +413,6 @@ private final class AddPanelPopoverController: NSViewController {
         labelStack.widthAnchor.constraint(equalToConstant: 100).isActive = true
         row.addArrangedSubview(labelStack)
 
-        // Right: three action buttons
         for (btnSymbol, mode) in [
             ("plus.square", AddPanelMode.tab),
             ("rectangle.split.2x1", .splitH),
@@ -498,16 +469,12 @@ private final class AddPanelPopoverController: NSViewController {
 final class TabBarView: NSView {
     static let height: CGFloat = 36
     static let collapsedTabWidth: CGFloat = 36
-    /// Width of a vertical (left/right) bar when collapsed to icon-only.
-    /// A touch wider than a collapsed pill so the toggle / "+" buttons
-    /// still sit centered without clipping.
     static let collapsedBarWidth: CGFloat = 44
 
     var onSelectTab: ((Int) -> Void)?
     var onCloseTab: ((Int) -> Void)?
     var onNewPanel: ((AddPanelType, AddPanelMode) -> Void)?
     var onToggle: (() -> Void)?
-    /// Called when the user commits a double-click inline rename.
     var onRenameTab: ((Int, String) -> Void)?
 
     private(set) var isCollapsed: Bool = false
@@ -518,20 +485,15 @@ final class TabBarView: NSView {
     private let addButton = NSButton()
     private var tabButtons: [TabButton] = []
     private var theme: CopadTheme
-    /// Vertical (left/right) orientation — the bar runs down one side of
-    /// the window with a fixed width. Horizontal (top/bottom) when false.
     private let isVertical: Bool
-    /// For a vertical bar, which edge the separator (and thus the content
-    /// area) sits on: leading for `right`-position tabs (content is to the
-    /// left), trailing for `left`-position tabs (content is to the right).
+    /// For a vertical bar, the edge the separator sits on: leading for `right`-position tabs,
+    /// trailing for `left`-position tabs.
     private let separatorLeading: Bool
     private var popover: NSPopover?
-    /// `[window] opacity` — only applied to the *bar* bg, not the tab
-    /// pills. Pills stay opaque so the active tab and hover state read
-    /// clearly against any backdrop.
+    /// `[window] opacity`, applied only to the bar bg: pills stay opaque so active and hover
+    /// states read against any backdrop.
     private var windowOpacity: Double
 
-    /// Width constraints for tab buttons (swapped on collapse/expand)
     private var tabWidthConstraints: [NSLayoutConstraint] = []
 
     init(theme: CopadTheme, windowOpacity: Double = 1.0, position: TabsPosition = .top) {
@@ -552,16 +514,12 @@ final class TabBarView: NSView {
         wantsLayer = true
         layer?.backgroundColor = Self.barBg(theme: theme, opacity: windowOpacity)
 
-        // Separator between the bar and the content area — bottom edge for
-        // a horizontal bar, trailing edge for a vertical (left/right) bar.
         let border = NSView()
         border.wantsLayer = true
         border.layer?.backgroundColor = theme.overlay0.nsColor.cgColor
         border.translatesAutoresizingMaskIntoConstraints = false
         addSubview(border)
         if isVertical {
-            // Separator on the edge that faces the content area: leading
-            // for `right`-position tabs, trailing for `left`-position tabs.
             let separatorEdge = separatorLeading
                 ? border.leadingAnchor.constraint(equalTo: leadingAnchor)
                 : border.trailingAnchor.constraint(equalTo: trailingAnchor)
@@ -580,7 +538,6 @@ final class TabBarView: NSView {
             ])
         }
 
-        // Toggle button (leftmost) — sidebar.left icon
         let toggleImg = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Toggle tab bar")?
             .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
         toggleButton.image = toggleImg
@@ -593,8 +550,6 @@ final class TabBarView: NSView {
         toggleButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(toggleButton)
 
-        // Tab stack — across the top/bottom when horizontal, down the
-        // side when vertical.
         stackView.orientation = isVertical ? .vertical : .horizontal
         stackView.spacing = 2
         stackView.edgeInsets = NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
@@ -607,7 +562,6 @@ final class TabBarView: NSView {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scrollView)
 
-        // "+" button — opens panel-type popover
         if let img = NSImage(systemSymbolName: "plus", accessibilityDescription: "New panel") {
             addButton.image = img
             addButton.title = ""
@@ -622,17 +576,12 @@ final class TabBarView: NSView {
         addSubview(addButton)
 
         if isVertical {
-            // Toggle pinned to the top, "+" to the bottom, tab list scrolls
-            // between them. The scroll viewport spans the bar minus the
-            // trailing 1px border.
             NSLayoutConstraint.activate([
                 toggleButton.topAnchor.constraint(equalTo: topAnchor, constant: 6),
                 toggleButton.centerXAnchor.constraint(equalTo: centerXAnchor),
                 toggleButton.heightAnchor.constraint(equalToConstant: 24),
 
                 scrollView.topAnchor.constraint(equalTo: toggleButton.bottomAnchor, constant: 6),
-                // Viewport spans from the separator to the far edge — flips
-                // with the separator side so `right`-position tabs don't clip.
                 separatorLeading
                     ? scrollView.leadingAnchor.constraint(equalTo: border.trailingAnchor)
                     : scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -645,8 +594,6 @@ final class TabBarView: NSView {
                 addButton.centerXAnchor.constraint(equalTo: centerXAnchor),
                 addButton.heightAnchor.constraint(equalToConstant: 28),
             ])
-            // Stack matches the viewport width and grows downward — it
-            // scrolls vertically once the tabs overflow the bar height.
             stackView.widthAnchor.constraint(equalTo: scrollView.widthAnchor).isActive = true
             stackView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.heightAnchor).isActive = true
         } else {
@@ -672,9 +619,8 @@ final class TabBarView: NSView {
     // MARK: - Public API
 
     func setTabs(titles: [String], types: [TabPanelType], activeIndex: Int) {
-        // Don't recreate buttons while the user is mid-rename — that would silently
-        // destroy the in-flight editor. The tab bar will resync on the next refresh
-        // after editing completes.
+        // Recreating buttons mid-rename would destroy the in-flight editor; the bar resyncs on
+        // the next refresh.
         if tabButtons.contains(where: \.isEditing) { return }
 
         tabButtons.forEach { $0.removeFromSuperview() }
@@ -691,10 +637,8 @@ final class TabBarView: NSView {
 
             let h = TabBarView.height - 8
             if isVertical {
-                // Each tab spans the bar width (minus the stack's 4px insets)
-                // and keeps the standard pill height; the whole bar narrows
-                // to icon-only via its width constraint when collapsed, so
-                // no per-tab width swap is needed here.
+                // The whole bar narrows to icon-only via its width constraint when collapsed, so
+                // no per-tab width swap is needed.
                 let w = btn.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -8)
                 w.isActive = true
                 tabWidthConstraints.append(w)
@@ -722,7 +666,6 @@ final class TabBarView: NSView {
 
     func setCollapsed(_ collapsed: Bool) {
         isCollapsed = collapsed
-        // The parent will call setTabs again; just update toggle button appearance here
         let tint = collapsed ? theme.text.nsColor : theme.subtext0.nsColor
         toggleButton.contentTintColor = tint
     }
@@ -765,9 +708,6 @@ final class TabBarView: NSView {
         pop.show(relativeTo: addButton.bounds, of: addButton, preferredEdge: .maxY)
     }
 
-    /// Hot-reload: `[window] opacity` and/or theme change. Recolors
-    /// the bar bg with the alpha-tinted surface; tab pills stay
-    /// opaque (per the pill's own draw path).
     func applyWindowOpacity(_ opacity: Double, theme: CopadTheme) {
         self.theme = theme
         windowOpacity = opacity

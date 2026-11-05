@@ -46,7 +46,6 @@ final class InputProxy: UITextView, UITextViewDelegate {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    /// The syllable still being composed, if any.
     var markedText: String {
         guard let r = markedTextRange else { return "" }
         return text(in: r) ?? ""
@@ -84,7 +83,6 @@ final class InputProxy: UITextView, UITextViewDelegate {
         if let s = UIPasteboard.general.string, !s.isEmpty { session?.send(.paste(s)) }
     }
 
-    /// Commit the IME's in-progress text (if any) and send everything committed.
     func commitComposition() {
         if markedTextRange != nil { unmarkText() }
         flush(holdingSyllable: false)
@@ -119,7 +117,6 @@ final class InputProxy: UITextView, UITextViewDelegate {
         if !added.isEmpty { emit(added) }
     }
 
-    /// Start a new line: the view empties and the keyboard is told, so it drops what it composed.
     private func clear() {
         sent = ""
         terminal?.marked = ""
@@ -150,7 +147,6 @@ final class InputProxy: UITextView, UITextViewDelegate {
         clear()
     }
 
-    /// Send a key from the bar or a hardware chord, after settling any composition.
     func key(_ k: KeyEvent) {
         commitComposition()
         session?.sendKey(k)
@@ -281,7 +277,6 @@ final class KeyBar: UIInputView {
 
     private func send(_ k: KeyEvent) { proxy?.key(k) }
 
-    /// The prefix and the chord key in one tap.
     private func chord(_ c: Character) {
         proxy?.key(.ctrl("b"))
         proxy?.key(KeyEvent(code: .char(c)))

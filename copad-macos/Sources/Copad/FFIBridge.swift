@@ -1,35 +1,18 @@
 import CCopadFFI
 import Foundation
 
-/// Thin Swift facade over the copad-ffi C-ABI staticlib.
-///
-/// PR 1 (Tier 2.1 spike) scope: prove the build/link path end-to-end with the
-/// smallest possible call surface. PR 2+ (registry seam, supervisor, trigger
-/// engine) will grow this file or split it per concern; for now everything
-/// the Rust side exposes lands here so Swift callers don't poke at C pointers
-/// directly.
-///
-/// Memory model:
-/// - `version()` returns a Swift String copy; no Rust allocation involved.
-/// - `callJSON(_:)` round-trips JSON. The C call returns a heap-allocated C
-///   string that this facade copies into a Swift String and immediately
-///   frees via `copad_ffi_free_string`. Callers never see a raw pointer.
-/// - `lastError()` reads a thread-local slot in Rust. The string is borrowed
-///   from Rust and copied to Swift on read; the Rust slot stays owned by Rust.
+/// Thin Swift facade over the copad-ffi staticlib, so callers never touch C pointers. Rust
+/// strings are copied into Swift and freed immediately via `copad_ffi_free_string`, except two
+/// that Rust owns and must not be freed: `version()`'s static string and `lastError()`'s
+/// thread-local slot.
 enum CopadFFI {
-    /// Static version string baked into the Rust crate. Cheap, no allocation.
     static func version() -> String {
-        // copad_ffi_version() returns a static C string we don't own.
         guard let cstr = copad_ffi_version() else { return "<null>" }
         return String(cString: cstr)
     }
 
-    /// Round-trip a JSON document through the Rust crate. The Rust side adds
-    /// an `echoed_at` field with a unix-epoch-millis timestamp so callers can
-    /// confirm the value came from Rust (not a Swift-side passthrough).
-    ///
-    /// On success returns the parsed JSON object.
-    /// On failure returns nil and writes the FFI error to stderr.
+    /// Round-trip a JSON document through Rust, which adds an `echoed_at` epoch-millis field.
+    /// Returns nil on failure and writes the FFI error to stderr.
     static func callJSON(_ payload: [String: Any]) -> [String: Any]? {
         guard let inputData = try? JSONSerialization.data(withJSONObject: payload),
               let inputStr = String(data: inputData, encoding: .utf8)
@@ -44,11 +27,6 @@ enum CopadFFI {
                 FileHandle.standardError.write(Data("[copad-ffi] call_json returned NULL: \(err)\n".utf8))
                 return nil
             }
-            // Important: copy to Swift String first, then free. If we passed
-            // resultPtr to JSONSerialization directly via a Data wrapper we'd
-            // have to manage the lifetime around the JSON parse, and Swift's
-            // Data(bytesNoCopy:) is easy to misuse. Copy-then-free is boring
-            // and obviously correct.
             defer { copad_ffi_free_string(resultPtr) }
             let resultStr = String(cString: resultPtr)
             guard let resultData = resultStr.data(using: .utf8),
@@ -61,17 +39,12 @@ enum CopadFFI {
         }
     }
 
-    /// Most recent error from the calling thread, copied into Swift.
-    /// Returns nil if no error has been recorded since the last successful call.
     static func lastError() -> String? {
         guard let cstr = copad_ffi_last_error() else { return nil }
         return String(cString: cstr)
     }
 
-    /// Smoke-test the FFI bridge. Called once during app launch (PR 1 spike)
-    /// to confirm the staticlib linked and basic round-trip works. Logs to
-    /// stderr; doesn't crash the app on failure (the FFI is non-load-bearing
-    /// at this stage — Tier 2.4 will replace this with real engine startup).
+    /// Smoke-test the link and a basic round-trip at app launch. Logs to stderr and never crashes.
     static func runSmokeTest() {
         FileHandle.standardError.write(Data("[copad-ffi] version = \(version())\n".utf8))
         if let echo = callJSON(["hello": "from swift", "spike": true]) {
@@ -80,70 +53,43 @@ enum CopadFFI {
     }
 }
 
-// MARK: - CopadEngine (PR 5c)
+// MARK: - CopadEngine
 
 /// Swift wrapper around the Rust `TriggerEngine` exposed via copad-ffi.
 ///
-/// Lifecycle:
-/// - `init()` creates the Rust engine + retains `self` so the C action
-///   callback can safely cast `user_data` back to a CopadEngine instance.
-/// - `setTriggers([...])` JSON-encodes and forwards. Hot-reload safe —
-///   engine swaps the trigger list atomically.
-/// - `dispatchEvent(kind:, payload:)` enters the engine; engine matches
-///   triggers and fires the C callback synchronously for each match.
-/// - `shutdown()` clears the callback slot, destroys the handle, releases
-///   `self`. After shutdown the instance must NOT be used again.
+/// `init()` creates the engine and retains `self` so the C action callback can cast `user_data`
+/// back. `setTriggers` hot-reloads (the engine swaps the list atomically). `dispatchEvent` matches
+/// triggers and fires the callback synchronously per match. After `shutdown()` the instance must
+/// not be used.
 ///
-/// Threading:
-/// - `dispatchEvent` runs on the calling thread (main actor in our use).
-///   The C action callback consequently fires inline on the main actor too,
-///   which is fine because it just records into a thread-safe Swift slot
-///   and dispatches to the registry asynchronously.
-/// - We deliberately do NOT pin the engine to a serial DispatchQueue here:
-///   the Rust `TriggerEngine` uses `RwLock` internally so concurrent
-///   dispatches are safe; pin-to-serial would only be necessary if we
-///   needed strict ordering between dispatch + setTriggers, which our
-///   AppDelegate-only call sites don't.
-/// Not `@MainActor` because EventBus.broadcast fires from any thread (plugin
-/// reader threads forward `event.publish` from there). The Rust engine itself
-/// is thread-safe (internal `RwLock`), so dispatching from any thread is fine
-/// at the Rust layer; the C action callback hops into main actor before
-/// touching `ActionRegistry`. `@unchecked Sendable` because the OpaquePointer
-/// handle isn't Sendable per se but ownership stays single-instance.
+/// Not `@MainActor`: EventBus.broadcast fires from any thread (plugin reader threads forward
+/// `event.publish`). The Rust engine is thread-safe (internal `RwLock`), and the callback hops to
+/// the main actor before touching `ActionRegistry`. `@unchecked Sendable` because the
+/// OpaquePointer handle is not Sendable but has a single owner.
 final class CopadEngine: @unchecked Sendable {
     private var handle: OpaquePointer?
-    /// Captured at init so the action callback (which has no Swift closure
-    /// context) can find its way back to ActionRegistry. Set ONCE by
-    /// AppDelegate immediately after construction; read from the C callback
-    /// thread. `nonisolated(unsafe)` is the Swift 6 escape hatch for the
-    /// "set once, read many" pattern that doesn't need a lock.
+    /// Set once by AppDelegate right after construction and read from the C callback thread, which
+    /// has no Swift closure context; `nonisolated(unsafe)` because no lock is needed.
     nonisolated(unsafe) var actionRegistry: ActionRegistry?
 
-    /// Gates `dispatchEvent`. Daemon-first cut-over flips this to false when
-    /// `gui.register` ack reports `host_triggers=true` so daemon-side and
-    /// local-side triggers don't double-fire on the same event. Drop guard
-    /// in `DaemonClient.handleDisconnect` flips it back to true.
-    ///
-    /// In-flight engine state (await preflight) is preserved across the
-    /// disable→enable cycle — `setTriggers([])` would reset it but also
-    /// require config reload to restore. Chained workflows that span a
-    /// cut-over boundary are unsupported either way.
+    /// Gates `dispatchEvent`. The daemon-first cut-over sets this to false when `gui.register`
+    /// reports `host_triggers=true`, so daemon and local triggers do not double-fire; the drop
+    /// guard in `DaemonClient.handleDisconnect` sets it back. Engine state (await preflight)
+    /// survives the cycle, unlike `setTriggers([])`. Chained workflows spanning a cut-over are
+    /// unsupported.
     private var enabled = true
     private let enableLock = NSLock()
 
     init() {
-        // copad_engine_create returns OpaquePointer? directly (Swift's clang
-        // importer maps the forward-declared C struct that way). No cast.
+        // copad_engine_create returns OpaquePointer? directly; no cast.
         guard let h = copad_engine_create() else {
             FileHandle.standardError.write(Data("[copad-engine] copad_engine_create returned NULL\n".utf8))
             return
         }
         handle = h
 
-        // Register the static C trampoline. user_data is a retained Swift
-        // pointer to self — paired with `Unmanaged.passRetained` on init
-        // and `takeRetainedValue` on shutdown, so the engine can safely
-        // dereference it for the entire lifetime of this instance.
+        // `user_data` is a retained pointer to self (`passRetained` here, released in `shutdown`),
+        // so the engine can dereference it for the instance's lifetime.
         let userData = Unmanaged.passRetained(self).toOpaque()
         copad_engine_set_action_callback(
             handle,
@@ -152,19 +98,11 @@ final class CopadEngine: @unchecked Sendable {
         )
     }
 
-    // No deinit. The Rust engine holds a retained pointer to `self`
-    // through `Unmanaged.passRetained` (so the C action callback can
-    // safely deref user_data). That retain count means deinit only
-    // fires AFTER `shutdown()` has run `passUnretained.release()`,
-    // which is the explicit teardown path AppDelegate must call.
-    // Adding a fallback destroy here would race with the retained
-    // pointer and isn't needed in practice — the app only constructs
-    // one CopadEngine and shutdown() is always reached on app quit.
+    // No deinit: the retained `self` pointer handed to Rust means deinit would only run after
+    // `shutdown()`, which AppDelegate must call. A fallback destroy would race that pointer.
 
-    /// Replace the engine's trigger list. Pass an array of trigger dicts
-    /// shaped like the TOML `[[triggers]]` blocks (decoded into JSON-friendly
-    /// values). Returns the count of loaded triggers, or nil on JSON
-    /// encoding failure.
+    /// Replace the engine's trigger list with dicts shaped like the TOML `[[triggers]]` blocks.
+    /// Returns the loaded count, or nil on JSON encoding failure.
     @discardableResult
     func setTriggers(_ triggers: [[String: Any]]) -> Int? {
         guard let handle else { return nil }
@@ -185,31 +123,16 @@ final class CopadEngine: @unchecked Sendable {
         }
     }
 
-    /// Dispatch an event to the engine. Triggers matching the kind/payload
-    /// fire their actions synchronously via the C callback (which then
-    /// hops to the action registry). Returns # triggers fired.
-    ///
-    /// `source` is stamped onto the synthesized `Event` and threads
-    /// through the trust boundary that gates Linux's await-promotion
-    /// (`copad_core::trigger::try_promote_or_drop_preflight` rejects
-    /// completion-suffixed events whose source is not
-    /// `COMPLETION_EVENT_SOURCE`). Defaults to `"macos.eventbus"` —
-    /// `ActionRegistry.publishCompletion` overrides with `"copad.action"`.
-    ///
-    /// `context` is the Context snapshot used for `{context.X}`
-    /// interpolation + condition evaluation. Pass `nil` (or empty dict)
-    /// to dispatch without context — interpolation tokens stay literal,
-    /// condition references resolve to null. macOS callers should pass
-    /// `ContextService.snapshot()` taken AFTER `apply`-ing the current
-    /// event to satisfy the apply-before-dispatch ordering Linux uses
-    /// in `Pump::pump_all`.
-    /// Cut-over hook called from `DaemonClient` register / disconnect.
-    /// Thread-safe via `enableLock`; safe to call from any thread.
+    /// Cut-over hook called from `DaemonClient` register / disconnect; safe from any thread.
     func setEnabled(_ value: Bool) {
         enableLock.lock(); defer { enableLock.unlock() }
         enabled = value
     }
 
+    /// `source` crosses the trust boundary gating await-promotion:
+    /// `copad_core::trigger::try_promote_or_drop_preflight` rejects completion-suffixed events
+    /// whose source is not `COMPLETION_EVENT_SOURCE`. Pass `ContextService.snapshot()` taken after
+    /// `apply`-ing the current event, the apply-before-dispatch order of Linux's `Pump::pump_all`.
     @discardableResult
     func dispatchEvent(
         kind: String,
@@ -223,8 +146,7 @@ final class CopadEngine: @unchecked Sendable {
         enableLock.unlock()
         guard isEnabled else { return 0 }
         guard let handle else { return 0 }
-        // `.fragmentsAllowed` so scalar / array / null payloads (matches
-        // serde_json::Value on the engine side) serialize.
+        // `.fragmentsAllowed` so scalar / array / null payloads serialize.
         let payloadObject: Any = payload ?? NSNull()
         let payloadStr: String = if let data = try? JSONSerialization.data(withJSONObject: payloadObject, options: [.fragmentsAllowed]),
                                     let s = String(data: data, encoding: .utf8)
@@ -233,9 +155,7 @@ final class CopadEngine: @unchecked Sendable {
         } else {
             "null"
         }
-        // Empty context dict short-circuits to nil so we pass NULL to FFI
-        // (saves a "{}" round-trip through serde — engine treats both
-        // identically but the NULL path is cheaper).
+        // An empty context becomes NULL, which is cheaper than a "{}" serde round-trip.
         let contextStr: String? = if let ctx = context, !ctx.isEmpty,
                                      let data = try? JSONSerialization.data(withJSONObject: ctx),
                                      let s = String(data: data, encoding: .utf8)
@@ -269,26 +189,23 @@ final class CopadEngine: @unchecked Sendable {
         }
     }
 
-    /// Diagnostic — current number of triggers loaded.
     var triggerCount: Int {
         guard let handle else { return 0 }
         let n = copad_engine_count_triggers(handle)
         return n < 0 ? 0 : Int(n)
     }
 
-    /// Tear down the engine. After this call the instance is unusable.
-    /// AppDelegate calls this from `applicationWillTerminate`.
+    /// Tear down the engine; the instance is unusable afterwards. Called from
+    /// `applicationWillTerminate`.
     func shutdown() {
         guard let handle else { return }
-        // Clear callback first so any in-flight dispatch can't invoke
-        // a stale function pointer between here and destroy.
+        // Clear the callback first so an in-flight dispatch cannot call a stale pointer.
         copad_engine_set_action_callback(
             handle,
             nil,
             nil,
         )
-        // Reclaim the retained self pointer so ARC can finalize this
-        // instance after AppDelegate drops its reference.
+        // Reclaim the retained self pointer so ARC can finalize the instance.
         Unmanaged<CopadEngine>.passUnretained(self).release()
         copad_engine_destroy(handle)
         self.handle = nil
@@ -296,24 +213,18 @@ final class CopadEngine: @unchecked Sendable {
 
     // MARK: - C callback trampoline
 
-    /// `@convention(c)` so the function pointer matches the C signature.
-    /// Cannot capture context, hence `user_data` carries the CopadEngine
-    /// instance pointer.
-    ///
-    /// Engine calls this from whatever thread invoked dispatchEvent.
-    /// We hop to the main actor before touching ActionRegistry (which is
-    /// `@MainActor`-isolated) or any other Swift state.
+    /// `@convention(c)`, so it cannot capture context: `user_data` carries the CopadEngine. The
+    /// engine calls from whatever thread invoked dispatchEvent; this hops to the main actor before
+    /// touching `ActionRegistry`.
     private static let actionCallback: copad_action_callback = { userData, actionPtr, paramsPtr in
         guard let userData, let actionPtr, let paramsPtr else { return }
-        // Take a borrowed reference; the engine owns the retained pointer
-        // and only releases it via CopadEngine.shutdown.
+        // Borrowed: the engine owns the retained pointer, released only by `shutdown`.
         let unmanaged = Unmanaged<CopadEngine>.fromOpaque(userData)
         let engine = unmanaged.takeUnretainedValue()
         let actionName = String(cString: actionPtr)
         let paramsJson = String(cString: paramsPtr)
 
-        // Decode params back into [String: Any] so ActionRegistry handlers
-        // can use the dict shape they expect from socket dispatch.
+        // Decode into the dict shape ActionRegistry handlers get from socket dispatch.
         let params: [String: Any] = if let data = paramsJson.data(using: .utf8),
                                        let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         {
@@ -322,18 +233,14 @@ final class CopadEngine: @unchecked Sendable {
             [:]
         }
 
-        // Fire-and-forget dispatch. We deliberately don't await the result —
-        // this matches the `{queued: true}` return from the Rust side and
-        // keeps the engine's dispatch loop non-blocking. ActionRegistry is
-        // @MainActor-isolated, so we hop via Task { @MainActor in ... }.
+        // Fire-and-forget, matching the Rust side's `{queued: true}`; ActionRegistry is
+        // @MainActor-isolated, hence the hop.
         let registryRef = engine.actionRegistry
         Task { @MainActor in
             guard let registry = registryRef else {
                 FileHandle.standardError.write(Data("[copad-engine] action callback fired but no ActionRegistry attached: \(actionName)\n".utf8))
                 return
             }
-            // Fire-and-forget. Plumbing the action result back into the
-            // Rust engine waits for await semantics.
             registry.tryDispatchOrFallback(actionName, params: params) { _ in }
         }
     }

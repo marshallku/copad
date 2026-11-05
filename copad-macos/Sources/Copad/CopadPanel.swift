@@ -2,73 +2,42 @@ import AppKit
 import Foundation
 
 extension Notification.Name {
-    /// Posted by any panel that changes its title — terminal
-    /// (`setCustomTitle`, OSC 0/2 future hook) or webview
-    /// (`didFinishNavigation`). The tab bar observes this to refresh
-    /// the active tab label. Lifts the constant out of the deleted
-    /// `TerminalViewController.swift` so all panel types share one
-    /// notification key.
     static let terminalTitleChanged = Notification.Name("copad.terminalTitleChanged")
-    /// A webview pane's persisted state — its URL or its scroll offset — is now
-    /// stale.
-    ///
-    /// Layout changes (new tab, split, close, tab switch) were the only things
-    /// that scheduled a session save, which meant a browser pane's URL was
-    /// persisted only if some UNRELATED structural change happened to follow
-    /// it. Navigate to a page and quit, and the pane came back at wherever it
-    /// had been when the last split or tab switch occurred — or, for a pane
-    /// opened blank and then navigated, at nothing at all.
+    /// A webview pane's persisted URL or scroll offset is stale. Layout changes were the only
+    /// thing that scheduled a session save, so a pane's URL was otherwise saved only if an
+    /// unrelated structural change followed.
     static let webviewStateChanged = Notification.Name("copad.webviewStateChanged")
 }
 
-/// Common interface for all panel types (terminal, webview, …).
-/// Both TerminalViewController and WebViewController conform to this.
 @MainActor
 protocol CopadPanel: AnyObject {
-    /// Stable identifier for this panel (UUID string). Used in event payloads.
     var panelID: String { get }
 
-    /// The root NSView managed by this panel (from NSViewController).
     var view: NSView { get }
 
-    /// The view that should receive keyboard focus. For panels that
-    /// wrap their input-handling view in a layout container, this is
-    /// the inner view (e.g. the alacritty `AlacrittyRenderView`).
-    /// External callers use this instead of `view` when calling
-    /// `makeFirstResponder`, so the container being unfocusable
-    /// doesn't break activation.
+    /// External callers focus this instead of `view`, which may be an unfocusable layout
+    /// container.
     var focusTarget: NSView { get }
 
-    /// Title shown in the tab bar.
     var currentTitle: String { get }
 
-    /// Called once after the panel's view is embedded and layout is resolved.
     func startIfNeeded()
 
-    /// Background image (no-op for panels that don't support it).
     func applyBackground(path: String, tint: Double, opacity: Double)
     func clearBackground()
     func setTint(_ alpha: Double)
 
-    /// NSViewController lifecycle (satisfied automatically by subclasses).
     func removeFromParent()
 }
 
 extension CopadPanel {
-    /// Default conformance: panels that don't have a separate focus
-    /// target (e.g. WebViewController, or terminal panels where the
-    /// root view IS the input-handling view) just hand back `view`.
-    /// Override on panels whose root view is a layout container that
-    /// shouldn't itself receive keyboard focus.
     var focusTarget: NSView {
         view
     }
 }
 
-/// Cmd+= / Cmd+- / Cmd+0 surface. Both terminal backends conform;
-/// non-terminal panels (WebView, plugin) don't — AppDelegate uses
-/// `activePane as? Zoomable` so the menu items become silent no-ops
-/// when focus is on a non-terminal pane.
+/// Cmd+= / Cmd+- / Cmd+0 surface. Non-terminal panels don't conform, so the menu items no-op
+/// there.
 @MainActor
 protocol Zoomable {
     func zoomIn()
@@ -76,11 +45,8 @@ protocol Zoomable {
     func zoomReset()
 }
 
-/// Backend-agnostic surface for the `terminal.*` socket methods.
-/// `AlacrittyTerminalViewController` is the only conformer today;
-/// WebView / plugin panels do not, so `panel as? TerminalCapable
-/// == nil` is the compile-time signal AppDelegate uses to emit
-/// `wrong_panel_type` — matching Linux's `as_terminal()` check in
+/// Backend-agnostic surface for the `terminal.*` socket methods. `panel as? TerminalCapable ==
+/// nil` is how AppDelegate emits `wrong_panel_type`, matching Linux's `as_terminal()` check in
 /// copad-linux/src/socket.rs::resolve_terminal.
 @MainActor
 protocol TerminalCapable: CopadPanel {
@@ -90,9 +56,7 @@ protocol TerminalCapable: CopadPanel {
     func readScreen() -> [String: Any]
     func history(lines: Int) -> [String: Any]
     func context(historyLines: Int) -> [String: Any]
-    /// Title override set via `tab.rename`. When non-nil, suppresses
-    /// auto-derived title updates (OSC 0/2 from the running shell).
-    /// `currentTitle` reflects this when set.
+    /// Title override set via `tab.rename`; suppresses auto-derived title updates (OSC 0/2).
     var customTitle: String? { get }
     func setCustomTitle(_ title: String)
 }

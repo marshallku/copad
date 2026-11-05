@@ -11,9 +11,7 @@ import UserNotifications
 final class PushRegistry: ObservableObject {
     static let shared = PushRegistry()
 
-    /// This install's APNs token (hex), once iOS has handed one over.
     @Published private(set) var token: String?
-    /// Why there is no token, or why a host refused it — shown on the hosts screen.
     @Published private(set) var status: [String: String] = [:]
     /// A tapped notification waiting for its host to be opened: (host id, pane token).
     @Published var tapped: (host: String, pane: String)?
@@ -62,7 +60,6 @@ final class PushRegistry: ObservableObject {
     }
 }
 
-/// The app delegate SwiftUI lacks: APNs token callbacks and notification presentation.
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions _: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
@@ -78,7 +75,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         Task { @MainActor in PushRegistry.shared.didFail(error) }
     }
 
-    /// A push for the host on screen shows nothing: the user is already looking at it.
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
         let host = PushEnvelope.open(n.request.content.userInfo)?.host

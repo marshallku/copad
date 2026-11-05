@@ -27,7 +27,6 @@ log() { printf '[verify-sim] %s\n' "$*" >&2; }
 
 command -v xcodegen >/dev/null || { log "xcodegen not installed (brew install xcodegen)"; exit 1; }
 
-# Preflight the local web-bridge so a server-down state isn't misread as a shell bug.
 case "$SERVER_URL" in
   http://127.0.0.1*|http://localhost*)
     if ! curl -fsS -o /dev/null "${SERVER_URL%/}/healthz"; then
@@ -40,8 +39,7 @@ esac
 log "generating project"
 xcodegen generate >/dev/null
 
-# Pick the newest available iOS runtime, then an iPhone device on it. Deterministic
-# ordering (sort by runtime version desc) — not JSON enumeration order.
+# Newest available iOS runtime, then an iPhone on it (sorted by runtime version, not JSON order).
 log "selecting simulator"
 UDID="$(xcrun simctl list devices available --json | python3 -c '
 import json,sys,re
@@ -70,8 +68,7 @@ xcodebuild -project copad-ios.xcodeproj -scheme "$SCHEME" \
 APP="$DERIVED/Build/Products/Debug-iphonesimulator/$SCHEME.app"
 [ -d "$APP" ] || { log "built app not found at $APP"; exit 1; }
 
-# Clean state: remove any prior install + reset notification permission so the
-# permission prompt (if driven) is reproducible.
+# Clean state, with notification permission reset so the prompt is reproducible.
 xcrun simctl uninstall "$UDID" "$BUNDLE_ID" 2>/dev/null || true
 xcrun simctl privacy "$UDID" reset all "$BUNDLE_ID" 2>/dev/null || true
 

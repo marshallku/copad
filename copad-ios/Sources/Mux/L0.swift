@@ -22,7 +22,6 @@ struct L0Session: Codable, Equatable, Identifiable {
 }
 
 extension L0Session {
-    /// The TUI's subtitle: the git branch, else what the focused pane runs.
     var subtitle: String {
         if !branch.isEmpty { return branch }
         return tabs.first { $0.active }?.panes.first { $0.focused }?.label ?? " "
@@ -81,7 +80,6 @@ struct L0Agent: Codable, Equatable, Identifiable {
     var compactQueued: Bool { compact_requested == true }
 }
 
-/// An agent's context window fill and spend, drawn as a gauge like the usage readout.
 struct L0AgentContext: Codable, Equatable {
     var used: Int64
     var window: Int64?
@@ -93,9 +91,7 @@ struct L0AgentContext: Codable, Equatable {
         guard let w = window, w > 0 else { return nil }
         return Double(used) * 100 / Double(w)
     }
-    /// `62%`, else the raw `131k` — as the TUI row.
     var short: String { pct.map { "\(Int($0.rounded()))%" } ?? L0AgentContext.tokens(used) }
-    /// `124k/200k · $1.20 · $3.40/h`, as the TUI switcher preview.
     var long: String {
         var out = window.map { "\(L0AgentContext.tokens(used))/\(L0AgentContext.tokens($0))" }
             ?? "\(L0AgentContext.tokens(used)) tokens"
@@ -205,7 +201,6 @@ struct L0Model: Equatable {
         case ignored
     }
 
-    /// Fold one L0 server line (already parsed JSON).
     mutating func apply(_ m: [String: Any]) -> Applied {
         switch m["t"] as? String {
         case "welcome":
@@ -268,11 +263,10 @@ struct L0Model: Equatable {
         return true
     }
 
-    /// The active session.
     var activeSession: L0Session? { tree?.sessions.first { $0.active } }
 
-    /// Whether `attachment` with `tag` is listed — the precondition for a claim (codex C1:
-    /// the render Hello can arrive before the server registered the attachment and its tag).
+    /// Whether `attachment` with `tag` is listed, the precondition for a claim (the render Hello
+    /// can arrive before the server registered the attachment and its tag).
     func lists(attachment: UInt64, tag: String) -> Bool {
         clients?.clients.contains { $0.id == attachment && $0.tag == tag } ?? false
     }
@@ -280,7 +274,6 @@ struct L0Model: Equatable {
 
 /// "4m", "2h13m" — a host renders elapsed time itself so the topic need not change each second.
 func elapsedLabel(since: Int64, now: Date = Date()) -> String {
-    // The TUI's `fmt_elapsed`: nothing under a minute, then whole minutes.
     let secs = max(0, Int64(now.timeIntervalSince1970) - since)
     if secs < 60 { return "" }
     let m = secs / 60
@@ -354,14 +347,12 @@ struct L0Picker: Equatable {
     /// Rows still being gathered (a directory listing, a transcript scan): the same overlay id
     /// arrives again with them (decisions #172).
     var loading: Bool
-    /// A line above the rows (an unreadable directory's error).
     var note: String
     var keys: [L0PickerKey] = []
     /// No filter field: printable keys belong to `keys`/`actions` (the center's `d`).
     var noFilter = false
 }
 
-/// A pane's screen as styled runs (`pane-preview`, decisions #180).
 struct L0Preview: Codable, Equatable {
     var pane: String
     var header: String?
@@ -380,7 +371,6 @@ struct L0Run: Codable, Equatable {
     var reverse: Bool?
 }
 
-/// A palette index (the host's theme for 0–15) or `#rrggbb`.
 enum L0RunColor: Codable, Equatable {
     case indexed(Int)
     case rgb(UInt32)

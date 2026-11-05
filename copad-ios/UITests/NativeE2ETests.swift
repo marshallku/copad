@@ -55,8 +55,7 @@ final class NativeE2ETests: XCTestCase {
         h.write(Data((line + "\n").utf8))
         try h.close()
         app.buttons["host-e2e"].tap()
-        // First contact asks at once — a refused key used to leave the connection open until
-        // the 20 s setup deadline.
+        // First contact asks at once, not after the 20 s setup deadline.
         let trust = app.buttons["trustHostKey"].firstMatch
         XCTAssertTrue(trust.waitForExistence(timeout: 8), "the host key prompt took too long")
         trust.tap()
@@ -90,12 +89,10 @@ final class NativeE2ETests: XCTestCase {
         while Date() < end, screen().contains("spaces") { Thread.sleep(forTimeInterval: 0.3) }
         XCTAssertFalse(screen().contains("spaces"), "TUI sidebar still drawn:\n\(screen())")
 
-        // 3. Typing reaches the shell (committed text → keys, Return → Enter).
         terminal.tap()
         app.typeText("echo NATIVE-$((6*7))\n")
         waitScreen("NATIVE-42")
 
-        // 4. Hangul through the text system, committed as text.
         app.typeText("echo 한글-확인\n")
         waitScreen("한글-확인")
         snapshot("typed")
@@ -272,8 +269,8 @@ final class NativeE2ETests: XCTestCase {
 
     /// The REAL iOS Korean keyboard, key by key (`E2E_KOREAN=1`: the script makes a simulator
     /// whose only keyboard is Korean). It composes without marked text and remembers what it
-    /// composed, so deleting past the held syllable rewrites the one before — which used to
-    /// leave a ghost syllable drawn and the sent one in the pane.
+    /// composed, so deleting past the held syllable rewrites the one before; a ghost syllable
+    /// must not stay drawn while the sent one sits in the pane.
     func testKoreanKeyboardTypesAndDeletes() throws {
         guard ProcessInfo.processInfo.environment["E2E_KOREAN"] == "1" else {
             throw XCTSkip("run with E2E_KOREAN=1")
@@ -356,7 +353,6 @@ final class NativeE2ETests: XCTestCase {
         waitForExpectations(timeout: 10)
         terminal.tap()
         app.typeText("./hello.sh\n")
-        // The pane is narrow: the line wraps.
         waitScreen("Hello from")
         snapshot("demo")
     }

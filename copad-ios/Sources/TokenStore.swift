@@ -3,10 +3,9 @@
 import Foundation
 import Security
 
-/// Secure persistence for the web-bridge bearer token. The token can drive the
-/// workstation terminal, so it lives in the iOS Keychain — never UserDefaults.
-/// `AfterFirstUnlock` so it survives reboots and is readable when a background
-/// push wakes the app.
+/// Keychain storage for the web-bridge bearer token, which can drive the workstation terminal
+/// (never UserDefaults). `AfterFirstUnlock` so it survives reboots and is readable when a
+/// background push wakes the app.
 enum TokenStore {
     private static let service = "com.marshall.copad.ios.bearer"
     private static let account = "web-bridge"
@@ -19,9 +18,8 @@ enum TokenStore {
         ]
     }
 
-    /// Persist the token. Updates in place when it already exists, adds it
-    /// otherwise — never deletes first, so a failed write can't lose the prior
-    /// value. Returns whether it succeeded.
+    /// Updates in place when the token exists, adds it otherwise; never deletes first, so a failed
+    /// write cannot lose the prior value. Returns whether it succeeded.
     @discardableResult
     static func save(_ token: String) -> Bool {
         let data = Data(token.utf8)

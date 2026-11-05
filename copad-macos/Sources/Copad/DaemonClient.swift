@@ -1,17 +1,13 @@
 import Darwin
 import Foundation
 
-/// Daemon client connection. Mirrors `copad-linux/src/gui_client.rs`.
+/// Daemon client connection. Mirrors `copad-linux/src/gui_client.rs`; wire shapes are in
+/// `copad-core/src/protocol.rs`. Inbound frames are demuxed by the presence of
+/// `invoke`/`ok`/`type`; `_ping` arrives as `Invoke {invoke: "_ping"}` and is answered with a
+/// normal `Response`.
 ///
-/// Wire shapes are defined in `copad-core/src/protocol.rs`:
-/// - Outbound: `Request {id, method, params}`
-/// - Inbound: `Response {id, ok, result?, error?}`, `Invoke {id, invoke, params}`,
-///   `Event {type, data, source?}`. Demuxed by presence of `invoke`/`ok`/`type`.
-/// - `_ping` arrives as `Invoke {invoke: "_ping"}`; reply is a normal `Response`.
-///
-/// `@unchecked Sendable`: synchronous `isConnected` is required by
-/// `ActionRegistry` fallback (every dispatch hits it), so an `actor` would
-/// force the call site async. State guarded by `stateLock`.
+/// `@unchecked Sendable` because `ActionRegistry` fallback reads `isConnected` synchronously on
+/// every dispatch, which an `actor` would make async. State is guarded by `stateLock`.
 final class DaemonClient: @unchecked Sendable {
     let capabilities: [String]
     let socketURL: URL
@@ -33,9 +29,7 @@ final class DaemonClient: @unchecked Sendable {
 
     private(set) var lastAck: RegisterAck?
 
-    /// Forwarder needs subscribe access on the bus, not just publish, so
-    /// `EventBus` is constructor-injected (lifecycle is intrinsic to
-    /// DaemonClient — wouldn't make sense to swap mid-flight).
+    /// `EventBus` is constructor-injected because the forwarder needs subscribe access.
     private let eventBus: EventBus
 
     init(socket: URL, capabilities: [String], eventBus: EventBus) {
@@ -44,14 +38,11 @@ final class DaemonClient: @unchecked Sendable {
         self.eventBus = eventBus
     }
 
-    /// Called by AppDelegate-side wiring on register / disconnect with the
-    /// daemon's `host_triggers` flag. `true` ⇒ disable local engine (daemon
-    /// owns trigger firing), `false` ⇒ re-enable local fallback. Invoked
-    /// from background threads; callers must be thread-safe (CopadEngine's
-    /// `setEnabled` is NSLock-guarded).
+    /// Called on register / disconnect with the daemon's `host_triggers` flag: `true` disables
+    /// the local engine (daemon owns trigger firing), `false` re-enables it. Invoked from
+    /// background threads; callers must be thread-safe.
     var cutoverHandler: (@Sendable (Bool) -> Void)?
 
-    /// Idempotent. Second call is a no-op.
     func start() {
         stateLock.lock()
         guard !started else { stateLock.unlock(); return }
@@ -121,14 +112,10 @@ final class DaemonClient: @unchecked Sendable {
     typealias InvokeHandler = @MainActor @Sendable (_ id: String, _ method: String, _ params: [String: Any], _ reply: @Sendable @escaping (String) -> Void) -> Void
     var invokeHandler: InvokeHandler?
 
-    /// Called from the reader thread for every inbound `Event`. AppDelegate
-    /// re-broadcasts on the local `EventBus` with a fresh `bridgeId` so PR 4b's
-    /// outbound forwarder can echo-skip. `data` mirrors `serde_json::Value`
-    /// (object/array/scalar/NSNull); the daemon wire has no `timestamp_ms`,
-    /// so the local broadcast assigns one. `origin` carries the daemon-side
-    /// trust-boundary tag — `external` for events that crossed the
-    /// `events.publish` ingest, `internal` otherwise. The GUI trigger engine's
-    /// `[security] accept_external` gate consumes this.
+    /// Called from the reader thread for every inbound `Event`. AppDelegate re-broadcasts it on
+    /// the local `EventBus` with a fresh `bridgeId` (outbound forwarders echo-skip on it); the
+    /// daemon wire has no `timestamp_ms`, so the local broadcast assigns one. `origin` is the
+    /// daemon-side trust tag that the GUI engine's `[security] accept_external` gate consumes.
     typealias InboundEventHandler = @Sendable (
         _ type: String,
         _ source: String,
@@ -269,11 +256,8 @@ final class DaemonClient: @unchecked Sendable {
                 "want_primary": true,
                 "version": "1.0.0",
                 "protocol_version": 1,
-                // Daemon's `GUI_ENV_ALLOWED_KEYS` is currently a Linux/
-                // Wayland-only set (HYPRLAND_INSTANCE_SIGNATURE,
-                // WAYLAND_DISPLAY, ...). None apply on macOS, so an empty
-                // dict is the correct contract until daemon-side allowlist
-                // grows macOS keys (separate trust-boundary review).
+                // `GUI_ENV_ALLOWED_KEYS` is a Linux/Wayland-only set, so an empty dict is correct
+                // until the daemon allowlist grows macOS keys (needs a trust-boundary review).
                 "gui_env": [:] as [String: String],
             ],
         ]
@@ -384,9 +368,7 @@ final class DaemonClient: @unchecked Sendable {
             // events at a protocol bump.
             let origin: Origin = (value["origin"] as? String)
                 .flatMap(Origin.init(rawValue:)) ?? .internal
-            // `data` may be NSNull / array / scalar / dict — pass through
-            // verbatim. AppDelegate's handler stamps a fresh bridge_id and
-            // republishes onto local EventBus.
+            // `data` may be NSNull / array / scalar / dict; pass through verbatim.
             inboundEventHandler?(type, source, value["data"], origin)
             return
         }
@@ -401,17 +383,13 @@ final class DaemonClient: @unchecked Sendable {
         writer.sendControl(line) // priority lane — bypasses bounded forward queue
     }
 
-    /// Admit an inbound Invoke through a bounded gate, then dispatch on the
-    /// main actor. Saturation and stale-generation invokes both reply
-    /// `overloaded` so the daemon completes its pending entry without
-    /// waiting for its own per-method timeout.
+    /// Admit an inbound Invoke through a bounded gate, then dispatch on the main actor.
+    /// Saturation and stale-generation invokes reply `overloaded` so the daemon completes its
+    /// pending entry without waiting for its own timeout.
     ///
-    /// The admission slot holds until the **response closure fires**, not
-    /// when the Task body returns: async handlers (`webview.execute_js`,
-    /// `claude.start`, `webview.screenshot`) complete later than the Task
-    /// closure exits, so deferring slot release on Task return would defeat
-    /// the bound. `SlotGuard.releaseOnce()` makes every terminal path
-    /// (response / missing handler / stale-gen / safety net) idempotent.
+    /// The slot is held until the response closure fires, not until the Task returns: async
+    /// handlers (`webview.execute_js`, `claude.start`, `webview.screenshot`) finish later.
+    /// `SlotGuard.releaseOnce()` makes every terminal path idempotent.
     private func admitInvoke(id: String, method: String, params: [String: Any]) {
         stateLock.lock()
         let admittedGen = generation
@@ -432,10 +410,8 @@ final class DaemonClient: @unchecked Sendable {
             self?.stateLock.unlock()
         }
 
-        // Slot leak guard: if a handler never completes (a buggy callback
-        // that drops its completion), this fires after daemon-side timeout
-        // has already given up. Late replies racing this no-op since
-        // writer.send on a shut-down channel returns false anyway.
+        // Slot leak guard for a handler that never completes. Late replies racing this no-op
+        // because writer.send on a shut-down channel returns false.
         timeoutQueue.asyncAfter(deadline: .now() + Self.invokeHandlerSafetyTimeout) {
             releaseSlot()
         }
@@ -527,9 +503,8 @@ final class DaemonClient: @unchecked Sendable {
         forwarderChannel = nil
         stateLock.unlock()
 
-        // Drop guard: re-enable local engine so GUI-only triggers keep
-        // firing through the reconnect-backoff window. Mirror of Linux
-        // HostTriggersGuard Drop impl.
+        // Drop guard: re-enable the local engine so GUI-only triggers fire through the reconnect
+        // backoff (mirrors Linux's HostTriggersGuard).
         if hadForwarder {
             cutoverHandler?(false)
         }
@@ -568,10 +543,8 @@ final class DaemonClient: @unchecked Sendable {
         return true
     }
 
-    /// Single-line blocking byte-by-byte read used only by the synchronous
-    /// register-ack handshake. Cap semantics match the runReader loop and
-    /// `copad-daemon::socket::read_line_capped`: `maxFrameBytes` includes
-    /// the trailing newline. Returns nil on EOF, error, or oversized frame.
+    /// Blocking byte-by-byte read for the synchronous register-ack handshake. `maxFrameBytes`
+    /// includes the trailing newline, as in `runReader`. Returns nil on EOF, error or oversize.
     private func readLine(fd: Int32) -> String? {
         var buf = Data()
         var byte: UInt8 = 0
@@ -603,7 +576,6 @@ final class DaemonClient: @unchecked Sendable {
 
 // MARK: - Supporting types
 
-/// Captured fields from the daemon's `gui.register` ack.
 struct RegisterAck {
     let clientId: String
     let primary: Bool
@@ -612,9 +584,7 @@ struct RegisterAck {
     let hostTriggers: Bool
 }
 
-/// Live socket-connection bundle for the GUI ↔ daemon connection.
-/// Renamed from `Session` to avoid clashing with the module-level
-/// `enum Session` introduced for tab-layout persistence.
+/// Live socket-connection bundle. Named to avoid clashing with `enum Session`.
 private struct ConnectedSession {
     let fd: Int32
     let writer: WriterChannel
@@ -660,10 +630,8 @@ final class WriterChannel: @unchecked Sendable {
         }
     }
 
-    /// Returns `false` on overflow OR when the channel has been shut down —
-    /// caller must fail-complete the corresponding pending entry. Silently
-    /// dropping the oldest frame would let the caller wait for a reply the
-    /// daemon never received.
+    /// Returns `false` on overflow or shutdown; the caller must fail-complete its pending entry
+    /// (dropping the oldest frame would leave it waiting for a reply the daemon never saw).
     func send(_ line: String) -> Bool {
         cond.lock()
         defer { cond.unlock() }
@@ -697,8 +665,6 @@ final class WriterChannel: @unchecked Sendable {
         cond.unlock()
     }
 
-    /// Wakes both the drain thread and any blocked `sendBlocking` callers
-    /// so they exit via the `stopped` check.
     func shutdown() {
         cond.lock()
         stopped = true

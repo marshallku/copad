@@ -3,10 +3,8 @@
 import SwiftUI
 import WebKit
 
-/// Observable load state for the WebView, so ContentView can overlay a
-/// failure/retry UI instead of a blank web view. `reloadToken` is bumped to
-/// force a reload of the same URL (the Retry button) — a URL-equality guard
-/// alone would otherwise skip it.
+/// Load state for the WebView, so ContentView can overlay a failure/retry UI. `reloadToken` is
+/// bumped to force a reload of the same URL (Retry); a URL-equality guard alone would skip it.
 @MainActor
 final class WebViewState: ObservableObject {
     @Published var failed: Bool = false
@@ -18,20 +16,16 @@ final class WebViewState: ObservableObject {
 
 /// A WKWebView wrapper that loads the configured server URL.
 ///
-/// Load-bearing behaviors (from the plan's review):
-///  - loads ONLY when the normalized URL changes OR a reload is explicitly
-///    requested, so unrelated SwiftUI updates never reload and drop the PWA's
-///    WebSocket session;
-///  - a navigation policy that allows only https / loopback-http to the
-///    configured origin and cancels file:/custom-scheme/off-origin navigations;
-///  - `activeNavigation` tracks the LATEST navigation (set in
-///    didStartProvisionalNavigation), so failure callbacks apply to in-page PWA
-///    navigations too, while a superseded navigation's late failure is ignored.
+/// * Loads ONLY when the normalized URL changes or a reload is requested, so unrelated SwiftUI
+///   updates never reload and drop the PWA's WebSocket session.
+/// * Navigation is limited to https / loopback-http on the configured origin; file:,
+///   custom-scheme and off-origin navigations are cancelled.
+/// * `activeNavigation` tracks the LATEST navigation, so failures apply to in-page PWA
+///   navigations too while a superseded navigation's late failure is ignored.
 struct WebView: UIViewRepresentable {
     let url: URL
     @ObservedObject var state: WebViewState
-    /// Bearer token to seed into the PWA's sessionStorage. Empty → no seeding
-    /// (the PWA shows its own token page).
+    /// Bearer token to seed into the PWA's sessionStorage; empty means no seeding.
     var token: String = ""
 
     func makeCoordinator() -> Coordinator { Coordinator(state: state) }
@@ -54,11 +48,9 @@ struct WebView: UIViewRepresentable {
         coord.lastReloadToken = state.reloadToken
         state.failed = false
 
-        // At document-start, scoped to the configured origin, either SET the
-        // token into sessionStorage (so the PWA skips its token page) or REMOVE
-        // it when the field is blank (sessionStorage survives reloads, so just
-        // dropping the script would leave a stale token active). Origin-scoped so
-        // the token is never written on any other page the web view reaches.
+        // At document-start, scoped to the configured origin, SET the token into sessionStorage
+        // or REMOVE it when blank (sessionStorage survives reloads, so dropping the script would
+        // leave a stale token). Origin-scoped so no other page gets the token.
         let ucc = web.configuration.userContentController
         ucc.removeAllUserScripts()
         if let origin = Self.expectedOrigin(url) {
@@ -67,14 +59,11 @@ struct WebView: UIViewRepresentable {
         web.load(URLRequest(url: url))
     }
 
-    /// The browser-normalized origin (default ports dropped) of `url`, matching
-    /// what `window.location.origin` reports.
     private static func expectedOrigin(_ url: URL) -> String? {
         guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else {
             return nil
         }
-        // Bracket IPv6 literals so `::1` becomes `[::1]`, matching what
-        // `window.location.origin` reports (URL.host strips the brackets).
+        // Bracket IPv6 literals (`::1` -> `[::1]`) as `window.location.origin` does.
         let hostPart = host.contains(":") ? "[\(host)]" : host
         var origin = "\(scheme)://\(hostPart)"
         if let port = url.port,
@@ -85,9 +74,8 @@ struct WebView: UIViewRepresentable {
         return origin
     }
 
-    /// A document-start, origin-scoped script that SETs the token when non-empty
-    /// or REMOVEs it when empty. JSON-encodes values so nothing breaks out of the
-    /// literal; on encoding failure it falls back to a no-op.
+    /// Document-start, origin-scoped script that SETs the token, or REMOVEs it when empty. Values
+    /// are JSON-encoded so nothing breaks out of the literal; encoding failure yields a no-op.
     private static func storageScript(token: String, origin: String) -> WKUserScript {
         let noop = WKUserScript(source: ";", injectionTime: .atDocumentStart, forMainFrameOnly: true)
         guard let originJSON = jsonString(origin) else { return noop }
@@ -107,7 +95,6 @@ struct WebView: UIViewRepresentable {
         guard let data = try? JSONSerialization.data(withJSONObject: [s], options: []),
               let arr = String(data: data, encoding: .utf8)
         else { return nil }
-        // `["..."]` → strip the array brackets to get the bare JSON string literal.
         return String(arr.dropFirst().dropLast())
     }
 
@@ -121,7 +108,6 @@ struct WebView: UIViewRepresentable {
 
         init(state: WebViewState) { self.state = state }
 
-        // Restrict navigation to https / loopback-http on the configured origin.
         func webView(_ webView: WKWebView,
                      decidePolicyFor navigationAction: WKNavigationAction,
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -137,7 +123,6 @@ struct WebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView,
                      didStartProvisionalNavigation navigation: WKNavigation!) {
-            // The most recent navigation is the one whose outcome we care about.
             activeNavigation = navigation
             state.failed = false
         }
@@ -159,16 +144,14 @@ struct WebView: UIViewRepresentable {
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            // Show the retry UI and STOP. Do not clear loadedURL — that would
-            // make updateUIView see a "changed" URL and silently auto-reload,
-            // bypassing the failure state. The Retry button (reloadToken) is the
-            // explicit path back, which reloads and revives the content process.
+            // Show the retry UI and STOP. Clearing loadedURL would make updateUIView see a
+            // changed URL and silently auto-reload past the failure state; Retry (reloadToken)
+            // is the explicit way back.
             state.failed = true
             state.failureMessage = "The web view stopped. Tap retry."
         }
 
         private func reportIfActive(_ navigation: WKNavigation!, _ error: Error) {
-            // Ignore a late failure from a navigation we've since superseded.
             guard navigation == activeNavigation else { return }
             let ns = error as NSError
             if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
@@ -182,9 +165,8 @@ struct WebView: UIViewRepresentable {
                 && effectivePort(a) == effectivePort(b)
         }
 
-        // Normalize the implicit default port so `https://h` and `https://h:443`
-        // (and http :80) count as the same origin — otherwise a canonical
-        // redirect between the two equivalent forms gets cancelled.
+        // Treat `https://h` and `https://h:443` (and http :80) as one origin, or a canonical
+        // redirect between the two forms gets cancelled.
         private func effectivePort(_ u: URL) -> Int? {
             if let p = u.port { return p }
             switch u.scheme?.lowercased() {

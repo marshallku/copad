@@ -8,7 +8,6 @@ import UIKit
 final class RenderPerfTests: XCTestCase {
     private let cols = 120, rows = 40
 
-    /// A full frame of mixed content: coloured runs, bold, CJK, and a few emoji.
     private func frameLine(full: Bool, salt: Int) -> Data {
         var cells: [String] = []
         let colors = ["Reset", "Red", "#89B4FA", "12", "Green", "#F9E2AF"]

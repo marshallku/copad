@@ -11,20 +11,16 @@ import SwiftUI
 final class ComuxGraphPanel: NSView, WKNavigationDelegate {
     private let web: WKWebView
     private weak var host: ComuxWindow?
-    /// The page said `ready`: before that nothing can be fed.
     private(set) var loaded = false
-    /// What was fed last, so an unchanged state costs nothing.
     private var fedEpoch = ""
     private var fedRev: UInt64?
     private var fedAgentsRev: UInt64?
     private var fedPage: UInt64 = 0
     private var fedTheme: ComuxStyle?
-    /// The focused agent the panel last followed, and when the user last picked one in the page
-    /// (a pick holds for `pickHolds`, then the panel follows focus again).
+/// A pick in the page holds for `pickHolds`, then the panel follows focus again.
     private var followed: String?
     private var pickedAt: Date?
     private let pickHolds: TimeInterval = 30
-    /// Run after a click in the page has moved the keys (a jump goes back to the pane).
     var refocusPane: () -> Void = {}
     var modeChanged: (String) -> Void = { _ in }
 
@@ -72,8 +68,6 @@ final class ComuxGraphPanel: NSView, WKNavigationDelegate {
 
     // MARK: feeding
 
-    /// Bring the page up to the window's comux: a new connection resets it, a changed graph,
-    /// agent list or history answer is fed, and agent mode follows the focused agent.
     func feed() {
         guard loaded, let host else { return }
         applyTheme(host.style)
@@ -117,8 +111,6 @@ final class ComuxGraphPanel: NSView, WKNavigationDelegate {
         followFocus()
     }
 
-    /// Agent mode shows the agent the user is looking at, unless they picked another one in
-    /// the page a moment ago.
     private func followFocus() {
         guard let focused = host?.state?.agents?.agents.first(where: { $0.focused })?.token else { return }
         if let at = pickedAt, Date().timeIntervalSince(at) < pickHolds { return }
@@ -151,7 +143,6 @@ final class ComuxGraphPanel: NSView, WKNavigationDelegate {
         js("comuxGraph.setMode(\(json(mode)))")
     }
 
-    /// The page's own read-out (`comuxGraph.state()`), for the e2e.
     func pageState(_ done: @escaping (Any?) -> Void) {
         guard loaded else { return done(nil) }
         web.evaluateJavaScript("JSON.stringify(comuxGraph.state())") { v, _ in
@@ -230,7 +221,6 @@ final class ComuxGraphPanel: NSView, WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        // Start over: the page is gone, and with it everything that was fed.
         loaded = false
         if let p = copad_graph_page() {
             let html = String(cString: p)

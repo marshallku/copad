@@ -3,70 +3,41 @@ import Security
 
 /// The one place a website password exists outside the page.
 ///
-/// **There is no plaintext fallback.** Decision #54 put Slack bot tokens in a
-/// `0600` file because they are revocable in one click and read by a background
-/// plugin that cannot answer a Keychain prompt. A user's website passwords are
-/// neither, and a `0600` file is readable by the very same-user agent this whole
-/// design exists to keep them away from. An unavailable Keychain therefore
-/// DISABLES the feature rather than downgrading it.
+/// There is no plaintext fallback. Decision #54 put Slack bot tokens in a `0600` file because
+/// they are revocable in one click and read by a plugin that cannot answer a Keychain prompt;
+/// website passwords are neither, and a `0600` file is readable by the same-user agent this
+/// design keeps them from. An unavailable Keychain DISABLES the feature.
 ///
-/// Prefers the **data-protection keychain** (`kSecUseDataProtectionKeychain`)
-/// and falls back to the legacy file keychain when the app is not entitled for
-/// it.
+/// Tiers:
+/// - The data-protection keychain (`kSecUseDataProtectionKeychain`) is preferred: it scopes
+///   items to the signing identity, while the legacy keychain binds an ACL and partition list
+///   to the binary's cdhash, so a rebuilt binary can PROMPT (decision #54).
+/// - It needs a `keychain-access-groups` entitlement, which needs a team identifier. A
+///   Developer ID build has one; a self-signed dev build does not and fails with
+///   `errSecMissingEntitlement` (-34018). Adding the entitlement to a self-signed bundle makes
+///   AMFI kill the process on launch (measured). Hence the fallback to the legacy file
+///   keychain, which also keeps this path exercised outside releases.
+/// - The last tier is the deprecated pre-unified `SecKeychain*` API (what the `security` CLI
+///   uses), which needs no entitlement.
 ///
-/// The preference exists because of decision #54: the legacy keychain gates
-/// access on an ACL plus a partition list bound to the calling binary's cdhash,
-/// so a rebuilt binary reading an item the previous build saved can PROMPT —
-/// and a prompt nobody answers is an indefinite block, not an error. The
-/// data-protection keychain scopes items to the signing identity instead, with
-/// no prompt and no partition list.
-///
-/// The fallback exists because the data-protection keychain requires a
-/// `keychain-access-groups` entitlement, which needs a team identifier — a
-/// Developer ID release build has one, a locally self-signed dev build does
-/// not, and both `SecItem` paths then fail with `errSecMissingEntitlement`
-/// (-34018). Adding the entitlement to a self-signed bundle is not a way out:
-/// AMFI kills the process on launch (`Killed: 9`), which was measured, not
-/// assumed. Refusing to work in a dev build would mean this code path was never
-/// exercised outside a release — the last place to find out it is wrong.
-///
-/// The last tier is the pre-unified `SecKeychain*` API. It is deprecated and it
-/// is what the `security` CLI uses; it talks to the file keychain directly and
-/// needs no entitlement at all.
-///
-/// **The legacy caveat is real and not papered over:** an item saved by one
-/// build and read by a later rebuild may prompt, because the cdhash changed and
-/// the ACL is bound to it (decision #54). Within one run — save and read by the
-/// same binary — it does not.
+/// Legacy caveat: an item saved by one build and read by a rebuild may prompt, because the
+/// cdhash changed. Within one run it does not.
 enum BrowserKeychain {
-    /// How long a keychain call may take before it is treated as unavailable.
-    ///
-    /// **This is not a nicety, it is the decision #54 failure.** A legacy
-    /// keychain read whose ACL does not list the calling binary raises a
-    /// SecurityAgent prompt, and a prompt nobody answers is an INDEFINITE
-    /// block. Run on the main actor — where every RPC handler lives — that
-    /// freezes the entire GUI, not just the credential call: measured here as a
-    /// socket that stopped answering and a window that stopped drawing.
-    ///
-    /// So every keychain operation runs off the main thread and is abandoned
-    /// after this long, surfacing as `secret_backend_unavailable`. A feature
-    /// that reports itself unavailable is recoverable; an app that stops
-    /// responding is not.
+    /// How long a keychain call may take before it is treated as unavailable. This is the
+    /// decision #54 failure: a legacy keychain read whose ACL does not list the calling binary
+    /// raises a SecurityAgent prompt, and an unanswered prompt blocks indefinitely. On the main
+    /// actor (where every RPC handler lives) that freezes the whole GUI, which was measured. So
+    /// every operation runs off the main thread and is abandoned after this long, surfacing as
+    /// `secret_backend_unavailable`.
     private static let timeout: TimeInterval = 3
 
-    /// Run a keychain operation off the main thread, bounded, and deliver the
-    /// result back on the main actor.
+    /// Run a keychain operation off the main thread, bounded, and deliver the result back on the
+    /// main actor.
     ///
-    /// **Asynchronous, not "off-thread but awaited".** A first version ran the
-    /// work on a queue and then blocked on a semaphore — which pushed the freeze
-    /// from indefinite down to three seconds but did not remove it: every
-    /// credential caller is on the main actor, so the whole GUI still stopped
-    /// for three seconds per call. Bounding a freeze is not the same as not
-    /// freezing.
-    ///
-    /// The work is NOT cancelled on timeout — there is no way to cancel a
-    /// blocked `SecItemCopyMatching` — it is abandoned, and a late completion
-    /// finds `delivered` already true and does nothing.
+    /// Asynchronous, not "off-thread but awaited": blocking on a semaphore would only shorten
+    /// the freeze, because every credential caller is on the main actor. The work is NOT
+    /// cancelled on timeout (a blocked `SecItemCopyMatching` can't be cancelled), it is
+    /// abandoned, and a late completion finds `delivered` already true and does nothing.
     private static func bounded<T: Sendable>(
         _ fallback: T,
         _ body: @escaping @Sendable () -> T,
@@ -95,34 +66,25 @@ enum BrowserKeychain {
         }
     }
 
-    /// Minimal mutable box so the escaping closure has somewhere to put its
-    /// result. Access is serialized by the semaphore.
     private final class UncheckedBox<T>: @unchecked Sendable {
         var value: T
         init(_ value: T) { self.value = value }
     }
 
-    /// One service for every browser credential; the credential id is the
-    /// account. Deliberately distinct from the plugins' service names so a
-    /// keychain audit can tell "a website password copad saved for me" apart
-    /// from "an API token a plugin holds".
+    /// One service for every browser credential (account = credential id), distinct from the
+    /// plugins' service names so an audit can tell website passwords from plugin API tokens.
     private static let service = "com.marshall.copad.browser"
 
     enum Failure: Error {
-        /// The backend itself is unusable — not "no such credential".
         case unavailable(String)
         case notFound
     }
 
-    /// What the keychain holds for one credential.
-    ///
-    /// The origin and slot travel WITH the secret, not alongside it in the
-    /// index. The index is a plain JSON file that anything running as the user
-    /// — including the agent — can rewrite; pointing an existing entry at an
-    /// attacker-chosen origin would otherwise keep its keychain account (the
-    /// lookup is by id alone) while making both the validator and the
-    /// injection's own origin check accept the new destination. The keychain is
-    /// the trusted store, so the binding lives there.
+    /// The origin and slot travel WITH the secret, not in the index. The index is a plain JSON
+    /// file anything running as the user (including the agent) can rewrite; re-pointing an
+    /// entry at an attacker-chosen origin would keep its keychain account (lookup is by id
+    /// alone) while the validator and the injection's origin check accepted the new
+    /// destination. The keychain is the trusted store, so the binding lives there.
     struct Stored: Sendable {
         let secret: String
         let origin: String
@@ -163,13 +125,9 @@ enum BrowserKeychain {
     // MARK: - Blocking implementations (always off the main thread)
 
     private static func saveBlocking(id: String, data: Data) -> Result<Void, Failure> {
-        // UPDATE first, add only if absent.
-        //
-        // Delete-then-add looked simpler and is destructive: re-saving a
-        // credential removed the stored secret and then, if the add failed for
-        // any reason, the old password was gone for good while its index entry
-        // still promised it. An update that matches nothing is an ordinary
-        // `errSecItemNotFound`, which is exactly the signal to add.
+        // UPDATE first, add only if absent. Delete-then-add is destructive: if the add failed,
+        // the old password would be gone while its index entry still promised it. An update
+        // that matches nothing is `errSecItemNotFound`, the signal to add.
         let updated = withKeychain { dataProtection in
             SecItemUpdate(
                 baseQuery(id: id, dataProtection: dataProtection) as CFDictionary,
@@ -183,9 +141,8 @@ enum BrowserKeychain {
         let status = withKeychain { dataProtection in
             var attrs = baseQuery(id: id, dataProtection: dataProtection)
             attrs[kSecValueData as String] = data
-            // Available whenever the device is unlocked, and never synced to
-            // iCloud: a browser password copad holds is for THIS machine, and
-            // syncing it would widen the blast radius for no benefit here.
+            // Available when unlocked and never synced to iCloud: the password is for THIS
+            // machine only.
             attrs[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
             return SecItemAdd(attrs as CFDictionary, nil)
         }
@@ -238,14 +195,9 @@ enum BrowserKeychain {
         return q
     }
 
-    /// Which keychain this process ended up on. Resolved once, on the first
-    /// operation, by trying the preferred one and watching for
-    /// `errSecMissingEntitlement`.
-    ///
-    /// Every keychain operation now runs on a global queue, so concurrent
-    /// credential requests reach this from several threads at once — a genuine
-    /// data race, which `nonisolated(unsafe)` would only have hidden from the
-    /// compiler. Guarded by `backendLock`.
+    /// Which keychain this process ended up on, resolved on the first operation by trying the
+    /// preferred one and watching for `errSecMissingEntitlement`. Operations run on global
+    /// queues, so concurrent requests reach this from several threads: guarded by `backendLock`.
     private nonisolated(unsafe) static var useDataProtectionStorage: Bool?
     private static let backendLock = NSLock()
 
@@ -262,8 +214,6 @@ enum BrowserKeychain {
         }
     }
 
-    /// Run `body` against the preferred keychain, retrying on the legacy one
-    /// exactly once if the app turns out not to be entitled.
     private static func withKeychain(_ body: (Bool) -> OSStatus) -> OSStatus {
         if let known = useDataProtection {
             return body(known)
@@ -286,15 +236,10 @@ enum BrowserKeychain {
 
     // MARK: - Pre-unified Keychain API
     //
-    // Entitlement-free, and the only tier that works in a self-signed dev
-    // build. Kept behind the modern paths so a properly signed release never
-    // touches it.
-    //
-    // `SecKeychain*` is deprecated and the compiler says so on each call below.
-    // The warnings are deliberate and left visible: the alternative is
-    // annotating these helpers `@available(deprecated:)`, which would be a lie
-    // — they are not deprecated, the API they wrap is — and would only move the
-    // same warnings to their call sites.
+    // Entitlement-free, and the only tier that works in a self-signed dev build; kept behind the
+    // modern paths so a signed release never touches it. The `SecKeychain*` deprecation
+    // warnings are left visible on purpose: annotating these helpers `@available(deprecated:)`
+    // would be a lie (the wrapped API is deprecated, not they) and only move the warnings.
 
     private static func legacySave(id: String, data: Data) -> Result<Void, Failure> {
         // Same rule as the modern path: modify in place when the item exists,
