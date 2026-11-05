@@ -1303,8 +1303,15 @@ pub(crate) fn snapshot_with_search<L: EventListener>(
 
             // Grapheme = base char + any zero-width combining marks. A kitty Unicode
             // placeholder is drawn as its image (decisions #194), never as a character.
+            //
+            // A TAB is a blank too. alacritty's `put_tab` stores '\t' in the cell it starts from
+            // (for its selection text), so a `git status` line holds a real control character
+            // here. Passed on, it reaches the client's emit, where a full repaint prints a row as
+            // one run: the outer terminal jumps to its next tab stop and everything after that
+            // cell lands up to 7 columns right. `clear` then only blanks the columns the row was
+            // supposed to occupy, leaving the shifted tail behind.
             let mut sym = String::new();
-            if cell.c == copad_graphics::PLACEHOLDER {
+            if cell.c == copad_graphics::PLACEHOLDER || cell.c == '\t' {
                 sym.push(' ');
             } else {
                 sym.push(cell.c);
@@ -1564,7 +1571,8 @@ struct CaptureRows {
 /// unicode-width to the column span alacritty allotted it, which drops VS16/ZWJ marks and
 /// blanks unrepresentable graphemes (`❤️` → `❤`). That is the right trade for rendering —
 /// it is the root fix for wide-glyph ghosting — and it is silent corruption for read-back.
-/// This walker emits the stored scalars verbatim.
+/// This walker emits the stored scalars verbatim, except a tab's first cell, read as the blank
+/// the screen shows there.
 ///
 /// Anchored at the LIVE bottom rather than the displayed viewport, so a human scrolling in
 /// copy-mode cannot change what a scripted reader sees.
@@ -1604,7 +1612,9 @@ fn capture_rows<L: EventListener>(term: &Term<L>, want_rows: usize) -> CaptureRo
             if retained + text.len() + cell.c.len_utf8() + 1 > CAPTURE_MAX_BYTES {
                 break 'walk;
             }
-            text.push(cell.c);
+            // alacritty keeps '\t' in the tab's first cell and blanks in the rest, so a verbatim
+            // copy would be a tab PLUS the blanks. The screen shows blanks; so does read-back.
+            text.push(if cell.c == '\t' { ' ' } else { cell.c });
             if let Some(zw) = cell.zerowidth() {
                 for ch in zw {
                     cells += 1;
@@ -2418,6 +2428,62 @@ mod render_repro {
             snap_text(&ref_snap),
             snap_text(&src_snap),
         );
+    }
+
+    #[test]
+    fn a_tab_is_blank_cells_and_never_reaches_the_terminal() {
+        // `git status` indents with a tab. alacritty stores '\t' in the tab's first cell; if that
+        // reaches the emit, a full repaint (one run per row) makes the outer terminal jump to its
+        // own tab stop and shifts the rest of the row. The shape of the output that showed it:
+        // a tab at column 0, mid-line tabs, a tab over a coloured background, a tab after CJK.
+        let (mut t, mut p) = term(40, 6);
+        feed(
+            &mut t,
+            &mut p,
+            b"\tmodified:   metadata.json\r\na\tb\tc\r\n\x1b[41m\tred\x1b[0m\tplain\r\n",
+        );
+        feed(&mut t, &mut p, "한글\t|\r\n".as_bytes());
+        let snap = snapshot_grid(&t);
+        for row in &snap.cells {
+            for c in row {
+                assert!(
+                    !c.sym.chars().any(char::is_control),
+                    "a control character reached a render cell: {:?}",
+                    c.sym
+                );
+            }
+        }
+        let texts = snap_text(&snap);
+        assert!(
+            texts[0].starts_with("        modified:   metadata.json"),
+            "{texts:?}"
+        );
+        assert!(texts[1].starts_with("a       b       c"), "{texts:?}");
+
+        // Through the real paint path, a from-scratch repaint lands every cell where it was.
+        let area = Rect::new(0, 0, 40, 6);
+        let sink = SharedBytes(Rc::new(RefCell::new(Vec::new())));
+        let mut cterm = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        crate::client::repaint_all(&mut cterm, &compose(&snap), (40, 6), None).unwrap();
+        let (mut ref_t, mut ref_p) = term(40, 6);
+        feed(&mut ref_t, &mut ref_p, &sink.0.borrow());
+        assert_eq!(snap_text(&snapshot_grid(&ref_t)), texts);
+    }
+
+    #[test]
+    fn capture_reads_a_tab_as_the_blanks_it_left() {
+        // Read-back has to show the columns the screen shows: a tab plus the blanks after it
+        // would be read as 15 columns of indent by anything that expands it.
+        let (mut t, mut p) = term(30, 2);
+        feed(&mut t, &mut p, b"\tx\ty");
+        let text = assemble_capture(capture_rows(&t, 2)).text;
+        assert_eq!(text.lines().next().unwrap(), "        x       y");
     }
 
     #[test]

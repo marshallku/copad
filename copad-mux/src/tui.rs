@@ -14476,6 +14476,7 @@ mod app_render_fidelity {
             let mut buf = Buffer::empty(self.area);
             let cursor = app.render_to(&mut buf).map(|p| (p.x, p.y));
             assert_no_dim_bold(&buf);
+            assert_no_control_chars(&buf);
 
             let full = self.first;
             if full {
@@ -14623,6 +14624,23 @@ mod app_render_fidelity {
         }
     }
 
+    /// No composed cell may hold a control character: printed, it moves the terminal's cursor
+    /// instead of filling a cell, so the rest of the run lands in the wrong column. The reference
+    /// emulator cannot catch this by comparison, because it is fed the same stream from scratch.
+    fn assert_no_control_chars(buf: &Buffer) {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(c) = buf.cell(Position::new(x, y)) {
+                    assert!(
+                        !c.symbol().chars().any(char::is_control),
+                        "cell ({x},{y}) holds a control character: {:?}",
+                        c.symbol()
+                    );
+                }
+            }
+        }
+    }
+
     /// No composed cell may carry DIM and BOLD together — see [`resolve_dim_bold`]. Checked on
     /// every tick of the fuzz rather than once, because any widget could reintroduce it.
     fn assert_no_dim_bold(buf: &Buffer) {
@@ -14702,6 +14720,9 @@ mod app_render_fidelity {
             "👨\u{200d}👩\u{200d}👧",
             "🎉",
             "→",
+            "\t",
+            "a\tb",
+            "가\t|",
         ]
         .iter()
         .map(|s| s.to_string())

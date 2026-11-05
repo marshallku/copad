@@ -60,7 +60,14 @@ impl WireCell {
     /// BOLD/DIM/REVERSED stick forever instead of following the frame. These are plain
     /// assignments for that reason; keep them that way.
     pub fn apply_to(&self, dst: &mut Cell) {
-        dst.set_symbol(&self.sym);
+        // A control character must not reach the terminal: it moves the cursor instead of filling
+        // a cell, so everything printed after it lands in the wrong column. The server no longer
+        // sends one, but it outlives client upgrades, so a new client still meets an older server.
+        if self.sym.chars().any(char::is_control) {
+            dst.set_symbol(" ");
+        } else {
+            dst.set_symbol(&self.sym);
+        }
         dst.fg = self.fg;
         dst.bg = self.bg;
         dst.modifier = self.mods;
@@ -351,6 +358,21 @@ pub enum ClientMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that predates the fix still sends the '\t' alacritty keeps in a tab's first cell,
+    /// and it outlives client upgrades. Printed, that shifts the rest of the row.
+    #[test]
+    fn a_control_character_from_the_wire_becomes_a_blank() {
+        let mut wire = WireCell::of(0, 0, &Cell::new("x"));
+        wire.sym = "\t".to_string();
+        let mut cell = Cell::new("y");
+        wire.apply_to(&mut cell);
+        assert_eq!(cell.symbol(), " ");
+
+        wire.sym = "가".to_string();
+        wire.apply_to(&mut cell);
+        assert_eq!(cell.symbol(), "가");
+    }
 
     /// An `attach` line from a client built before the pid field must still open a
     /// session — the field only decides whether a window gets raised, and refusing the
