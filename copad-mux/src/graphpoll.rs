@@ -5,9 +5,8 @@
 //! never held across I/O. It adds no forks: which transcript an agent is in comes from
 //! `agentpoll::conversation`, resolved and re-checked there.
 //!
-//! **Budgets.** Each tick reads at most [`CONV_BUDGET`] per conversation and [`TICK_BUDGET`]
-//! in all, visiting conversations round-robin, so a fresh 30 MB transcript fills in over a few
-//! seconds without starving the others. A graph is cloned for publishing only when it changed.
+//! Each tick reads at most [`CONV_BUDGET`] per conversation and [`TICK_BUDGET`] in all,
+//! round-robin, so a fresh 30 MB transcript cannot starve the others.
 //!
 //! **Disk.** With `persist` on, a changed graph is saved at most every [`SAVE_EVERY`]; a
 //! conversation nobody wants any more is saved once more and dropped from memory after
@@ -32,18 +31,14 @@ const KEEP_FILES: usize = 500;
 /// happens when its mtime moved, or every [`SUB_RESCAN`] regardless.
 const SUB_CHECK: Duration = Duration::from_secs(2);
 const SUB_RESCAN: Duration = Duration::from_secs(10);
-/// Most agents tracked at once (as `agentpoll`).
 const MAX_TRACKED: usize = 64;
 
-/// An agent the render loop wants a graph for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Want {
     pub pid: u32,
-    /// `claude` / `codex` (others get no graph).
     pub tool: String,
     pub conversation: String,
     pub transcript: PathBuf,
-    /// The agent's process cwd, when known.
     pub cwd: String,
 }
 
@@ -60,15 +55,12 @@ pub struct Settings {
 pub struct Inner {
     wanted: Vec<Want>,
     settings: Option<Settings>,
-    /// Published graphs by agent pid.
     graphs: HashMap<u32, Arc<ConvGraph>>,
-    /// Bumped whenever `graphs` changes.
     rev: u64,
 }
 
 pub type Shared = Arc<Mutex<Inner>>;
 
-/// A poller that never runs (the client; tests).
 pub fn idle() -> Shared {
     Arc::new(Mutex::new(Inner::default()))
 }
@@ -87,7 +79,6 @@ pub fn set_settings(shared: &Shared, settings: Settings) {
     }
 }
 
-/// The published graphs and their revision.
 pub fn snapshot(shared: &Shared) -> (u64, HashMap<u32, Arc<ConvGraph>>) {
     shared
         .lock()
@@ -95,7 +86,6 @@ pub fn snapshot(shared: &Shared) -> (u64, HashMap<u32, Arc<ConvGraph>>) {
         .unwrap_or_default()
 }
 
-/// The supported tools.
 pub fn tracks(tool: &str) -> bool {
     matches!(tool, "claude" | "codex")
 }
@@ -163,8 +153,6 @@ fn publish(out: &Shared, graphs: HashMap<u32, Arc<ConvGraph>>) {
     }
 }
 
-/// One pass: read what is new for every wanted agent, save, evict; returns the graphs to
-/// publish by pid. Pure apart from the filesystem.
 fn tick(
     wanted: &[Want],
     settings: &Settings,
@@ -258,7 +246,6 @@ fn tick(
     out
 }
 
-/// The saved graph when it still matches its files, else a fresh one.
 fn open(w: &Want, settings: &Settings) -> ConvGraph {
     settings
         .persist
@@ -281,7 +268,6 @@ fn fresh(w: &Want) -> Tracked {
     }
 }
 
-/// `<transcript without .jsonl>/subagents/agent-*.meta.json`: register each subagent found.
 fn scan_subagents(t: &mut Tracked, transcript: &Path, now: Instant) {
     if t.sub_checked
         .is_some_and(|c| now.duration_since(c) < SUB_CHECK)
@@ -401,7 +387,6 @@ mod tests {
         let g = out.get(&7).expect("published");
         assert_eq!(g.overview(32, 24, 8).files[0].display, "a.rs");
         assert!(settings.dir.join(format!("claude-{CID}.json")).exists());
-        // A subagent appears.
         let subs = want.transcript.with_extension("").join("subagents");
         std::fs::create_dir_all(&subs).unwrap();
         std::fs::write(
@@ -454,7 +439,6 @@ mod tests {
         let mut tracked = HashMap::new();
         tick(std::slice::from_ref(&want), &settings, &mut tracked, &mut 0);
         let gen1 = tracked.values().next().unwrap().graph.generation.clone();
-        // Append, then "restart" (a fresh poller).
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)

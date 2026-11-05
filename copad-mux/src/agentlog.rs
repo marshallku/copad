@@ -1,13 +1,8 @@
-//! `comux agent-log`: the last few entries of another agent's OWN conversation log.
+//! `comux agent-log`: the last few entries of another agent's own conversation log, read from
+//! its transcript (Claude's `~/.claude/projects/…/<id>.jsonl`, Codex's rollout) rather than
+//! the screen. Only the TAIL is read, never the whole file (hundreds of megabytes).
 //!
-//! `capture-pane` is a poor way to follow an agent: the bottom of its screen is its input box,
-//! status line and session title, and the rest is whatever its TUI chose to redraw. The
-//! transcript the agent writes for itself (Claude's `~/.claude/projects/…/<id>.jsonl`, Codex's
-//! rollout) is the actual conversation. This reads its TAIL — never the whole file, which
-//! runs to hundreds of megabytes — and normalizes both formats into one entry shape.
-//!
-//! Both formats are undocumented and move. Anything unrecognized is skipped, never an error:
-//! a log with nothing readable yields no entries, which the caller reports as such.
+//! The formats are undocumented and move: anything unrecognized is skipped, never an error.
 
 use serde::Serialize;
 use std::path::Path;
@@ -25,13 +20,11 @@ pub struct Entry {
     pub role: &'static str,
     /// `text`, `tool_use`, `tool_result`, or `thinking`.
     pub kind: &'static str,
-    /// The tool's name, on a `tool_use`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub text: String,
 }
 
-/// What [`read`] found.
 pub struct Log {
     /// Oldest first.
     pub entries: Vec<Entry>,
@@ -62,12 +55,10 @@ pub fn read(path: &Path, tool: &str, last: usize, max_chars: usize) -> Result<Lo
     Ok(Log { entries, partial })
 }
 
-/// One entry as a line (or a few) for a human: `12:43:01 assistant tool_use Bash: …`.
-///
-/// The text is the agent's and its tools' OUTPUT — untrusted — so every control character is
-/// replaced before it reaches the terminal: an escape sequence in a tool result could
-/// otherwise rewrite the screen, retitle the window or set the clipboard. Newlines survive,
-/// indented under the entry.
+/// The text is the agent's and its tools' OUTPUT, so untrusted: every control character is
+/// replaced before it reaches the terminal, or an escape sequence in a tool result could
+/// rewrite the screen, retitle the window or set the clipboard. Newlines survive, indented
+/// under the entry.
 pub fn render(e: &Entry) -> String {
     // EVERY transcript-derived field, not just the text: a tool name or timestamp is just as
     // writable by whoever wrote the log.
@@ -85,7 +76,6 @@ pub fn render(e: &Entry) -> String {
     format!("{time} {:<9} {}{name}: {text}", e.role, e.kind)
 }
 
-/// `s` with every control character replaced — except newline and tab when `multiline`.
 pub(crate) fn inert(s: &str, multiline: bool) -> String {
     s.chars()
         .map(|c| match c {
@@ -96,9 +86,7 @@ pub(crate) fn inert(s: &str, multiline: bool) -> String {
         .collect()
 }
 
-/// One Claude transcript record → its entries (an assistant turn may hold several).
 fn claude_line(line: &str) -> Vec<Entry> {
-    // Most records are attachments and bookkeeping; skip them before paying for JSON.
     if !line.contains("\"message\"") {
         return Vec::new();
     }
@@ -163,7 +151,6 @@ fn claude_line(line: &str) -> Vec<Entry> {
         .collect()
 }
 
-/// One Codex rollout record → its entry, if it is part of the conversation.
 fn codex_line(line: &str) -> Vec<Entry> {
     if !line.contains("\"response_item\"") {
         return Vec::new();
@@ -237,11 +224,9 @@ fn codex_line(line: &str) -> Vec<Entry> {
     vec![e]
 }
 
-/// One grok `chat_history.jsonl` record → its entries. grok records carry no timestamps.
-///
-/// Only a user record with `prompt_index` is something the user typed; the rest of the user
-/// role is grok's own injection (`<user_info>`, skill lists, hook feedback marked
-/// `synthetic_reason`).
+/// grok records carry no timestamps. Only a user record with `prompt_index` was typed by the
+/// user; the rest of the user role is grok's own injection (`<user_info>`, skill lists, hook
+/// feedback marked `synthetic_reason`).
 fn grok_line(line: &str) -> Vec<Entry> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
@@ -302,8 +287,6 @@ fn grok_line(line: &str) -> Vec<Entry> {
         .collect()
 }
 
-/// One agy `transcript.jsonl` step → its entries.
-///
 /// `USER_INPUT` wraps what was typed in `<USER_REQUEST>`, followed by agy's own metadata
 /// blocks; `GENERIC` steps from the model are tool results; `SYSTEM_MESSAGE` is agy talking to
 /// the model and is skipped.
@@ -373,7 +356,6 @@ fn agy_line(line: &str) -> Vec<Entry> {
         .collect()
 }
 
-/// The context Codex prepends to a thread as user messages.
 fn is_injected(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("# AGENTS.md instructions")
@@ -381,13 +363,10 @@ fn is_injected(text: &str) -> bool {
         || t.starts_with("<user_instructions>")
 }
 
-/// `c[key]` as a string.
 fn str_at(c: &serde_json::Value, key: &str) -> Option<String> {
     c.get(key).and_then(|t| t.as_str()).map(str::to_string)
 }
 
-/// A tool's input as one readable line: the field a human would want first (the command,
-/// the file, the description), else the whole input as compact JSON.
 fn tool_input(input: Option<&serde_json::Value>) -> String {
     let Some(input) = input else {
         return String::new();
@@ -427,7 +406,6 @@ fn tool_input(input: Option<&serde_json::Value>) -> String {
     input.to_string()
 }
 
-/// Text out of a content value: a string, or an array of `{text}`-bearing parts.
 fn flatten(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
@@ -443,7 +421,6 @@ fn flatten(v: &serde_json::Value) -> String {
     }
 }
 
-/// At most `max` chars (0 = no limit), with an ellipsis when cut.
 pub(crate) fn cut(s: &str, max: usize) -> String {
     if max == 0 || s.chars().count() <= max {
         return s.to_string();

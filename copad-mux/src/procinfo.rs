@@ -1,14 +1,12 @@
 //! Foreground-process + agent classification for pane labels.
 //!
-//! One sweep builds a pid→(ppid, pgid, comm) tree; from a pane's shell pid we
-//! descend to the deepest descendant (the foreground-ish process) and classify
-//! its command name as an AI agent, a shell, or something else. Cheap enough to
-//! run on a throttled cadence (~2 Hz), never per frame.
+//! From a pane's shell pid we descend to the deepest descendant (the foreground-ish process)
+//! and classify its command name as an AI agent, a shell, or something else. Runs on a
+//! throttled cadence (~2 Hz), never per frame.
 //!
-//! The sweep is IN-PROCESS (`/proc` on Linux, libproc on macOS) rather than a
-//! `ps` fork: a mux server lives for weeks and would otherwise fork twice a
-//! second forever, and every one of those forks was a chance to blank the whole
-//! label map — see [`ProcTree::snapshot`].
+//! The sweep is IN-PROCESS (`/proc` on Linux, libproc on macOS), not a `ps` fork: a mux server
+//! lives for weeks, and each fork was a chance to blank the whole label map (see
+//! [`ProcTree::snapshot`]).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,8 +15,8 @@ use std::path::PathBuf;
 #[cfg(not(target_os = "linux"))]
 use std::process::Command;
 
-/// The current working directory of a process (Linux `/proc/<pid>/cwd`, macOS
-/// libproc `PROC_PIDVNODEPATHINFO`). Used to derive a session's git branch.
+/// The current working directory of a process (Linux `/proc/<pid>/cwd`, macOS libproc
+/// `PROC_PIDVNODEPATHINFO`).
 #[cfg(target_os = "linux")]
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
@@ -119,11 +117,9 @@ pub fn process_start_time(_pid: u32) -> Option<std::time::SystemTime> {
     None
 }
 
-/// The argv (structural, NOT space-joined) of `pid`, for restoring a whitelisted program
-/// (agent) on session restore. Structural so argument boundaries + quoting survive
-/// (`claude "a; b"` stays ONE arg, re-quoted on restore — never re-split into two shell
-/// commands). Linux reads `/proc/<pid>/cmdline`; macOS uses `sysctl KERN_PROCARGS2`. `None`
-/// if the process is gone or has no readable argv.
+/// The argv of `pid`, structural (NOT space-joined) so argument boundaries survive restore:
+/// `claude "a; b"` stays ONE arg, never re-split into two shell commands. `None` if the process
+/// is gone or has no readable argv.
 #[cfg(target_os = "linux")]
 pub fn process_command(pid: u32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
@@ -143,9 +139,8 @@ pub fn process_command(pid: u32) -> Option<Vec<String>> {
 }
 
 /// One variable from the environment `pid` was STARTED with (Linux `/proc/<pid>/environ`,
-/// macOS the tail of `KERN_PROCARGS2`). `None` when it is unset, empty, or unreadable — an
-/// agent launched as `GROK_HOME=/x grok` keeps its data where THAT says, not where the server's
-/// own environment would put it.
+/// macOS the tail of `KERN_PROCARGS2`). `None` when unset, empty or unreadable. An agent
+/// launched as `GROK_HOME=/x grok` keeps its data where THAT says.
 #[cfg(target_os = "linux")]
 pub fn process_env(pid: u32, name: &str) -> Option<String> {
     let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
@@ -173,7 +168,6 @@ fn env_lookup(env: impl Iterator<Item = String>, name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// `pid`'s `(argv, environment)` out of one `KERN_PROCARGS2` read.
 #[cfg(target_os = "macos")]
 fn procargs(pid: u32) -> Option<(Vec<String>, Vec<String>)> {
     // KERN_PROCARGS2 buffer: [argc: i32][exec_path\0][padding \0…][argv0\0 argv1\0 …][env…].
@@ -211,14 +205,12 @@ fn procargs(pid: u32) -> Option<(Vec<String>, Vec<String>)> {
     buf.truncate(size);
     let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
     let mut p = 4;
-    // Skip the exec_path string and any NUL padding after it.
     while p < buf.len() && buf[p] != 0 {
         p += 1;
     }
     while p < buf.len() && buf[p] == 0 {
         p += 1;
     }
-    // Read exactly `argc` NUL-terminated args.
     let mut args = Vec::with_capacity(argc.min(256));
     for _ in 0..argc {
         if p >= buf.len() {
@@ -229,9 +221,8 @@ fn procargs(pid: u32) -> Option<(Vec<String>, Vec<String>)> {
             p += 1;
         }
         args.push(String::from_utf8_lossy(&buf[start..p]).into_owned());
-        p += 1; // skip the NUL
+        p += 1;
     }
-    // The environment follows argv: NUL-terminated `K=V` strings up to an empty one.
     let env = buf[p.min(buf.len())..]
         .split(|&b| b == 0)
         .take_while(|e| !e.is_empty())
@@ -245,16 +236,13 @@ pub fn process_command(_pid: u32) -> Option<Vec<String>> {
     None
 }
 
-/// The regular files a process holds open, used to resolve an agent's live session file
-/// (e.g. the Codex rollout `…/rollout-<ts>-<uuid>.jsonl` an interactive TUI keeps open).
-/// Linux reads the `/proc/<pid>/fd` symlinks; macOS shells out to `lsof -p <pid> -Fn`.
+/// The regular files a process holds open, used to resolve an agent's live session file (e.g.
+/// the Codex rollout an interactive TUI keeps open). Linux reads `/proc/<pid>/fd`; macOS shells
+/// out to `lsof -p <pid> -Fn`.
 ///
 /// `None` means the open files COULD NOT BE ENUMERATED; `Some(v)` means they were, and `v` may
-/// legitimately be empty. Collapsing those two into an empty `Vec` — which this returned until
-/// #121 — makes "we cannot see" indistinguishable from "we looked, there is nothing", and a
-/// caller that caches a source then has no way to tell a transient `lsof` failure from an
-/// agent that has genuinely closed its log. Decision #88 forced the same distinction on
-/// [`ProcTree::snapshot`] for the same reason.
+/// be empty. A caller that caches a source must tell a transient failure from an agent that has
+/// closed its log (decision #88 draws the same line for [`ProcTree::snapshot`]).
 #[cfg(target_os = "linux")]
 pub fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
     let rd = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
@@ -265,8 +253,7 @@ pub fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
         let entry = entry.ok()?;
         match std::fs::read_link(entry.path()) {
             Ok(target) => out.push(target),
-            // The descriptor was closed while we walked: genuinely gone, and skipping it
-            // leaves the list honest.
+            // The descriptor was closed while we walked: genuinely gone.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Anything else (EACCES on a process we do not own) is us being unable to look.
             Err(_) => return None,
@@ -303,48 +290,37 @@ pub fn open_files(_pid: u32) -> Option<Vec<PathBuf>> {
     None
 }
 
-/// What a pane is running, for styling the sidebar/popup row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A known AI coding agent (claude, codex, …).
     Agent,
-    /// An interactive shell (zsh, bash, …).
     Shell,
-    /// Anything else (nvim, cargo, top, …).
     Other,
 }
 
-/// A pane's foreground command + its classification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Label {
     pub text: String,
     pub kind: Kind,
-    /// The pid of the resolved foreground process (the agent process for an agent
-    /// pane) — used to read its `~/.claude/sessions/<pid>.json` status.
     pub pid: u32,
 }
 
-/// Case-insensitive basenames treated as AI agents.
 const AGENTS: &[&str] = &[
     "claude", "codex", "agy", "grok", "aider", "cursor", "gemini", "opencode", "droid", "copilot",
     "qwen", "crush",
 ];
 
-/// The built-in AI-agent basenames — the default whitelist for restoring running
-/// programs on session restore (config `restore_processes` overrides/extends it).
+/// The built-in AI-agent basenames: the default whitelist for restoring programs on session
+/// restore (config `restore_processes` overrides/extends it).
 pub fn agent_basenames() -> &'static [&'static str] {
     AGENTS
 }
-/// Interactive shells (also matched with a leading `-` for login shells).
 const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "nu", "dash", "tcsh", "ksh"];
 
-/// Normalize a `comm` to a basename without a leading `-` (login shells) or path.
 fn basename(comm: &str) -> String {
     let b = comm.trim().rsplit('/').next().unwrap_or(comm).trim();
     b.strip_prefix('-').unwrap_or(b).to_string()
 }
 
-/// Classify a command basename.
 pub fn classify(comm: &str) -> Kind {
     let c = basename(comm).to_ascii_lowercase();
     if AGENTS.iter().any(|a| c == *a) {
@@ -356,29 +332,22 @@ pub fn classify(comm: &str) -> Kind {
     }
 }
 
-/// One process row.
 struct ProcRec {
     ppid: u32,
     pgid: u32,
     comm: String,
 }
 
-/// A snapshot of the process tree (`pid -> {ppid, pgid, comm-basename}`).
 pub struct ProcTree {
     procs: HashMap<u32, ProcRec>,
 }
 
-/// Restore a resolved label's text to the process's own `argv[0]`.
+/// Restore a resolved label's text to the process's own `argv[0]` (macOS only).
 ///
-/// macOS only, and purely to preserve what the label ALREADY said: `ps -o comm=`
-/// printed argv[0], but the libproc sweep reports the EXEC name, so a command
-/// reached through a shim symlink would silently relabel — with coreutils' gnubin
-/// early on `$PATH`, `sleep` renders as `gsleep` and `tail` as `gtail`. Linux needs
-/// none of this: its sweep reads the same `/proc` `comm` that `ps` did.
-///
-/// Costs one `KERN_PROCARGS2` sysctl per PANE (the single resolved foreground pid),
-/// not per process, so it does not scale with the machine's process count. Leaves
-/// the sweep's name in place when argv is unreadable (process already gone).
+/// `ps -o comm=` printed argv[0] but the libproc sweep reports the EXEC name, so a command
+/// reached through a shim symlink would relabel: with coreutils' gnubin early on `$PATH`,
+/// `sleep` renders as `gsleep`. Costs one `KERN_PROCARGS2` sysctl per PANE. Leaves the
+/// sweep's name when argv is unreadable.
 #[cfg(target_os = "macos")]
 pub fn refine_label(label: &mut Label) {
     let Some(argv0) = process_command(label.pid).and_then(|a| a.into_iter().next()) else {
@@ -388,8 +357,7 @@ pub fn refine_label(label: &mut Label) {
     if name.is_empty() {
         return;
     }
-    // Reclassify: the old behaviour classified argv[0], so an agent launched through
-    // a wrapper keeps being detected exactly as it was before the sweep changed.
+    // Reclassify, so an agent launched through a wrapper is still detected from argv[0].
     label.kind = classify(&name);
     label.text = name;
 }
@@ -397,12 +365,9 @@ pub fn refine_label(label: &mut Label) {
 #[cfg(not(target_os = "macos"))]
 pub fn refine_label(_label: &mut Label) {}
 
-/// Read the whole process table. `None` only when the table could not be read at
-/// all; a single process that exits mid-sweep is skipped, never fatal.
-///
-/// Zombies are dropped on the in-process paths: a pane's just-exited child would
-/// otherwise win [`ProcTree::foreground`]'s highest-pid descent and label the pane
-/// with a command that already finished.
+/// Read the whole process table. `None` only when the table could not be read at all; a
+/// process that exits mid-sweep is skipped. Zombies are dropped: a pane's just-exited child
+/// would otherwise win [`ProcTree::foreground`]'s highest-pid descent.
 #[cfg(target_os = "linux")]
 fn sweep() -> Option<HashMap<u32, ProcRec>> {
     let mut procs = HashMap::new();
@@ -412,9 +377,8 @@ fn sweep() -> Option<HashMap<u32, ProcRec>> {
             .to_str()
             .and_then(|s| s.parse::<u32>().ok())
         else {
-            continue; // /proc also holds non-pid entries (self, meminfo, …)
+            continue;
         };
-        // A process can exit between readdir and read — skip its row, not the sweep.
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
@@ -425,10 +389,9 @@ fn sweep() -> Option<HashMap<u32, ProcRec>> {
     Some(procs)
 }
 
-/// Parse `/proc/<pid>/stat`: `pid (comm) state ppid pgrp …`. `comm` is unquoted and
-/// may itself contain spaces AND parens (`(sd-pam)`, a process renamed to `a (b)`),
-/// so it is delimited by the FIRST `(` and the LAST `)` — splitting on whitespace
-/// would mis-align every field after it. `None` for a zombie or an unparsable row.
+/// Parse `/proc/<pid>/stat`: `pid (comm) state ppid pgrp ...`. `comm` may contain spaces AND
+/// parens, so it is delimited by the FIRST `(` and LAST `)`. `None` for a zombie or an
+/// unparsable row.
 #[cfg(target_os = "linux")]
 fn parse_proc_stat(stat: &str) -> Option<ProcRec> {
     let open = stat.find('(')?;
@@ -447,10 +410,9 @@ fn parse_proc_stat(stat: &str) -> Option<ProcRec> {
     })
 }
 
-/// macOS has no readable `/proc`, so sweep via libproc: one call for the pid list,
-/// then one `PROC_PIDTBSDINFO` per pid. That is ~1600 cheap syscalls on a busy
-/// machine — still far less work than forking `ps` and parsing its output, and
-/// unlike a fork it cannot fail under process pressure.
+/// macOS has no readable `/proc`, so sweep via libproc: one call for the pid list, then one
+/// `PROC_PIDTBSDINFO` per pid. Cheaper than forking `ps`, and cannot fail under process
+/// pressure.
 #[cfg(target_os = "macos")]
 fn sweep() -> Option<HashMap<u32, ProcRec>> {
     let pids = list_all_pids()?;
@@ -461,7 +423,6 @@ fn sweep() -> Option<HashMap<u32, ProcRec>> {
             continue;
         }
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a zeroed, correctly-sized out-param for this flavor.
         let read = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -471,17 +432,12 @@ fn sweep() -> Option<HashMap<u32, ProcRec>> {
                 size,
             )
         };
-        // A short read means the process exited mid-sweep or belongs to another
-        // user (EPERM). Skip the row — our own pane shells are always readable.
+        // A short read means the process exited mid-sweep or belongs to another user (EPERM).
         if read != size || info.pbi_status == libc::SZOMB {
             continue;
         }
-        // `pbi_name` is the 32-char accounting name, `pbi_comm` the 16-char `comm`;
-        // prefer the longer one so a long binary name survives. Both are the EXEC
-        // name, where `ps -o comm=` printed argv[0] — so a process that rewrites its
-        // own argv (`npm exec …`) or is reached through a symlink (`sh`→`bash`) now
-        // labels as what actually runs. Agent detection is unaffected: `claude` and
-        // `codex` are real executables, verified against a live `ps` sweep.
+        // Prefer the 32-char `pbi_name` over the 16-char `pbi_comm` so a long binary name
+        // survives. Both are the EXEC name, where `ps -o comm=` printed argv[0].
         let Some(comm) = c_str_field(&info.pbi_name).or_else(|| c_str_field(&info.pbi_comm)) else {
             continue;
         };
@@ -497,18 +453,13 @@ fn sweep() -> Option<HashMap<u32, ProcRec>> {
     Some(procs)
 }
 
-/// Every pid on the system, via libproc.
-///
-/// `proc_listallpids` TRUNCATES to the buffer it is given and reports only how many
-/// pids it wrote, so a completely full buffer is indistinguishable from an exact fit
-/// — and a silently short table can omit a pane's own shell. So size it, over-allocate
-/// a slack margin (the table can grow between the two calls), and treat a full buffer
-/// as truncation worth retrying with double the room. If it is STILL full after the
-/// last attempt, report failure: a `None` sweep retains the previous labels, which is
-/// always better than a table that is quietly missing processes.
+/// Every pid on the system, via libproc. `proc_listallpids` TRUNCATES to the buffer it is given
+/// and reports only how many it wrote, so a full buffer is indistinguishable from an exact fit
+/// and a short table can omit a pane's own shell. Size it, over-allocate (the table can grow
+/// between calls), and retry with double the room on a full buffer. If still full after the
+/// last attempt, report failure: a `None` sweep retains the previous labels.
 #[cfg(target_os = "macos")]
 fn list_all_pids() -> Option<Vec<i32>> {
-    // SAFETY: the null/0 form is libproc's documented "how big?" query.
     let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if count <= 0 {
         return None;
@@ -517,7 +468,6 @@ fn list_all_pids() -> Option<Vec<i32>> {
     for _ in 0..4 {
         let mut pids = vec![0i32; cap];
         let bytes = (cap * std::mem::size_of::<i32>()) as libc::c_int;
-        // SAFETY: `pids` owns `bytes` writable bytes; libproc fills at most that many.
         let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
         if got <= 0 {
             return None;
@@ -532,7 +482,6 @@ fn list_all_pids() -> Option<Vec<i32>> {
     None
 }
 
-/// Read a fixed-size C char array as a `String` up to its NUL. `None` when empty.
 #[cfg(target_os = "macos")]
 fn c_str_field(buf: &[libc::c_char]) -> Option<String> {
     // SAFETY: `buf` is a live, contiguous C char array from libproc.
@@ -541,7 +490,6 @@ fn c_str_field(buf: &[libc::c_char]) -> Option<String> {
     (end > 0).then(|| String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
-/// Fallback for unixes with neither `/proc` nor libproc: one `ps` fork.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn sweep() -> Option<HashMap<u32, ProcRec>> {
     let out = Command::new("ps")
@@ -555,8 +503,7 @@ fn sweep() -> Option<HashMap<u32, ProcRec>> {
 }
 
 /// Parse `ps -eo pid=,ppid=,pgid=,comm=`. Columns are space-PADDED, so peel one
-/// whitespace-delimited field at a time (splitting on every space would yield
-/// empty fields and drop the row). `comm` (the tail) may hold a path.
+/// whitespace-delimited field at a time; `comm` (the tail) may hold a path.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn parse_ps(text: &str) -> HashMap<u32, ProcRec> {
     let mut procs = HashMap::new();
@@ -590,25 +537,15 @@ fn parse_ps(text: &str) -> HashMap<u32, ProcRec> {
 }
 
 impl ProcTree {
-    /// One sweep of the process table.
-    ///
-    /// `None` means the SWEEP ITSELF failed — never "nothing is running". The
-    /// distinction is the whole point of the `Option`: a caller that reads a
-    /// failed sweep as an empty machine unlabels every pane at once, which is
-    /// exactly the bug where a mux's tab names and agent list blinked out
-    /// together (see `docs/troubleshooting.md`). On `None` the caller must keep
-    /// its last-known labels.
-    ///
-    /// An empty table is treated as failure too: the sweeping process is always
-    /// in its own process table, so zero rows can only mean a truncated read.
+    /// One sweep of the process table. `None` means the SWEEP ITSELF failed, never "nothing is
+    /// running": a caller that reads it as an empty machine unlabels every pane at once (see
+    /// `docs/troubleshooting.md`) and must keep its last-known labels. An empty table is
+    /// failure too, since the sweeper is always in its own table.
     pub fn snapshot() -> Option<Self> {
         let procs = sweep()?;
         (!procs.is_empty()).then_some(Self { procs })
     }
 
-    /// This pid's `(ppid, comm-basename)`, or `None` when it is not in the snapshot.
-    /// The primitive behind the window-raise ancestor walk (`winfocus`), kept here so
-    /// `ProcRec` stays private.
     /// Every pid whose comm basename satisfies `pred`.
     pub fn pids_where(&self, pred: impl Fn(&str) -> bool) -> Vec<u32> {
         self.procs
@@ -622,11 +559,9 @@ impl ProcTree {
         self.procs.get(&pid).map(|r| (r.ppid, r.comm.clone()))
     }
 
-    /// The classified label of the terminal's foreground PROCESS GROUP (from
-    /// `tcgetpgrp`). The pgid is NOT necessarily a live pid — in a pipeline like
-    /// `true | sleep 300` the group leader (`true`) can exit while `sleep` runs —
-    /// so resolve a LIVE member of the group: the leader if it's alive, else the
-    /// most-recently-started (highest-pid) member. `None` if the group is empty.
+    /// The classified label of the terminal's foreground PROCESS GROUP. The pgid is NOT
+    /// necessarily a live pid (in `true | sleep 300` the leader exits while `sleep` runs), so
+    /// resolve a LIVE member: the leader if alive, else the highest-pid member.
     pub fn command_of_pgroup(&self, pgid: u32) -> Option<Label> {
         let mut members: Vec<u32> = self
             .procs
@@ -650,9 +585,6 @@ impl ProcTree {
         })
     }
 
-    /// Fallback foreground heuristic when the terminal PGID isn't resolvable:
-    /// descend from `shell_pid` to the deepest descendant (highest-pid child at
-    /// each level ≈ most recently spawned). `None` if the pid is unknown.
     pub fn foreground(&self, shell_pid: u32) -> Option<Label> {
         let mut cur = shell_pid;
         let mut comm = self.procs.get(&cur).map(|r| r.comm.clone())?;
@@ -684,16 +616,14 @@ impl ProcTree {
 #[cfg(test)]
 mod tests {
 
-    /// Child for [`process_env_reads_the_target_process_environment`]: just stays alive.
     #[test]
     #[ignore]
     fn env_probe_child() {
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
 
-    /// The environment a child was STARTED with is readable — and is its own, not ours. The
-    /// child is this test binary rather than `/bin/sleep`: macOS withholds the environment of
-    /// platform binaries from `KERN_PROCARGS2`, which says nothing about an agent like grok.
+    /// The child is this test binary rather than `/bin/sleep`: macOS withholds the environment
+    /// of platform binaries from `KERN_PROCARGS2`.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn process_env_reads_the_target_process_environment() {
@@ -711,7 +641,6 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        // `spawn` returns after fork; wait for the exec so we read the child's block, not ours.
         let mut got = None;
         for _ in 0..200 {
             got = process_env(pid, "GROK_HOME");
@@ -756,17 +685,14 @@ mod tests {
         procs.insert(200, rec(100, 200, "claude"));
         procs.insert(300, rec(200, 200, "node"));
         let tree = ProcTree { procs };
-        // 100 → 200 → 300 : deepest is node
         assert_eq!(tree.foreground(100).unwrap().text, "node");
-        // unknown pid → None
         assert!(tree.foreground(999).is_none());
     }
 
     #[test]
     fn snapshot_reads_the_live_process_table() {
-        // The sweep must SUCCEED and must contain the sweeping process itself —
-        // the guarantee `refresh_labels` relies on to tell "sweep broke" (keep the
-        // old labels) apart from "this pane really has nothing running".
+        // Must SUCCEED and contain the sweeping process itself: the guarantee `refresh_labels`
+        // relies on to tell "sweep broke" from "this pane has nothing running".
         let tree = ProcTree::snapshot().expect("a live process sweep must succeed");
         let me = std::process::id();
         assert!(
@@ -780,24 +706,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn proc_stat_parses_comm_containing_spaces_and_parens() {
-        // `comm` is unquoted: it can hold spaces and parens, so only the FIRST `(`
-        // and LAST `)` delimit it. Anything else mis-aligns ppid/pgid.
+        // `comm` is unquoted and can hold spaces and parens, so only the FIRST `(` and LAST `)`
+        // delimit it.
         let rec = parse_proc_stat("42 (my (odd) name) S 7 9 0 0 -1 4194304 100").unwrap();
         assert_eq!(rec.comm, "my (odd) name");
         assert_eq!(rec.ppid, 7);
         assert_eq!(rec.pgid, 9);
-        // A login-shell/path comm still reduces to a basename.
         assert_eq!(parse_proc_stat("1 (zsh) S 0 1 0").unwrap().comm, "zsh");
-        // Zombies are dropped — they would win `foreground`'s highest-pid descent.
         assert!(parse_proc_stat("42 (ps) Z 7 9 0").is_none());
         assert!(parse_proc_stat("garbage").is_none());
     }
 
     #[test]
     fn pgroup_resolves_to_a_live_member_when_leader_is_dead() {
-        // Pipeline `true | sleep 300`: the group leader (`true`, pid==pgid==500)
-        // has exited; only `sleep` (pid 501, pgid 500) survives. The foreground
-        // label must be `sleep`, not a fallback to the shell.
+        // Pipeline `true | sleep 300`: the group leader (pid 500) has exited and only `sleep`
+        // (pid 501, pgid 500) survives. The label must be `sleep`, not the shell.
         let mut procs = HashMap::new();
         procs.insert(400, rec(1, 400, "zsh"));
         procs.insert(501, rec(400, 500, "sleep")); // leader 500 gone
@@ -805,19 +728,14 @@ mod tests {
         let label = tree.command_of_pgroup(500).unwrap();
         assert_eq!(label.text, "sleep");
         assert_eq!(label.kind, Kind::Other);
-        // With the leader alive, its own comm is used.
         let mut procs = HashMap::new();
         procs.insert(600, rec(400, 600, "claude"));
         procs.insert(601, rec(600, 600, "node"));
         let tree = ProcTree { procs };
         assert_eq!(tree.command_of_pgroup(600).unwrap().text, "claude");
-        // Empty group → None.
         assert!(tree.command_of_pgroup(9999).is_none());
     }
 
-    /// The distinction `open_files` exists to carry: `None` means we could not look, not that
-    /// the process holds nothing open. Conflating the two lets a caller that caches a resolved
-    /// path (`agentpoll`) drop a working source the moment an enumeration hiccups.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn enumeration_failure_is_not_reported_as_an_empty_set() {

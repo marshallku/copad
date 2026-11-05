@@ -1,23 +1,17 @@
-//! Best-effort **window raising** for the notification jump path: bring the terminal
-//! emulator hosting an attached comux client to the front, so clicking an agent toast
-//! lands you looking at the pane instead of merely switching it behind another window.
+//! Best-effort window raising for the notification jump path: bring the terminal emulator
+//! hosting an attached comux client to the front.
 //!
-//! Scope, deliberately narrow: this activates an *application*, not a window or a tab.
-//! A terminal with several windows (or native tabs) sharing one pid will surface
-//! whichever one the WM/compositor considers current — pid is the only identity a
-//! client hands us. Documented as best-effort rather than papered over.
+//! This activates an application, not a window or tab: a terminal with several windows sharing
+//! one pid surfaces whichever the WM considers current, since pid is the only identity a client
+//! hands us.
 //!
-//! Who runs this matters. The raise executes in the short-lived `comux jump` process
-//! (the one the notifier spawns on click), NOT in the server: the server scrubs
-//! `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`/… out of its own environment at startup (tmux
-//! `update-environment`), so a GUI command spawned there would have no session to talk
-//! to. The caller passes the environment explicitly ([`raise`] takes an `env` overlay)
-//! because even the click-spawned process is a child of whatever spawned the notifier.
+//! The raise runs in the short-lived `comux jump` process, NOT in the server: the server
+//! scrubs `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`/... from its environment at startup, so a GUI
+//! command spawned there would have no session. [`raise`] takes an `env` overlay because even
+//! the click-spawned process is a child of whatever spawned the notifier.
 
 use std::process::{Command, Stdio};
 
-/// Terminal-emulator process basenames worth activating. Mirrors the list the retired
-/// `~/.claude/scripts/notify-attention.sh` walked, plus copad's own binaries.
 const TERMINALS: &[&str] = &[
     "kitty",
     "ghostty",
@@ -50,22 +44,16 @@ const TERMINALS: &[&str] = &[
     "kitty-wrapper",
 ];
 
-/// How far up the process tree to look for a terminal emulator. A client is normally
-/// 1–3 hops from its terminal (shell → comux, sometimes a `tmux`/`ssh` hop between).
+/// A client is normally 1-3 hops from its terminal (shell, comux, sometimes a `tmux`/`ssh` hop).
 const MAX_DEPTH: usize = 12;
 
-/// Is `comm` a known terminal emulator? Case-insensitive: macOS reports `Ghostty`
-/// where Linux reports `ghostty`.
+/// Case-insensitive: macOS reports `Ghostty` where Linux reports `ghostty`.
 pub fn is_terminal(comm: &str) -> bool {
     TERMINALS.iter().any(|t| t.eq_ignore_ascii_case(comm))
 }
 
-/// Walk up from `pid` to the first ancestor that is a known terminal emulator,
-/// returning `(pid, comm)`. `lookup` maps a pid to its `(ppid, comm)` — injected so the
-/// walk is unit-testable without a live process table.
-///
-/// The starting process is examined too: a client launched directly by the emulator
-/// (no shell in between) would otherwise be missed on the first hop.
+/// Walk up from `pid` (itself included) to the first known terminal emulator, returning
+/// `(pid, comm)`. `lookup` maps a pid to `(ppid, comm)` so tests need no live process table.
 pub fn terminal_ancestor(
     pid: u32,
     lookup: impl Fn(u32) -> Option<(u32, String)>,
@@ -85,13 +73,11 @@ pub fn terminal_ancestor(
     None
 }
 
-/// The same walk against the live process table.
 pub fn terminal_ancestor_live(pid: u32) -> Option<(u32, String)> {
     let tree = crate::procinfo::ProcTree::snapshot()?;
     terminal_ancestor(pid, |p| tree.parent_of(p))
 }
 
-/// Spawn `cmd` detached, reaping it on a short-lived thread. Returns whether it spawned.
 fn spawn_reaped(mut cmd: Command) -> bool {
     match cmd
         .stdin(Stdio::null())
@@ -110,11 +96,9 @@ fn spawn_reaped(mut cmd: Command) -> bool {
 }
 
 /// Raise the application owning `pid`, best-effort. `env` is overlaid on the child's
-/// environment (the session vars a scrubbed server can't supply — `DISPLAY`,
-/// `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, `HYPRLAND_INSTANCE_SIGNATURE`, …).
-///
-/// Returns whether a raise command was launched — not whether the window actually came
-/// forward, which no exit code reliably reports.
+/// environment (the session vars a scrubbed server can't supply: `DISPLAY`, `XAUTHORITY`,
+/// `DBUS_SESSION_BUS_ADDRESS`, `HYPRLAND_INSTANCE_SIGNATURE`, ...). Returns whether a raise
+/// command was launched, not whether the window came forward.
 pub fn raise(pid: u32, env: &[(String, String)]) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -147,8 +131,6 @@ fn raise_macos(pid: u32, env: &[(String, String)]) -> bool {
     spawn_reaped(os)
 }
 
-/// Linux: Hyprland's `focuswindow pid:N` when we're on it, else resolve the pid's window
-/// through `wmctrl`.
 #[cfg(target_os = "linux")]
 fn raise_linux(pid: u32, env: &[(String, String)]) -> bool {
     let hypr = env.iter().any(|(k, _)| k == "HYPRLAND_INSTANCE_SIGNATURE")
@@ -183,8 +165,6 @@ fn raise_linux(pid: u32, env: &[(String, String)]) -> bool {
     spawn_reaped(act)
 }
 
-/// The first `wmctrl -lp` window id owned by `pid`. Split out as a pure function so the
-/// parse is testable on both platforms (the column layout is fixed and documented).
 pub fn window_id_for_pid(listing: &str, pid: u32) -> Option<String> {
     listing.lines().find_map(|line| {
         let mut f = line.split_whitespace();
@@ -209,7 +189,6 @@ mod tests {
 
     #[test]
     fn walks_up_to_the_emulator() {
-        // comux client → zsh → ghostty → launchd
         let t = tree(&[(400, 300, "comux"), (300, 200, "zsh"), (200, 1, "ghostty")]);
         let got = terminal_ancestor(400, |p| t.get(&p).cloned());
         assert_eq!(got, Some((200, "ghostty".to_string())));
@@ -226,7 +205,6 @@ mod tests {
 
     #[test]
     fn no_terminal_in_the_chain_is_none() {
-        // A server started by systemd/launchd has no emulator above it.
         let t = tree(&[(400, 300, "comux"), (300, 1, "systemd")]);
         assert_eq!(terminal_ancestor(400, |p| t.get(&p).cloned()), None);
     }
@@ -262,7 +240,6 @@ mod tests {
         assert_eq!(window_id_for_pid(listing, 222).as_deref(), Some("0x02"));
         assert_eq!(window_id_for_pid(listing, 999), None);
         assert_eq!(window_id_for_pid("", 1), None);
-        // A malformed row must not panic or match.
         assert_eq!(
             window_id_for_pid("garbage\n0x04 0 7 h t\n", 7).as_deref(),
             Some("0x04")

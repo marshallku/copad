@@ -1,11 +1,9 @@
-//! The `Ctrl-b C` directory browser's model: list a directory's subdirectories off the
-//! render loop, and turn a listing + the typed filter into the rows the overlay shows.
+//! The `Ctrl-b C` directory browser's model.
 //!
-//! Listing runs on a detached thread ([`spawn_list`]) because `read_dir` — and following a
-//! symlink to see whether it is a directory — can block indefinitely on a network mount or a
-//! dead automount, and the App loop also serves every other client and the control socket.
-//! A thread stuck that way is simply abandoned: the next navigation bumps the request id and
-//! its late result is discarded.
+//! Listing runs on a detached thread ([`spawn_list`]) because `read_dir` (and following a
+//! symlink to see whether it is a directory) can block indefinitely on a dead network mount or
+//! automount, and the App loop also serves every other client and the control socket. A stuck
+//! thread is abandoned: the next navigation bumps the request id and its late result is dropped.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -22,7 +20,6 @@ const MAX_SCANNED: usize = 50_000;
 /// full of files can't crowd every usable row out.
 const MAX_DIRS: usize = 5_000;
 
-/// The subdirectories of one directory, sorted case-insensitively.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Listing {
     /// Kept as `OsString` so a non-UTF-8 name stays navigable (it only DISPLAYS lossily).
@@ -31,7 +28,6 @@ pub struct Listing {
     pub truncated: bool,
 }
 
-/// A finished listing, tagged with the request it answers.
 #[derive(Debug, Clone)]
 pub struct ListResult {
     pub req: u64,
@@ -39,10 +35,8 @@ pub struct ListResult {
     pub listing: Result<Listing, String>,
 }
 
-/// Where the listing thread drops its result for the App loop to adopt.
 pub type Slot = Arc<Mutex<Option<ListResult>>>;
 
-/// List `dir`'s subdirectories (symlinks to directories included).
 pub fn list_dirs(dir: &Path) -> Result<Listing, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
     let mut names = Vec::new();
@@ -94,27 +88,22 @@ fn publish(slot: &Slot, res: ListResult) {
 /// there would hang the same way.
 const PROBE_HANG: Duration = Duration::from_secs(2);
 
-/// Whether each session's start directory still exists, learned OFF the App loop.
-///
-/// The loop only ever reads the last answer ([`DirProbe::usable`] never touches the
-/// filesystem); [`DirProbe::refresh`] stats on detached threads, at most one in flight per
-/// directory, so a dead mount strands one thread rather than one per refresh.
+/// Whether each session's start directory still exists, learned OFF the App loop: the loop only
+/// reads the last answer, and [`DirProbe::refresh`] stats on detached threads, at most one in
+/// flight per directory, so a dead mount strands one thread rather than one per refresh.
 #[derive(Clone, Default)]
 pub struct DirProbe(Arc<Mutex<HashMap<PathBuf, Probe>>>);
 
 #[derive(Default)]
 struct Probe {
-    /// The last answer; `None` until the first probe lands.
     alive: Option<bool>,
-    /// A probe is in flight, started then.
     pending: Option<Instant>,
 }
 
 impl DirProbe {
-    /// Whether a new tab may open in `dir`: confirmed to exist, and not stuck on a probe.
-    /// Unconfirmed is NOT usable — a shell spawned in a missing directory silently starts in
-    /// the server's cwd instead of failing — so a directory counts only once a probe (or a
-    /// shell started there, [`Self::mark_alive`]) has vouched for it.
+    /// Whether a new tab may open in `dir`. Unconfirmed is NOT usable: a shell spawned in a
+    /// missing directory silently starts in the server's cwd, so a directory counts only once a
+    /// probe (or [`Self::mark_alive`]) has vouched for it.
     pub fn usable(&self, dir: &Path) -> bool {
         let Ok(g) = self.0.lock() else { return false };
         g.get(dir).is_some_and(|p| {
@@ -122,7 +111,6 @@ impl DirProbe {
         })
     }
 
-    /// A shell just started in `dir`, which is as good as a probe.
     pub fn mark_alive(&self, dir: PathBuf) {
         if let Ok(mut g) = self.0.lock() {
             let p = g.entry(dir).or_default();
@@ -131,7 +119,6 @@ impl DirProbe {
         }
     }
 
-    /// Re-check `dirs` (and forget any other directory) on detached threads.
     pub fn refresh(&self, dirs: impl IntoIterator<Item = PathBuf>) {
         let dirs: HashSet<PathBuf> = dirs.into_iter().collect();
         let Ok(mut g) = self.0.lock() else { return };
@@ -157,25 +144,19 @@ impl DirProbe {
     }
 }
 
-/// One row of the browser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
-    /// Create the session in the directory being browsed.
     Here,
-    /// Go to the parent directory.
     Up,
-    /// A subdirectory, by name.
     Dir(OsString),
     /// The filter is a path (`/…` or `~…`): jump there.
     Path(PathBuf),
 }
 
-/// Whether the filter is a path to jump to rather than a name to narrow by.
 pub fn is_path_filter(filter: &str) -> bool {
     filter.starts_with('/') || filter.starts_with('~')
 }
 
-/// Expand a path filter: a leading `~` is `home`.
 pub fn expand(filter: &str, home: &Path) -> PathBuf {
     match filter.strip_prefix('~') {
         Some(rest) => home.join(rest.trim_start_matches('/')),
@@ -183,12 +164,10 @@ pub fn expand(filter: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// The rows for `dir`'s `listing` under `filter`.
-///
-/// No filter: `Here`, `Up` (unless at the root), then every non-hidden subdirectory. A
-/// filter narrows to matching subdirectories only — so the best match is the first row and
-/// Enter descends into it — ranked prefix, then substring, then scattered (fzf-style)
-/// matches; a filter starting with `.` is what reveals hidden directories.
+/// No filter: `Here`, `Up` (unless at the root), then every non-hidden subdirectory. A filter
+/// keeps matching subdirectories only, ranked prefix, then substring, then scattered
+/// (fzf-style), so Enter descends into the best match; a filter starting with `.` reveals
+/// hidden directories.
 pub fn rows(dir: &Path, listing: &Listing, filter: &str, home: &Path) -> Vec<Row> {
     if is_path_filter(filter) {
         return vec![Row::Path(expand(filter, home))];
@@ -231,7 +210,6 @@ pub fn rows(dir: &Path, listing: &Listing, filter: &str, home: &Path) -> Vec<Row
             Some((rank, n))
         })
         .collect();
-    // Stable: names keep their sorted order within a rank.
     ranked.sort_by_key(|(r, _)| *r);
     ranked
         .into_iter()
@@ -239,7 +217,6 @@ pub fn rows(dir: &Path, listing: &Listing, filter: &str, home: &Path) -> Vec<Row
         .collect()
 }
 
-/// The default session name for `dir`: its last component (empty for `/`).
 pub fn default_name(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -270,7 +247,6 @@ mod tests {
                 Row::Dir("docs".into())
             ]
         );
-        // The root has no parent to go up to.
         let r = rows(Path::new("/"), &l, "", Path::new("/home/u"));
         assert_eq!(r[..2], [Row::Here, Row::Dir("copad".into())]);
     }
@@ -360,7 +336,6 @@ mod tests {
         let probe = DirProbe::default();
         let gone = std::env::temp_dir().join("comux-dirprobe-definitely-missing");
         let here = std::env::temp_dir();
-        // Unconfirmed is not usable.
         assert!(!probe.usable(&here));
         probe.refresh([gone.clone(), here.clone()]);
         for _ in 0..200 {
@@ -376,7 +351,6 @@ mod tests {
         assert!(!probe.usable(&here));
         probe.mark_alive(here.clone());
         assert!(probe.usable(&here));
-        // A directory no session uses any more is forgotten.
         probe.refresh([here.clone()]);
         assert!(!probe.0.lock().unwrap().contains_key(&gone));
     }

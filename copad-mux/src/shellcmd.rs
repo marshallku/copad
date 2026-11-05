@@ -20,28 +20,23 @@
 //! SUCCEEDED gives `Ok`, RAN only gives `Unknown` (shown, never counted), anything else is
 //! dropped — redirections included, since an earlier one failing skips the rest.
 //!
-//! **cwd.** A standalone `cd LITERAL` moves the directory for the rest of its `&&` chain (one to
-//! where the shell already is moves nothing); at the
-//! end of a chain that held one, or the moment any stage could move it in a way not modelled
-//! (`cd` inside a pipeline, `pushd`, `eval`, `source`, `exec`, `command`, …), the directory is
-//! UNKNOWN and relative operands are dropped from then on.
+//! **cwd.** A standalone `cd LITERAL` moves the directory for the rest of its `&&` chain (one
+//! to where the shell already is moves nothing). At the end of a chain that held one, or the
+//! moment any stage could move it in a way not modelled (`cd` inside a pipeline, `pushd`,
+//! `eval`, `source`, `exec`, `command`, …), the directory is UNKNOWN and relative operands are
+//! dropped from then on.
 
 use crate::workgraph::normalize;
 use copad_mux_proto::graph::{Outcome, StepKind};
 
-/// One file effect of a command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Effect {
     pub kind: StepKind,
-    /// Absolute and lexically normalised.
     pub path: String,
-    /// The pattern of a search.
     pub label: Option<String>,
-    /// The step's outcome when the command exited 0 (`Ok` or `Unknown`).
     pub on_ok: Outcome,
 }
 
-/// What a command did, as far as can be told.
 #[derive(Debug, Default, PartialEq)]
 pub struct Analysis {
     pub effects: Vec<Effect>,
@@ -162,7 +157,6 @@ fn redirect_effects(
         .collect()
 }
 
-/// `path` made absolute, or `None` when it is relative and the directory is unknown.
 fn resolve(dir: Option<&str>, path: &str, home: &str) -> Option<String> {
     let path = expand_tilde(path, home)?;
     if path.starts_with('/') {
@@ -181,19 +175,15 @@ fn expand_tilde(path: &str, home: &str) -> Option<String> {
     Some(path.to_string())
 }
 
-// ---- lexing and parsing --------------------------------------------------------------------
-
 /// One shell word: its text with quoting removed, and whether that text is exactly what the
 /// shell will pass (no expansion of any kind left in it).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Word {
     text: String,
     literal: bool,
-    /// Any part of it was quoted (an empty quoted word is still a word).
     quoted: bool,
     /// Starts with an unquoted `~` that expands (`~` or `~/…`); `text` keeps the `~`.
     tilde: bool,
-    /// An unquoted `NAME=` prefix: a variable assignment in command position.
     assign: bool,
 }
 
@@ -224,12 +214,10 @@ struct Redir {
 struct Stage {
     words: Vec<Word>,
     redirs: Vec<Redir>,
-    /// A heredoc or here-string feeds its stdin.
     stdin: bool,
 }
 
 impl Stage {
-    /// The command words: leading assignments dropped.
     fn argv(&self) -> &[Word] {
         let skip = self.words.iter().take_while(|w| w.assign).count();
         &self.words[skip..]
@@ -254,7 +242,6 @@ impl Stage {
         })
     }
 
-    /// The stage could change the shell's directory in a way not followed.
     fn moves_cwd(&self) -> bool {
         match self.argv().first() {
             None => false,
@@ -286,26 +273,21 @@ type Chain = Vec<Pipeline>;
 enum Tok {
     Word(Word),
     Redir(Redir),
-    /// A redirection that names no file (`2>&1`, `<&-`).
     Inert,
-    /// A heredoc or here-string: stdin, no file.
     Stdin,
     And,
     Pipe,
     Seq,
     /// Parsing stops here; the stage before it is complete (`||`, a background `&`, `;;`).
     StopAfter,
-    /// Parsing stops inside the current stage, which is dropped.
     Stop,
 }
 
-/// Words that stop the parse in command position.
 const RESERVED: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
     "function", "select", "coproc", "{", "}", "[[", "]]", "!",
 ];
 
-/// `script` as chains of pipelines of stages, and whether the parse stopped early.
 fn parse(script: &str) -> (Vec<Chain>, bool) {
     let toks = lex(script);
     let mut chains: Vec<Chain> = Vec::new();
@@ -395,7 +377,6 @@ fn parse(script: &str) -> (Vec<Chain>, bool) {
 struct Lexer<'a> {
     s: &'a [u8],
     i: usize,
-    /// Heredoc delimiters waiting for the next newline: (delimiter, strip leading tabs).
     heredocs: Vec<(String, bool)>,
     out: Vec<Tok>,
 }
@@ -597,8 +578,6 @@ impl Lexer<'_> {
         }
     }
 
-    /// Consume the bodies of the heredocs opened on the line just ended. False when one never
-    /// ends.
     fn heredoc_bodies(&mut self) -> bool {
         for (delim, strip) in std::mem::take(&mut self.heredocs) {
             loop {
@@ -770,7 +749,6 @@ impl Lexer<'_> {
         Some(w)
     }
 
-    /// Append the (possibly multi-byte) char at `i + skip` and move past it.
     fn push_char(&mut self, w: &mut Word, skip: usize) {
         let at = self.i + skip;
         let len = utf8_len(self.s[at]);
@@ -789,10 +767,6 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
-// ---- commands ------------------------------------------------------------------------------
-
-/// An option table: short flags with no value, short flags taking one, long flags (which may
-/// carry `=value`), long flags taking one, and whether `-NUM` is accepted.
 struct Spec {
     flags: &'static str,
     valued: &'static str,
@@ -801,7 +775,6 @@ struct Spec {
     numeric: bool,
 }
 
-/// What option parsing found: the options as `(name, value)`, then the operands.
 type Parsed<'a> = (Vec<(String, Option<&'a Word>)>, Vec<&'a Word>);
 
 /// Split `args` into options and operands by `spec` (GNU-style: options may follow operands
@@ -871,7 +844,6 @@ fn options<'a>(args: &'a [Word], spec: &Spec) -> Option<Parsed<'a>> {
     Some((opts, operands))
 }
 
-/// Paths of literal operands (a lone `-` is stdin).
 fn paths(words: &[&Word]) -> Vec<String> {
     words
         .iter()
@@ -892,7 +864,6 @@ fn each(kind: StepKind, ps: Vec<String>) -> Found {
 fn classify(stage: &Stage, first: bool) -> Option<Found> {
     let argv = stage.argv();
     let Some(cmd) = stage.name() else {
-        // Only assignments and/or redirections.
         return (argv.is_empty()).then(Vec::new);
     };
     let args = &argv[1..];
@@ -1185,7 +1156,6 @@ fn sed_script_safe(script: &str) -> bool {
             *i += 1;
         }
     };
-    // A delimited part ending at `delim`; returns false if unterminated.
     let delimited = |i: &mut usize, delim: char| -> bool {
         while *i < n {
             if s[*i] == '\\' {
@@ -1542,7 +1512,6 @@ fn find(args: &[Word]) -> Option<Found> {
     )
 }
 
-/// A search pattern as a step label: one line.
 fn pattern_label(p: &str) -> String {
     p.lines().next().unwrap_or_default().to_string()
 }
@@ -1592,7 +1561,6 @@ mod tests {
         assert_eq!(fx("cat ~/notes.md"), vec![e(R, "/h/notes.md", O)]);
         assert_eq!(fx("cat 'with space.md'"), vec![e(R, "/r/with space.md", O)]);
         assert_eq!(fx("cat ../x/./y"), vec![e(R, "/x/y", O)]);
-        // Several reads in one go, every line its own chain.
         assert_eq!(
             fx("sed -n '1,9p' a.rs\nsed -n '20,30p' b.rs"),
             vec![e(R, "/r/a.rs", U), e(R, "/r/b.rs", O)]

@@ -1,25 +1,18 @@
 //! The argument grammar every flat `comux <verb>` shares.
 //!
-//! Before this existed, most verbs read their arguments ad hoc, so `--help` and a mistyped
-//! flag were silently ignored — or, worse, read as a VALUE: `comux new-session --help` made
-//! a session named `--help` and switched the user's view to it. Every verb now goes through
-//! [`parse`], which fails BEFORE a request is built, so a bad invocation never reaches the
-//! server:
+//! [`parse`] fails BEFORE a request is built, so a bad invocation never reaches the server (and a
+//! flag like `--help` is never read as a VALUE, e.g. a session named `--help`).
 //!
 //! - `-h` / `--help` print the verb's usage to stdout and exit 0.
 //! - An unknown `-flag` is a usage error (exit 2).
-//! - Everything after `--` is positional, which is how a body or a name that starts with
-//!   `-` is passed (`comux send <pane> -- --json`).
+//! - Everything after `--` is positional (`comux send <pane> -- --json`).
 //! - More positionals than the verb takes is a usage error (exit 2).
 
-/// One flag a verb accepts. `names[0]` is the canonical name [`Parsed`] reports it under.
 pub struct Flag {
     pub names: &'static [&'static str],
-    /// The flag consumes the next argument as its value.
     pub value: bool,
 }
 
-/// Shorthand for a flag table entry.
 pub const fn flag(names: &'static [&'static str]) -> Flag {
     Flag {
         names,
@@ -27,27 +20,22 @@ pub const fn flag(names: &'static [&'static str]) -> Flag {
     }
 }
 
-/// Shorthand for a value-taking flag table entry.
 pub const fn opt(names: &'static [&'static str]) -> Flag {
     Flag { names, value: true }
 }
 
-/// How many positional arguments a verb takes.
 #[derive(Clone, Copy)]
 pub enum Positionals {
     AtMost(usize),
-    /// Unbounded — the verb joins them (a name, a body).
     Any,
 }
 
-/// A verb's grammar.
 pub struct Spec {
     pub usage: &'static str,
     pub flags: &'static [Flag],
     pub positionals: Positionals,
 }
 
-/// A verb that takes nothing at all.
 pub const fn bare(usage: &'static str) -> Spec {
     Spec {
         usage,
@@ -56,10 +44,8 @@ pub const fn bare(usage: &'static str) -> Spec {
     }
 }
 
-/// What a successful parse produced.
 #[derive(Debug, Default, PartialEq)]
 pub struct Parsed {
-    /// `(canonical name, value)` in command-line order; a repeated flag appears repeatedly.
     pub flags: Vec<(&'static str, Option<String>)>,
     pub positionals: Vec<String>,
     /// Where `--` fell, as an index into `positionals` — what lets a verb that takes both a
@@ -82,16 +68,12 @@ impl Parsed {
     }
 }
 
-/// Why a parse stopped short of producing a [`Parsed`].
 #[derive(Debug, PartialEq)]
 pub enum Stop {
-    /// `--help` was asked for: print the usage, exit 0.
     Help,
-    /// The invocation is malformed: print this reason and the usage, exit 2.
     Usage(String),
 }
 
-/// Parse `args` (the verb's arguments, WITHOUT the verb itself) against `spec`.
 pub fn parse(spec: &Spec, args: &[&str]) -> Result<Parsed, Stop> {
     let mut out = Parsed::default();
     let mut i = 0;
@@ -195,7 +177,6 @@ mod tests {
 
     #[test]
     fn the_separator_position_is_kept() {
-        // `split down -- cargo test` must not read as three positionals.
         let p = parse(&SPEC, &["down", "--", "x"]).unwrap();
         assert_eq!((p.positionals.len(), p.literal_at), (2, Some(1)));
         let p = parse(&SPEC, &["--", "down"]).unwrap();

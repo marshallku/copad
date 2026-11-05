@@ -1,27 +1,19 @@
 //! The client attach/stream protocol (agent-mux-spec §4b, single-client v1).
 //!
 //! A persistent [`crate::server`] hosts the authoritative `State` + PTYs; a thin
-//! [`crate::client`] renders and forwards input. They speak ndjson over the same
-//! Unix socket the `ctl` API uses — a connection's first line selects the role:
-//! a `{"cmd":…}` line is a one-shot control request (see [`crate::control`]),
-//! a [`ClientMsg::Attach`] (`{"t":"attach",…}`) opens a streaming session.
+//! [`crate::client`] renders and forwards input over ndjson on the same Unix socket the `ctl`
+//! API uses. A connection's first line selects the role: a `{"cmd":…}` line is a one-shot
+//! control request (see [`crate::control`]), a [`ClientMsg::Attach`] opens a streaming session.
 //!
-//! Render transport is a **composed cell diff**: the server renders the whole TUI
-//! into an off-screen buffer at the attached client's size, then ships only the
-//! cells that changed since the client's last frame (`Buffer::diff`). This is a
-//! deliberate v1 simplification of the spec's semantic-grid directive — it couples
-//! composition to one client, which is fine while at most one client attaches at a
-//! time; multi-client composition is a later unit (see decisions.md).
+//! Render transport is a composed cell diff: the server renders the whole TUI into an
+//! off-screen buffer at the client's size and ships only the cells that changed (`Buffer::diff`).
 
 use ratatui::buffer::Cell;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::style::{Color, Modifier};
 use serde::{Deserialize, Serialize};
 
-/// One rendered cell in a frame: absolute position + glyph + full style. Carries
-/// the complete ratatui style relevant to rendering (fg/bg + every `Modifier`,
-/// incl. `DIM` on inactive panes and `REVERSED`), so the client reproduces the
-/// server's composition exactly.
+/// One rendered cell in a frame: absolute position, glyph and full style.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireCell {
     pub x: u16,
@@ -29,16 +21,13 @@ pub struct WireCell {
     pub sym: String,
     pub fg: Color,
     pub bg: Color,
-    /// `ratatui::style::Modifier` bits (BOLD/DIM/REVERSED/…).
     pub mods: Modifier,
-    /// The ratatui `skip` flag — set on the trailing half of a wide glyph so the
-    /// renderer doesn't clobber it. Must be reproduced or CJK/emoji break.
+    /// Set on the trailing half of a wide glyph; must be reproduced or CJK/emoji break.
     #[serde(default)]
     pub skip: bool,
 }
 
 impl WireCell {
-    /// The wire form of one composed cell at `(x, y)` — what [`crate::server`] ships.
     pub fn of(x: u16, y: u16, cell: &Cell) -> Self {
         Self {
             x,
@@ -51,14 +40,10 @@ impl WireCell {
         }
     }
 
-    /// Apply this cell onto the client's mirror of the screen.
-    ///
     /// The ONE definition of what a frame does to a client buffer, so the render-fidelity
-    /// harnesses model production instead of approximating it. The approximation that matters:
-    /// `Cell::set_style` takes a `Style`, whose `sub_modifier` is empty for a style read back
-    /// off a cell, and it therefore only ever ADDS modifier bits — using it here would make
-    /// BOLD/DIM/REVERSED stick forever instead of following the frame. These are plain
-    /// assignments for that reason; keep them that way.
+    /// harnesses model production. These are plain assignments on purpose: `Cell::set_style`
+    /// only ever ADDS modifier bits, so BOLD/DIM/REVERSED would stick forever instead of
+    /// following the frame.
     pub fn apply_to(&self, dst: &mut Cell) {
         // A control character must not reach the terminal: it moves the cursor instead of filling
         // a cell, so everything printed after it lands in the wrong column. The server no longer
@@ -75,19 +60,16 @@ impl WireCell {
     }
 }
 
-/// An 8-bit RGB triple.
 pub type Rgb8 = (u8, u8, u8);
 
 fn shown() -> bool {
     true
 }
 
-/// A render frame: the cells that changed since the client's previous frame, plus
-/// the cursor. `full` marks a baseline repaint (diff against an empty buffer) that
-/// the client must apply after clearing — emitted on attach, resize, and takeover.
-/// `cols`/`rows` stamp the frame's viewport so a client that just resized can drop
-/// stale-size frames until the matching `full` frame arrives. `epoch` increments on
-/// every baseline reset (attach/resize/takeover) for debugging + future multi-client.
+/// A render frame: the cells that changed since the client's previous frame, plus the cursor.
+/// `full` marks a baseline repaint the client must apply after clearing (attach, resize,
+/// takeover). `cols`/`rows` stamp the viewport so a client that just resized can drop
+/// stale-size frames until the matching `full` frame arrives.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameMsg {
     pub epoch: u64,
@@ -96,29 +78,18 @@ pub struct FrameMsg {
     pub full: bool,
     pub cells: Vec<WireCell>,
     pub cursor: Option<(u16, u16)>,
-    /// The program in the focused pane hid its cursor (`?25l`). `cursor` still carries where it
-    /// is, so the client can park the real (hidden) cursor there for an IME. Defaults to shown,
-    /// which is what a frame from an older server meant.
     #[serde(default = "shown")]
     pub cursor_visible: bool,
     /// The focused program's cursor shape as a `DECSCUSR` parameter; `0` = the terminal's own
     /// default (also what an older server's frame means).
     #[serde(default)]
     pub cursor_shape: u8,
-    /// **Silent full repaint.** Re-emit every cell of the client's buffer to the terminal
-    /// after applying this frame, WITHOUT clearing it first — the self-healing counterpart
-    /// to `full`, which the client honours with a `Clear(All)` that flashes a blank frame.
-    ///
-    /// This is the recovery for a divergence BELOW the client's buffer: the client renders
-    /// through ratatui's incremental diff, whose cached previous-buffer can drift from what
-    /// the real terminal shows (its wide-glyph suppression is computed over a FLAT buffer, so
-    /// it crosses row and pane/sidebar boundaries; and an outer emulator or a lossy link can
-    /// simply drop a cell). Once drifted, ratatui deems the stale cell "unchanged" and never
-    /// repaints it — residue that only a full repaint clears. Overwriting every cell with the
-    /// content already believed correct costs no `Clear`, so it is invisible.
-    ///
-    /// Cheap on the wire (it carries no extra cells — the client re-emits what it already
-    /// holds), so the server sets it often. See `reconcile_secs`.
+    /// **Silent full repaint.** Re-emit every cell of the client's buffer WITHOUT clearing it
+    /// first, the counterpart to `full`, whose `Clear(All)` flashes a blank frame. It recovers a
+    /// divergence below the client's buffer: ratatui's cached previous-buffer can drift from
+    /// what the terminal shows (its wide-glyph suppression runs over a flat buffer, and an outer
+    /// emulator or lossy link can drop a cell), and it then never repaints the stale cell.
+    /// Carries no extra cells. See `reconcile_secs`.
     #[serde(default)]
     pub repaint: bool,
     /// The images to show (decisions #194), sent only to a client that said its terminal
@@ -126,34 +97,25 @@ pub struct FrameMsg {
     /// client got. The client places them over the cells after drawing every frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageRun>>,
-    /// Image data the runs need that this client does not hold yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uploads: Vec<ImageUpload>,
-    /// Images this client may forget (it should delete them from its terminal).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drops: Vec<u32>,
 }
 
-/// One row-run of an image on the client's screen (decisions #194).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageRun {
-    /// The image (an [`ImageUpload::id`] the client holds).
     pub id: u32,
-    /// The first cell, in frame coordinates.
     pub x: u16,
     pub y: u16,
-    /// Cells the run covers (a partly covered last cell counts).
     pub cols: u16,
-    /// The part of the image shown, in image pixels: `[x, y, w, h]`.
     pub src: [u32; 4],
     /// Where in the first cell the image starts, as fractions of a cell (the client turns
     /// them into its own pixels).
     pub off: [f32; 2],
-    /// Stacking order (kitty's `z`).
     pub z: i32,
 }
 
-/// An image a client must send its terminal before the runs naming it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageUpload {
     pub id: u32,
@@ -163,23 +125,19 @@ pub struct ImageUpload {
     pub data: String,
 }
 
-/// Which earlier attachment a reconnecting client replaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Replaces {
     pub attachment: u64,
     pub tag: String,
 }
 
-/// Server → client messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "kebab-case")]
 pub enum ServerMsg {
-    /// Sent once, first, on attach: the server-authoritative settings a client needs
-    /// before it touches its terminal. `mouse` = whether to enable mouse capture (the
-    /// server is the single config authority, so all clients agree regardless of what
-    /// each one's local `mux.toml` says). `update_environment` = the variable names the
-    /// server wants refreshed from this client (tmux `update-environment`); the client
-    /// replies with a [`ClientMsg::Env`] carrying just those it holds, BEFORE any input.
+    /// Sent once, first, on attach: the server-authoritative settings a client needs before it
+    /// touches its terminal. `mouse` = whether to enable mouse capture (the server is the single
+    /// config authority); `update_environment` = the variable names to refresh from this client
+    /// (tmux `update-environment`), answered by [`ClientMsg::Env`] before any input.
     Hello {
         mouse: bool,
         #[serde(default)]
@@ -190,12 +148,9 @@ pub enum ServerMsg {
         /// there and a paste still arrives as keystrokes.
         #[serde(default)]
         paste: bool,
-        /// The server understands [`ClientMsg::Focus`] (its terminal gained/lost focus), so the
-        /// client may forward focus events. Same old-server reasoning as `paste`.
+        /// The server understands [`ClientMsg::Focus`]. Same old-server reasoning as `paste`.
         #[serde(default)]
         focus: bool,
-        /// The server understands [`ClientMsg::Colors`], so the client may report its
-        /// terminal's foreground/background for panes that ask (OSC 10/11).
         #[serde(default)]
         colors: bool,
         /// The server process's identity (decisions #166): changes on every restart, and is
@@ -203,79 +158,69 @@ pub enum ServerMsg {
         /// and an L0 connection can check they reached the same server. Empty from an older one.
         #[serde(default)]
         incarnation: String,
-        /// This render connection's attachment id — what the L0 `clients` topic lists and a
-        /// host claims chrome for. `0` from an older server.
         #[serde(default)]
         attachment: u64,
         /// The server runs [`ClientMsg::Command`] / answers [`ClientMsg::Ping`] on this
         /// connection (decisions #167). An older server says nothing and would drop both.
         #[serde(default)]
         commands: bool,
-        /// The server understands [`ClientMsg::Graphics`] and can put images in frames.
         #[serde(default)]
         graphics: bool,
     },
-    /// The answer to a [`ClientMsg::Command`] (an opaque control `Resp`).
-    Reply { id: String, resp: serde_json::Value },
-    /// The answer to a [`ClientMsg::Ping`].
-    Pong { id: u64 },
+    Reply {
+        id: String,
+        resp: serde_json::Value,
+    },
+    Pong {
+        id: u64,
+    },
     /// The attach was refused before it registered (e.g. `expect_incarnation` did not match:
     /// the server restarted between the host's L0 subscribe and this attach). Nothing about
     /// the shared view changed; the connection closes after this line.
-    Refused { code: String, message: String },
-    /// A render frame (delta or full).
+    Refused {
+        code: String,
+        message: String,
+    },
     Frame(FrameMsg),
-    /// A pane rang the bell: ring this client's terminal too (tmux `bell-action any`), so the
-    /// dock bounces / the tab marks itself as it would without a multiplexer. An older client
-    /// cannot parse this and skips it.
+    /// A pane rang the bell: ring this client's terminal too (tmux `bell-action any`). An older
+    /// client cannot parse this and skips it.
     Bell,
-    /// Set this client's terminal title (tmux `set-titles`): the focused pane's title or
-    /// program, and the session.
-    Title { text: String },
+    Title {
+        text: String,
+    },
     /// Put `text` on the system clipboard (the result of a mouse-drag selection copy). The
     /// client emits an OSC 52 sequence to its own terminal — so it works over SSH, unlike a
     /// server-side `pbcopy`/`xclip`. Sent only to the client that made the selection.
-    Copy { text: String },
-    /// Detach acknowledged / forced (Ctrl-b d, takeover, or server shutdown): the
-    /// client restores its terminal and exits; the server keeps running.
+    Copy {
+        text: String,
+    },
     Bye,
 }
 
-/// A forwarded mouse action. The server maps `(x, y)` (frame cells) to a pane.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MouseKind {
-    /// Wheel up → scroll that pane back into history.
     ScrollUp,
-    /// Wheel down → scroll that pane toward the live bottom.
     ScrollDown,
     /// Left button down → focus that pane and anchor a drag-selection there.
     Click,
-    /// Left button held + moved → extend the drag-selection (clamped to the origin pane).
     Drag,
     /// Left button released → finish the selection; if it moved, copy the pane text.
     Up,
-    /// Right button down → open a context menu on chrome (tab chip / session pill /
-    /// sidebar row), tmux `display-menu` style.
     RightClick,
-    /// Right button held + moved → hover-highlight the menu item under the pointer.
     RightDrag,
     /// Right button released → over a menu item executes it; elsewhere the menu stays
     /// open for left-click / keyboard selection.
     RightUp,
 }
 
-/// Client → server messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "kebab-case")]
 pub enum ClientMsg {
-    /// Open a streaming session at the client's terminal size (must be the first
-    /// line on the connection).
+    /// Open a streaming session at the client's terminal size (must be the first line).
     ///
-    /// `pid` is the client process's own pid, used only to find the terminal emulator
-    /// hosting it so a notification jump can raise that window. `#[serde(default)]`
-    /// keeps a client built before this field compatible with a newer server — it just
-    /// means no window gets raised.
+    /// `pid` is only used to find the terminal emulator hosting the client so a notification
+    /// jump can raise that window; `serde(default)` keeps older clients compatible.
     Attach {
         cols: u16,
         rows: u16,
@@ -297,61 +242,63 @@ pub enum ClientMsg {
         replaces: Option<Replaces>,
     },
     /// The client's values for the variables the server advertised in
-    /// [`ServerMsg::Hello::update_environment`] (only those the client actually has,
-    /// valid UTF-8). Sent immediately after `Hello`, before any input, so new panes
-    /// this client spawns inherit its live SSH/display session (tmux `update-environment`).
-    /// A struct variant (named `vars`) — an internally-tagged enum (`tag = "t"`) cannot
-    /// serialize a newtype variant whose payload is a sequence, so this must NOT be `Env(Vec<…>)`.
+    /// [`ServerMsg::Hello::update_environment`], sent right after `Hello` and before any input.
+    /// Must stay a struct variant: an internally-tagged enum (`tag = "t"`) cannot serialize a
+    /// newtype variant whose payload is a sequence.
     Env {
         vars: Vec<(String, String)>,
-        /// The COPAD terminal this client is running inside, when it is one:
-        /// `(COPAD_SOCKET, COPAD_PANEL_ID)`. Copad exports both into every tab's shell, so a
-        /// client hosted by it can say exactly WHICH tab it occupies — which app-level window
-        /// activation cannot express, and which nothing else can infer without guessing.
-        ///
-        /// Kept OUT of `vars`: that list is the tmux `update-environment` scrub set, and its
-        /// members are re-injected into every pane comux spawns. A pane inheriting
-        /// `COPAD_PANEL_ID` would make each of them claim to be the copad panel.
-        ///
-        /// `serde(default)` so a client built before this field still parses.
+        /// The COPAD terminal this client runs inside: `(COPAD_SOCKET, COPAD_PANEL_ID)`, so a
+        /// notification jump can name the exact tab. Kept OUT of `vars`: those are re-injected
+        /// into every pane comux spawns, and a pane inheriting `COPAD_PANEL_ID` would claim to
+        /// be the copad panel.
         #[serde(default)]
         copad_host: Option<(String, String)>,
         /// The binding tag a host UI finds this attachment by in the L0 `clients` topic
-        /// (decisions #166): `COPAD_MUX_HOST_TAG` when set, else the copad tab's
-        /// `copad:<panel>@<socket>`. Discovery only — a host still claims by attachment id.
+        /// (decisions #166): `COPAD_MUX_HOST_TAG`, else `copad:<panel>@<socket>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_tag: Option<String>,
     },
-    /// A forwarded key event (interpreted server-side: prefix/nav/tabs/input).
     Key(KeyEvent),
-    /// A paste the client's terminal delivered as ONE bracketed paste (a Cmd-V, or a file
-    /// dropped on the window). Forwarded whole so the pane's program can see it as a paste:
-    /// Claude Code only attaches a dropped image when its path arrives as a paste, and
-    /// replaying it as keystrokes makes it plain typed text. Sent only when the server's
-    /// `Hello` advertised `paste`.
-    Paste { text: String },
-    /// This client's terminal gained (`true`) or lost focus. Sent only when the server's
-    /// `Hello` says `focus`.
-    Focus { gained: bool },
-    /// This client's terminal colours, read once at attach (OSC 10/11), so a pane asking for
-    /// its background (dark/light detection in nvim, Claude Code, …) gets the real answer.
-    /// Sent only when the server's `Hello` says `colors`.
-    Colors { fg: Rgb8, bg: Rgb8 },
+    /// A paste the terminal delivered as ONE bracketed paste, forwarded whole: Claude Code only
+    /// attaches a dropped image when its path arrives as a paste. Sent only when `Hello`
+    /// advertised `paste`.
+    Paste {
+        text: String,
+    },
+    Focus {
+        gained: bool,
+    },
+    /// This client's terminal colours (OSC 10/11), so a pane asking for its background gets the
+    /// real answer. Sent only when `Hello` says `colors`.
+    Colors {
+        fg: Rgb8,
+        bg: Rgb8,
+    },
     /// This client's terminal draws kitty graphics (probed at attach), and its cell size in
-    /// pixels: from now on frames carry images for it (decisions #194). Sent only to a server
-    /// whose `Hello` said `graphics`.
-    Graphics { cell_width: u16, cell_height: u16 },
-    /// A forwarded mouse action at frame cell `(x, y)`.
-    Mouse { x: u16, y: u16, kind: MouseKind },
+    /// pixels (decisions #194). Sent only when `Hello` said `graphics`.
+    Graphics {
+        cell_width: u16,
+        cell_height: u16,
+    },
+    Mouse {
+        x: u16,
+        y: u16,
+        kind: MouseKind,
+    },
     /// Run a control request (the `{"cmd":…}` object) IN ORDER with this connection's keys
     /// and pastes — so a native client's navigation can never overtake text it already sent
     /// (decisions #167). Answered by [`ServerMsg::Reply`].
-    Command { id: String, req: serde_json::Value },
-    /// Liveness; answered by [`ServerMsg::Pong`].
-    Ping { id: u64 },
-    /// The client's terminal was resized.
-    Resize { cols: u16, rows: u16 },
-    /// Explicit detach request (a dropped connection detaches too).
+    Command {
+        id: String,
+        req: serde_json::Value,
+    },
+    Ping {
+        id: u64,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Detach,
 }
 
@@ -374,9 +321,7 @@ mod tests {
         assert_eq!(cell.symbol(), "가");
     }
 
-    /// An `attach` line from a client built before the pid field must still open a
-    /// session — the field only decides whether a window gets raised, and refusing the
-    /// attach would break every running client the moment the server is upgraded.
+    /// An `attach` from a client built before the pid field must still open a session.
     #[test]
     fn attach_without_pid_still_parses() {
         let old = r#"{"t":"attach","cols":80,"rows":24}"#;
@@ -391,9 +336,8 @@ mod tests {
         }
     }
 
-    /// `ClientMsg::Env` MUST be a struct variant: an internally-tagged enum can't tag a
-    /// newtype variant carrying a sequence, so `Env(Vec<…>)` would fail to serialize and
-    /// the client's environment handshake would silently never send. Lock the round-trip.
+    /// `ClientMsg::Env` MUST be a struct variant: an internally-tagged enum cannot tag a newtype
+    /// variant carrying a sequence, so `Env(Vec<…>)` would never serialize.
     #[test]
     fn client_env_round_trips() {
         let msg = ClientMsg::Env {
@@ -421,8 +365,6 @@ mod tests {
         }
     }
 
-    /// The right-button kinds must round-trip in kebab-case (`right-click` …) — the
-    /// context-menu feature rides entirely on these three wire values.
     #[test]
     fn right_mouse_kinds_round_trip() {
         for (kind, wire) in [
@@ -440,8 +382,6 @@ mod tests {
         }
     }
 
-    /// A `Hello` written by an older server (no `update_environment`) must still parse
-    /// (the field defaults to empty) so the client degrades to "no refresh" rather than erroring.
     #[test]
     fn hello_without_update_environment_defaults_empty() {
         let m: ServerMsg = serde_json::from_str(r#"{"t":"hello","mouse":true}"#).unwrap();
@@ -456,9 +396,7 @@ mod tests {
             } => {
                 assert!(mouse);
                 assert!(update_environment.is_empty());
-                // An old server can't take a `Paste`, so the client must not enable it.
                 assert!(!paste);
-                // …nor a `Focus` or `Colors`.
                 assert!(!focus && !colors);
             }
             _ => panic!("expected Hello"),

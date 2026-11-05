@@ -1,24 +1,20 @@
-//! Session and tab ADDRESSES for the control CLI, resolved against a plain view of the mux.
+//! Session and tab selectors for the control CLI, resolved against a plain view of the mux.
 //!
-//! An index is a position, and positions move: a session created or killed in between a
-//! listing and a command shifts every index after it. The selectors below let a script name
-//! the thing itself.
+//! Indices move when a session is created or killed between a listing and a command, so a script
+//! can name the thing itself.
 //!
-//! Session: `s4` (its id), `name:hub` (its display name), `hub` (a bare name, when no id
-//! matches), `4` (an index in creation order, as `list-sessions` prints it).
+//! Session: `s4` (id), `name:hub` (display name), `hub` (bare name, when no id matches), `4`
+//! (index in creation order, as `list-sessions` prints it).
 //!
-//! Tab: `s4:t13` (its id, anywhere in the mux), `<session>/<tab>` where `<session>` is any
-//! session selector and `<tab>` is a tab id, an index in that session, a `name:` name, or a
-//! bare name — and a plain `12` is an index in the active session, as before.
+//! Tab: `s4:t13` (id, anywhere in the mux), `<session>/<tab>` where `<tab>` is an id, an index in
+//! that session, a `name:` name or a bare name; a plain `12` is an index in the active session.
 //!
-//! A name that matches more than one thing is AMBIGUOUS, never "the first one": the caller
-//! is about to act on the answer, and a guess there is a wrong pane typed into.
+//! A name matching more than one thing is AMBIGUOUS, never "the first one": the caller is about
+//! to act on the answer.
 
-/// One session, as the resolver needs to see it.
 pub struct SessionView<'a> {
     pub id: &'a str,
     pub name: Option<&'a str>,
-    /// `(tab id, tab name)` in tab order.
     pub tabs: Vec<(&'a str, Option<&'a str>)>,
 }
 
@@ -29,7 +25,6 @@ pub enum SelErr {
 }
 
 impl SelErr {
-    /// The machine-readable error code a response carries.
     pub fn code(&self) -> &'static str {
         match self {
             SelErr::NotFound(_) => "not_found",
@@ -44,7 +39,6 @@ impl SelErr {
     }
 }
 
-/// Resolve a session selector to its position in `sessions`.
 pub fn session(sessions: &[SessionView], sel: &str) -> Result<usize, SelErr> {
     if let Ok(i) = sel.parse::<usize>() {
         return (i < sessions.len())
@@ -93,7 +87,6 @@ pub fn tab(sessions: &[SessionView], active: usize, sel: &str) -> Result<(usize,
     by_name(tabs.iter().copied(), name, "tab").map(|ti| (si, ti))
 }
 
-/// The single entry whose name is `name`.
 fn by_name<'a>(
     items: impl Iterator<Item = (&'a str, Option<&'a str>)>,
     name: &str,

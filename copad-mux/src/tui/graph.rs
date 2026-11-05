@@ -1,7 +1,3 @@
-//! The work graph on the App side (decisions #204): which agents `graphpoll` should read, the
-//! L0 `graph` topic (a globally byte-bounded overview), and the `graph` command (one agent's
-//! history, page by page).
-
 use super::*;
 use crate::control::Resp;
 use crate::graphpoll;
@@ -12,15 +8,11 @@ use copad_mux_proto::graph as g;
 const TOPIC_BUDGET: usize = 256 << 10;
 /// Per-agent overview sizes tried in turn until the topic fits: (files, steps, subagents).
 const LEVELS: [(usize, usize, usize); 4] = [(32, 24, 8), (12, 8, 4), (4, 2, 2), (0, 0, 0)];
-/// The most steps one history page holds, and its byte budget.
 pub const PAGE_LIMIT: usize = 1000;
 const PAGE_BUDGET: usize = 512 << 10;
 
-/// What the topic depends on: the poller's revision and each agent row (token, pid, space,
-/// tab).
 type CacheKey = (u64, Vec<(String, u32, String, String)>);
 
-/// The topic's cache: valid while its [`CacheKey`] is unchanged.
 #[derive(Default)]
 pub struct GraphCache {
     key: Option<CacheKey>,
@@ -28,17 +20,14 @@ pub struct GraphCache {
 }
 
 impl App {
-    /// Start the work-graph reader (server-only).
     pub fn start_graph_poll(&mut self) {
         self.graph_poll = graphpoll::spawn();
     }
 
-    /// Where saved graphs live: beside the session state file.
     pub fn graph_dir() -> PathBuf {
         crate::persist::state_path().with_file_name("graphs")
     }
 
-    /// Tell the poller which agents to read, from this sweep's `(pid, tool, cwd)`.
     pub(super) fn set_graph_wants(&self, agents: &[(u32, String, Option<PathBuf>)]) {
         let wants = if self.cfg.graph {
             agents
@@ -80,8 +69,6 @@ impl App {
         graphpoll::set_settings(&self.graph_poll, self.graph_settings());
     }
 
-    /// Every agent pane with a graph: `(token, space id, tab id, graph)`, most recently
-    /// active first.
     fn graphs_by_pane(&self) -> Vec<(String, String, String, std::sync::Arc<ConvGraph>)> {
         let (_, graphs) = graphpoll::snapshot(&self.graph_poll);
         let mut out: Vec<_> = self
@@ -102,7 +89,6 @@ impl App {
         out
     }
 
-    /// The `graph` topic, serialised (cached across publish passes while nothing moved).
     pub fn host_graph_json(&self) -> String {
         let rev = graphpoll::snapshot(&self.graph_poll).0;
         let rows: Vec<(String, u32, String, String)> = self
@@ -126,7 +112,6 @@ impl App {
         cache.json.clone()
     }
 
-    /// The `graph` topic: every live agent's overview, within [`TOPIC_BUDGET`].
     pub fn host_graph(&self) -> g::Graph {
         fit_overview(&self.graphs_by_pane(), TOPIC_BUDGET)
     }
@@ -166,8 +151,8 @@ impl App {
     }
 }
 
-/// The overview of `graphs` (most recently active first) within `budget` bytes: every agent
-/// at the richest level that fits, then less, then agents dropped from the least active end.
+/// Within `budget` bytes: every agent at the richest level that fits, then less, then agents
+/// dropped from the least active end.
 pub(super) fn fit_overview(
     graphs: &[(String, String, String, std::sync::Arc<ConvGraph>)],
     budget: usize,

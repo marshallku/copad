@@ -1,10 +1,6 @@
-//! Background poller for the "what is this agent actually DOING" line in the `Ctrl-f`
-//! switcher.
-//!
-//! [`crate::agentstate`] takes screen scraping as far as it goes: it classifies
-//! working/ready/blocked from stable UI furniture (#109). It cannot say *what* — the content
-//! area is arbitrary, it reflows, and it is exactly what scrolls away. Both CLIs do write
-//! structured logs, so the detail is read from those instead:
+//! Background poller for the "what is this agent actually DOING" line in the `Ctrl-f` switcher.
+//! [`crate::agentstate`] classifies working/ready/blocked from screen furniture but cannot say
+//! *what*, so the detail is read from each CLI's structured log:
 //!
 //! * **Claude** — `~/.claude/sessions/<pid>.json` gives `sessionId` and `cwd`; the transcript
 //!   is `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl`, whose `assistant` records carry
@@ -19,43 +15,33 @@
 //!   transcript is `brain/<id>/.system_generated/logs/transcript.jsonl`, whose
 //!   `PLANNER_RESPONSE` steps carry `tool_calls[]` with a `toolSummary`.
 //!
-//! **Why a thread.** `procinfo::open_files` forks `lsof` on macOS and decision #88 forbids
-//! forking on the sweep cadence; Claude's path needs no fork but does need a bounded tail read
-//! of a transcript that runs to megabytes, and at 2 Hz per pane that is real I/O on the
-//! single-writer loop. So this has the same shape as `usagepoll`/`versionpoll`: `spawn() ->
-//! Shared`, `idle()` for the client/no-server case, and the lock is never held across I/O.
+//! **Why a thread.** `procinfo::open_files` forks `lsof` on macOS and decision #88 forbids forking
+//! on the sweep cadence, and a transcript tail read at 2 Hz per pane is real I/O on the
+//! single-writer loop. Same shape as `usagepoll`/`versionpoll`: `spawn() -> Shared`, `idle()` for
+//! the client/no-server case, and the lock is never held across I/O.
 //!
-//! **Absence is reported as absence.** No entry for a pid means "we do not know", and the row
-//! renders exactly as it did before this module existed. This is inference from another
-//! program's private on-disk format — twice — and both formats have already moved under us
-//! once, so the failure mode is deliberately bounded to "no detail" rather than a stale or
-//! invented one.
+//! **Absence is reported as absence.** No entry for a pid means "we do not know" and the row
+//! renders without detail. The formats are another program's private on-disk ones and have moved
+//! before, so the failure mode is bounded to "no detail", never a stale or invented one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-/// How often the thread wakes. Skipped entirely when nothing is being tracked.
 const TICK: Duration = Duration::from_secs(1);
 
-/// Most agent pids tracked at once. A mux with more agents than this is not a case worth
-/// growing unbounded I/O for.
 const MAX_TRACKED: usize = 64;
 
-/// Source-file resolutions attempted per tick, for the tools whose resolution costs a FORK.
-/// Bounds the burst when several codex panes appear at once. It deliberately does NOT gate
-/// Claude, whose resolution is one small read: capping a fork-free path at 4/tick would defeat
-/// the every-tick revalidation below as soon as there were five Claude agents.
+/// Source-file resolutions attempted per tick, for tools whose resolution costs a FORK. Claude is
+/// deliberately not gated: its resolution is one small read, and capping it would defeat the
+/// every-tick revalidation.
 const RESOLVE_BUDGET: usize = 4;
 
-/// How long between re-checks of a source that costs a fork to resolve.
-///
-/// A conversation can change inside the SAME pid — Claude `/clear` mints a new `sessionId`,
-/// codex `/new` rotates to a fresh rollout — and in both cases the previous log stays on disk,
-/// so "the file is still there" is not evidence that it is still the right file. Claude has a
-/// cheap identity oracle and is re-checked every tick; codex has none (the check IS the
-/// `lsof`), and decision #88 forbids forking on the sweep cadence, so it waits this out.
+/// How long between re-checks of a source that costs a fork to resolve. A conversation can change
+/// inside the SAME pid (Claude `/clear`, codex `/new`) while the old log stays on disk, so "the
+/// file is still there" proves nothing. Claude has a cheap identity oracle and is re-checked every
+/// tick; codex's check IS the `lsof`, which decision #88 forbids on the sweep cadence.
 const SOURCE_RECHECK: Duration = Duration::from_secs(30);
 
 /// How long before retrying a resolution that failed. Without this a non-interactive `codex
@@ -81,10 +67,8 @@ const AGY_TAIL: u64 = 256 * 1024;
 /// routinely non-ASCII.
 const MAX_DETAIL: usize = 72;
 
-/// What an agent was last seen doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Activity {
-    /// Display-ready, already trimmed (`"Bash: cargo test"`).
     pub detail: String,
 }
 
@@ -111,26 +95,20 @@ pub(crate) enum Mark {
 
 #[derive(Default)]
 pub struct Inner {
-    /// Agent panes the render loop wants tracked: `(pid, tool basename)`.
     wanted: Vec<(u32, String)>,
-    /// Published readings, keyed by agent pid.
     seen: HashMap<u32, Activity>,
     /// The log each pid was resolved to, published whether or not it has yielded a detail
     /// yet — a fresh conversation that has run no tool still HAS a conversation.
     sources: HashMap<u32, PathBuf>,
-    /// The last context reading per pid ([`Context`]).
     contexts: HashMap<u32, Context>,
 }
 
 pub type Shared = Arc<Mutex<Inner>>;
 
-/// A poller that never runs — the client, and any path with no server.
 pub fn idle() -> Shared {
     Arc::new(Mutex::new(Inner::default()))
 }
 
-/// Tell the poller which agent pids to track. Called from the render loop at the label
-/// cadence; holds the lock only long enough to store a short `Vec`.
 pub fn set_wanted(shared: &Shared, wanted: Vec<(u32, String)>) {
     if let Ok(mut g) = shared.lock() {
         g.wanted = wanted;
@@ -168,62 +146,45 @@ fn transcript_session_id(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The activity last read for `pid`, if any.
 pub fn activity(shared: &Shared, pid: u32) -> Option<Activity> {
     shared.lock().ok()?.seen.get(&pid).cloned()
 }
 
-/// The context fill last read for `pid`, if any.
 pub fn context(shared: &Shared, pid: u32) -> Option<Context> {
     shared.lock().ok()?.contexts.get(&pid).copied()
 }
 
-/// What we know about one tracked pid between ticks.
 struct Entry {
     tool: String,
-    /// The log we read for it, once resolved.
     path: Option<PathBuf>,
-    /// `(mtime, len)` at the last read, so an unchanged file costs one `stat`.
     stamp: Option<(SystemTime, u64)>,
-    /// The reading `stamp` was taken from, so an unchanged file costs the `stat` and
-    /// NOTHING ELSE. Without this the stamp was computed and then ignored: every tick
-    /// re-tailed 256 KiB per Claude agent, lossy-decoded it and parsed JSON, only to
-    /// publish the same string again. At 30 agents that is ~7.7 MB/s of pure waste.
-    ///
-    /// `None` means "read fine, nothing parseable in the tail" — which is exactly what
-    /// gets republished, so the distinction from a FAILED read matters and is why
-    /// [`read_detail`] returns a nested `Option`.
+    /// The reading `stamp` was taken from, so an unchanged file costs only the `stat` instead of
+    /// re-tailing and re-parsing 256 KiB per agent every tick. `None` means "read fine, nothing
+    /// parseable", which differs from a FAILED read; that is why [`read_detail`] returns a nested
+    /// `Option`.
     last: Option<Activity>,
     /// The newest context reading in this source. Unlike `last` it is KEPT across a read whose
     /// tail holds no usage record — a turn of big tool output can push the last response out
     /// of the tail, and that says nothing about the context having emptied. Only a source
     /// change or a compaction marker clears it.
     ctx: Option<Context>,
-    /// When resolution last produced no path, for [`RESOLVE_RETRY`].
     failed_at: Option<Instant>,
-    /// When a source that costs a FORK to resolve was last re-resolved, for
-    /// [`SOURCE_RECHECK`]. `None` = never attempted, so the first resolve is immediate.
+    /// When a source that costs a FORK to resolve was last re-resolved, for [`SOURCE_RECHECK`];
+    /// `None` = never, so the first resolve is immediate.
     checked_at: Option<Instant>,
 }
 
-/// What the CHEAP re-check can say about the source we hold.
-///
-/// Only Claude has one. Its `~/.claude/sessions/<pid>.json` names the conversation the pid is
-/// CURRENTLY in, and the transcript path's file stem is that same id, so comparing them is one
-/// ~520-byte read and no path work at all.
+/// What the CHEAP re-check can say about the source we hold. Only Claude has one: its session file
+/// names the conversation the pid is in NOW, and the transcript's file stem is that same id.
 #[derive(Debug, PartialEq, Eq)]
 enum Source {
     /// No usable signal — KEEP what we have. The session file is rewritten in place constantly
     /// (`updatedAt`), so a read landing mid-write must not blow away a working source.
     Unknown,
-    /// Still the conversation we are reading.
     Same,
-    /// A DIFFERENT conversation, positively identified.
     Changed,
 }
 
-/// Whether resolving this tool's source costs a fork. See [`RESOLVE_BUDGET`] and
-/// [`SOURCE_RECHECK`], which both branch on it.
 fn forks(tool: &str) -> bool {
     matches!(tool, "codex" | "agy")
 }
@@ -234,18 +195,15 @@ pub fn spawn() -> Shared {
     let _ = std::thread::Builder::new()
         .name("agent-poll".into())
         .spawn(move || {
-            // Read `HOME` ONCE, here, and pass it down. Everything below then takes it as a
-            // parameter, which is what makes the resolver testable: `std::env::set_var` is
-            // `unsafe` in edition 2024 and races the other test threads. An absent `HOME`
-            // leaves an empty path, whose reads fail, which this module already reports as
-            // "no detail" rather than a wrong one.
+            // Read `HOME` once and pass it down: `std::env::set_var` is `unsafe` in edition 2024
+            // and races other test threads, so the resolver takes it as a parameter. An absent
+            // `HOME` yields an empty path whose reads fail, reported as "no detail".
             let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
             let mut cache: HashMap<u32, Entry> = HashMap::new();
             let mut cursor = 0usize;
             loop {
-                // Copy the request out and RELEASE the lock before any I/O: the render loop
-                // takes the same lock to publish `wanted` and to read results, and must never
-                // wait on a file read.
+                // Release the lock before any I/O: the render loop takes it to publish `wanted` and
+                // read results and must never wait on a file read.
                 let wanted: Vec<(u32, String)> = match out.lock() {
                     Ok(g) => g.wanted.iter().take(MAX_TRACKED).cloned().collect(),
                     Err(_) => Vec::new(),
@@ -279,14 +237,9 @@ pub fn spawn() -> Shared {
     shared
 }
 
-/// One pass over the tracked pids. Pure except for the filesystem, so it is testable with a
-/// hand-built cache.
-///
-/// `cursor` rotates the visit order by one each tick. `wanted` is otherwise walked in a fixed
-/// order, so with more unresolvable entries than [`RESOLVE_BUDGET`] the ones at the front eat
-/// every tick's budget and an entry behind them never re-checks — it would keep publishing a
-/// conversation that had already ended. Rotating makes every position the head within
-/// `wanted.len()` ticks. The result is a `HashMap`, so visit order is not otherwise observable.
+/// One pass over the tracked pids. `cursor` rotates the visit order each tick so that, with more
+/// unresolvable entries than [`RESOLVE_BUDGET`], the ones at the front cannot eat every tick's
+/// budget and starve those behind them.
 fn sweep(
     wanted: &[(u32, String)],
     cache: &mut HashMap<u32, Entry>,
@@ -310,13 +263,9 @@ fn sweep(
             failed_at: None,
             checked_at: None,
         });
-        // The file we were reading was DELETED. Distinct from the checks below, which ask
-        // whether a file that still exists is still the right one.
-        //
-        // NOT `Path::exists()`: it collapses every `stat` error into `false`, so a permission
-        // or I/O hiccup would read as "deleted" and throw away a source that is fine — and for
-        // codex the 30s timer would then leave the row blank until the next recheck. Only a
-        // confirmed `NotFound` counts.
+        // The file we were reading was DELETED. Not `Path::exists()`: it maps every `stat` error to
+        // `false`, so a permission or I/O hiccup would discard a working source. Only a confirmed
+        // `NotFound` counts.
         let vanished = e.path.as_ref().is_some_and(|p| {
             matches!(std::fs::metadata(p), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
         });
@@ -326,17 +275,15 @@ fn sweep(
             e.last = None;
             e.ctx = None;
         }
-        // The cheap oracle, for the tool that has one. codex has none, so it is the timer in
-        // `want` that decides for it and this stays `false`.
+        // The cheap oracle, for the tool that has one; codex's timer is in `want`.
         let changed = !forks(tool)
             && match cheap_source(home, *pid, tool, e.path.as_deref()) {
                 Source::Unknown | Source::Same => false,
                 Source::Changed => {
-                    // A positively different conversation invalidates the reading AT ONCE —
-                    // before, and independently of, whether the new transcript can be resolved
-                    // yet. Claude writes the session-file entry before the first transcript
-                    // record exists, so "B named, B not yet on disk" is a real window, and
-                    // republishing A across it is the exact bug being fixed.
+                    // A positively different conversation invalidates the reading AT ONCE, even if
+                    // the new transcript is not resolvable yet: Claude writes the session-file
+                    // entry before the first transcript record exists, and republishing the old
+                    // conversation across that window is the bug.
                     e.path = None;
                     e.stamp = None;
                     e.last = None;
@@ -345,11 +292,10 @@ fn sweep(
                 }
             };
         let due = e.failed_at.is_none_or(|t| t.elapsed() >= RESOLVE_RETRY);
-        // What makes a re-resolve WANTED differs by tool, and for a forking tool it must not
-        // include "we have no path": an observed absence clears the path, so keying off that
-        // would fork `lsof` every single tick for a codex pane that simply has no rollout open.
-        // For codex the timer is the only gate; `checked_at == None` means never attempted, so
-        // the first resolve is still immediate.
+        // For a forking tool "we have no path" must not make a re-resolve wanted: an observed
+        // absence clears the path, so that would fork `lsof` every tick for a codex pane with no
+        // rollout. The timer is the only gate; `checked_at == None` means the first resolve is
+        // immediate.
         let want = if forks(tool) {
             e.checked_at.is_none_or(|t| t.elapsed() >= SOURCE_RECHECK)
         } else {
@@ -367,7 +313,6 @@ fn sweep(
                 Some(found) => {
                     e.failed_at = found.is_none().then(Instant::now);
                     if found.as_ref() != e.path.as_ref() {
-                        // The cached reading belongs to the OLD source.
                         e.path = found;
                         e.stamp = None;
                         e.last = None;
@@ -381,29 +326,22 @@ fn sweep(
             .ok()
             .and_then(|m| Some((m.modified().ok()?, m.len())));
         if now.is_some() && now == e.stamp {
-            // Unchanged: republish the last reading rather than dropping it, so an idle agent
-            // does not flicker between a detail and nothing. This is the whole point of
-            // `stamp` — see [`Entry::last`] for what it used to cost.
+            // Unchanged: republish the last reading so an idle agent does not flicker.
             if let Some(a) = e.last.clone() {
                 out.insert(*pid, a);
             }
             continue;
         }
-        // A read that SUCCEEDED commits both the stamp and the reading, whether or not the
-        // tail held anything parseable — an inner `None` legitimately blanks the row.
-        //
-        // A read that FAILED falls through, leaving `stamp` uncommitted so the very next tick
-        // retries. Committing it would suppress the pid permanently: a file restored to
-        // readability without its mtime or length changing would never re-stamp. What we
-        // already had is republished below rather than blanking the row over a transient
-        // failure.
+        // A read that SUCCEEDED commits both the stamp and the reading, even if the tail held
+        // nothing parseable (an inner `None` legitimately blanks the row). A FAILED read leaves
+        // `stamp` uncommitted so the next tick retries, and what we had is republished instead of
+        // blanking the row; committing it would suppress the pid until mtime or length changed.
         if let Some((detail, mark)) = read_log(&path, tool) {
             e.stamp = now;
             e.last = detail;
             match mark {
                 Some(Mark::Used(c)) => e.ctx = Some(c),
                 Some(Mark::Reset(Some(used))) => {
-                    // The window outlives a compaction; only the fill changed.
                     let window = e.ctx.and_then(|c| c.window);
                     e.ctx = Some(Context { used, window });
                 }
@@ -418,17 +356,14 @@ fn sweep(
     out
 }
 
-/// Locate the log for an agent pid.
+/// Locate the log for an agent pid. The nested `Option` must keep two negatives apart:
 ///
-/// The nested `Option` is the same convention [`read_detail`] uses, one level up, and the two
-/// negatives must NOT be conflated:
-/// * `None` — could not OBSERVE (session file unreadable, `lsof`/`/proc` enumeration failed,
-///   or the tool has no log we know how to find). The caller keeps whatever it holds.
-/// * `Some(None)` — observed, and there is no log for this pid. The caller DROPS what it holds.
+/// * `None`: could not OBSERVE (session file unreadable, `lsof`/`/proc` enumeration failed, or no
+///   known log). The caller keeps what it holds.
+/// * `Some(None)`: observed, and there is no log. The caller DROPS what it holds.
 ///
-/// Codex closes its old rollout before opening the new one, so a re-check landing in that
-/// window sees a successful enumeration with no rollout in it. Reading that as "could not
-/// observe" would pin the previous conversation forever.
+/// Codex closes its old rollout before opening the new one, so a re-check landing in between sees
+/// no rollout; reading that as "could not observe" would pin the previous conversation forever.
 fn resolve_log(home: &Path, pid: u32, tool: &str) -> Option<Option<PathBuf>> {
     match tool {
         "claude" => claude_transcript(home, pid),
@@ -439,9 +374,8 @@ fn resolve_log(home: &Path, pid: u32, tool: &str) -> Option<Option<PathBuf>> {
     }
 }
 
-/// The rollout a codex TUI holds open, else — a TUI attached to the shared app-server daemon
-/// holds none — the daemon-held rollout [`crate::codexdaemon`] correlates to it, the same
-/// answer session restore uses.
+/// The rollout a codex TUI holds open, else the daemon-held one [`crate::codexdaemon`] correlates
+/// to it (a daemon-attached TUI holds none), as session restore does.
 fn codex_rollout(pid: u32) -> Option<Option<PathBuf>> {
     match crate::agentstate::codex_rollout_path(pid)? {
         Some(own) => Some(Some(own)),
@@ -473,14 +407,13 @@ fn grok_transcript(pid: u32) -> Option<Option<PathBuf>> {
     grok_transcript_in(&crate::agentstate::grok_home_of(pid)?.join("sessions"), &id)
 }
 
-/// `<sessions>/*/<id>/chat_history.jsonl`. The directory level is grok's encoding of the cwd,
-/// which we do not reproduce; it is enumerated instead, with the same rule as
-/// [`claude_transcript`]: an entry we could not read makes the answer "cannot observe", never
-/// a confirmed absence.
+/// `<sessions>/*/<id>/chat_history.jsonl`. The directory level is grok's encoding of the cwd, so it
+/// is enumerated; an entry we could not read makes the answer "cannot observe", as in
+/// [`claude_transcript`].
 ///
-/// `NotADirectory` is an absence like `NotFound`: grok keeps its `session_search.sqlite` index
-/// in the same directory as the per-cwd folders, and `<that file>/<id>/…` fails with ENOTDIR —
-/// which, read as "cannot observe", blanked every grok pane's detail on a real install.
+/// `NotADirectory` counts as absence: grok keeps `session_search.sqlite` beside the per-cwd
+/// folders, and `<that file>/<id>/…` fails with ENOTDIR, which as "cannot observe" blanked every
+/// grok pane's detail.
 fn grok_transcript_in(sessions: &Path, id: &str) -> Option<Option<PathBuf>> {
     for entry in std::fs::read_dir(sessions).ok()? {
         let candidate = entry.ok()?.path().join(id).join("chat_history.jsonl");
@@ -517,11 +450,9 @@ pub(crate) fn agy_transcript_path(home: &Path, id: &str) -> PathBuf {
         .join(".system_generated/logs/transcript.jsonl")
 }
 
-/// Whether the transcript we hold is still the conversation `pid` is in.
-///
-/// The cached path's file stem IS the `sessionId`, so this is a string compare against one
-/// small read — no path work, and in particular never the `read_dir` scan in
-/// [`claude_transcript`]. Only a genuinely changed id pays for a resolve.
+/// Whether the transcript we hold is still the conversation `pid` is in. The cached path's file
+/// stem IS the `sessionId`, so this is a string compare against one small read, never the
+/// `read_dir` scan.
 fn claude_source(home: &Path, pid: u32, path: Option<&Path>) -> Source {
     let Some(id) = claude_session_id(home, pid) else {
         return Source::Unknown;
@@ -555,17 +486,13 @@ fn claude_session_id(home: &Path, pid: u32) -> Option<String> {
     claude_session(home, pid).map(|(id, _)| id)
 }
 
-/// Claude's transcript for `pid`: guess the project slug from the session file's `cwd`, and
-/// fall back to scanning `~/.claude/projects/*` for `<sessionId>.jsonl`.
+/// Claude's transcript for `pid`: guess the project slug from the session file's `cwd`, else scan
+/// `~/.claude/projects/*` for `<sessionId>.jsonl`. The slug is another program's private encoding,
+/// so a guess is used only when the file exists (a missing file looks the same as an agent that ran
+/// no tools).
 ///
-/// The slug is another program's private encoding. Deriving it and trusting the result fails
-/// SILENTLY — a missing file is indistinguishable from an agent that has run no tools — so the
-/// guess is only ever used when it actually exists. `agentsessions.rs`, the other reader of
-/// these files, enumerates for the same reason.
-///
-/// `Some(None)` means the session file named a conversation whose transcript is not on disk:
-/// a real, observed absence (Claude creates the session entry before the first record), and
-/// the caller must drop the previous conversation's transcript rather than keep reading it.
+/// `Some(None)` is an observed absence (Claude creates the session entry before the first record):
+/// the caller must drop the previous transcript.
 fn claude_transcript(home: &Path, pid: u32) -> Option<Option<PathBuf>> {
     let (id, cwd) = claude_session(home, pid)?;
     let projects = home.join(".claude").join("projects");
@@ -576,12 +503,9 @@ fn claude_transcript(home: &Path, pid: u32) -> Option<Option<PathBuf>> {
             return Some(Some(guess));
         }
     }
-    // The guess was wrong (or there was no cwd): find it. Bounded by the directory listing,
-    // and only reached when the conversation actually changed.
-    //
-    // Neither `flatten()` nor `is_file()` is used to walk it: both turn an error into "not this
-    // one", so one unreadable entry would make an INCOMPLETE listing look like a confirmed
-    // absence — and `Some(None)` is exactly what tells the caller to drop the source it holds.
+    // The guess was wrong: scan. Not via `flatten()`/`is_file()`: both turn an error into "not this
+    // one", so one unreadable entry would make an incomplete listing look like a confirmed absence,
+    // and `Some(None)` tells the caller to drop its source.
     let rd = std::fs::read_dir(&projects).ok()?;
     for entry in rd {
         let candidate = entry.ok()?.path().join(&want);
@@ -595,20 +519,15 @@ fn claude_transcript(home: &Path, pid: u32) -> Option<Option<PathBuf>> {
     Some(None)
 }
 
-/// Claude's project-directory encoding for a cwd, as observed: path separators become `-`.
-/// Only ever used as a guess that is verified to exist (see [`claude_transcript`]).
+/// Claude's project-directory encoding for a cwd, as observed (separators become `-`). Only a
+/// guess, verified by [`claude_transcript`].
 fn project_slug(cwd: &str) -> String {
     cwd.replace('/', "-")
 }
 
-/// Read the newest activity out of `path`'s tail.
-///
-/// The nested `Option` separates two outcomes the caller must NOT conflate:
-/// * `None` — could not read (unknown tool, open/seek/read failed). The caller leaves its
-///   stamp uncommitted so the next tick retries; caching this would suppress the pid
-///   forever once the file became readable again without its mtime/len changing.
-/// * `Some(None)` — read fine, but the tail held nothing parseable. A real, cacheable
-///   reading of "no activity".
+/// Read the newest activity out of `path`'s tail. `None` = could not read (the caller leaves its
+/// stamp uncommitted so the next tick retries); `Some(None)` = read fine but nothing parseable, a
+/// cacheable "no activity".
 #[cfg(test)]
 fn read_detail(path: &Path, tool: &str) -> Option<Option<Activity>> {
     read_log(path, tool).map(|(a, _)| a)
@@ -685,13 +604,9 @@ fn codex_line_context(line: &str) -> Option<Mark> {
     Some(Mark::Used(Context { used, window }))
 }
 
-/// The last `budget` bytes of `path` as UTF-8, with a leading PARTIAL line discarded.
-///
-/// The partial line is dropped rather than parsed: a JSON record cut mid-way is not merely
-/// unparseable, it can be a valid prefix that parses to something else.
-///
-/// `None` means the file could not be READ, and nothing else — see the caller in
-/// [`read_detail`] for why a successful read with no usable content must not share it.
+/// The last `budget` bytes of `path` as UTF-8, with a leading PARTIAL line discarded (a JSON record
+/// cut mid-way can be a valid prefix that parses to something else). `None` means the file could
+/// not be READ, nothing else.
 fn tail(path: &Path, budget: u64) -> Option<String> {
     tail_from(path, budget).map(|(text, _)| text)
 }
@@ -707,22 +622,17 @@ pub(crate) fn tail_from(path: &Path, budget: u64) -> Option<(String, bool)> {
     let mut buf = Vec::with_capacity(budget.min(len) as usize);
     f.take(budget).read_to_end(&mut buf).ok()?;
     if from > 0 {
-        // Not at the start of the file, so the first line is a fragment. NO newline at all
-        // means the budget landed entirely inside one record — there is nothing complete to
-        // parse, but the read still SUCCEEDED. That distinction is load-bearing now that the
-        // caller uses `None` to mean "could not read, retry next tick": reporting a failure
-        // here would make an oversized record re-read its file on every single tick, forever.
-        //
-        // Cut in BYTES, before decoding: the cut usually lands inside a multi-byte character,
-        // which sent the whole buffer down the lossy (copying) path, and slicing off the
-        // fragment afterwards copied it again — 256 KiB twice per working agent per second.
+        // Not at the start, so the first line is a fragment. NO newline at all means the budget
+        // landed inside one record: nothing complete to parse, but the read SUCCEEDED, and
+        // reporting failure would re-read an oversized record every tick forever. Cut in BYTES
+        // before decoding: the cut usually lands mid-character, which sent the whole buffer down
+        // the lossy copying path.
         let keep = buf
             .iter()
             .position(|&b| b == b'\n')
             .map_or(buf.len(), |i| i + 1);
         buf.drain(..keep);
     }
-    // Whole lines are valid UTF-8 unless the file itself is not; only then is a copy made.
     let text = String::from_utf8(buf)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     Some((text, from > 0))
@@ -730,14 +640,12 @@ pub(crate) fn tail_from(path: &Path, budget: u64) -> Option<(String, bool)> {
 
 /// One Claude transcript line → `"Bash: commit the fix"`, or `None` when it names no tool use.
 fn claude_line_detail(line: &str) -> Option<String> {
-    // Pre-filter before paying for JSON: most lines are not tool uses, and a line here runs
-    // to 30 KB.
+    // Pre-filter before paying for JSON: a line runs to 30 KB.
     if !line.contains("\"tool_use\"") {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let content = v.pointer("/message/content")?.as_array()?;
-    // The LAST tool_use in the record: one assistant turn may call several.
     let c = content
         .iter()
         .rev()
@@ -843,13 +751,9 @@ pub(crate) fn agy_arg(v: &serde_json::Value) -> Option<String> {
     Some(serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.to_string()))
 }
 
-/// The human-readable command out of a codex `CommandExecution` item.
-///
-/// `command` is an ARRAY, not a string — `["/bin/zsh", "-lc", "git status --short"]` — so the
-/// interesting part is the LAST element, the script the wrapper was handed. codex also
-/// pre-parses it into `parsed_cmd[].cmd`, which is cleaner still, so that is preferred.
-/// (The first version of this read `command` as a string. It passed against a fixture that
-/// was invented rather than captured, and produced nothing at all against a real rollout.)
+/// The human-readable command out of a codex `CommandExecution` item. `command` is an ARRAY
+/// (`["/bin/zsh", "-lc", "git status --short"]`) whose LAST element is the script;
+/// `parsed_cmd[].cmd` is cleaner and preferred.
 fn command_text(item: &serde_json::Value) -> Option<String> {
     let parsed = item
         .pointer("/parsed_cmd/0/cmd")
@@ -868,7 +772,6 @@ fn command_text(item: &serde_json::Value) -> Option<String> {
     Some(clean(&text)).filter(|c| !c.is_empty())
 }
 
-/// Collapse a multi-line hint to one line of single-spaced text.
 fn clean(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -889,7 +792,6 @@ mod tests {
     #[test]
     fn a_tail_cut_inside_a_character_keeps_only_whole_lines() {
         let path = std::env::temp_dir().join(format!("comux-tail-{}.jsonl", std::process::id()));
-        // 3-byte characters, so most cut points land mid-character.
         let body = "가나다라마바사\n".repeat(50);
         std::fs::write(&path, &body).unwrap();
         for budget in [1u64, 5, 40, 41, 200] {
@@ -902,7 +804,6 @@ mod tests {
             );
             assert!(body.ends_with(&text));
         }
-        // From the start: everything, unmarked.
         assert_eq!(tail_from(&path, 1 << 20), Some((body.clone(), false)));
         let _ = std::fs::remove_file(&path);
     }
@@ -1009,7 +910,6 @@ mod tests {
         );
     }
 
-    /// A transcript line that parses to `"Bash: <what>"`.
     fn tool_use_line(what: &str) -> String {
         format!(
             r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"description":"{what}"}}}}]}}}}"#
@@ -1028,9 +928,8 @@ mod tests {
         }
     }
 
-    /// A home with no `sessions/` in it, so the cheap oracle returns [`Source::Unknown`] and a
-    /// hand-built path stands. That is what the tests below mean by "this pane reads this
-    /// file"; the conversation-change tests build a real home instead.
+    /// A home with no `sessions/`, so the cheap oracle returns [`Source::Unknown`] and a hand-built
+    /// path stands.
     fn no_home() -> &'static Path {
         Path::new("/nonexistent/agentpoll-test-home")
     }
@@ -1043,12 +942,9 @@ mod tests {
         sweep(wanted, cache, no_home(), &mut cursor)
     }
 
-    /// The bug this module's `stamp` was always supposed to prevent: an unchanged transcript
-    /// was re-tailed, lossy-decoded and JSON-parsed on EVERY tick.
-    ///
-    /// Proving a read did NOT happen needs the read to be observable, so the second pass runs
-    /// against a file whose CONTENT has been swapped while its length and mtime are restored.
-    /// Anything that re-reads publishes the new content; only the cache publishes the old.
+    /// An unchanged transcript must not be re-tailed and re-parsed on every tick. The second pass
+    /// runs against a file whose CONTENT is swapped while length and mtime are restored: anything
+    /// that re-reads publishes the new content, only the cache publishes the old.
     #[test]
     fn an_unchanged_transcript_is_not_re_read() {
         let dir = std::env::temp_dir().join(format!("agentpoll-unchanged-{}", std::process::id()));
@@ -1064,7 +960,6 @@ mod tests {
         let first = sweep_once(&wanted, &mut cache);
         assert_eq!(first[&1].detail, "Bash: first");
 
-        // Same length ("first" and "wrong" are both 5 bytes), same mtime → same stamp.
         std::fs::write(&path, tool_use_line("wrong") + "\n").unwrap();
         std::fs::File::options()
             .write(true)
@@ -1087,8 +982,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Build a fake `$HOME` holding Claude's two files: the per-pid session record naming a
-    /// conversation, and that conversation's transcript.
     struct FakeHome {
         dir: PathBuf,
     }
@@ -1106,7 +999,6 @@ mod tests {
             Self { dir }
         }
 
-        /// Point `pid`'s session record at conversation `id`, as Claude does on `/clear`.
         fn in_conversation(&self, pid: u32, id: &str) {
             std::fs::write(
                 self.dir
@@ -1118,7 +1010,6 @@ mod tests {
             .unwrap();
         }
 
-        /// Write a transcript for `id` whose newest tool use says `what`.
         fn transcript(&self, id: &str, what: &str) -> PathBuf {
             let path = self
                 .dir
@@ -1150,10 +1041,9 @@ mod tests {
     const A: &str = "aaaaaaaa-1111-2222-3333-444444444444";
     const B: &str = "bbbbbbbb-1111-2222-3333-444444444444";
 
-    /// The bug: a conversation can change inside the SAME pid — Claude `/clear` mints a new
-    /// `sessionId` — and the previous transcript stays on disk. Re-resolving only when the
-    /// cached path has VANISHED therefore never fires, and the old conversation's activity is
-    /// republished indefinitely.
+    /// A conversation can change inside the SAME pid (Claude `/clear` mints a new `sessionId`)
+    /// while the previous transcript stays on disk, so re-resolving only when the cached path
+    /// VANISHED would republish the old conversation forever.
     #[test]
     fn a_new_conversation_in_the_same_pid_stops_republishing_the_old_one() {
         let home = FakeHome::new("cleared");
@@ -1164,7 +1054,6 @@ mod tests {
         let mut cache = HashMap::from([(1u32, entry_for(&old))]);
         assert_eq!(home.sweep(&mut cache)[&1].detail, "Bash: first");
 
-        // `/clear`: same pid, new conversation, and A is STILL THERE.
         home.in_conversation(1, B);
         assert!(
             old.is_file(),
@@ -1177,9 +1066,8 @@ mod tests {
         );
     }
 
-    /// The window the plan review caught: Claude writes the session record naming B before B's
-    /// transcript exists. Publishing A's activity across that gap is the same bug wearing a
-    /// hat — absence is what this module reports when it does not know.
+    /// Claude writes the session record naming B before B's transcript exists; A's activity must
+    /// not be published across that gap.
     #[test]
     fn a_named_conversation_with_no_transcript_yet_publishes_nothing() {
         let home = FakeHome::new("nascent");
@@ -1315,12 +1203,9 @@ mod tests {
         );
     }
 
-    /// `wanted` is walked in a fixed order, so the entries at the front get first claim on
-    /// [`RESOLVE_BUDGET`] every tick. Under today's gates that cannot actually starve anyone —
-    /// each codex entry wants a resolve at most once per [`SOURCE_RECHECK`], so the queue
-    /// drains — but the bias is one gate change away from mattering, and rotating the head
-    /// costs three lines. This test forces the pathological case (every entry wanting a resolve
-    /// on every tick) to exercise the mechanism, since nothing reachable does.
+    /// `wanted` is walked in a fixed order, so the front entries get first claim on
+    /// [`RESOLVE_BUDGET`]. Nothing reachable starves today, so this forces the pathological case
+    /// (every entry wanting a resolve every tick) to exercise the rotation.
     #[test]
     fn the_resolve_budget_rotates_so_the_tail_is_not_starved() {
         let n = RESOLVE_BUDGET + 2;
@@ -1333,7 +1218,6 @@ mod tests {
         let mut served: Vec<u32> = Vec::new();
         let home = no_home();
 
-        // Rotating by one means every position becomes the head within `n` ticks.
         for _ in 0..n {
             sweep(&wanted, &mut cache, home, &mut cursor);
             for (pid, e) in cache.iter_mut() {
@@ -1368,7 +1252,6 @@ mod tests {
         let mut cache = HashMap::from([(1u32, entry_for(&path))]);
         assert_eq!(sweep_once(&wanted, &mut cache)[&1].detail, "Bash: first");
 
-        // Content AND length change (so the stamp differs), but the file cannot be read.
         std::fs::write(&path, tool_use_line("second reading") + "\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let blocked = sweep_once(&wanted, &mut cache);
@@ -1430,7 +1313,6 @@ mod tests {
         assert_eq!(claude_line_detail(cmd).as_deref(), Some("Bash: ls -la"));
         let path = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
         assert_eq!(claude_line_detail(path).as_deref(), Some("Read: /a/b.rs"));
-        // A tool with no recognised hint still names itself rather than vanishing.
         let bare = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[]}}]}}"#;
         assert_eq!(claude_line_detail(bare).as_deref(), Some("TodoWrite"));
     }
@@ -1452,7 +1334,6 @@ mod tests {
 
     #[test]
     fn the_last_tool_use_in_a_record_wins() {
-        // One assistant turn may call several tools; the newest is what it is doing NOW.
         let line = r#"{"message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a"}},{"type":"tool_use","name":"Bash","input":{"description":"second"}}]}}"#;
         assert_eq!(claude_line_detail(line).as_deref(), Some("Bash: second"));
     }
@@ -1466,24 +1347,20 @@ mod tests {
             codex_line_detail(run).as_deref(),
             Some("running: git status --short")
         );
-        // Without `parsed_cmd`, the LAST array element is the script, not `/bin/zsh`.
         let arr = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","cargo  test\n--all"]}}}"#;
         assert_eq!(
             codex_line_detail(arr).as_deref(),
             Some("running: cargo test --all"),
             "a multi-line command collapses to one line"
         );
-        // A scalar `command` (an older/plainer shape) still works.
         let scalar = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":"ls"}}}"#;
         assert_eq!(codex_line_detail(scalar).as_deref(), Some("running: ls"));
         let think = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning"}}}"#;
         assert_eq!(codex_line_detail(think).as_deref(), Some("thinking"));
         let reply = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage"}}}"#;
         assert_eq!(codex_line_detail(reply).as_deref(), Some("replying"));
-        // An item type we do not know yields nothing rather than a guess.
         let other = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Extension"}}}"#;
         assert_eq!(codex_line_detail(other), None);
-        // A different event entirely.
         let tok = r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#;
         assert_eq!(codex_line_detail(tok), None);
     }
@@ -1505,23 +1382,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("t.jsonl");
         std::fs::write(&f, "AAAA\nBBBB\nCCCC\n").unwrap();
-        // Budget lands mid-way through the first line, so it must be discarded whole — a
-        // JSON record cut mid-way is not merely unparseable, it can be a valid prefix that
-        // parses to something else.
+        // Budget lands mid-way through the first line, which must be discarded whole.
         assert_eq!(tail(&f, 12).as_deref(), Some("BBBB\nCCCC\n"));
-        // A budget covering the file keeps everything.
         assert_eq!(tail(&f, 999).as_deref(), Some("AAAA\nBBBB\nCCCC\n"));
 
-        // A single record LARGER than the budget leaves no complete line — but the read
-        // succeeded, so this must be an empty tail, NOT the `None` that means "could not
-        // read". `sweep` leaves its stamp uncommitted on `None`, so conflating the two would
-        // make an oversized record re-read its file on every tick forever: exactly the bug
-        // the stamp exists to prevent.
+        // A single record LARGER than the budget leaves no complete line, but the read succeeded:
+        // that is an empty tail, NOT the `None` that means "could not read" (which would re-read
+        // the file every tick).
         let big = dir.join("big.jsonl");
         std::fs::write(&big, "x".repeat(4096)).unwrap();
         assert_eq!(tail(&big, 64).as_deref(), Some(""));
 
-        // And `None` still means unreadable.
         assert_eq!(tail(&dir.join("absent.jsonl"), 64), None);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1597,7 +1468,6 @@ mod tests {
                 window: None
             })
         );
-        // Growth with no response in it: the reading stands.
         let mut text = usage(5000);
         text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"x\"}}\n");
         std::fs::write(&f, &text).unwrap();
@@ -1658,10 +1528,6 @@ mod live_tests {
     #[test]
     #[ignore = "reads the developer's own ~/.codex"]
     fn live_codex_rollout_still_yields_a_detail() {
-        // Pick a rollout that actually RAN something. The newest rollout is often a session
-        // that only reached the trust prompt, and asserting against that would make this
-        // oracle green while the parser was broken — which is exactly how the first version
-        // of `command_text` shipped reading an array as a string.
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let mut best: Option<(SystemTime, PathBuf)> = None;
         let mut stack = vec![home.join(".codex/sessions")];

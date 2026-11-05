@@ -1,25 +1,15 @@
-//! Desktop notifications for agent turn events — the piece that lets the scattered
-//! `~/.claude` notify hooks (notify-stop/notification/attention.sh) be retired: the
-//! server watches each agent's status TRANSITIONS itself (no Claude hook needed) and
-//! fires a native toast. Best-effort + non-blocking; the server fires it, so toasts
-//! arrive even while detached.
+//! Desktop notifications for agent turn events. The server watches each agent's status
+//! transitions itself and fires a native toast, so toasts arrive even while detached.
 //!
-//! A toast can carry an **action**: a shell command run when the user clicks it, which
-//! the caller sets to `comux jump <pane-token>` so the click lands in the pane that
-//! raised the notification (macOS `terminal-notifier -execute`, Linux `dunstify
-//! --action` / `notify-send --action`).
+//! A toast can carry an action: a shell command run on click, which the caller sets to
+//! `comux jump <pane-token>` (macOS `terminal-notifier -execute`, Linux `dunstify --action` /
+//! `notify-send --action`).
 //!
-//! Two environment notes, both load-bearing:
-//!
-//! * The server SCRUBS `DISPLAY`/`XAUTHORITY`/`DBUS_SESSION_BUS_ADDRESS`/… out of its
-//!   own environment at startup (tmux `update-environment`), so a notifier spawned with
-//!   the bare daemon environment has no session bus to publish to — on Linux that is the
-//!   difference between a toast and silence. Callers pass the attached client's refreshed
-//!   session vars as `env`.
-//! * The action command is run by whatever we spawn here (the `dunstify` waiter, or
-//!   `terminal-notifier`), so it is a child of the SERVER, not of the notification
-//!   daemon. It therefore needs the same `env` carried explicitly — which is why the
-//!   command is built as `env K=V … comux jump …` by [`action_command`].
+//! * The server SCRUBS `DISPLAY`/`XAUTHORITY`/`DBUS_SESSION_BUS_ADDRESS`/... from its own
+//!   environment at startup, so a notifier spawned with it has no session bus (on Linux, silence
+//!   instead of a toast). Callers pass the attached client's session vars as `env`.
+//! * The action command runs as a child of the SERVER, not of the notification daemon, so it
+//!   needs the same `env` carried explicitly: [`action_command`] builds `env K=V ... comux jump`.
 //!
 //! Opt out with `COPAD_MUX_NOTIFY=0` (or `off`/`false`).
 
@@ -28,9 +18,8 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 /// The `COPAD_MUX_NOTIFY` override, if set to a RECOGNIZED value: `Some(false)` for
-/// `0`/`off`/`false`/`no`, `Some(true)` for `1`/`on`/`true`/`yes`, `None` otherwise (unset
-/// or unrecognized). The env value takes precedence over the config `notify` flag; when it
-/// is `None` the caller falls back to config (see `MuxConfig::notify`).
+/// `0`/`off`/`false`/`no`, `Some(true)` for `1`/`on`/`true`/`yes`, `None` otherwise. It takes
+/// precedence over the config `notify` flag.
 pub fn env_override() -> Option<bool> {
     match std::env::var("COPAD_MUX_NOTIFY").ok().as_deref() {
         Some("0") | Some("off") | Some("false") | Some("no") => Some(false),
@@ -39,16 +28,14 @@ pub fn env_override() -> Option<bool> {
     }
 }
 
-/// Is desktop notification enabled? (Default on; the whole point is to replace the
-/// hook-based notifier.) Env-only; config-aware callers compute
-/// `env_override().unwrap_or(cfg.notify)` and gate before calling [`desktop`].
+/// Env-only; config-aware callers compute `env_override().unwrap_or(cfg.notify)` and gate
+/// before calling [`desktop`].
 pub fn enabled() -> bool {
     env_override().unwrap_or(true)
 }
 
-/// Spawn a command detached (stdio nulled) and REAP it in a short-lived thread so a
-/// long-lived server never accumulates zombie notifier processes. Returns whether it
-/// spawned (so the caller can fall back).
+/// Spawn a command detached (stdio nulled) and REAP it on a short-lived thread so the
+/// long-lived server never accumulates zombie notifiers. Returns whether it spawned.
 #[allow(unused)]
 fn spawn_reaped(mut cmd: Command) -> bool {
     match cmd
@@ -67,18 +54,15 @@ fn spawn_reaped(mut cmd: Command) -> bool {
     }
 }
 
-/// POSIX single-quote one argument for embedding in a shell command line: wrap in `'…'`
-/// and turn any embedded `'` into `'\''`. The action command is handed to a shell by both
-/// notifier backends, and its pieces include user-controlled data (a `COPAD_MUX_SOCK`
-/// path), so every element goes through this.
+/// POSIX single-quote one argument (`'` becomes `'\''`). The action command is handed to a
+/// shell and includes user-controlled data (a `COPAD_MUX_SOCK` path), so every element goes
+/// through this.
 pub fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-/// Build the shell command a toast click should run: `env K=V … <exe> jump <target>`.
-///
-/// `env` carries the session variables the server no longer holds (see the module note);
-/// entries whose NAME is not a plain `[A-Za-z_][A-Za-z0-9_]*` are dropped rather than
+/// Build the shell command a toast click should run: `env K=V ... <exe> jump <target>`.
+/// `env` entries whose NAME is not a plain `[A-Za-z_][A-Za-z0-9_]*` are dropped rather than
 /// quoted, since `env` would treat them as a command instead of an assignment.
 pub fn action_command(exe: &str, target: &str, env: &[(String, String)]) -> String {
     let mut parts = vec!["env".to_string()];
@@ -92,15 +76,13 @@ pub fn action_command(exe: &str, target: &str, env: &[(String, String)]) -> Stri
     }
     parts.push(shell_quote(exe));
     parts.push("jump".to_string());
-    // A clicked toast has been seen: its pane's notifications leave the center.
     parts.push("--consume".to_string());
     parts.push(shell_quote(target));
     parts.join(" ")
 }
 
-/// Does the installed `notify-send` understand `--action`? libnotify gained it in 0.8;
-/// older builds ERROR OUT on the flag, which would swap a plain toast for no toast at
-/// all. Probed once and cached — the answer cannot change while the server runs.
+/// Does the installed `notify-send` understand `--action`? Older libnotify (< 0.8) ERRORS OUT
+/// on the flag, which would swap a plain toast for no toast. Probed once and cached.
 #[cfg(target_os = "linux")]
 fn notify_send_has_actions() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
@@ -118,9 +100,9 @@ fn notify_send_has_actions() -> bool {
     })
 }
 
-/// Run a notifier that BLOCKS until the toast is clicked or dismissed, printing the
-/// chosen action id on stdout, and run `action` through `sh -c` when it printed one.
-/// The wait happens on its own thread so the server's single-writer loop never parks.
+/// Run a notifier that BLOCKS until the toast is clicked or dismissed, and run `action` through
+/// `sh -c` when it printed the `default` action id. Waits on its own thread so the server's
+/// single-writer loop never parks.
 #[cfg(target_os = "linux")]
 fn wait_for_action(mut cmd: Command, action: String, env: Vec<(String, String)>) -> bool {
     let spawned = cmd
@@ -134,7 +116,6 @@ fn wait_for_action(mut cmd: Command, action: String, env: Vec<(String, String)>)
                 let Ok(out) = child.wait_with_output() else {
                     return;
                 };
-                // Dismissed (or timed out) → no action id on stdout → nothing to do.
                 if String::from_utf8_lossy(&out.stdout).trim() != "default" {
                     return;
                 }
@@ -151,15 +132,11 @@ fn wait_for_action(mut cmd: Command, action: String, env: Vec<(String, String)>)
     }
 }
 
-/// Fire a native desktop toast (best-effort, non-blocking).
+/// Fire a native desktop toast (best-effort, non-blocking). `action`, when set, is a shell
+/// command run if the user clicks it. `env` is overlaid on every spawned process.
 ///
-/// `action`, when set, is a shell command run if the user clicks the notification.
-/// `env` is overlaid on every spawned process (see the module note on the scrubbed
-/// daemon environment).
-///
-/// macOS: `terminal-notifier` (with the `Glass` sound, matching the retired hook) →
-/// `osascript` fallback (no action support). Linux: `dunstify` → `notify-send`
-/// (`--action` only when the installed libnotify supports it).
+/// macOS: `terminal-notifier`, then `osascript` (no action support). Linux: `dunstify`, then
+/// `notify-send` (`--action` only when the installed libnotify supports it).
 pub fn desktop(title: &str, body: &str, action: Option<&str>, env: &[(String, String)]) {
     if !enabled() {
         return;
@@ -175,7 +152,6 @@ pub fn desktop(title: &str, body: &str, action: Option<&str>, env: &[(String, St
             tn.env(k, v);
         }
         if !spawn_reaped(tn) {
-            // Escape embedded quotes for the AppleScript string literals.
             let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
             let script = format!(
                 "display notification \"{}\" with title \"{}\"",
@@ -208,9 +184,9 @@ pub fn desktop(title: &str, body: &str, action: Option<&str>, env: &[(String, St
                 return;
             }
             if notify_send_has_actions() {
-                // NOTE the `=` where dunstify takes a `,`: libnotify's notify-send parses
-                // `--action=[NAME=]TEXT`, so the comma form would name the action `0` and
-                // the waiter — which only honors `default` — would never fire the jump.
+                // `=` where dunstify takes a `,`: notify-send parses `--action=[NAME=]TEXT`, so
+                // the comma form would name the action `0` and the waiter, which honors only
+                // `default`, would never fire the jump.
                 let mut ns = Command::new("notify-send");
                 ns.args([
                     "-a",
@@ -227,7 +203,6 @@ pub fn desktop(title: &str, body: &str, action: Option<&str>, env: &[(String, St
                 }
             }
         }
-        // No action wanted, or no backend that supports one: plain toast.
         let mut ns = Command::new("notify-send");
         ns.args(["-a", "copad-mux", title, body]);
         for (k, v) in env {
@@ -247,7 +222,6 @@ mod tests {
 
     #[test]
     fn env_gating() {
-        // Serialized within one test to avoid cross-test env races.
         for (val, want) in [
             ("0", false),
             ("off", false),
@@ -267,7 +241,6 @@ mod tests {
     fn quotes_neutralize_shell_metacharacters() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a b;rm -rf /"), "'a b;rm -rf /'");
-        // The one character single-quoting cannot contain must be broken out.
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
     }
 
@@ -291,8 +264,6 @@ mod tests {
         );
     }
 
-    /// `env` parses `K=V` positionally: a name that isn't a valid identifier would be
-    /// taken as the COMMAND to run, so those entries are dropped instead.
     #[test]
     fn action_command_drops_unusable_env_names() {
         let env = vec![

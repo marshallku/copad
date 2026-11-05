@@ -8,15 +8,6 @@
 //!   comux doctor [--json]    diagnose config problems (runs locally, no server)
 //!   comux <cmd> …            shorthand: any other verb is a control command, so
 //!                            `comux new-session work` == `comux ctl new-session work`
-//!
-//! Control commands: list | split | resize | focus | close | send | capture-pane | wait-output |
-//! list-agents | wait-agent | list-tabs | new-tab |
-//! select-tab | close-tab | rename-tab | list-sessions | new-session [name] |
-//! rename-session | select-session | kill-session | jump | notify |
-//! worktree <create|list|rm> | reload | health | kill-server.
-//!
-//! The server holds the shells; the client renders + forwards input and can detach
-//! (`Ctrl-b d`) / reattach, so a session survives the terminal that launched it.
 
 fn print_usage() {
     eprintln!(
@@ -74,8 +65,6 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(|s| s.as_str()) {
         Some("ctl") => std::process::exit(copad_mux::control::run_client(&args[1..])),
-        // Bare `comux server` runs the headless server in the foreground (unchanged). With a
-        // subcommand it's a lifecycle verb (start|stop|restart|status) handled by the client.
         Some("server") => match args.get(1).map(|s| s.as_str()) {
             None => copad_mux::server::run(),
             Some(sub) => std::process::exit(copad_mux::control::run_server_admin(sub)),
@@ -89,14 +78,12 @@ fn main() {
         // `proxy --stdio` bridges the comux socket to stdin/stdout — one SSH exec channel per
         // connection, for a host UI on another machine (decisions #166).
         Some("proxy") => std::process::exit(copad_mux::client::run_proxy(&args[1..])),
-        // `doctor` is a local diagnostic — it must run without (and report on) the
-        // server, so it's dispatched here rather than through the control client.
+        // Runs locally so it can diagnose a missing or broken server.
         Some("doctor") => std::process::exit(copad_mux::doctor::run(&args[1..])),
         Some("help" | "-h" | "--help") => {
             print_usage();
             std::process::exit(0);
         }
-        // Any other verb is a shorthand control command (tmux-style: `comux new-session`).
         Some(_) => std::process::exit(copad_mux::control::run_client(&args)),
     };
     if let Err(e) = result {

@@ -2,23 +2,13 @@
 //!
 //! Since codex-cli 0.160 the interactive TUI attaches to a managed app-server daemon
 //! (`$CODEX_HOME/app-server-daemon/daemon.pid`) and the DAEMON owns the rollout file, so the
-//! pane's `codex` pid holds nothing that names its conversation and restore fell back to a
-//! fresh `codex`. Nothing Codex exposes maps a client pid to a thread (the rollout's
-//! `session_meta`, `state_5.sqlite` and the app-server's `thread/loaded/list` carry no client
-//! pid), so this correlates instead:
-//!
-//! - the rollout is open in the daemon (the thread is loaded),
-//! - its `session_meta.cwd` is the TUI's cwd and its originator is interactive,
-//! - it was written after the TUI started (rules out a thread whose TUI exited before this one
-//!   was launched — the daemon keeps a thread loaded after its client goes away).
-//!
-//! The answer is the ONE interactive thread loaded for that cwd, if it was also written since
-//! launch — and only while this is the sole live Codex TUI there. Several loaded threads (this
-//! pane may idle on a resumed one while a sibling's — live or exited — is fresh), a live sibling,
-//! or a thread seen loaded beside a sibling earlier all yield `None` (a fresh start), because resuming another pane's conversation is worse
-//! than resuming none — unless this process was resolved uniquely earlier, which is remembered
-//! per `(pid, start time)` so a second `codex` opened later in the same repo doesn't erase an
-//! answer the autosave already had.
+//! pane's `codex` pid holds nothing that names its conversation. Nothing Codex exposes maps a
+//! client pid to a thread, so this correlates instead: the ONE interactive thread loaded in
+//! the daemon for the TUI's cwd, if it was also written since the TUI launched, and only while
+//! this is the sole live Codex TUI there. Anything ambiguous yields `None` (a fresh start),
+//! because resuming another pane's conversation is worse than resuming none, unless this
+//! process was resolved uniquely earlier. That answer is remembered per `(pid, start time)` so
+//! a second `codex` opened later in the same repo doesn't erase it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,7 +21,6 @@ use crate::procinfo;
 /// Bytes read looking for line 1. `session_meta` embeds the base instructions (~22 KB seen).
 const META_SCAN: u64 = 256 * 1024;
 
-/// A daemon-held rollout, reduced to what the correlation needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Candidate {
     id: String,
@@ -40,10 +29,8 @@ struct Candidate {
     mtime: SystemTime,
 }
 
-/// What earlier lookups established, kept for the server's lifetime.
 #[derive(Default)]
 struct Memory {
-    /// `(tui pid, its start time)` → the conversation it was last uniquely resolved to.
     resolved: HashMap<(u32, SystemTime), String>,
     /// Threads seen loaded in a cwd while two TUIs ran there. Any of them may belong to a TUI
     /// that has since EXITED (the daemon keeps it loaded), so being the lone fresh thread later
@@ -53,14 +40,11 @@ struct Memory {
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
-/// What a lookup may fall back on, from [`Memory`].
 struct Recall<'a> {
     known: Option<&'a str>,
     tainted: &'a HashSet<String>,
 }
 
-/// The conversation a daemon-attached Codex TUI (`pid`) is in, or `None` when it can't be
-/// told apart from another loaded thread.
 pub fn session_id(pid: u32) -> Option<String> {
     let start = procinfo::process_start_time(pid)?;
     let cwd = canonical(&procinfo::process_cwd(pid)?);
@@ -85,7 +69,6 @@ pub fn session_id(pid: u32) -> Option<String> {
         mem.resolved.remove(&key);
     }
     let sibling = shares_cwd_with_another_tui(pid, &cwd)?;
-    // Forget threads the daemon has unloaded, so the set stays bounded.
     mem.tainted
         .retain(|id| candidates.iter().any(|c| &c.id == id));
     if sibling {
@@ -105,8 +88,6 @@ pub fn session_id(pid: u32) -> Option<String> {
     Some(id)
 }
 
-/// The rollout file of the conversation [`session_id`] resolves for `pid`, so the activity
-/// poller and `agent-log` can read a daemon-attached TUI's transcript like any other codex's.
 pub fn rollout_path(pid: u32) -> Option<PathBuf> {
     let id = session_id(pid)?;
     daemon_rollouts()?
@@ -114,16 +95,14 @@ pub fn rollout_path(pid: u32) -> Option<PathBuf> {
         .find(|p| crate::agentstate::rollout_session_id(p).as_deref() == Some(id.as_str()))
 }
 
-/// A TUI launched as `codex resume <id>` — how comux restores one — whose thread is the ONE
+/// A TUI launched as `codex resume <id>` (how comux restores one) whose thread is the ONE
 /// interactive thread loaded for its cwd is in that conversation, whatever else is true.
 ///
-/// Without this, `comux server restart` lost the conversation of every daemon-attached codex it
-/// had just resumed: the old pane's codex is still exiting when the new one starts, so the two
-/// count as siblings, the thread is tainted for the server's lifetime, and an idle resumed
-/// thread was never written since launch anyway. The launch argument is not trusted blindly — a
-/// `/new` inside the TUI loads a second thread here, and then this says nothing and the
-/// correlation below decides as before. Another TUI sharing the thread would be in the same
-/// conversation, so the answer is right for it too.
+/// Without this, a restarted server lost every resumed conversation: the old pane's codex is
+/// still exiting when the new one starts, so the two count as siblings and the thread is
+/// tainted, and an idle resumed thread is never written since launch. The launch argument is
+/// not trusted blindly: a `/new` inside the TUI loads a second thread, and then this says
+/// nothing.
 fn launched_resume(argv: &[String], candidates: &[Candidate], cwd: &Path) -> Option<String> {
     let arg = resume_arg(argv)?;
     let here: Vec<&Candidate> = loaded_here(candidates, cwd).collect();
@@ -133,8 +112,6 @@ fn launched_resume(argv: &[String], candidates: &[Candidate], cwd: &Path) -> Opt
     }
 }
 
-/// Launched as `codex resume <id>`, that thread still loaded here, and NOT alone (the lone case
-/// is [`launched_resume`]'s).
 fn resumed_thread_is_shared(argv: &[String], candidates: &[Candidate], cwd: &Path) -> bool {
     resume_arg(argv).is_some_and(|a| {
         let here: Vec<&Candidate> = loaded_here(candidates, cwd).collect();
@@ -151,7 +128,6 @@ fn resume_arg(argv: &[String]) -> Option<&str> {
         .map(|w| w[1].as_str())
 }
 
-/// Interactive threads the daemon holds for `cwd`.
 fn loaded_here<'a>(
     candidates: &'a [Candidate],
     cwd: &'a Path,
@@ -161,7 +137,6 @@ fn loaded_here<'a>(
         .filter(move |c| !c.headless && canonical(&c.cwd) == cwd)
 }
 
-/// The decision, split from the IO so it is testable.
 fn pick(
     candidates: &[Candidate],
     cwd: &Path,
@@ -183,7 +158,6 @@ fn pick(
     remembered(candidates, cwd, recall.known)
 }
 
-/// `known`, while its thread is still loaded for `cwd`.
 fn remembered(candidates: &[Candidate], cwd: &Path, known: Option<&str>) -> Option<String> {
     known
         .filter(|k| loaded_here(candidates, cwd).any(|c| c.id == *k))
@@ -286,7 +260,6 @@ fn parse_meta(line: &str, mtime: SystemTime) -> Option<Candidate> {
         .pointer("/payload/cwd")?
         .as_str()
         .filter(|c| !c.is_empty())?;
-    // Same denylist as the resume picker: an originator we don't know counts as interactive.
     let headless = v
         .pointer("/payload/originator")
         .and_then(|o| o.as_str())

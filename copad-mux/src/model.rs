@@ -1,13 +1,9 @@
-//! Authoritative-state data model (agent-mux-spec.md §1).
-//!
-//! Pure data + tree helpers, no PTYs and no I/O. Every mutable entity carries a
-//! monotonic [`Rev`] bumped on each change; the single authoritative actor
-//! ([`crate::state::State`]) owns all instances and is the only writer.
+//! Authoritative-state data model (agent-mux-spec.md §1): pure data and tree helpers, no PTYs
+//! and no I/O. Every mutable entity carries a monotonic [`Rev`]; [`crate::state::State`] is
+//! the only writer.
 
 use serde::{Deserialize, Serialize};
 
-/// Monotonic revision. Bumped on every change to its entity so optimistic
-/// concurrency (`if_rev`) and event ordering are well-defined (spec §1, §4a).
 pub type Rev = u64;
 
 macro_rules! string_id {
@@ -39,8 +35,6 @@ string_id!(
     "A live PTY runtime. A pane can move while its terminal stays alive."
 );
 
-/// An attached surface connection. `u64` because clients are ephemeral and
-/// server-minted (spec §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClientId(pub u64);
 
@@ -59,8 +53,8 @@ pub enum Role {
     Observer,
 }
 
-/// Split direction (BSP). `Right` = a vertical divider (side by side), `Down` =
-/// a horizontal divider (stacked). Matches the herdr/session-v3 vocabulary.
+/// Split direction (BSP). `Right` = a vertical divider (side by side), `Down` = a horizontal
+/// divider (stacked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dir {
@@ -68,7 +62,6 @@ pub enum Dir {
     Down,
 }
 
-/// Rolled-up agent state (spec §8; classification authority is `tmx`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
@@ -91,9 +84,8 @@ pub struct Terminal {
     pub rev: Rev,
 }
 
-/// A BSP split tree: a typed leaf (pane ↔ terminal) or a branch of two subtrees.
-/// `ratio` is a normalized 0..1 divider position (never pixels). Reuses the
-/// session-v3 shape (#64).
+/// A BSP split tree: a typed leaf (pane ↔ terminal) or a branch of two subtrees. `ratio` is a
+/// normalized 0..1 divider position (never pixels).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "node", rename_all = "snake_case")]
 pub enum SplitTree {
@@ -109,10 +101,9 @@ pub enum SplitTree {
     },
 }
 
-/// A layout description used to REBUILD a [`SplitTree`] at restore time. It carries the
-/// tree SHAPE (branch dirs + ratios) but no ids — the builder mints fresh pane/terminal
-/// ids per leaf and reports them back in DFS pre-order. (Persistence keeps the runtime
-/// ids out of the on-disk snapshot; they're regenerated on restore.)
+/// A layout description used to REBUILD a [`SplitTree`] at restore time: the tree SHAPE
+/// (branch dirs + ratios) but no ids. The builder mints fresh pane/terminal ids per leaf and
+/// reports them back in DFS pre-order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutSpec {
     Leaf,
@@ -141,7 +132,6 @@ pub enum LayoutPreset {
 }
 
 impl LayoutPreset {
-    /// tmux's `next-layout` order.
     pub const CYCLE: [LayoutPreset; 5] = [
         LayoutPreset::EvenHorizontal,
         LayoutPreset::EvenVertical,
@@ -150,7 +140,6 @@ impl LayoutPreset {
         LayoutPreset::Tiled,
     ];
 
-    /// tmux's name for it (`even-horizontal`, …).
     pub fn name(self) -> &'static str {
         match self {
             LayoutPreset::EvenHorizontal => "even-horizontal",
@@ -165,7 +154,6 @@ impl LayoutPreset {
         LayoutPreset::CYCLE.into_iter().find(|p| p.name() == s)
     }
 
-    /// The one after `self` in [`LayoutPreset::CYCLE`], wrapping.
     pub fn next(self) -> LayoutPreset {
         let i = LayoutPreset::CYCLE
             .iter()
@@ -175,10 +163,8 @@ impl LayoutPreset {
     }
 }
 
-/// The main pane's share in the `main-*` presets.
 const MAIN_SHARE: f32 = 0.6;
 
-/// A rectangle in terminal cells, used to derive per-pane geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub cols: u16,
@@ -186,7 +172,6 @@ pub struct Rect {
 }
 
 impl SplitTree {
-    /// DFS pre-order pane ids.
     pub fn panes(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         self.collect_panes(&mut out);
@@ -203,7 +188,6 @@ impl SplitTree {
         }
     }
 
-    /// The leftmost (DFS pre-order) leaf's pane id.
     pub fn leftmost_pane(&self) -> PaneId {
         match self {
             SplitTree::Leaf { pane, .. } => pane.clone(),
@@ -211,16 +195,10 @@ impl SplitTree {
         }
     }
 
-    /// DFS pre-order terminal ids.
-    ///
-    /// The counterpart to [`SplitTree::panes`]. Walking panes and then calling
-    /// [`SplitTree::terminal_of`] for each is O(N²) — `terminal_of` re-descends the tree per
-    /// pane — which matters for anything asked every frame.
-    /// The first terminal in depth-first order, WITHOUT collecting the subtree.
-    ///
-    /// `terminals()` allocates and walks everything below it; used per divider per mouse event
-    /// that is O(N log N) on a balanced tree and O(N²) on a skewed one, paid as input latency
-    /// on every pointer move during a drag.
+    /// The first terminal in depth-first order, WITHOUT collecting the subtree. `terminals()`
+    /// allocates and walks everything below it; per divider per mouse event that is O(N log N)
+    /// on a balanced tree and O(N²) on a skewed one, paid as input latency on every pointer
+    /// move during a drag.
     pub fn first_terminal(&self) -> Option<&TerminalId> {
         match self {
             SplitTree::Leaf { terminal, .. } => Some(terminal),
@@ -246,7 +224,6 @@ impl SplitTree {
         }
     }
 
-    /// Find the terminal id for a pane, if present.
     pub fn terminal_of(&self, target: &PaneId) -> Option<&TerminalId> {
         match self {
             SplitTree::Leaf { pane, terminal } => (pane == target).then_some(terminal),
@@ -312,7 +289,6 @@ impl SplitTree {
         let SplitTree::Branch { first, second, .. } = self else {
             return None;
         };
-        // Is a direct child the target leaf?
         if let SplitTree::Leaf { pane, terminal } = first.as_ref()
             && pane == target
         {
@@ -327,7 +303,6 @@ impl SplitTree {
             *self = (**first).clone();
             return Some(term);
         }
-        // Recurse.
         first
             .remove_leaf_inner(target)
             .or_else(|| second.remove_leaf_inner(target))
@@ -337,7 +312,6 @@ impl SplitTree {
         matches!(self, SplitTree::Leaf { .. })
     }
 
-    /// Every leaf's `(pane, terminal)`, DFS pre-order.
     pub fn leaves(&self) -> Vec<(PaneId, TerminalId)> {
         match self {
             SplitTree::Leaf { pane, terminal } => vec![(pane.clone(), terminal.clone())],
@@ -399,7 +373,6 @@ impl SplitTree {
         true
     }
 
-    /// The tree for `leaves` (DFS order kept) arranged as `preset`.
     pub fn preset(leaves: Vec<(PaneId, TerminalId)>, preset: LayoutPreset) -> Option<SplitTree> {
         if leaves.is_empty() {
             return None;
@@ -441,7 +414,6 @@ impl SplitTree {
         })
     }
 
-    /// `leaves` in a row (`Right`) or column (`Down`), each an equal share.
     fn even(leaves: Vec<(PaneId, TerminalId)>, dir: Dir) -> SplitTree {
         let trees = leaves
             .into_iter()
@@ -471,6 +443,9 @@ impl SplitTree {
     /// branch gets a share proportional to how many panes it lines up ALONG that branch's
     /// direction, so `a | (b | c)` becomes thirds and `a | (b / c)` halves. Returns whether
     /// any ratio moved.
+    /// tmux `select-layout -E`: each side of a branch gets a share proportional to how many panes
+    /// it lines up along that branch's direction, so `a | (b | c)` becomes thirds and
+    /// `a | (b / c)` halves.
     pub fn spread(&mut self) -> bool {
         match self {
             SplitTree::Leaf { .. } => false,
@@ -491,7 +466,6 @@ impl SplitTree {
         }
     }
 
-    /// How many panes this subtree lines up along `dir`.
     fn slots_along(&self, dir: Dir) -> usize {
         match self {
             SplitTree::Leaf { .. } => 1,
@@ -522,7 +496,6 @@ impl SplitTree {
         else {
             return false;
         };
-        // Deepest-first: let a nested branch on this axis handle it before we do.
         if first.resize(pane, axis, grow, step) || second.resize(pane, axis, grow, step) {
             return true;
         }
@@ -537,7 +510,6 @@ impl SplitTree {
                 // long chain legitimately sets `1/n`, and clamping that up to 5% would GROW a pane
                 // the user asked to shrink.
                 let new = (*ratio + delta).clamp(ratio.min(0.05), ratio.max(0.95));
-                // Already at the clamp boundary → no real change (don't churn revs).
                 if (new - *ratio).abs() <= f32::EPSILON {
                     return false;
                 }
@@ -565,10 +537,9 @@ impl SplitTree {
         (a, usable - a, divider)
     }
 
-    /// Assign a derived cell size to each terminal, tiling `area` by ratios with a
-    /// 1-cell divider per (non-degenerate) branch. Cells are **conserved** — the
-    /// tree's footprint equals `area` exactly (G2), so no leaf and no sum can
-    /// exceed the viewport.
+    /// Assign a derived cell size to each terminal, tiling `area` by ratios with a 1-cell
+    /// divider per non-degenerate branch. Cells are conserved (G2): the tree's footprint
+    /// equals `area` exactly.
     pub fn derive_sizes(&self, area: Rect, out: &mut Vec<(TerminalId, u16, u16)>) {
         match self {
             SplitTree::Leaf { terminal, .. } => {
@@ -619,9 +590,7 @@ impl SplitTree {
         }
     }
 
-    /// The bounding box the tree occupies when tiled into `area`. With the
-    /// conserving `derive_sizes`, this equals `area` exactly — the invariant a
-    /// geometry test asserts (G2: nothing derived outside the viewport).
+    /// The bounding box the tree occupies when tiled into `area`; equals `area` exactly (G2).
     pub fn footprint(&self, area: Rect) -> Rect {
         match self {
             SplitTree::Leaf { .. } => area,
@@ -666,9 +635,6 @@ impl SplitTree {
     }
 }
 
-/// A pane's placed rectangle (position + size in cells) for rendering. Derived
-/// from a split tree tiled into an area; dividers occupy the 1-cell gaps between
-/// adjacent rects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneRect {
     pub terminal: TerminalId,
@@ -712,12 +678,10 @@ impl SplitTree {
         }
     }
 
-    /// Place every branch's DIVIDER, mirroring [`Self::derive_layout`] so the two agree
-    /// cell-for-cell. A branch too small to show a divider (`split3` gives it 0 cells)
-    /// contributes nothing — there is no gap to grab.
-    /// Returns this subtree's FIRST terminal, so a parent gets its children's identities from
-    /// the traversal it is already doing. Re-descending with `first_terminal` per divider is
-    /// O(N²) on a tree skewed through `first`; this is one pass.
+    /// Place every branch's DIVIDER, mirroring [`Self::derive_layout`] cell-for-cell. A branch
+    /// too small to show a divider (`split3` gives it 0 cells) contributes nothing. Returns
+    /// this subtree's FIRST terminal, so a parent gets its children's identities from the one
+    /// traversal; re-descending with `first_terminal` per divider is O(N²) on a skewed tree.
     pub fn derive_dividers(
         &self,
         x: u16,
@@ -739,8 +703,6 @@ impl SplitTree {
             };
             return Some(terminal.clone());
         };
-        // Recurse FIRST: each child hands back its own first terminal, which is this
-        // branch's identity, so nothing has to descend a second time.
         let (a, b, div, fx, fy, sx, sy, fc, fr, sc, sr) = match dir {
             Dir::Right => {
                 let (a, b, div) = Self::split3(cols, *ratio);
@@ -823,19 +785,15 @@ pub struct DividerRect {
     /// the divider it grabbed. The pair identifies the branch because it is their lowest common
     /// ancestor; an edit deeper on either side leaves it, and the drag rightly survives.
     pub ends: (TerminalId, TerminalId),
-    /// Which way the branch splits: `Right` = a vertical divider you drag horizontally.
     pub dir: Dir,
     pub x: u16,
     pub y: u16,
     pub cols: u16,
     pub rows: u16,
-    /// First cell of the BRANCH along `dir` — the origin a pointer position is measured from.
     pub origin: u16,
-    /// The branch's full extent along `dir`, so a pointer maps to a ratio.
     pub extent: u16,
 }
 
-/// A tab: one BSP layout + a focused pane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tab {
     pub id: TabId,
@@ -860,7 +818,6 @@ impl Tab {
             .filter(|p| self.layout.contains(p) && self.layout.panes().len() > 1)
     }
 
-    /// [`SplitTree::derive_layout`] as the tab is SHOWN: one full-area rect while zoomed.
     pub fn view_layout(&self, x: u16, y: u16, cols: u16, rows: u16, out: &mut Vec<PaneRect>) {
         if let Some(z) = self.zoom()
             && let Some(terminal) = self.layout.terminal_of(z)
@@ -878,8 +835,6 @@ impl Tab {
     }
 }
 
-/// A workspace: ordered tabs + the control lease (≤1 controller, invariant G1) +
-/// the controller's viewport (drives geometry, G2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
@@ -904,7 +859,6 @@ impl Workspace {
     pub fn tab_mut(&mut self, id: &TabId) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|t| &t.id == id)
     }
-    /// The tab whose layout contains `pane`.
     pub fn tab_of_pane(&self, pane: &PaneId) -> Option<&Tab> {
         self.tabs.iter().find(|t| t.layout.contains(pane))
     }
@@ -979,7 +933,6 @@ mod tests {
             "panes + dividers must tile the width exactly"
         );
 
-        // The OUTER divider spans the whole area; the inner one only its half.
         let outer = divs.iter().find(|d| d.path.is_empty()).unwrap();
         let inner = divs.iter().find(|d| d.path == vec![false]).unwrap();
         assert_eq!((outer.origin, outer.extent), (0, cols));
@@ -1100,28 +1053,23 @@ mod tests {
         // repaint on every mouse event.
         assert!(!tree.set_ratio_at(&[], 5.0));
         assert!(!tree.set_ratio_at(&[], 0.95));
-        // A path that runs off a leaf is refused rather than panicking.
         assert!(!tree.set_ratio_at(&[false, true], 0.5));
     }
 
     #[test]
     fn resize_nudges_the_nearest_axis_branch_and_conserves() {
-        // p0 | p1  (a horizontal / Right split)
         let mut tree = SplitTree::Branch {
             dir: Dir::Right,
             ratio: 0.5,
             first: Box::new(leaf("p0", "t0")),
             second: Box::new(leaf("p1", "t1")),
         };
-        // grow p0 (left pane) to the right → ratio increases
         assert!(tree.resize(&PaneId::new("p0"), Dir::Right, true, 0.1));
         let SplitTree::Branch { ratio, .. } = &tree else {
             panic!()
         };
         assert!((*ratio - 0.6).abs() < 1e-4, "p0 grew: ratio 0.5→0.6");
-        // a vertical resize has no Down branch here → no-op
         assert!(!tree.resize(&PaneId::new("p0"), Dir::Down, true, 0.1));
-        // geometry still conserves at the new ratio
         let area = Rect {
             cols: 100,
             rows: 40,
@@ -1154,7 +1102,6 @@ mod tests {
             assert!(r.x + r.cols <= area.cols, "rect within viewport width");
             assert!(r.y + r.rows <= area.rows, "rect within viewport height");
         }
-        // derive_layout and derive_sizes agree on each terminal's size.
         let mut sizes = Vec::new();
         tree.derive_sizes(area, &mut sizes);
         for (tid, c, rr) in &sizes {
@@ -1241,14 +1188,12 @@ mod arrange {
         assert!(t.swap_with(&PaneId::new("p1"), 1));
         assert_eq!(order(&t), ["p2", "p1", "p3"]);
         assert_eq!(sizes(&t, 100, 40), shape, "the shape is untouched");
-        // Wraps backwards from the first slot to the last.
         assert!(t.swap_with(&PaneId::new("p2"), -1));
         assert_eq!(order(&t), ["p3", "p1", "p2"]);
         assert!(t.rotate(true));
         assert_eq!(order(&t), ["p1", "p2", "p3"]);
         assert!(t.rotate(false));
         assert_eq!(order(&t), ["p3", "p1", "p2"]);
-        // A pane keeps its terminal wherever it goes.
         assert_eq!(t.terminal_of(&PaneId::new("p2")).unwrap().to_string(), "t2");
         assert!(!leaf(1).clone().rotate(true));
     }

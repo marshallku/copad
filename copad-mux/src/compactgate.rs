@@ -29,7 +29,6 @@ const BUDGET: Duration = Duration::from_millis(1500);
 pub const DEFAULT_HEADROOM: u64 = 60_000;
 pub const DEFAULT_MAX_DEFERRALS: u32 = 40;
 
-/// What the hook was asked (Claude's `PreCompact` input).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ask {
     pub trigger: String,
@@ -38,7 +37,6 @@ pub struct Ask {
     pub transcript_path: String,
 }
 
-/// The tracked work tree, as `git status` saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tree {
     Clean,
@@ -47,13 +45,11 @@ pub enum Tree {
     Unknown,
 }
 
-/// What the decision rests on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Facts {
     /// Tokens in the context at the last response, and the window, from comux's reading of
     /// this agent — only when both are known for THIS conversation.
     pub fill: Option<(u64, u64)>,
-    /// Blocked asks so far in this streak.
     pub deferred: u32,
     pub tree: Tree,
 }
@@ -65,10 +61,8 @@ pub struct Limits {
     pub when: When,
 }
 
-/// What an automatic compaction waits for besides a `comux compact` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum When {
-    /// The work tree to be committed (the default).
     Commit,
     /// Nothing: only a request (or running out of room) lets it through.
     Request,
@@ -78,7 +72,6 @@ pub enum When {
 /// such allowance — a persistently unreadable transcript must not compact on every request.
 const UNKNOWN_COOLDOWN_SECS: u64 = 600;
 
-/// The transcript tail the request mode reads for its own estimate.
 const TRANSCRIPT_TAIL: u64 = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +82,6 @@ pub enum Verdict {
     Block(String),
 }
 
-/// Decide. Pure, so every escape is testable.
 pub fn decide(ask: &Ask, facts: &Facts, limits: Limits) -> Verdict {
     if ask.trigger != "auto" {
         return Verdict::Allow("asked for by hand");
@@ -116,7 +108,6 @@ pub fn decide(ask: &Ask, facts: &Facts, limits: Limits) -> Verdict {
     }
 }
 
-/// The hook's stdin → [`Ask`], `None` when it is not a `PreCompact` input we can read.
 pub fn parse_ask(raw: &[u8]) -> Option<Ask> {
     let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
     let s = |k: &str| {
@@ -133,8 +124,8 @@ pub fn parse_ask(raw: &[u8]) -> Option<Ask> {
     })
 }
 
-/// Run the hook: read the ask, gather what can be known in time, print the verdict. Always
-/// exits 0 — a failing hook must never be what stops a compaction or a session.
+/// Run the hook. Always exits 0: a failing hook must never be what stops a compaction or a
+/// session.
 pub fn run(limits: Limits) -> i32 {
     let deadline = Instant::now() + BUDGET;
     let mut raw = Vec::new();
@@ -287,7 +278,6 @@ fn unknown_allowance(session_id: &str) -> bool {
     }
 }
 
-/// The git-preference judgement ([`decide`]) with its streak counter.
 fn judge_commit(ask: &Ask, limits: Limits, deadline: Instant) -> Verdict {
     let fill = crate::control::agent_fill(&ask.session_id, deadline);
     let counter = counter_path(&ask.session_id);
@@ -335,7 +325,6 @@ fn counter_path(session_id: &str) -> Option<PathBuf> {
     )
 }
 
-/// The stored count; absent = 0, unreadable = `None`.
 fn read_count(p: &Path) -> Option<u32> {
     match std::fs::read_to_string(p) {
         Ok(s) => s.trim().parse().ok(),
@@ -462,7 +451,6 @@ mod tests {
                 "{a:?} {f:?}"
             );
         }
-        // A 1M window defers far later than a 200k one.
         assert!(matches!(
             decide(
                 &ask("auto"),
@@ -546,7 +534,6 @@ mod tests {
         );
         std::fs::write(&f, format!("{usage}\n{result}\n")).unwrap();
         let e = estimate(&f).unwrap();
-        // 100000 in + 500 out + at least 9000 bytes / 2.
         assert!(e >= 100_500 + 4_500, "{e}");
         std::fs::write(&f, format!("{usage}\n{{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"postTokens\":9000}}}}\n")).unwrap();
         assert_eq!(estimate(&f), Some(9000));

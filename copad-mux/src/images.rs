@@ -1,15 +1,9 @@
 //! Images in comux panes, shown by the terminal a client runs in (decisions #194).
 //!
-//! Panes run copad's kitty graphics code (`copad-graphics`), so their cells carry image
-//! fragments. While composing, comux turns the visible ones into screen-space row runs
-//! ([`ScreenRun`]) — clipped to the pane and to what chrome left of it — and each client whose
-//! terminal draws kitty graphics gets them as [`ImageRun`]s with every frame, plus the image
-//! data it lacks. The client places them over the cells after drawing every frame (re-placing
-//! also restores images a terminal like copad erases under rewritten text).
-//!
-//! Per client, what it holds advances only when a frame actually reached its queue: a dropped
-//! frame is rebuilt later against the same state, so no frame can name an image the client
-//! has not been given.
+//! Visible image fragments are turned into screen-space row runs while composing, and each
+//! client whose terminal draws kitty graphics gets them with every frame plus the image data it
+//! lacks. What a client holds advances only when a frame actually reached its queue, so no frame
+//! can name an image the client has not been given.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -27,19 +21,14 @@ use crate::proto::{ImageRun, ImageUpload};
 /// 320 MiB; this stays well under it so uploads never fail silently there).
 pub const CLIENT_BUDGET: usize = 160 << 20;
 
-/// One visible row-run of an image, in frame cells.
 #[derive(Clone)]
 pub struct ScreenRun {
     pub image: Arc<GraphicImage>,
-    /// `[left, top, right, bottom]` in frame cells (fractional at the image's edges).
     pub rect: [f32; 4],
-    /// `[left, top, right, bottom]` in the image, 0..=1.
     pub uv: [f32; 4],
     pub z: i32,
 }
 
-/// The visible runs of one pane: `runs` from `PaneTerm::image_runs`, in pane cells, placed at
-/// `(x, y)` and clipped to `cols` x `rows`.
 pub fn pane_runs(
     (runs, images): (Vec<copad_graphics::CopadGraphic>, Vec<Arc<GraphicImage>>),
     x: u16,
@@ -52,7 +41,6 @@ pub fn pane_runs(
         let Some(image) = images.get(r.image as usize) else {
             continue;
         };
-        // Rows are whole runs; clip to the pane's rows and columns, cutting the source with it.
         if r.rect[1] >= rows as f32 || r.rect[3] <= 0.0 {
             continue;
         }
@@ -74,7 +62,6 @@ pub fn pane_runs(
     out
 }
 
-/// The part of a run between columns `lo` and `hi`, its source cut in proportion.
 fn clip_x(rect: [f32; 4], uv: [f32; 4], lo: f32, hi: f32) -> Option<([f32; 4], [f32; 4])> {
     let (l, r) = (rect[0].max(lo), rect[2].min(hi));
     if l >= r {
@@ -85,7 +72,6 @@ fn clip_x(rect: [f32; 4], uv: [f32; 4], lo: f32, hi: f32) -> Option<([f32; 4], [
     Some(([l, rect[1], r, rect[3]], [at(l), uv[1], at(r), uv[3]]))
 }
 
-/// What the panes wrote where their images are, before any chrome is drawn.
 pub fn remember(runs: &[ScreenRun], buf: &Buffer) -> Vec<(Position, Cell)> {
     let mut cells = Vec::new();
     for r in runs {
@@ -138,12 +124,10 @@ pub fn uncovered(
     out
 }
 
-/// Client ids for images, server-wide and stable while an image lives.
 #[derive(Default)]
 pub struct ImageIds {
     by_key: HashMap<u64, u32>,
     next: u32,
-    /// Encoded uploads, shared by every client that needs them this frame.
     encoded: HashMap<u64, Arc<String>>,
 }
 
@@ -156,7 +140,6 @@ impl ImageIds {
         })
     }
 
-    /// Forget images no run shows any more (their ids are not reused while referenced).
     pub fn retain(&mut self, shown: &HashSet<u64>) {
         self.by_key.retain(|k, _| shown.contains(k));
         self.encoded.retain(|k, _| shown.contains(k));
@@ -177,7 +160,6 @@ impl ImageIds {
     }
 }
 
-/// Straight RGBA, zlib, base64 (kitty `f=32,o=z`); the cells hold premultiplied pixels.
 fn encode(image: &GraphicImage) -> String {
     let mut straight = image.rgba.clone();
     for px in straight.chunks_exact_mut(4) {
@@ -193,18 +175,13 @@ fn encode(image: &GraphicImage) -> String {
     base64::engine::general_purpose::STANDARD.encode(z.finish().unwrap_or_default())
 }
 
-/// What one graphics-capable client holds.
 pub struct ClientImages {
-    /// Image id → (decoded bytes, last frame that showed it).
     held: HashMap<u32, (usize, Instant)>,
     held_bytes: usize,
     last_runs: Vec<ImageRun>,
-    /// Nothing sent yet: the first frame states its runs even when empty.
     fresh: bool,
 }
 
-/// The image part of one frame for one client; [`ClientImages::commit`] it once the frame is
-/// queued.
 pub struct Outgoing {
     pub runs: Option<Vec<ImageRun>>,
     pub uploads: Vec<ImageUpload>,
@@ -237,7 +214,6 @@ impl ClientImages {
     pub fn prepare(&self, runs: &[ScreenRun], ids: &mut ImageIds, budget: usize) -> Outgoing {
         let keyed: Vec<(u32, &ScreenRun)> = runs.iter().map(|r| (ids.id(r.image.key), r)).collect();
         let wanted: HashSet<u32> = keyed.iter().map(|(id, _)| *id).collect();
-        // Room is made by forgetting held images nothing shows now, longest unshown first.
         let mut idle: Vec<(u32, usize, Instant)> = self
             .held
             .iter()
@@ -289,7 +265,6 @@ impl ClientImages {
         }
     }
 
-    /// The frame carrying `out` reached the client's queue.
     pub fn commit(&mut self, out: Outgoing) {
         let now = Instant::now();
         for id in &out.drops {
@@ -400,7 +375,6 @@ mod tests {
         let runs = vec![run(&a, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0])];
         let mut ids = ImageIds::default();
         let mut client = ClientImages::default();
-        // A frame that never reached the client: the next one uploads again.
         let lost = client.prepare(&runs, &mut ids, CLIENT_BUDGET);
         assert_eq!(lost.uploads.len(), 1);
         let sent = client.prepare(&runs, &mut ids, CLIENT_BUDGET);
@@ -427,7 +401,6 @@ mod tests {
         let ra = vec![run(&a, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0])];
         let out = client.prepare(&ra, &mut ids, 1000);
         client.commit(out);
-        // Now only b shows, and both do not fit: a goes.
         let rb = vec![run(&b, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0])];
         let out = client.prepare(&rb, &mut ids, 500);
         assert_eq!(out.uploads.len(), 1);

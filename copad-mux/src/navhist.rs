@@ -1,23 +1,14 @@
 //! Back / forward / last navigation history across sessions and tabs (decisions #140).
 //!
-//! A browser-style pair of stacks around the current location, fed by OBSERVATION rather than
-//! by every focus path calling in: the view can move from ~25 places (keys, clicks, the switcher,
-//! toast jumps, control verbs, reaping), and a hook per path is exactly how one gets forgotten.
-//! `App` observes the landed location once per input it handles instead.
-//!
-//! Only a change of `(session, tab)` is a JUMP. Moving between panes of one tab just updates the
-//! current entry's pane, so `back` lands on the pane you last used there without `h/j/k/l`
-//! flooding the list.
-//!
-//! State-free on purpose: validity is the caller's question (`valid`), so this module never sees
-//! `State` and every rule is unit-testable on plain ids.
+//! Fed by observation rather than by every focus path calling in: the view moves from many
+//! places, and a hook per path is how one gets forgotten. Only a change of `(session, tab)` is
+//! a jump; moving between panes of one tab just updates the current entry's pane. State-free:
+//! validity is the caller's question (`valid`).
 
 use crate::model::{TabId, TerminalId, WorkspaceId};
 
-/// The most entries either stack keeps.
 pub const CAP: usize = 50;
 
-/// One place the user was: a tab of a session, and the pane focused there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loc {
     pub ws: WorkspaceId,
@@ -26,7 +17,6 @@ pub struct Loc {
 }
 
 impl Loc {
-    /// Whether `other` is the same jump target (pane aside).
     fn same_place(&self, other: &Loc) -> bool {
         self.ws == other.ws && self.tab == other.tab
     }
@@ -52,7 +42,6 @@ impl NavHistory {
         self.forward.len()
     }
 
-    /// Record that the view is now at `now`. Returns whether that was a jump (a new entry).
     pub fn observe(&mut self, now: Loc) -> bool {
         match self.cur.take() {
             None => {
@@ -72,7 +61,6 @@ impl NavHistory {
         }
     }
 
-    /// Step back to the newest still-valid entry, moving the current one onto `forward`.
     pub fn back(&mut self, valid: impl Fn(&Loc) -> bool) -> Option<Loc> {
         let target = pop_valid(&mut self.back, self.cur.as_ref(), &valid)?;
         if let Some(cur) = self.cur.take() {
@@ -82,7 +70,6 @@ impl NavHistory {
         Some(target)
     }
 
-    /// Step forward again — the mirror of [`Self::back`].
     pub fn forward(&mut self, valid: impl Fn(&Loc) -> bool) -> Option<Loc> {
         let target = pop_valid(&mut self.forward, self.cur.as_ref(), &valid)?;
         if let Some(cur) = self.cur.take() {
@@ -92,14 +79,12 @@ impl NavHistory {
         Some(target)
     }
 
-    /// Alt-Tab: go to the previous location as a NEW jump, so pressing it again comes back.
     pub fn last(&mut self, valid: impl Fn(&Loc) -> bool) -> Option<Loc> {
         let target = pop_valid(&mut self.back, self.cur.as_ref(), &valid)?;
         self.observe(target.clone());
         Some(target)
     }
 
-    /// Drop every entry that no longer exists, and normalize the current one.
     pub fn prune(&mut self, valid: impl Fn(&Loc) -> bool) {
         self.back.retain(|l| valid(l));
         self.forward.retain(|l| valid(l));
@@ -108,14 +93,11 @@ impl NavHistory {
         }
     }
 
-    /// Put `now` in place as the current location WITHOUT recording a jump — after a
-    /// back/forward landed somewhere slightly different from the entry (its pane died).
     pub fn settle(&mut self, now: Loc) {
         self.cur = Some(now);
     }
 }
 
-/// Push `loc`, removing any older entry for the same place and keeping at most [`CAP`].
 fn push_dedup(stack: &mut Vec<Loc>, loc: Loc) {
     stack.retain(|l| !l.same_place(&loc));
     stack.push(loc);
@@ -124,9 +106,8 @@ fn push_dedup(stack: &mut Vec<Loc>, loc: Loc) {
     }
 }
 
-/// Pop the newest entry that is alive AND somewhere else: an entry for where the view
-/// already is would "succeed" without moving (the fallback after killing the attached session
-/// is typically the top of `back`), so it is dropped like a dead one.
+/// An entry for where the view already is would "succeed" without moving (the fallback after
+/// killing the attached session is typically the top of `back`), so it is dropped like a dead one.
 fn pop_valid(
     stack: &mut Vec<Loc>,
     cur: Option<&Loc>,
@@ -216,7 +197,6 @@ mod tests {
         assert_eq!(ws_of(h.last(|_| true)).as_deref(), Some("b"));
         assert_eq!(ws_of(h.last(|_| true)).as_deref(), Some("c"));
         assert_eq!(ws_of(h.last(|_| true)).as_deref(), Some("b"));
-        // `a` is still reachable behind the toggle pair.
         assert_eq!(ws_of(h.back(|_| true)).as_deref(), Some("c"));
         assert_eq!(ws_of(h.back(|_| true)).as_deref(), Some("a"));
     }
@@ -249,7 +229,6 @@ mod tests {
 
     #[test]
     fn an_entry_for_where_the_view_already_is_is_skipped() {
-        // a → b → c, then c dies and the view falls back to b, which is still atop `back`.
         let mut h = NavHistory::default();
         walk(&mut h, &[("a", "t0"), ("b", "t0"), ("c", "t0")]);
         let alive = |l: &Loc| l.ws.to_string() != "c";
@@ -270,13 +249,11 @@ mod tests {
             h.observe(loc("a", &format!("t{i}")));
         }
         assert_eq!(h.back_len(), CAP);
-        // The oldest fell off; the newest are kept.
         let mut seen = 0;
         while h.back(|_| true).is_some() {
             seen += 1;
         }
         assert_eq!(seen, CAP);
-        // 70 places, the newest is current: the oldest 50-back is t19.
         assert_eq!(h.current().unwrap().tab.to_string(), "a:t19");
     }
 }

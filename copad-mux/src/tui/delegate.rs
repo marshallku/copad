@@ -28,7 +28,6 @@ pub(super) enum Delegated {
     Menu(Vec<MenuAction>),
 }
 
-/// A host-drawn `Ctrl-b C` directory browser.
 pub(super) struct BrowserOv {
     dir: PathBuf,
     slot: dirbrowse::Slot,
@@ -42,7 +41,6 @@ pub(super) struct BrowserOv {
     note: String,
 }
 
-/// A host-drawn `Ctrl-b R` resume picker.
 pub(super) struct ResumeOv {
     st: ResumeState,
     shared: agentsessions::Shared,
@@ -102,7 +100,6 @@ fn key(key: &str, choice: &str, stays: bool) -> l0::PickerKey {
     }
 }
 
-/// `<prefix>:<i>` → `i`.
 /// The list a delegated switcher was opened on, from the spec last sent.
 fn opened_on(spec: &l0::OverlaySpec) -> PopupTab {
     match spec {
@@ -207,7 +204,6 @@ impl App {
         out
     }
 
-    /// A host-drawn browser at `dir`, listing on its own thread (sent as `loading`).
     fn delegate_browser(&mut self, dir: PathBuf) -> (u64, l0::OverlaySpec) {
         let slot = dirbrowse::Slot::default();
         let mut ov = BrowserOv {
@@ -240,7 +236,6 @@ impl App {
         self.delegate(Delegated::Browser(ov), spec)
     }
 
-    /// A host-drawn resume picker, scanning on its own thread (sent as `loading`).
     fn delegate_resume(&mut self, st: ResumeState) -> (u64, l0::OverlaySpec) {
         let shared = agentsessions::idle();
         let mut ov = ResumeOv {
@@ -353,7 +348,6 @@ impl App {
         out
     }
 
-    /// The pane token of each resume row whose conversation is live in a pane.
     fn resume_live_tokens(&self, r: &ResumeOv) -> Vec<Option<String>> {
         r.rows
             .iter()
@@ -365,7 +359,6 @@ impl App {
             .collect()
     }
 
-    /// The `$COPAD_MUX_PANE` token a host previews for `target`.
     fn preview_token(&self, target: &PopupTarget) -> String {
         self.preview_terminal(target)
             .and_then(|t| self.panes.get(&t)?.pane_token().map(str::to_string))
@@ -465,12 +458,10 @@ impl App {
         spec
     }
 
-    /// A host answered overlay `id`: run what the TUI would have run. `choice`/`text` both
-    /// absent = cancelled. Returns whether anything visible changed, and the overlays the
-    /// answer opened IN THE HOST (a browser descending into a directory, the resume picker
-    /// flipping to headless runs) — the caller hands those to the same host. Overlays the
-    /// answer opened in the TUI (a menu item's rename prompt) are found by the caller's
-    /// [`OverlayMarks`] diff instead.
+    /// A host answered overlay `id`: run what the TUI would have run; `choice` and `text` both
+    /// absent = cancelled. Returns whether anything visible changed, and the overlays the answer
+    /// opened in the host, which the caller hands to the same host. Overlays opened in the TUI
+    /// are found by the caller's [`OverlayMarks`] diff instead.
     pub fn overlay_result(
         &mut self,
         id: u64,
@@ -478,8 +469,6 @@ impl App {
         text: Option<String>,
     ) -> (bool, Vec<(u64, l0::OverlaySpec)>) {
         let out = self.overlay_result_inner(id, choice, text);
-        // An answer can move the view (a session, an agent, a tab): observe it like a key,
-        // so recency and the nav history count a host's picks too.
         self.track_nav();
         out
     }
@@ -520,8 +509,6 @@ impl App {
                 Some(c) => {
                     let stays = c == "clear-all" || c.starts_with("dismiss:");
                     let changed = self.center_choice(&c);
-                    // Dismissing keeps the center up (the TUI's `d` / `D`): the same id again,
-                    // so the host replaces it in place.
                     if stays {
                         let spec = self.center_spec();
                         self.delegated.insert(id, Delegated::Center(spec.clone()));
@@ -532,7 +519,6 @@ impl App {
                 None => false,
             },
             Delegated::Browser(b) => {
-                // `open:<row>` is `→`: descend into a directory, never create (TUI parity).
                 let (open_only, choice) = match choice.as_deref().map(|c| c.strip_prefix("open:")) {
                     Some(Some(rest)) => (true, Some(rest.to_string())),
                     _ => (false, choice),
@@ -544,7 +530,6 @@ impl App {
                         "up" => Some(dirbrowse::Row::Up),
                         _ => index_of(c, "d:").and_then(|i| b.rows.as_ref()?.get(i).cloned()),
                     })
-                    // Only a row this overlay offered (an unreadable directory has no `here`).
                     .filter(|r| b.rows.as_ref().is_some_and(|rows| rows.contains(r)));
                 match picked {
                     Some(dirbrowse::Row::Here) if open_only => {
@@ -585,7 +570,6 @@ impl App {
                     next.push(self.delegate_resume(st));
                     false
                 }
-                // The TUI's ^r: scan again.
                 Some("rescan") => {
                     next.push(self.delegate_resume(r.st));
                     false
@@ -627,8 +611,6 @@ impl App {
     }
 
     fn switcher_choice(&mut self, c: &str) {
-        // ^R on a session row: switch to it and open the rename prompt there (the TUI's
-        // `popup_rename`); the prompt is delegated by the caller's marks diff.
         if let Some(w) = c.strip_prefix("rename:s:") {
             let Some(ws) = self
                 .state
@@ -700,10 +682,9 @@ impl App {
         true
     }
 
-    /// A host asked to open one of comux's overlays (`SubMsg::Open`, decisions #172). It runs
-    /// the same opener the key or menu item would; the caller then delegates whatever opened
-    /// to that host. Refused while the same kind of overlay is open in the TUI (another
-    /// client's), which the opener would otherwise replace.
+    /// A host asked to open one of comux's overlays (`SubMsg::Open`, decisions #172), through the
+    /// opener a key or menu item would run. Refused while the same kind of overlay is open in the
+    /// TUI (another client's), which the opener would otherwise replace.
     pub fn open_for_host(&mut self, what: &str, target: Option<&str>) -> Result<(), String> {
         let busy = |open: bool| {
             if open {
@@ -727,8 +708,6 @@ impl App {
             }
             "tabs" => {
                 busy(self.popup.is_some())?;
-                // Record where the view is first: a tab picked here last time must count as
-                // visited before this list picks its Alt-Tab default.
                 self.track_nav();
                 self.open_popup_on(PopupTab::Tabs);
             }
@@ -768,7 +747,6 @@ impl App {
         Ok(())
     }
 
-    /// `<session id>`, or the active session when absent.
     fn target_session(&self, target: Option<&str>) -> Result<WorkspaceId, String> {
         let Some(t) = target else {
             return Ok(self.ws.clone());
@@ -780,7 +758,6 @@ impl App {
             .ok_or_else(|| format!("no session {t:?}"))
     }
 
-    /// `<session id>/<tab id>`, or the active session's active tab when absent.
     fn target_tab(&self, target: Option<&str>) -> Result<(WorkspaceId, TabId), String> {
         let (ws, tab) = match target {
             None => (self.ws.clone(), None),
@@ -798,8 +775,6 @@ impl App {
         Ok((ws, tab))
     }
 
-    /// The host that held these overlays is gone: they are simply dropped (the TUI never
-    /// showed them, so there is nothing to close).
     pub fn forget_overlays(&mut self, ids: &[u64]) {
         for id in ids {
             self.delegated.remove(id);
@@ -849,7 +824,6 @@ fn browser_spec(b: &BrowserOv) -> l0::OverlaySpec {
         ..
     } = &mut spec
     {
-        // The TUI browser's arrows: ← goes up, → descends without creating.
         actions.push(action("open", "Open", "Right", false));
         if has_up {
             keys.push(key("Left", "up", false));
@@ -911,7 +885,6 @@ fn resume_spec(r: &ResumeOv, live_tokens: &[Option<String>]) -> l0::OverlaySpec 
         tabs[0].name = "conversations".into();
         keys.push(key("C-a", "toggle-all", false));
         keys.push(key("C-r", "rescan", false));
-        // Enter picks the newest conversation, not the headless toggle above it.
         *selected = r
             .rows
             .as_ref()

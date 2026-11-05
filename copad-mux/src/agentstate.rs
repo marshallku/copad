@@ -1,25 +1,15 @@
-//! Per-agent rolled-up status — a clean-room port of the algorithm in the owner's
-//! `tmx` (`~/dev/tmx/src/agents/{session_meta,classify}.rs`), adapted to copad-mux's
-//! in-process PTY (we already hold the agent pid + the pane's screen snapshot, so no
-//! `tmux capture-pane` / cwd is needed).
-//!
-//! PRIMARY signal (Claude): read Claude's own status file
-//! `~/.claude/sessions/<pid>.json` keyed by the agent process pid — `status`:
-//! `busy`→Working, `idle`→Ready, `waiting`→Blocked. FALLBACK (Codex/custom, or no
-//! file): scrape the last 30 screen lines for the same UI cues tmx matches.
+//! Per-agent rolled-up status. Claude: read its own status file `~/.claude/sessions/<pid>.json`
+//! keyed by the agent pid (`busy`→Working, `idle`→Ready, `waiting`→Blocked). Fallback (Codex,
+//! custom, or no file): scrape the last 30 screen lines for the UI cues of the owner's `tmx`
+//! (`~/dev/tmx/src/agents/{session_meta,classify}.rs`).
 
 use crate::term::Snapshot;
 
-/// A rolled-up agent status for the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
-    /// Mid-turn: running tools / composing. No user input needed.
     Working,
-    /// Parked at the chat prompt — the user can type a new request.
     Ready,
-    /// Blocking on a permission / selection dialog until the user acts.
     Blocked,
-    /// No recognised agent UI (plain shell view, editor, etc.).
     Idle,
 }
 
@@ -63,18 +53,14 @@ impl WaitKind {
     }
 }
 
-/// The longest wait text kept — a sidebar subtitle, not a transcript.
 pub const WAIT_MAX_CHARS: usize = 80;
 
-/// One reading of an agent: its status, plus the wait when it is blocked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
     pub status: AgentStatus,
     pub wait: Option<Wait>,
 }
 
-/// Resolve an agent pane's status: Claude session file first (accurate, pid-keyed),
-/// else the screen-text fallback for `tool` (the pane's agent basename).
 pub fn resolve(tool: &str, pid: Option<u32>, snap: &Snapshot) -> AgentStatus {
     session_first(pid).unwrap_or_else(|| screen_status_for(tool, snap))
 }
@@ -110,12 +96,10 @@ pub fn screen_status_for(tool: &str, snap: &Snapshot) -> AgentStatus {
     }
 }
 
-/// The PRIMARY signal, shared by both resolvers so the policy cannot drift between them.
 fn session_first(pid: Option<u32>) -> Option<AgentStatus> {
     claude_session_status(pid?)
 }
 
-/// Path of Claude's per-process status file, `~/.claude/sessions/<pid>.json`.
 fn claude_session_file(pid: u32) -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(
@@ -126,8 +110,6 @@ fn claude_session_file(pid: u32) -> Option<std::path::PathBuf> {
     )
 }
 
-/// Read `~/.claude/sessions/<pid>.json` → `status` field. `None` on any failure
-/// (missing/unreadable/malformed/unknown status) so the caller falls back.
 pub fn claude_session_status(pid: u32) -> Option<AgentStatus> {
     parse_session_status(&std::fs::read_to_string(claude_session_file(pid)?).ok()?)
 }
@@ -155,19 +137,14 @@ pub fn is_session_uuid(s: &str) -> bool {
             .all(|(&len, g)| g.len() == len && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// Parse Claude's session JSON → status. `None` on malformed JSON or an unrecognized
-/// status (reject rather than guess — tmx does the same); tolerates extra fields.
 fn parse_session_status(json: &str) -> Option<AgentStatus> {
     parse_session(json).map(|r| r.status)
 }
 
-/// Read `~/.claude/sessions/<pid>.json` → status + wait. `None` exactly when
-/// [`claude_session_status`] is.
 fn claude_session(pid: u32) -> Option<Reading> {
     parse_session(&std::fs::read_to_string(claude_session_file(pid)?).ok()?)
 }
 
-/// Parse Claude's session JSON → status, and for `waiting` the wait it names.
 fn parse_session(json: &str) -> Option<Reading> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let status = match v.get("status").and_then(|s| s.as_str())? {
@@ -224,20 +201,12 @@ const DECISION_MARKERS: &[&str] = &[
     "Allow this tool",
 ];
 
-/// Codex's blocking dialogs. Captured one at a time from a live codex-cli 0.154.0 pane; the
-/// last entry is the confirm footer codex renders under EVERY picker, so it also catches the
-/// ones not enumerated above (model picker, usage-limit picker, …).
-///
-/// These are matched WRAP-TOLERANTLY (see [`squeeze`]) because they are full sentences that
-/// a narrow pane hard-wraps. That is safe only because they are full sentences: a marker
-/// this long cannot plausibly be assembled by accident out of two adjacent screen rows.
-///
-/// Every entry also has to be specific enough that it cannot show up in an agent's ordinary
-/// OUTPUT — a false Blocked is not a silent mis-label, it raises a desktop toast and bumps
-/// the status-bar `⚑N`. That is why codex's generic footer is carried as the long
-/// `"Press enter to confirm or esc to"` rather than the far broader
-/// `"Press enter to continue"`, which an agent quoting a pager footer or documentation would
-/// trip while genuinely working.
+/// Codex's blocking dialogs, matched WRAP-TOLERANTLY (see [`squeeze`]): full sentences that a
+/// narrow pane hard-wraps, and so long that two adjacent rows cannot assemble one by accident.
+/// The last entry is the confirm footer codex renders under EVERY picker. Each entry must be
+/// specific enough not to appear in ordinary agent OUTPUT, since a false Blocked raises a
+/// desktop toast and bumps `⚑N`: hence `"Press enter to confirm or esc to"` rather than
+/// `"Press enter to continue"`, which a quoted pager footer would trip.
 const WRAP_TOLERANT_MARKERS: &[&str] = &[
     "Would you like to run the following command?",
     "Would you like to make the following edits?",
@@ -254,10 +223,8 @@ const WRAP_TOLERANT_MARKERS: &[&str] = &[
     "enter to submit answer",
 ];
 
-/// `WRAP_TOLERANT_MARKERS` + the running hint, pre-squeezed once rather than on every sweep.
-/// `screen_status` runs per agent pane twice a second while a client is attached, and an
-/// idle server is held to 0.17% of a core (decision #92), so the per-call work stays to the
-/// single unavoidable pass over the window.
+/// `WRAP_TOLERANT_MARKERS` + the running hint, pre-squeezed once: `screen_status` runs per agent
+/// pane twice a second while attached, and an idle server is held to 0.17% of a core (#92).
 static SQUEEZED_MARKERS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     WRAP_TOLERANT_MARKERS
         .iter()
@@ -270,7 +237,6 @@ static SQUEEZED_MARKERS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock:
 static SQUEEZED_INTERRUPT: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| squeeze("esc to interrupt".chars()));
 
-/// Composing/tool-running spinners (Claude/Codex).
 const SPINNERS: &[char] = &['✱', '✻', '✷', '✸', '✹', '✺'];
 
 /// Screen-text fallback: inspect the last 30 lines of the pane in tmx's strict
@@ -278,17 +244,10 @@ const SPINNERS: &[char] = &['✱', '✻', '✷', '✸', '✹', '✺'];
 pub fn screen_status(snap: &Snapshot) -> AgentStatus {
     let lines = window(snap);
     let joined = lines.join("\n");
-    // Markers are matched with ALL whitespace removed from both sides. A terminal hard-wraps
-    // at the pane width, and it wraps MID-WORD: in a 27-column split pane codex's
-    // `Would you like to run the following command?` arrives as `…run the f` / `ollowing
-    // command?`, so a plain substring match silently fails — which is how a blocked agent in
-    // a narrow pane went on reading `idle`. Rejoining with a space does not fix it either;
-    // that just reassembles `the f ollowing`. Deleting whitespace entirely is insensitive to
-    // WHERE the break fell, which is the only property we can rely on, and it lets the
-    // markers stay long and specific — the thing that stops them firing on ordinary output.
-    //
-    // NOTE `lines` is bottom-up, so this must run in SCREEN order or the two halves of a
-    //      wrapped phrase swap and match nothing.
+    // Markers are matched with ALL whitespace removed from both sides: a terminal hard-wraps at
+    // the pane width MID-WORD (codex's `…run the f` / `ollowing command?` in a 27-column pane),
+    // so a plain substring match fails and rejoining with a space reassembles `the f ollowing`.
+    // `lines` is bottom-up, so this must run in SCREEN order or the halves of a phrase swap.
     let flat = squeezed(&lines);
 
     // 1) a decision dialog wins over everything.
@@ -301,20 +260,11 @@ pub fn screen_status(snap: &Snapshot) -> AgentStatus {
     if flat.contains(SQUEEZED_INTERRUPT.as_str()) {
         return AgentStatus::Working;
     }
-    // 3) the BOTTOM-most composer cursor line decides readiness (checked before the
-    //    spinner so decorative sparkles in a message don't override a genuine prompt).
-    //
-    //    Position, not presence. Both CLIs keep their composer at the bottom of the
-    //    screen, and a dialog awaiting input sits below whatever preceded it — while an
-    //    already-ANSWERED numbered list scrolls up and can linger inside the window above
-    //    a live prompt. Asking `any()` therefore let a stale line vote, in both
-    //    directions: it could call a codex approval prompt `ready` (codex keeps its
-    //    composer rendered during a turn) and a Claude pane `idle` (an answered list
-    //    sitting above the prompt). The last cursor line on screen is right in both cases.
-    //
-    //    `lines` is built bottom-up (`.rev().take(30)`), so the FIRST match here is the
-    //    bottom-most screen row. Reversing that would silently pick the top-most cursor
-    //    line and reintroduce the stale-line vote while still passing any single-line test.
+    // 3) the BOTTOM-most composer cursor line decides readiness (before the spinner so
+    //    decorative sparkles in a message don't override a genuine prompt). Position, not
+    //    presence: an already-ANSWERED numbered list can linger above a live prompt, so `any()`
+    //    let a stale line vote in both directions. `lines` is bottom-up, so the FIRST match is
+    //    the bottom-most row; reversing it would silently pick the top-most.
     if let Some(line) = lines.iter().find(|l| cursor_rest(l).is_some())
         && is_ready_prompt(line)
     {
@@ -345,7 +295,6 @@ fn window(snap: &Snapshot) -> Vec<String> {
         .collect()
 }
 
-/// [`window`] with all whitespace squeezed out, in SCREEN order, for wrap-tolerant matching.
 fn squeezed(lines: &[String]) -> String {
     squeeze(lines.iter().rev().flat_map(|l| l.chars()))
 }
@@ -395,7 +344,6 @@ fn agy_status(snap: &Snapshot) -> AgentStatus {
     AgentStatus::Idle
 }
 
-/// A horizontal rule row (`────…`), as agy draws above and below its composer.
 fn is_rule(line: &str) -> bool {
     let t = line.trim();
     t.chars().count() >= 8 && t.chars().all(|c| c == '─')
@@ -440,21 +388,14 @@ fn grok_status(snap: &Snapshot) -> AgentStatus {
     AgentStatus::Idle
 }
 
-/// Drop every whitespace character, so a phrase the terminal hard-wrapped across two rows
-/// still matches. Applied to both the screen window and the marker before comparing.
 fn squeeze(chars: impl Iterator<Item = char>) -> String {
     chars.filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Composer cursor glyphs. Claude Code draws `❯` (U+276F); codex draws `›` (U+203A) — for
-/// its prompt AND for the highlighted row of a selection dialog, exactly like Claude.
-/// Matching only Claude's glyph is why a codex pane used to fall through every branch of
-/// [`screen_status`] to `Idle`, both when parked at its composer and when blocked on an
-/// approval — and `idle` is a status `comux wait-agent` refuses to wait on.
+/// Composer cursor glyphs: Claude Code draws `❯` (U+276F), codex `›` (U+203A), for its prompt
+/// AND for the highlighted row of a selection dialog.
 const CURSOR_GLYPHS: &[char] = &['❯', '›'];
 
-/// If `line` is a cursor line, what follows the glyph (leading space trimmed); `None` when
-/// the first non-space character is not a cursor glyph.
 fn cursor_rest(line: &str) -> Option<&str> {
     let t = line.trim_start();
     let mut chars = t.chars();
@@ -473,7 +414,6 @@ fn is_ready_prompt(line: &str) -> bool {
     if rest.is_empty() {
         return true; // bare cursor
     }
-    // reject a numbered selection like `❯ 1.` / `› 12.`
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     if !digits.is_empty() && rest[digits.len()..].starts_with('.') {
         return false;
@@ -481,23 +421,11 @@ fn is_ready_prompt(line: &str) -> bool {
     true
 }
 
-// ===== session restore: resume the actual conversation, not just re-run the agent =====
-//
-// On session restore, comux re-runs a whitelisted agent's saved argv. Bare re-execution
-// starts a FRESH conversation, losing the work in progress. These helpers rebuild the
-// command so it RESUMES the live conversation instead: they resolve the agent's current
-// session id (Claude: a pid-keyed status file; Codex: the rollout file the process holds
-// open) and reconstruct a canonical resume command.
-//
-// Reconstruction is canonical (not a surgical argv edit) on purpose: without each flag's
-// arity we can't reliably tell an option's value from a positional prompt, so re-running an
-// edited argv risks replaying the initial prompt or carrying a conflicting selector. Instead
-// we rebuild `claude --resume <id> <safe-flags…>` / `codex resume <id>` from scratch, keeping
-// only an allowlist of arity-known, session-independent runtime flags.
+// Session restore reconstructs the command canonically, not by editing argv: without each flag's
+// arity we cannot tell an option's value from a positional prompt, so an edited argv risks
+// replaying the initial prompt or carrying a conflicting selector. We rebuild `claude --resume
+// <id> <safe-flags…>` / `codex resume <id>` from an allowlist of arity-known flags.
 
-/// Resolve an agent's live session id from its pid, dispatching on the command basename.
-/// `None` (→ leave the argv untouched → fresh start) when the agent is unknown or its id
-/// can't be resolved.
 pub fn agent_session_id(comm: &str, pid: u32) -> Option<String> {
     match comm.to_ascii_lowercase().as_str() {
         "claude" => claude_session_id(pid),
@@ -517,14 +445,10 @@ pub fn agy_session_id(pid: u32) -> Option<String> {
     agy_live_id(&open, || crate::procinfo::process_command(pid))
 }
 
-/// The presence lock decides; with NO lock, the process's own `--conversation <id>`.
-///
-/// agy takes the lock when a turn starts, not at launch, so an agy just restored with
-/// `--conversation <id>` holds none until its first message — and without the fallback the
-/// very conversation comux resumed would read as unknown (no live marker in the picker, fork
-/// refused). Using the launch argument then is safe: any NEWER conversation in that process
-/// would have run a turn, and so taken a lock. Several distinct locks stay ambiguous → `None`:
-/// guessing would resume (or fork) the wrong conversation.
+/// The presence lock decides; with NO lock, the process's own `--conversation <id>`: agy takes
+/// the lock when a turn starts, so a just-restored agy holds none until its first message. The
+/// launch argument is safe then, since any NEWER conversation would have run a turn and taken a
+/// lock. Several distinct locks stay ambiguous -> `None`.
 fn agy_live_id(
     open: &[std::path::PathBuf],
     argv: impl FnOnce() -> Option<Vec<String>>,
@@ -536,7 +460,6 @@ fn agy_live_id(
     }
 }
 
-/// `--conversation <id>` / `--conversation=<id>` in an agy argv, validated.
 fn conversation_arg(argv: &[String]) -> Option<String> {
     let mut it = argv.iter().skip(1);
     while let Some(a) = it.next() {
@@ -553,7 +476,6 @@ fn conversation_arg(argv: &[String]) -> Option<String> {
     None
 }
 
-/// The distinct conversation ids among `open`'s presence locks.
 fn agy_presence_ids(open: &[std::path::PathBuf]) -> Vec<String> {
     let mut ids: Vec<String> = open
         .iter()
@@ -571,8 +493,6 @@ fn agy_presence_ids(open: &[std::path::PathBuf]) -> Vec<String> {
     ids
 }
 
-/// grok's data directory: `$GROK_HOME`, else `~/.grok` — what grok itself resolves — as seen
-/// by THIS process.
 pub fn grok_home() -> Option<std::path::PathBuf> {
     match std::env::var_os("GROK_HOME") {
         Some(h) if !h.is_empty() => Some(h.into()),
@@ -634,10 +554,8 @@ fn grok_active_session(json: &str, pid: u32, started: std::time::SystemTime) -> 
     ids.all(|id| id == first).then_some(first)
 }
 
-/// Rebuild a whitelisted agent's argv into a resume command for `session_id`. `comm` is the
-/// program basename; `argv` is what it was launched with. Returns the argv unchanged when the
-/// agent is unknown, the invocation shouldn't be resumed (one-shot / non-interactive), or
-/// `session_id` isn't a UUID.
+/// Rebuild a whitelisted agent's argv into a resume command for `session_id`; unchanged when
+/// the agent is unknown, the invocation is one-shot, or `session_id` isn't a UUID.
 pub fn resume_argv(comm: &str, argv: &[String], session_id: &str) -> Vec<String> {
     if argv.is_empty() || !is_session_uuid(session_id) {
         return argv.to_vec();
@@ -780,9 +698,6 @@ const CLAUDE_BOOL_FLAGS: &[&str] = &[
 ];
 const CLAUDE_VALUE_FLAGS: &[&str] = &["--model", "--permission-mode", "--settings", "--agent"];
 
-/// `claude … → claude --resume <id> <carried-flags…>`. Skips (returns argv unchanged) for
-/// non-interactive `-p`/`--print` and `--no-session-persistence` invocations, which have no
-/// resumable interactive conversation.
 fn claude_resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
     if argv
         .iter()
@@ -808,11 +723,9 @@ fn claude_resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
 /// we never wrap a non-interactive run or double a resume. Codex `resume` accepts a UUID
 /// directly; flags/prompt are dropped (the conversation they seeded is already in the rollout).
 fn codex_resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
-    // Skip if ANY token is a subcommand name, not just the first non-option one: a value-taking
-    // global flag can put a non-option token AHEAD of the subcommand (`codex --cd /repo exec …`),
-    // and we don't track per-flag arity. Over-approximating toward "skip" is the safe direction —
-    // a missed resume just restarts fresh, whereas wrapping a real `exec`/`review` run would break
-    // it. A bare prompt equal to a subcommand word (`codex review`) is ambiguous; skipping is safe.
+    // Skip if ANY token is a subcommand name: a value-taking global flag can put a
+    // non-option token AHEAD of the subcommand (`codex --cd /repo exec …`) and per-flag arity
+    // is not tracked. A missed resume just restarts fresh; wrapping a real `exec` would break it.
     if argv[1..].iter().any(|a| is_codex_subcommand(a)) {
         return argv.to_vec();
     }
@@ -856,9 +769,6 @@ fn is_codex_subcommand(s: &str) -> bool {
     SUBCOMMANDS.contains(&s)
 }
 
-/// Filter an argv tail to an allowlist of boolean (arity-0) and value (arity-1) flags,
-/// carrying each recognized flag (and, for value flags, its following argument) through and
-/// dropping everything else (positional prompt, unknown flags, session selectors).
 fn carry_flags(tail: &[String], bool_flags: &[&str], value_flags: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -867,7 +777,6 @@ fn carry_flags(tail: &[String], bool_flags: &[&str], value_flags: &[&str]) -> Ve
         if bool_flags.contains(&a) {
             out.push(tail[i].clone());
         } else if let Some(eq) = a.find('=') {
-            // `--flag=value` form: carry whole if the flag part is an allowed value flag.
             if value_flags.contains(&&a[..eq]) {
                 out.push(tail[i].clone());
             }
@@ -883,33 +792,21 @@ fn carry_flags(tail: &[String], bool_flags: &[&str], value_flags: &[&str]) -> Ve
     out
 }
 
-/// The rollout file a Codex process holds open (`~/.codex/sessions/**/rollout-<ts>-<uuid>.jsonl`).
-/// An interactive Codex TUI keeps exactly its one session file open; if several are open
-/// (broker/subsessions), the most-recently modified one is the live session.
+/// The rollout file a Codex process holds open (`~/.codex/sessions/**/rollout-<ts>-<uuid>.jsonl`);
+/// with several open (broker/subsessions) the most recently modified is live.
 ///
-/// The nested `Option` carries the distinction [`crate::procinfo::open_files`] now makes:
-/// `None` = could not enumerate the pid's open files, `Some(None)` = enumerated, and it holds
-/// no rollout. A caller caching the path needs both — the first must keep what it has, the
-/// second must drop it.
-///
-/// Ties are broken on `(mtime, path)` rather than on enumeration order, so the answer does not
-/// depend on how `lsof` happened to sort its output. Rollout filenames embed their timestamp,
-/// so the greater path is also the newer session.
-///
-/// This is the ONE place that decides which rollout is live; [`codex_session_id`] and
-/// `agentpoll`'s resolver both go through it. They used to disagree — this picked newest-mtime,
-/// the poller picked whichever `lsof` listed first.
+/// The nested `Option`: `None` = could not enumerate the pid's open files, `Some(None)` =
+/// enumerated and none is a rollout. A caller caching the path must keep what it has for the
+/// first and drop it for the second. Ties break on `(mtime, path)` (filenames embed their
+/// timestamp), not on `lsof` order. This is the ONE place that decides which rollout is live;
+/// [`codex_session_id`] and `agentpoll`'s resolver both go through it.
 pub fn codex_rollout_path(pid: u32) -> Option<Option<std::path::PathBuf>> {
     newest_rollout(crate::procinfo::open_files(pid)?)
 }
 
-/// The newest rollout among `open`, split out so the ranking is testable without a live pid.
-///
-/// A candidate we cannot `stat` returns `None` for the WHOLE lookup rather than being ranked at
-/// `UNIX_EPOCH`: defaulting it would silently demote the live session below an older sibling
-/// and hand the caller a different conversation, which is worse than no answer. Only a
-/// candidate that has since gone (`NotFound` — closed and unlinked between the enumeration and
-/// the `stat`) is skipped, since dropping it leaves the ranking honest.
+/// The newest rollout among `open`, split out so the ranking is testable without a live pid. A
+/// candidate we cannot `stat` fails the WHOLE lookup: ranking it at `UNIX_EPOCH` would demote the
+/// live session below an older sibling. Only one that has since gone (`NotFound`) is skipped.
 fn newest_rollout(open: Vec<std::path::PathBuf>) -> Option<Option<std::path::PathBuf>> {
     let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
     for path in open {
@@ -928,10 +825,9 @@ fn newest_rollout(open: Vec<std::path::PathBuf>) -> Option<Option<std::path::Pat
     Some(best.map(|(_, p)| p))
 }
 
-/// Read Codex's live conversation id from the rollout file the process holds open, else — a
-/// TUI attached to the shared app-server daemon holds none — from the daemon's (see
-/// [`crate::codexdaemon`]). `None` if neither resolves — the caller (restore) treats that as
-/// "fresh start", which is the safe answer.
+/// Codex's live conversation id: from the rollout the process holds open, else (a TUI attached
+/// to the shared app-server daemon holds none) from the daemon's, see [`crate::codexdaemon`].
+/// `None` means fresh start, the safe answer.
 pub fn codex_session_id(pid: u32) -> Option<String> {
     codex_rollout_path(pid)
         .flatten()
@@ -939,9 +835,8 @@ pub fn codex_session_id(pid: u32) -> Option<String> {
         .or_else(|| crate::codexdaemon::session_id(pid))
 }
 
-/// Extract the UUID from a Codex rollout path `…/sessions/…/rollout-<ts>-<uuid>.jsonl`. The
-/// timestamp segment also contains dashes, so the id is the trailing five hex groups. `None`
-/// unless the path is under a `sessions` dir and ends in a valid rollout filename.
+/// The UUID of a Codex rollout path `…/rollout-<ts>-<uuid>.jsonl`. The timestamp also contains
+/// dashes, so the id is the trailing five hex groups. `None` unless under a `sessions` dir.
 pub fn is_rollout_path(path: &std::path::Path) -> bool {
     rollout_session_id(path).is_some()
 }
@@ -967,9 +862,8 @@ pub(crate) fn rollout_session_id(path: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Ranking candidates we cannot `stat` at `UNIX_EPOCH` would silently demote the LIVE
-    /// rollout below an older sibling and hand the caller a different conversation. A lookup
-    /// that cannot be completed says so instead.
+    /// Ranking an un-`stat`able candidate at `UNIX_EPOCH` would demote the live rollout; the
+    /// lookup must fail instead.
     #[test]
     #[cfg(unix)]
     fn a_rollout_we_cannot_stat_fails_the_lookup_instead_of_ranking_last() {
@@ -1064,10 +958,7 @@ mod tests {
         assert_ne!(screen_status(&s), AgentStatus::Ready);
     }
 
-    // ===== codex (codex-cli 0.154.0). Every fixture below is a VERBATIM capture from a
-    // live codex pane read back with `comux capture-pane`, not a reconstruction. Before
-    // this unit all three reported `Idle`, because `is_ready_prompt` only knew Claude's
-    // `❯` and the spinner set only knew Claude's glyphs.
+    // ===== codex (codex-cli 0.154.0): every fixture is a VERBATIM `comux capture-pane` read.
 
     #[test]
     fn codex_parked_at_its_composer_is_ready() {
@@ -1135,13 +1026,8 @@ mod tests {
 
     #[test]
     fn a_marker_hard_wrapped_by_a_narrow_pane_still_matches() {
-        // Found by the e2e, not by reasoning: in a SPLIT pane codex's 43-column approval
-        // question arrives as two rows, and a plain substring match over the joined window
-        // misses it — so a blocked agent in a narrow pane kept reading `idle`, the exact
-        // bug this unit exists to kill, just in a different place.
-        // The break is MID-WORD, which is what a terminal actually does — the first version
-        // of this test wrapped at a space and so passed against a join-with-space fix that
-        // reassembled `the f` + `ollowing` as `the f ollowing` and still matched nothing.
+        // In a SPLIT pane codex's 43-column approval question arrives as two rows, broken
+        // MID-WORD; a join-with-space fix would reassemble `the f` + `ollowing` and still miss.
         let s = snap_from(&[
             "Would you like to run the f",
             "ollowing command?",
@@ -1153,10 +1039,8 @@ mod tests {
         assert_eq!(screen_status(&w), AgentStatus::Working);
     }
 
-    // ===== codex-cli 0.164.0 — two dialogs that changed under the 0.154 markers. Both are
-    // verbatim `capture-pane` reads. Before the fix the trust prompt read `idle` and the
-    // plan-mode question read `working` (its footer carries `esc to interrupt`), so an agent
-    // waiting on the user raised no toast.
+    // ===== codex-cli 0.164.0: two dialogs that changed under the 0.154 markers (verbatim reads).
+    // The trust prompt read `idle` and the plan-mode question read `working`.
 
     #[test]
     fn codex_0_164_folder_trust_prompt_is_blocked() {
@@ -1577,14 +1461,12 @@ mod tests {
         assert_ne!(screen_status(&s), AgentStatus::Blocked);
     }
 
-    // ===== the position rule (REV 4b): the BOTTOM-most cursor line decides.
+    // The position rule: the BOTTOM-most cursor line decides.
 
     #[test]
     fn a_stale_answered_list_above_a_live_prompt_is_still_ready() {
-        // `lines` is built bottom-up, so this is the case that fails if the scan direction
-        // is inverted: the top-most cursor line is a numbered selection, the bottom-most is
-        // the live prompt. Under the old `any()` this passed by luck; it must now pass by
-        // construction.
+        // `lines` is built bottom-up: this fails if the scan direction is inverted (the top-most
+        // cursor line is a numbered selection, the bottom-most is the live prompt).
         let s = snap_from(&["❯ 2. No", "  (answered)", "❯ "]);
         assert_eq!(screen_status(&s), AgentStatus::Ready);
     }
@@ -1767,7 +1649,6 @@ mod tests {
             resume_argv("claude", &argv(&["claude"]), ID),
             argv(&["claude", "--resume", ID])
         );
-        // A full path basename still classifies as claude via the caller; here comm is passed.
         assert_eq!(
             resume_argv(
                 "claude",
@@ -1840,12 +1721,10 @@ mod tests {
             resume_argv("claude", &argv(&["claude"]), "bogus"),
             argv(&["claude"])
         );
-        // Unknown agent → untouched.
         assert_eq!(
             resume_argv("vim", &argv(&["vim", "file"]), ID),
             argv(&["vim", "file"])
         );
-        // Empty argv → untouched.
         assert!(resume_argv("claude", &[], ID).is_empty());
     }
 

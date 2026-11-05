@@ -1,29 +1,17 @@
-//! Background poller for the status-bar usage/limits readout.
-//!
-//! Resolves the subscription rate-limit windows in-process via the shared
-//! `copad_usage::limits` crate — Claude 5h + weekly (a live OAuth call) and
-//! Codex weekly (newest rollout snapshot) — into a [`UsageSnapshot`], and shares
-//! it with the render loop. Numbers (not a pre-formatted string) so the status
-//! bar can render either text or a progress bar per config + width. Calling it
-//! does network + disk I/O, so it runs on a dedicated thread, never the render
-//! loop. Reading the limits in-process (not by shelling out to `coctl`) is what
-//! lets comux install standalone. `COPAD_MUX_USAGE=0` disables it.
+//! Background poller for the status-bar usage/limits readout. Resolves rate-limit windows
+//! in-process via `copad_usage::limits` (network + disk I/O, so on a dedicated thread, never
+//! the render loop) into numbers, so the bar can render text or a gauge. `COPAD_MUX_USAGE=0`
+//! disables it.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
-/// How often to re-poll. The 5h / weekly windows move slowly and each poll is a
-/// process spawn + network round-trip, so a minute is plenty.
 const POLL: Duration = Duration::from_secs(60);
 
 const BAR_FILLED: char = '━';
 const BAR_EMPTY: char = '╌';
 
-/// Which rate-limit windows the status bar is allowed to show (config
-/// `usage_windows`). A window is rendered only if it is BOTH available in the
-/// snapshot AND enabled here — so a user can hide, e.g., Claude's 5h window and
-/// keep only the weekly ones. Default = all on (the historical readout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageWindows {
     pub claude_5h: bool,
@@ -38,7 +26,6 @@ impl Default for UsageWindows {
 }
 
 impl UsageWindows {
-    /// Every window enabled (the zero-config readout: Claude 5h + weekly, Codex weekly).
     pub fn all() -> Self {
         UsageWindows {
             claude_5h: true,
@@ -47,7 +34,6 @@ impl UsageWindows {
         }
     }
 
-    /// No window enabled (starting point when a config list is given).
     pub fn none() -> Self {
         UsageWindows {
             claude_5h: false,
@@ -57,8 +43,6 @@ impl UsageWindows {
     }
 }
 
-/// Parsed rate-limit percentages. `None` window = unavailable (omitted); `stale`
-/// = the provider was served from the on-disk cache (rendered with a `~`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UsageSnapshot {
     pub claude_5h: Option<f64>,
@@ -66,8 +50,6 @@ pub struct UsageSnapshot {
     pub claude_stale: bool,
     pub codex_wk: Option<f64>,
     pub codex_stale: bool,
-    /// UNIX epoch SECONDS at which each window resets (for the carousel's
-    /// countdown/clock). `None` = the backend didn't report it → no reset shown.
     pub claude_5h_reset: Option<i64>,
     pub claude_wk_reset: Option<i64>,
     pub codex_wk_reset: Option<i64>,
@@ -78,16 +60,12 @@ impl UsageSnapshot {
         self.claude_5h.is_none() && self.claude_wk.is_none() && self.codex_wk.is_none()
     }
 
-    /// Whether any window would render given the config selection `sel` — a window
-    /// shows only when it is both available AND enabled. The status bar uses this
-    /// (rather than [`Self::is_empty`]) so hiding every enabled window hides the readout.
     pub fn has_visible(&self, sel: UsageWindows) -> bool {
         (self.claude_5h.is_some() && sel.claude_5h)
             || (self.claude_wk.is_some() && sel.claude_wk)
             || (self.codex_wk.is_some() && sel.codex_wk)
     }
 
-    /// Percentages: `claude 5h 5% wk 34% · codex wk 60%` (stale provider `~`-prefixed).
     pub fn text(&self) -> String {
         self.parts(None, UsageWindows::all())
             .iter()
@@ -95,7 +73,6 @@ impl UsageSnapshot {
             .collect()
     }
 
-    /// A progress bar per window: `claude 5h ━━╌╌╌╌╌╌ 5% wk ━━━╌╌╌╌╌ 34% · codex wk …`.
     pub fn bar(&self, width: u16) -> String {
         self.parts(Some(width), UsageWindows::all())
             .iter()
@@ -103,23 +80,15 @@ impl UsageSnapshot {
             .collect()
     }
 
-    /// The readout broken into render parts so the status bar can color each
-    /// window by its utilization (threshold coloring) while leaving labels and
-    /// separators neutral. `bar_width = None` = text; `Some(w)` = a `w`-cell bar
-    /// before each percent. Only windows enabled in `sel` are emitted, and a
-    /// provider label is dropped when none of its windows survive. The concatenation
-    /// equals [`Self::text`]/[`Self::bar`] when `sel` is [`UsageWindows::all`].
     pub fn parts(&self, bar_width: Option<u16>, sel: UsageWindows) -> Vec<UsagePart> {
         let cell = |pct: f64| match bar_width {
             Some(w) => format!("{} ", bar_glyphs(pct, w)),
             None => String::new(),
         };
-        // A window = neutral " <label> " + a gauge (`bar %`) colored by threshold.
         let window = |out: &mut Vec<UsagePart>, label: &str, pct: f64| {
             out.push(UsagePart::Neutral(format!(" {label} ")));
             out.push(UsagePart::window(format!("{}{pct:.0}%", cell(pct)), pct));
         };
-        // A window renders only when both available and enabled in `sel`.
         let claude_5h = self.claude_5h.filter(|_| sel.claude_5h);
         let claude_wk = self.claude_wk.filter(|_| sel.claude_wk);
         let codex_wk = self.codex_wk.filter(|_| sel.codex_wk);
@@ -153,11 +122,6 @@ impl UsageSnapshot {
         out
     }
 
-    /// Break the visible windows into carousel pages per `unit`, in the same order
-    /// as the inline readout (claude 5h, claude wk, codex wk). Empty when nothing
-    /// is visible — the caller then hides the readout. A page groups one window
-    /// (`Window`) or all of a provider's windows (`Provider`); each entry carries
-    /// its reset so the tui layer can render a countdown/clock beside the gauge.
     pub fn pages(
         &self,
         sel: UsageWindows,
@@ -200,7 +164,6 @@ impl UsageSnapshot {
                     entries: vec![e],
                 })
                 .collect(),
-            // Coalesce consecutive same-provider entries onto one page (order-preserving).
             PageUnit::Provider => {
                 let mut pages: Vec<UsagePage> = Vec::new();
                 for e in entries {
@@ -216,10 +179,6 @@ impl UsageSnapshot {
                 }
                 pages
             }
-            // Split by metric: page 1 = every window's utilization, page 2 = every
-            // window's reset. The reset page is omitted when no window reports a reset
-            // OR resets are turned off (`usage_reset = off`) — else it'd be a blank
-            // second page with a misleading `2/2`.
             PageUnit::Metric => {
                 if entries.is_empty() {
                     return Vec::new();
@@ -240,10 +199,6 @@ impl UsageSnapshot {
     }
 }
 
-/// Carousel page granularity (config `usage_page_unit`). `Window` = one rate-limit
-/// window per page (most room for a reset countdown); `Provider` = all of a
-/// provider's windows on a single page; `Metric` = split by METRIC — page 1 is
-/// every window's utilization, page 2 every window's reset time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageUnit {
     #[default]
@@ -252,9 +207,6 @@ pub enum PageUnit {
     Metric,
 }
 
-/// What a carousel page shows for each of its entries. `Full` = gauge + reset
-/// together (Window/Provider units); `Usage`/`Reset` are the two halves of the
-/// `Metric` unit (utilization-only / reset-only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageKind {
     Full,
@@ -265,16 +217,13 @@ pub enum PageKind {
 /// How a window's reset time is shown in the carousel (config `usage_reset`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResetStyle {
-    /// Countdown to reset, e.g. `⟳2h13m`.
     #[default]
     Relative,
-    /// Local wall-clock of the reset instant, e.g. `⟳14:32` / `⟳Wed 09:00`.
     Absolute,
     /// Hide the reset.
     Off,
 }
 
-/// One window on a carousel page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageEntry {
     pub provider: &'static str, // "claude" | "codex"
@@ -302,37 +251,23 @@ impl UsageEntry {
     }
 }
 
-/// One carousel page: its render `kind` plus the window entries it covers (one for
-/// `Window`, a provider's windows for `Provider`, every window for a `Metric` half).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsagePage {
     pub kind: PageKind,
     pub entries: Vec<UsageEntry>,
 }
 
-/// Render ONE carousel page into colored chunks — threshold-colored gauges,
-/// neutral provider/window labels and reset text — so the tui layer can pad the
-/// result to the widest page and append the `n/N` indicator. `now` is Unix
-/// seconds from the caller's clock; the countdown refreshes as the render loop
-/// repaints on each `HH:MM` rollover.
 pub fn page_parts(
     page: &UsagePage,
     bar_width: Option<u16>,
     now: i64,
     reset_style: ResetStyle,
 ) -> Vec<UsagePart> {
-    // What each entry contributes: `Full` = gauge + reset; the `Metric` halves show
-    // one or the other. Entries are grouped by provider inline (a ` · ` separator +
-    // one heading per provider), so this covers a single-provider page (Window/
-    // Provider units → one group, no separator) and a cross-provider metric page alike.
     let (show_gauge, show_reset) = match page.kind {
         PageKind::Full => (true, true),
         PageKind::Usage => (true, false),
         PageKind::Reset => (false, true),
     };
-    // On a reset-ONLY page a window with no resolvable reset carries no value, so
-    // drop it (and any provider heading that would be left dangling) rather than
-    // print a bare `5h ` label. Full/Usage pages always have a gauge, so keep all.
     let entries: Vec<&UsageEntry> = if page.kind == PageKind::Reset {
         page.entries
             .iter()
@@ -371,11 +306,8 @@ pub fn page_parts(
             && let Some(r) = e.reset
             && let Some(s) = format_reset(r, now, reset_style)
         {
-            // A leading space only when a gauge precedes it (`… 4% ⟳ 5d19h`); on a
-            // reset-only page the window label already carries the trailing space.
-            // The space AFTER `⟳` is load-bearing: `⟳` (U+27F3) is ambiguous-width
-            // and some fonts draw it wider than its one cell, so butting a digit
-            // against it overlaps — same reason the `●`/`⬆`/`⚑` chips are spaced.
+            // The space after `⟳` is load-bearing: U+27F3 is ambiguous-width and some fonts draw it
+            // wider than one cell, so a digit butted against it overlaps.
             let sep = if show_gauge { " " } else { "" };
             out.push(UsagePart::Neutral(format!("{sep}⟳ {s}")));
         }
@@ -383,9 +315,6 @@ pub fn page_parts(
     out
 }
 
-/// Human reset text per `usage_reset`. `None` = hidden (`Off`). Pure for
-/// `Relative`; `Absolute` reads the local zone via libc (same path as the
-/// status-bar clock — no chrono dep).
 pub fn format_reset(reset_epoch: i64, now: i64, style: ResetStyle) -> Option<String> {
     match style {
         ResetStyle::Off => None,
@@ -394,9 +323,8 @@ pub fn format_reset(reset_epoch: i64, now: i64, style: ResetStyle) -> Option<Str
     }
 }
 
-/// `delta` seconds until reset → `2h13m` / `3d04h` / `05m` / `<1m` / `now`.
-/// Minutes/hours are zero-padded so a page's width doesn't jitter as the
-/// countdown ticks (the tui layer additionally pads to the widest page).
+/// `delta` seconds until reset → `2h13m` / `3d04h` / `05m` / `<1m` / `now`. Minutes and hours are
+/// zero-padded so a page's width does not jitter as the countdown ticks.
 fn fmt_relative(delta: i64) -> String {
     if delta <= 0 {
         return "now".to_string();
@@ -415,18 +343,14 @@ fn fmt_relative(delta: i64) -> String {
     }
 }
 
-/// Local wall-clock of the reset instant: `14:32` within a day, else `Wed 09:00`.
-/// libc `localtime_r`, mirroring the status-bar clock (no chrono dep).
 fn fmt_absolute(reset_epoch: i64, now: i64) -> String {
     let t = reset_epoch as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `t` is a valid time_t; `tm` is a zeroed, correctly-sized out-param.
     let r = unsafe { libc::localtime_r(&t as *const libc::time_t, &mut tm) };
     if r.is_null() {
         return "--:--".to_string();
     }
     let hm = format!("{:02}:{:02}", tm.tm_hour, tm.tm_min);
-    // Within the next day → just the clock; further out → prefix the weekday.
     if reset_epoch - now < 24 * 3600 {
         hm
     } else {
@@ -439,8 +363,6 @@ fn fmt_absolute(reset_epoch: i64, now: i64) -> String {
     }
 }
 
-/// One piece of the rendered readout. `Window` chunks carry their utilization so
-/// the caller can color them by threshold; `Neutral` is labels/separators.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UsagePart {
     Window { text: String, pct: f64 },
@@ -460,7 +382,6 @@ impl UsagePart {
     }
 }
 
-/// `filled`/`empty` glyphs proportional to `pct` (0–100) over `width` cells.
 pub(crate) fn bar_glyphs(pct: f64, width: u16) -> String {
     let w = width as usize;
     let filled = ((pct / 100.0) * width as f64)
@@ -472,9 +393,6 @@ pub(crate) fn bar_glyphs(pct: f64, width: u16) -> String {
     s
 }
 
-/// Display width of the bar rendering (only the windows enabled in `sel`) — used by
-/// the status bar to decide whether the terminal is wide enough for bars before
-/// falling back to text.
 pub fn bar_display_width(u: &UsageSnapshot, width: u16, sel: UsageWindows) -> usize {
     u.parts(Some(width), sel)
         .iter()
@@ -482,18 +400,12 @@ pub fn bar_display_width(u: &UsageSnapshot, width: u16, sel: UsageWindows) -> us
         .sum()
 }
 
-/// Latest snapshot shared with the render loop. `None` = nothing fetched yet /
-/// disabled; `Some(empty)` = fetched but nothing to show.
 pub type Shared = Arc<Mutex<Option<UsageSnapshot>>>;
 
-/// An empty handle with no poller behind it (default before `spawn`, and in
-/// tests that construct an `App` without a server).
 pub fn idle() -> Shared {
     Arc::new(Mutex::new(None))
 }
 
-/// Spawn the detached poller thread and return the handle the status bar reads.
-/// `COPAD_MUX_USAGE=0` returns an idle handle that stays empty forever.
 pub fn spawn() -> Shared {
     let shared = idle();
     if std::env::var("COPAD_MUX_USAGE").is_ok_and(|v| v == "0") {
@@ -515,15 +427,11 @@ pub fn spawn() -> Shared {
     shared
 }
 
-/// Resolve both providers' rate-limit windows in-process. `None` = `HOME` is
-/// unset (can't locate credentials/rollouts) → keep the previous snapshot;
-/// `Some(snapshot)` (possibly empty) = a fresh reading. The shared crate never
-/// fails the call itself — an unavailable provider is simply an empty window
-/// (backfilled from the short-lived cache and flagged stale where possible).
+/// Resolve both providers' rate-limit windows in-process. `None` = `HOME` is unset, so keep the
+/// previous snapshot; `Some` (possibly empty) = a fresh reading.
 fn fetch() -> Option<UsageSnapshot> {
     let home = std::env::var("HOME").ok()?;
-    // Diagnostics (why a provider is missing) are for `coctl`'s stderr; the
-    // status bar only shows values, so ignore them here.
+    // Diagnostics are for `coctl`'s stderr; the status bar only shows values.
     let (limits, stale, _diags) = copad_usage::limits::resolve(&home, true, true);
     let mut snap = UsageSnapshot::default();
     if let Some(c) = &limits.claude {
@@ -564,8 +472,6 @@ mod tests {
     #[test]
     fn parts_carry_pct_and_concat_to_text() {
         let parts = full().parts(None, UsageWindows::all());
-        // Each gauge chunk carries its utilization (for threshold coloring); the
-        // order is claude 5h, claude wk, codex wk.
         let pcts: Vec<f64> = parts
             .iter()
             .filter_map(|p| match p {
@@ -574,7 +480,6 @@ mod tests {
             })
             .collect();
         assert_eq!(pcts, vec![5.0, 34.0, 60.0]);
-        // Concatenation is byte-identical to the flat text form.
         let concat: String = parts.iter().map(UsagePart::text).collect();
         assert_eq!(concat, full().text());
     }
@@ -582,7 +487,6 @@ mod tests {
     #[test]
     fn window_selection_filters_and_drops_empty_labels() {
         let u = full();
-        // Claude weekly only + Codex weekly → 5h is dropped, claude label stays.
         let sel = UsageWindows {
             claude_5h: false,
             claude_wk: true,
@@ -592,7 +496,6 @@ mod tests {
         assert_eq!(s, "claude wk 34% · codex wk 60%");
         assert!(u.has_visible(sel));
 
-        // Disabling every Claude window drops the whole `claude` label (no orphan).
         let codex_only = UsageWindows {
             claude_5h: false,
             claude_wk: false,
@@ -605,11 +508,9 @@ mod tests {
             .collect();
         assert_eq!(s, "codex wk 60%");
 
-        // Nothing enabled → nothing rendered, and `has_visible` is false so the bar hides.
         assert!(u.parts(None, UsageWindows::none()).is_empty());
         assert!(!u.has_visible(UsageWindows::none()));
 
-        // An enabled-but-unavailable window doesn't make it visible.
         let missing = UsageSnapshot::default();
         assert!(!missing.has_visible(UsageWindows::all()));
     }
@@ -626,7 +527,6 @@ mod tests {
         assert_eq!(bar_glyphs(0.0, 8), "╌╌╌╌╌╌╌╌");
         assert_eq!(bar_glyphs(100.0, 8), "━━━━━━━━");
         assert_eq!(bar_glyphs(50.0, 8), "━━━━╌╌╌╌");
-        // rounds to nearest cell; clamps out-of-range
         assert_eq!(bar_glyphs(12.5, 8), "━╌╌╌╌╌╌╌");
         assert_eq!(bar_glyphs(150.0, 4), "━━━━");
     }
@@ -634,13 +534,10 @@ mod tests {
     #[test]
     fn bar_render_has_a_bar_per_window() {
         let s = full().bar(8);
-        // 5% of 8 rounds to 0 filled cells; the "5%" label carries the value.
         assert!(s.contains("5h ╌╌╌╌╌╌╌╌ 5%"), "got: {s}");
         assert!(s.contains("wk ━━━╌╌╌╌╌ 34%"), "got: {s}"); // 34% → 3/8
         assert!(s.contains("codex wk ━━━━━╌╌╌ 60%"), "got: {s}"); // 60% → 5/8
     }
-
-    // ── carousel (paged) rendering ─────────────────────────────────────────
 
     #[test]
     fn fmt_relative_buckets() {
@@ -657,7 +554,6 @@ mod tests {
     #[test]
     fn format_reset_off_hides_relative_counts() {
         assert_eq!(format_reset(1000, 0, ResetStyle::Off), None);
-        // 1000s = 16m40s → 16m.
         assert_eq!(
             format_reset(1000, 0, ResetStyle::Relative),
             Some("16m".to_string())
@@ -707,7 +603,6 @@ mod tests {
         let pages = full().pages(sel, PageUnit::Window, ResetStyle::Relative);
         assert_eq!(pages.len(), 2); // 5h dropped
         assert_eq!(pages[0].entries[0].window, "wk");
-        // Nothing enabled → no pages (caller hides the readout).
         assert!(
             full()
                 .pages(UsageWindows::none(), PageUnit::Window, ResetStyle::Relative)
@@ -759,7 +654,6 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].kind, PageKind::Usage);
         assert_eq!(pages[1].kind, PageKind::Reset);
-        // Both halves cover every visible window.
         assert_eq!(pages[0].entries.len(), 3);
         assert_eq!(pages[1].entries.len(), 3);
     }

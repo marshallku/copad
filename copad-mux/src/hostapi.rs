@@ -2,9 +2,7 @@
 //! publication, and the chrome claims that let a host UI draw the sidebar / status bar
 //! instead of the TUI.
 //!
-//! Wire types and the client half live in `copad-mux-proto`; this module owns the delivery
-//! contract the codex rounds pinned down:
-//!
+//! Wire types and the client half live in `copad-mux-proto`; the delivery contract:
 //! * **Never block the single-writer loop.** Each subscriber has an [`Outbox`] drained by its
 //!   own writer thread. The loop only ever appends.
 //! * **Reliable messages are delivered or the connection dies.** Welcome, snapshot, replies,
@@ -32,13 +30,11 @@ const RELIABLE_CAP: usize = 8 << 20;
 /// A single topic value larger than this is published as `unavailable` instead.
 pub const TOPIC_CAP: usize = 1 << 20;
 
-/// Reliable lines per writer pass before the slots get their turn.
 const RELIABLE_BATCH: usize = 16;
 
 /// How long one line may take to write before the subscriber is declared stalled.
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Minimum spacing between two publication passes.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What a subscriber's writer thread sends: reliable lines first in bounded batches, then
@@ -79,7 +75,6 @@ impl Outbox {
         true
     }
 
-    /// Replace `topic`'s pending value.
     pub fn slot(&self, topic: &'static str, line: String) {
         if let Ok(mut g) = self.inner.lock()
             && !g.dead
@@ -89,7 +84,6 @@ impl Outbox {
         }
     }
 
-    /// Stop the writer (it exits once it wakes).
     pub fn kill(&self) {
         if let Ok(mut g) = self.inner.lock() {
             g.dead = true;
@@ -149,7 +143,6 @@ fn line(msg: &PubMsg) -> String {
     serde_json::to_string(msg).unwrap_or_else(|_| "{\"t\":\"error\"}".into())
 }
 
-/// One live subscriber.
 pub struct Sub {
     pub id: u64,
     pub outbox: Arc<Outbox>,
@@ -157,7 +150,6 @@ pub struct Sub {
     pub last_seen: Instant,
 }
 
-/// A render attachment as the host API needs to see it.
 pub struct AttachView {
     pub id: u64,
     pub tag: Option<String>,
@@ -165,17 +157,14 @@ pub struct AttachView {
     pub rows: u16,
 }
 
-/// Every topic's freshly computed value, serialized.
 pub struct TopicValues(pub Vec<(&'static str, String)>);
 
-/// The host API's state on the main loop.
 #[derive(Default)]
 pub struct Hub {
     pub subs: Vec<Sub>,
     /// attachment id → (owning subscriber, claimed features). One owner per attachment.
     claims: HashMap<u64, (u64, BTreeSet<Feature>)>,
     rev: u64,
-    /// Last published (serialized data, rev) per topic.
     last: BTreeMap<&'static str, (String, u64)>,
     last_pub: Option<Instant>,
     /// Delegated overlays (decisions #170): overlay id → (the subscriber showing it, the
@@ -186,7 +175,6 @@ pub struct Hub {
     notif_seen: Option<u64>,
 }
 
-/// A reason a claim was refused, sent back as a protocol `error`.
 pub type Refusal = (&'static str, String);
 
 impl Hub {
@@ -194,7 +182,6 @@ impl Hub {
         self.subs.is_empty()
     }
 
-    /// Whether a publication pass is due.
     pub fn due(&self) -> bool {
         !self.subs.is_empty()
             && self
@@ -284,8 +271,6 @@ impl Hub {
         changed
     }
 
-    /// One publication pass: changed topics into every subscriber's slots, then events.
-    /// Returns the ids of subscribers that blew their budget (caller disconnects them).
     pub fn publish(
         &mut self,
         values: TopicValues,
@@ -330,7 +315,6 @@ impl Hub {
         over
     }
 
-    /// Queue a reliable message to one subscriber. `false` = it must be disconnected.
     pub fn send(&self, sub: u64, msg: &PubMsg) -> bool {
         self.subs
             .iter()
@@ -338,14 +322,12 @@ impl Hub {
             .is_none_or(|s| s.outbox.push(line(msg)))
     }
 
-    /// Note activity from `sub` (any line keeps its claims alive).
     pub fn touch(&mut self, sub: u64) {
         if let Some(s) = self.subs.iter_mut().find(|s| s.id == sub) {
             s.last_seen = Instant::now();
         }
     }
 
-    /// Hand overlay `ov` to subscriber `sub`. `false` = it must be disconnected.
     pub fn send_overlay(&mut self, sub: u64, ov: u64, client: u64, spec: l0::OverlaySpec) -> bool {
         self.overlays.insert(ov, (sub, client));
         self.send(
@@ -362,8 +344,7 @@ impl Hub {
     /// overlays (so its answer may run).
     ///
     /// `attached` is the CURRENT client list: a detach handled earlier in the same input batch
-    /// has not been folded into the claims yet, so the attachment's presence is checked here
-    /// directly (codex P3 r2 C2).
+    /// has not been folded into the claims yet, so the attachment's presence is checked here.
     ///
     /// `None` = not `sub`'s overlay (nothing changes — another host's overlay stays theirs);
     /// `Some(true)` = its answer may run; `Some(false)` = it was `sub`'s but ownership ended,
@@ -385,14 +366,13 @@ impl Hub {
         }
     }
 
-    /// Who shows overlay `ov`: `(subscriber, attachment)`.
     pub fn overlay_owner(&self, ov: u64) -> Option<(u64, u64)> {
         self.overlays.get(&ov).copied()
     }
 
     /// Overlays whose host no longer owns their attachment's overlays (released, expired,
     /// detached): cancelled server-side and told to the host as `overlay-closed`, so an old
-    /// answer — a destructive confirm — can never run after ownership ended (codex P3 C2).
+    /// answer (a destructive confirm) can never run after ownership ended.
     pub fn prune_overlays(&mut self) -> Vec<u64> {
         let dead: Vec<(u64, u64)> = self
             .overlays
@@ -407,7 +387,6 @@ impl Hub {
         dead.into_iter().map(|(ov, _)| ov).collect()
     }
 
-    /// The overlays a departing subscriber was showing.
     pub fn take_overlays_of(&mut self, sub: u64) -> Vec<u64> {
         let ids: Vec<u64> = self
             .overlays
@@ -421,7 +400,6 @@ impl Hub {
         ids
     }
 
-    /// Drop a subscriber and every claim it held. Returns whether claims changed.
     pub fn remove(&mut self, sub: u64) -> bool {
         if let Some(pos) = self.subs.iter().position(|s| s.id == sub) {
             let s = self.subs.remove(pos);
@@ -433,7 +411,6 @@ impl Hub {
         before != self.claims.len()
     }
 
-    /// Claim `attachment` for `features` on behalf of `sub`.
     pub fn claim(
         &mut self,
         sub: u64,
@@ -470,7 +447,6 @@ impl Hub {
         Ok(())
     }
 
-    /// Release `attachment` if `sub` owns it. Returns whether claims changed.
     pub fn release(&mut self, sub: u64, attachment: u64) -> bool {
         if self.claims.get(&attachment).is_some_and(|(o, _)| *o == sub) {
             self.claims.remove(&attachment);
@@ -486,7 +462,6 @@ impl Hub {
             .retain(|id, _| attached.iter().any(|a| a.id == *id));
     }
 
-    /// Drop the claims of owners silent for longer than the expiry. Returns whether any went.
     pub fn expire(&mut self) -> bool {
         let limit = Duration::from_secs(l0::CLAIM_EXPIRY_SECS);
         let silent: BTreeSet<u64> = self
@@ -516,7 +491,6 @@ impl Hub {
             .collect()
     }
 
-    /// The subscriber that claims `attachment` for `feature`, if any.
     pub fn host_of(&self, attachment: u64, feature: Feature) -> Option<u64> {
         self.claims
             .get(&attachment)
@@ -524,7 +498,6 @@ impl Hub {
             .map(|(o, _)| *o)
     }
 
-    /// The `clients` topic value.
     pub fn clients_topic(&self, attached: &[AttachView]) -> l0::Clients {
         l0::Clients {
             clients: attached
@@ -546,12 +519,10 @@ impl Hub {
     }
 }
 
-/// Serialize a topic value; the publication compares these strings.
 pub fn ser<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".into())
 }
 
-/// Spawn the writer for a new subscriber; `tx_gone` is called once when it ends.
 pub fn spawn_writer(outbox: Arc<Outbox>, stream: UnixStream, tx_gone: impl Fn() + Send + 'static) {
     std::thread::spawn(move || writer_loop(outbox, stream, tx_gone));
 }
@@ -605,7 +576,6 @@ mod tests {
         o.slot("tree", "t1".into());
         o.slot("tree", "t2".into());
         let b = o.next_batch().unwrap();
-        // A bounded reliable batch, then the slots — the topic is not starved by 40 replies.
         assert_eq!(b.len(), RELIABLE_BATCH + 1);
         assert_eq!(b.last().unwrap(), "t2");
         assert_eq!(o.next_batch().unwrap().len(), RELIABLE_BATCH);
@@ -638,7 +608,7 @@ mod tests {
         let (s, _peer) = sub_pair(1);
         let ob = s.outbox.clone();
         hub.add(s, vals("{\"a\":1}"), "9");
-        let _ = ob.next_batch(); // welcome + snapshot
+        let _ = ob.next_batch();
         let n = l0::Notifications::default();
         hub.publish(vals("{\"a\":1}"), vec![], &n);
         assert!(
@@ -715,7 +685,6 @@ mod tests {
             ob.inner.lock().unwrap().reliable.is_empty(),
             "backlog is not toasted"
         );
-        // And from an EMPTY log, the very first notification is announced.
         let mut fresh = Hub::default();
         let (s2, _p2) = sub_pair(2);
         let ob2 = s2.outbox.clone();
@@ -819,7 +788,6 @@ mod tests {
             None,
             "already pruned: not anyone's"
         );
-        // Claimed, but the attachment detached in this very batch: refused too.
         hub.claim(1, 4, inc, vec![Feature::Overlays], &one).unwrap();
         assert!(hub.send_overlay(
             1,
@@ -865,8 +833,8 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         let o = Outbox::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        // Our write half is closed: the first write fails deterministically (a dropped PEER
-        // can let the first write land in the kernel buffer on macOS, which flaked this).
+        // A dropped PEER can let the first write land in the kernel buffer on macOS (flaked);
+        // closing our write half makes it fail deterministically.
         a.shutdown(std::net::Shutdown::Write).unwrap();
         drop(b);
         o.push("hello".into());

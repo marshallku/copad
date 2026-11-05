@@ -1,6 +1,4 @@
-//! Declarative workspaces (decisions #162): a TOML file describing a session — its tabs, how
-//! each tab's panes are arranged, and what to type into each — that `comux apply-layout`
-//! builds in one go. zellij's layouts and tmuxinator/tmuxp's project files, in comux's terms.
+//! Declarative workspace file for `comux apply-layout` (decisions #162).
 //!
 //! ```toml
 //! name = "api"                 # the session (default: the file's name)
@@ -22,10 +20,8 @@
 //! run = "claude"
 //! ```
 //!
-//! Every pane is a shell; `run` lines are TYPED into it, as tmuxinator does — so aliases and
-//! your rc files apply, the shell's history has them, and what they print stays when they
-//! end. This module only parses and validates: it produces a [`Plan`], and the CLI executes
-//! it with the same requests a script would send.
+//! Every pane is a shell and `run` lines are typed into it, so aliases and rc files apply.
+//! This module only parses and validates; the CLI executes the resulting [`Plan`].
 
 use std::path::{Path, PathBuf};
 
@@ -33,12 +29,9 @@ use serde::Deserialize;
 
 use crate::model::LayoutPreset;
 
-/// The most tabs one file may ask for.
 pub const MAX_TABS: usize = 32;
-/// The most panes one tab may ask for.
 pub const MAX_PANES: usize = 16;
 
-/// A validated layout, every path absolute.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub session: String,
@@ -52,14 +45,12 @@ pub struct PlanTab {
     pub cwd: PathBuf,
     /// `None` for a one-pane tab: there is nothing to arrange.
     pub layout: Option<LayoutPreset>,
-    /// At least one.
     pub panes: Vec<PlanPane>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanPane {
     pub cwd: PathBuf,
-    /// Lines to type, each followed by Enter, in order.
     pub run: Vec<String>,
 }
 
@@ -96,7 +87,6 @@ enum Run {
     Many(Vec<String>),
 }
 
-/// Read and validate `path`.
 pub fn load(path: &Path) -> Result<Plan, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let base = path
@@ -112,8 +102,6 @@ pub fn load(path: &Path) -> Result<Plan, String> {
     parse(&text, &base, &stem).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Validate a layout's `text`; relative paths are taken from `base`, and `stem` names the
-/// session when the file does not.
 pub fn parse(text: &str, base: &Path, stem: &str) -> Result<Plan, String> {
     let raw: RawFile = toml::from_str(text).map_err(|e| e.to_string())?;
     let session = raw
@@ -194,8 +182,6 @@ pub fn parse(text: &str, base: &Path, stem: &str) -> Result<Plan, String> {
     Ok(Plan { session, cwd, tabs })
 }
 
-/// `p` against `base`: `~` is the home directory, a relative path joins `base`, absent is
-/// `base` itself.
 fn resolve(base: &Path, p: Option<&str>) -> PathBuf {
     let Some(p) = p.map(str::trim).filter(|p| !p.is_empty()) else {
         return base.to_path_buf();
@@ -230,7 +216,6 @@ impl Plan {
         out
     }
 
-    /// What applying the plan will build, one line per tab and pane, for `--dry-run`.
     pub fn describe(&self) -> String {
         let mut out = format!("session {} in {}\n", self.session, self.cwd.display());
         for (ti, t) in self.tabs.iter().enumerate() {
@@ -318,7 +303,6 @@ mod tests {
         assert_eq!(p.cwd, PathBuf::from("/proj"));
         assert_eq!(p.tabs.len(), 1);
         assert_eq!(p.tabs[0].panes.len(), 1);
-        // Two panes with no layout given are tiled.
         let p = plan("[[tab]]\n[[tab.pane]]\n[[tab.pane]]\n").unwrap();
         assert_eq!(p.tabs[0].layout, Some(LayoutPreset::Tiled));
     }

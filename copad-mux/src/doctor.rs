@@ -1,18 +1,10 @@
 //! `comux doctor` — diagnose copad configuration problems.
 //!
-//! Surfaces WHERE and WHAT is wrong across the config surface so a broken setup
-//! is a one-command find instead of a mystery. Runs entirely locally — it never
-//! contacts the server for the config checks (only a cheap connect probe reports
-//! whether one is running), so it works on a cold machine.
+//! Runs locally: only a cheap connect probe reports whether a server is running.
 //!
-//! The headline check is the cross-platform float lint: copad's config schema
-//! has a handful of float fields (`[background] tint`/`opacity`, `[window]
-//! opacity`). Linux/serde silently coerces an integer literal (`tint = 0`) into
-//! a float, but the macOS app parses via TOMLKit, whose strict decoder REJECTS
-//! the integer and — before the parser was hardened — discarded the ENTIRE
-//! config, falling back to a non-Nerd default font so every glyph icon rendered
-//! as tofu. A config that worked on Linux broke only on macOS, with the error
-//! buried in a GUI-app stderr nobody reads. `doctor` names the exact line.
+//! The headline check is the cross-platform float lint. Linux/serde coerces an integer literal
+//! (`tint = 0`) into a float, but the macOS app parses via TOMLKit, whose strict decoder
+//! REJECTS it (in older builds discarding the whole config). `doctor` names the exact line.
 
 use std::path::Path;
 
@@ -20,9 +12,8 @@ use serde::Serialize;
 
 use crate::config::MuxConfig;
 
-/// Severity of a single diagnostic. `Note` is purely informational (never
-/// affects the exit code); `Warn` flags a tolerated-but-suspect condition;
-/// `Error` is something known to break a platform.
+/// `Note` is informational and never affects the exit code; `Warn` is tolerated but suspect;
+/// `Error` is known to break a platform.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Level {
@@ -33,8 +24,6 @@ enum Level {
 }
 
 impl Level {
-    /// The status glyph shown in human output. ASCII-safe fallbacks are not
-    /// needed — comux already assumes a UTF-8 terminal everywhere else.
     fn glyph(self) -> &'static str {
         match self {
             Level::Ok => "✓",
@@ -49,7 +38,6 @@ impl Level {
 struct Finding {
     level: Level,
     message: String,
-    /// A concrete fix, printed indented under the message when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
 }
@@ -69,40 +57,28 @@ impl Finding {
     }
 }
 
-/// One report section (a config file or a subsystem) with its findings.
 #[derive(Serialize)]
 struct Section {
     title: String,
-    /// The file/socket the section is about, shown next to the title. `None` for
-    /// sections that aren't tied to a single path.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     findings: Vec<Finding>,
 }
 
-/// The float fields in copad's `config.toml` schema. Mirrors the `f64` fields in
-/// `copad_core::config` — kept as a small explicit list rather than reflecting
-/// the schema because the whole point is to catch a value the *macOS* parser
-/// rejects, which the Rust schema itself would happily coerce and hide.
-/// Pane headroom below which `doctor` warns about the descriptor budget. Chosen so
-/// the warning arrives while the user can still act on it: a single busy session is
-/// a handful of panes, so fewer than this means the next few keypresses are the ones
-/// that will start failing.
+/// Pane headroom below which `doctor` warns about the descriptor budget, early enough that the
+/// user can still act on it.
 const LOW_FD_PANES: usize = 8;
 
+/// Mirrors the `f64` fields in `copad_core::config`. An explicit list, because the point is to
+/// catch a value the macOS parser rejects, which the Rust schema would coerce and hide.
 const FLOAT_FIELDS: &[(&str, &str)] = &[
     ("background", "tint"),
     ("background", "opacity"),
     ("window", "opacity"),
 ];
 
-/// `comux doctor [--json]` entry point. Exit code follows the `brew doctor`
-/// convention: 0 only when the config surface is completely clean, 1 when there
-/// is anything worth a look — an `Error` (broken on every platform right now) OR
-/// a `Warn` (e.g. an integer for a float field: tolerated by the current parser
-/// but a hazard on older/released builds and other platforms). `Note`-level
-/// findings are purely informational and never affect the exit code, so the
-/// command stays usable as a CI/pre-commit gate.
+/// `comux doctor [--json]` entry point. Exit code is 0 only when nothing is `Error` or
+/// `Warn`; `Note` findings never affect it, so the command works as a CI/pre-commit gate.
 pub fn run(args: &[String]) -> i32 {
     let json_out = args.iter().any(|a| a == "--json");
 
@@ -127,7 +103,6 @@ pub fn run(args: &[String]) -> i32 {
     i32::from(errors > 0 || warnings > 0)
 }
 
-/// Count `Error`/`Warn` findings across every section.
 fn tally(sections: &[Section]) -> (usize, usize) {
     let mut errors = 0;
     let mut warnings = 0;
@@ -143,8 +118,6 @@ fn tally(sections: &[Section]) -> (usize, usize) {
     (errors, warnings)
 }
 
-/// `config.toml` — copad's shared GUI config. Checks that it parses and lints
-/// the cross-platform float footgun; echoes the configured font for context.
 fn check_config_toml(path: &Path) -> Section {
     let mut findings = Vec::new();
 
@@ -180,8 +153,6 @@ fn check_config_toml(path: &Path) -> Section {
     section("config.toml", Some(path), findings)
 }
 
-/// Pure lint over a parsed `config.toml` — split out so it's unit-testable
-/// without touching the filesystem.
 fn lint_config_value(value: &toml::Value) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -190,13 +161,9 @@ fn lint_config_value(value: &toml::Value) -> Vec<Finding> {
             continue;
         };
         if let Some(n) = field.as_integer() {
-            // A Warn, not an Error: the current macOS parser coerces int→float,
-            // so this no longer breaks a copad built from this source, and failing
-            // the exit code on a config the current binary accepts would be wrong.
-            // It stays worth flagging because a macOS build from BEFORE the parser
-            // hardening (any released binary until the next release) still rejects
-            // an integer here and discards the whole config → non-Nerd fallback
-            // font → tofu glyphs. Writing the float is the portable, safe form.
+            // A Warn, not an Error: the current parser coerces int to float. It is still
+            // worth flagging because a macOS build from before the parser was hardened
+            // rejects an integer here and discards the whole config (non-Nerd font, tofu).
             findings.push(
                 Finding::new(
                     Level::Warn,
@@ -212,8 +179,7 @@ fn lint_config_value(value: &toml::Value) -> Vec<Finding> {
         }
     }
 
-    // Informational: surface the configured font so a "my icons are broken"
-    // report can be eyeballed against what's actually installed.
+    // Surface the configured font so "my icons are broken" can be checked against it.
     if let Some(font) = value
         .get("terminal")
         .and_then(|t| t.get("font_family"))
@@ -228,13 +194,9 @@ fn lint_config_value(value: &toml::Value) -> Vec<Finding> {
     findings
 }
 
-/// `mux.toml` — comux's own config. Read + syntax errors are checked here first
-/// (as `Error`s, symmetric with `config.toml`) because `MuxConfig::load_from`
-/// flattens *everything* — an unreadable file, a TOML syntax error, and a merely
-/// suspect value — into one severity-less `Vec<String>`. Only once the file
-/// genuinely parses do we defer to `load_from` for the value-level warnings (bad
-/// bindings, out-of-range numbers, collisions) it already knows how to collect,
-/// keeping the definition of a "bad value" in one place.
+/// `mux.toml` — comux's own config. Read and syntax errors are checked here as `Error`s
+/// because `MuxConfig::load_from` flattens everything into a severity-less `Vec<String>`; only
+/// once the file parses do we defer to it for value-level warnings.
 fn check_mux_toml(path: &Path) -> Section {
     let mut findings = Vec::new();
 
@@ -261,7 +223,6 @@ fn check_mux_toml(path: &Path) -> Section {
         return section("mux.toml", Some(path), findings);
     }
 
-    // Parses as TOML; surface only the value-level warnings from load_from.
     let (_cfg, warnings) = MuxConfig::load_from(path);
     if warnings.is_empty() {
         findings.push(Finding::new(Level::Ok, "parses (no warnings)"));
@@ -273,11 +234,9 @@ fn check_mux_toml(path: &Path) -> Section {
     section("mux.toml", Some(path), findings)
 }
 
-/// Report whether a server is running, via a cheap connect probe on the control
-/// socket (the same signal `comux server status` uses), plus — when one IS running
-/// — its live label/sweep counters. Those counters are the only way to see, after
-/// the fact, that a process sweep failed: the visible symptom (tab names and the
-/// sidebar agents list blinking out together) is transient and leaves no trace.
+/// Report whether a server is running (connect probe on the control socket) plus, when one
+/// is, its label/sweep counters: the only trace of a failed process sweep, whose visible
+/// symptom (tab names and sidebar agents blinking out) is transient.
 fn check_server() -> Section {
     let sock = crate::control::socket_path();
     let running = std::os::unix::net::UnixStream::connect(&sock).is_ok();
@@ -288,9 +247,8 @@ fn check_server() -> Section {
     }
 
     let mut findings = vec![Finding::new(Level::Ok, "running")];
-    // A server that answers `list` but not `health` is an OLDER binary than this
-    // client — worth naming, since the counters silently reading zero would be
-    // indistinguishable from a healthy server.
+    // A server that answers `list` but not `health` is an OLDER binary than this client;
+    // name it, since zeroed counters would look like a healthy server.
     match crate::control::round_trip(&crate::control::Req::Health) {
         Ok(resp) => match resp.health {
             Some(h) => {
@@ -310,9 +268,8 @@ fn check_server() -> Section {
                          tab names/agent list may lag. Please report this with the count.",
                     )
                 });
-                // Descriptor headroom. Worth a WARN well before it hits zero: at zero
-                // the symptom is already "new tab / new session does nothing", and the
-                // only cure is a server restart, which costs the user their scrollback.
+                // Warn well before zero: at zero new tabs silently fail and the only cure is a
+                // server restart, which costs the user their scrollback.
                 if let (Some(soft), Some(open), Some(room)) =
                     (h.fd_soft, h.fd_open, h.panes_remaining())
                 {
@@ -393,8 +350,6 @@ fn print_human(sections: &[Section], errors: usize, warnings: usize) {
         for f in &s.findings {
             println!("    {} {}", f.level.glyph(), f.message);
             if let Some(hint) = &f.hint {
-                // Indent the hint under its finding; wrap-agnostic (the terminal
-                // soft-wraps) so we keep it one logical line.
                 println!("        → {hint}");
             }
         }
@@ -441,9 +396,7 @@ mod tests {
 
     #[test]
     fn integer_float_field_is_a_warning() {
-        // The exact bug: `tint = 0` (integer) where a float is expected. It's a
-        // Warn, not an Error — the current parser coerces it, but a pre-hardening
-        // build breaks, so it's flagged with the fix without failing the exit code.
+        // `tint = 0` (integer) where a float is expected is a Warn, not an Error.
         let v: toml::Value = "[background]\ntint = 0\nopacity = 0.5\n".parse().unwrap();
         let findings = lint_config_value(&v);
         assert_eq!(levels(&findings, Level::Warn), 1);
@@ -466,7 +419,6 @@ mod tests {
 
     #[test]
     fn every_float_field_is_linted() {
-        // An integer in each known float field yields one warning apiece.
         let v: toml::Value = "[background]\ntint = 1\nopacity = 1\n\n[window]\nopacity = 1\n"
             .parse()
             .unwrap();

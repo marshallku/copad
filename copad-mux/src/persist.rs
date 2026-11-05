@@ -1,21 +1,16 @@
 //! Session persistence: save the mux's session/tab/split-layout structure to disk and
-//! restore it when the server next starts, so a reboot or crash brings your workspace
-//! back (tmux-resurrect / continuum parity).
+//! restore it when the server next starts.
 //!
-//! Lifecycle (continuum-style, the reference the owner cited): a background thread
-//! autosaves periodically; on server start, if a snapshot exists and `persist` is on, it
-//! is restored. There is NO tombstone-on-teardown — the snapshot is the last-known layout
-//! and is always restored (delete the file, or set `persist = false`, for a fresh start).
-//! This keeps the design race-free (no delete competing with the writer).
+//! The snapshot is the last-known layout and is always restored when `persist` is on (delete
+//! the file, or set `persist = false`, for a fresh start). There is no tombstone on teardown,
+//! so no delete competes with the writer.
 //!
-//! What is saved: session names + active flags, tab names + active flags, each tab's BSP
-//! split tree (structure + ratios), and per-leaf working directory. NOT saved: running
-//! programs (shells restart fresh in their cwd), scrollback, focus-within-tab.
+//! Saved: session names + active flags, tab names + active flags, each tab's BSP split tree
+//! (structure + ratios), per-leaf working directory. Not saved: scrollback, focus-within-tab.
 //!
-//! Durability: the writer runs OFF the render loop (a dedicated thread fed a coalescing
-//! `SyncSender(1)`), writes a temp file, `fsync`s it, renames onto the target, then
-//! `fsync`s the parent directory — so a completed save survives power loss, and a crash
-//! mid-write leaves the previous good snapshot intact.
+//! The writer runs OFF the render loop (a dedicated thread fed a coalescing `SyncSender(1)`),
+//! writes a temp file, `fsync`s it, renames onto the target, then `fsync`s the parent directory:
+//! a completed save survives power loss and a crash mid-write leaves the previous snapshot.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,34 +21,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Dir;
 
-/// Bump when the on-disk schema changes incompatibly.
 pub const SCHEMA_VERSION: u32 = 1;
 
-// ---- validation bounds (untrusted file: never build unbounded state from it) ----
-/// Max split-tree depth restored from a snapshot (deeper subtrees are pruned).
+// Validation bounds: the file is untrusted, never build unbounded state from it.
 pub const MAX_DEPTH: usize = 8;
-/// Max leaves (panes) restored per tab.
 pub const MAX_LEAVES_PER_TAB: usize = 32;
-/// Max total panes restored across ALL sessions (caps PTY spawn + memory).
 pub const MAX_TOTAL_PANES: usize = 100;
-/// Reject a snapshot file larger than this BEFORE parsing, so a hostile/corrupt file can't
-/// exhaust memory during deserialization (the per-tree caps only apply during restore). A
-/// real layout — even 100 panes with long cwds — is a few KiB; 1 MiB is generous slack.
+/// Reject a snapshot file larger than this BEFORE parsing, so a hostile or corrupt file can't
+/// exhaust memory during deserialization (the per-tree caps only apply during restore).
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
-/// Defense-in-depth cap on session count after parse (the file-size cap already bounds this).
+/// Defense-in-depth session cap after parse (the file-size cap already bounds this).
 pub const MAX_SESSIONS: usize = 64;
-/// Max length of a restored `command` injected into a shell (guards against a hostile file
-/// injecting a huge/absurd command line).
+/// Max length of a restored `command` injected into a shell (guards against a hostile file).
 pub const MAX_COMMAND_LEN: usize = 512;
 
-/// The whole persisted mux state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistState {
     pub version: u32,
-    /// Unix seconds when saved (informational).
     #[serde(default)]
     pub saved_at: u64,
-    /// Index into `sessions` of the session that was active.
     #[serde(default)]
     pub active_session: usize,
     pub sessions: Vec<PSession>,
@@ -62,14 +48,12 @@ pub struct PersistState {
     pub marks: Vec<PMark>,
 }
 
-/// One pinned slot: `slot` 1–9 → the leaf carrying `pane_ref`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PMark {
     pub slot: u8,
     pub pane_ref: u32,
 }
 
-/// One persisted session (workspace).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PSession {
     #[serde(default)]
@@ -83,7 +67,6 @@ pub struct PSession {
     pub dir: Option<String>,
 }
 
-/// One persisted tab (a BSP layout).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PTab {
     #[serde(default)]
@@ -96,7 +79,6 @@ pub struct PTab {
     pub owner: Option<u32>,
 }
 
-/// A persisted split tree: a leaf (with its cwd) or a branch (dir + ratio + children).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum PLayout {
@@ -110,10 +92,8 @@ pub enum PLayout {
         /// argument boundaries survive. `None`/missing = restore a bare shell.
         #[serde(default)]
         command: Option<Vec<String>>,
-        /// A snapshot-local id, set only on a leaf some tab's `owner` or a mark points at.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_ref: Option<u32>,
-        /// The pane's user-given name (`Ctrl-b T`), if any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -126,8 +106,8 @@ pub enum PLayout {
 }
 
 impl PLayout {
-    /// The cwd of the leftmost leaf — a pre-`dir` snapshot's best guess at where its session
-    /// started (the first pane is the one the session was born with).
+    /// The cwd of the leftmost leaf: a pre-`dir` snapshot's best guess at where its session
+    /// started.
     pub fn first_cwd(&self) -> Option<&str> {
         match self {
             PLayout::Leaf { cwd, .. } => cwd.as_deref(),
@@ -135,7 +115,6 @@ impl PLayout {
         }
     }
 
-    /// Count leaves (panes) in this subtree.
     pub fn leaf_count(&self) -> usize {
         match self {
             PLayout::Leaf { .. } => 1,
@@ -144,9 +123,6 @@ impl PLayout {
     }
 }
 
-/// The state file path: `$COPAD_MUX_STATE` if set (tests / multi-instance so they don't
-/// clobber a shared file), else `$XDG_STATE_HOME/copad/mux-session.json`, else
-/// `$HOME/.local/state/copad/mux-session.json`.
 pub fn state_path() -> PathBuf {
     if let Ok(p) = std::env::var("COPAD_MUX_STATE")
         && !p.is_empty()
@@ -167,15 +143,13 @@ pub fn state_path() -> PathBuf {
     base.join("copad").join("mux-session.json")
 }
 
-/// Load + parse the snapshot, or `None` if it is missing, unreadable, malformed, or a
-/// newer schema — a bad file must NEVER block startup.
+/// Load and parse the snapshot, or `None` if missing, unreadable, malformed or a newer schema:
+/// a bad file must NEVER block startup.
 pub fn load() -> Option<PersistState> {
     load_from(&state_path())
 }
 
 pub fn load_from(path: &std::path::Path) -> Option<PersistState> {
-    // Bound BEFORE reading/parsing: an oversized (hostile/corrupt) file must fall back to a
-    // fresh session, not exhaust memory during deserialization.
     if std::fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
         eprintln!(
             "comux persist: {} exceeds {MAX_FILE_BYTES} bytes — ignoring",
@@ -191,25 +165,23 @@ pub fn load_from(path: &std::path::Path) -> Option<PersistState> {
     Some(state)
 }
 
-/// A handle to the background save thread. Dropping it closes the queue and JOINS the
-/// writer, so a queued/in-flight save completes before the server exits (a clean shutdown
-/// doesn't lose the last snapshot). A crash still can't corrupt: `write_durably` is atomic.
+/// Handle to the background save thread. Dropping it closes the queue and JOINS the writer,
+/// so a queued save completes before exit; `write_durably` is atomic, so a crash can't corrupt.
 pub struct Saver {
     tx: Option<SyncSender<PersistState>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Saver {
-    /// Spawn the writer thread for `path`.
     pub fn new(path: PathBuf) -> Self {
-        // Capacity 1 = coalesce: if a write is in flight, a newer request is dropped and
-        // picked up by the next periodic autosave (we only care about the latest state).
+        // Capacity 1 coalesces: a request arriving during an in-flight write is dropped and
+        // the next periodic autosave picks up the latest state.
         let (tx, rx) = std::sync::mpsc::sync_channel::<PersistState>(1);
         let handle = std::thread::spawn(move || {
             let mut warned = false;
-            // The last successful write, minus its timestamp. An idle server's layout is the
-            // same every 15 s and each write is two fsyncs — skip the ones that would change
-            // nothing but `saved_at` (unless the file has gone missing).
+            // The last successful write minus its timestamp: an idle server's layout is
+            // unchanged every 15 s and each write is two fsyncs, so skip writes that would
+            // change only `saved_at` (unless the file has gone missing).
             let mut last: Option<Vec<u8>> = None;
             for state in rx {
                 let res = serialize(&PersistState {
@@ -227,7 +199,6 @@ impl Saver {
                 if let Err(e) = res
                     && !warned
                 {
-                    // Surface the first failure so persistence isn't silently broken.
                     eprintln!("comux persist: save to {} failed: {e}", path.display());
                     warned = true;
                 }
@@ -239,7 +210,6 @@ impl Saver {
         }
     }
 
-    /// Queue a snapshot to be written (non-blocking; coalesces under backpressure).
     pub fn request(&self, state: PersistState) {
         if let Some(tx) = &self.tx {
             match tx.try_send(state) {
@@ -248,14 +218,12 @@ impl Saver {
         }
     }
 
-    /// Shutdown save: push `final_state` as the writer's LAST item, then close + join it —
-    /// all within `timeout` total. Because the SAME single writer performs every rename in
-    /// order, the final (newest) snapshot is guaranteed to be the last write on disk (no
-    /// race with a separate writer). `timeout` bounds it so a hung/networked filesystem can
-    /// never block shutdown — on timeout it detaches (the last autosave remains on disk).
+    /// Shutdown save: push `final_state` as the writer's LAST item, then close and join, all
+    /// within `timeout`. The same single writer performs every rename in order, so the newest
+    /// snapshot is the last write on disk. On timeout (hung/networked filesystem) it detaches
+    /// and the last autosave remains.
     pub fn finish(mut self, final_state: PersistState, timeout: Duration) {
         let start = Instant::now();
-        // Push the final state, retrying briefly so a coalescing-full queue doesn't drop it.
         if let Some(tx) = self.tx.as_ref() {
             let mut pending = Some(final_state);
             while let Some(s) = pending.take() {
@@ -263,7 +231,7 @@ impl Saver {
                     Ok(()) => break,
                     Err(TrySendError::Full(s)) => {
                         if start.elapsed() >= timeout {
-                            break; // give up pushing (writer wedged) — will exit anyway
+                            break;
                         }
                         std::thread::sleep(Duration::from_millis(5));
                         pending = Some(s);
@@ -272,8 +240,6 @@ impl Saver {
                 }
             }
         }
-        // Close the channel so the writer drains + exits, then bounded-join (Drop would also
-        // run, but its handle is already taken here → no double work).
         self.tx.take();
         if let Some(h) = self.handle.take() {
             while !h.is_finished() && start.elapsed() < timeout {
@@ -288,9 +254,8 @@ impl Saver {
 
 impl Drop for Saver {
     fn drop(&mut self) {
-        // Close the channel FIRST (drop the sender) so the writer's `for state in rx` loop
-        // drains its last item and ends, then BOUNDED-join it — a completed autosave lands
-        // on disk, but a writer wedged in `fsync` (slow/networked FS) must NOT hang teardown.
+        // Close the channel FIRST so the writer drains its last item and ends, then
+        // BOUNDED-join: a writer wedged in `fsync` (slow/networked FS) must NOT hang teardown.
         self.tx.take();
         if let Some(h) = self.handle.take() {
             for _ in 0..300 {
@@ -302,26 +267,22 @@ impl Drop for Saver {
             if h.is_finished() {
                 let _ = h.join();
             }
-            // else: detach — the process is exiting anyway; the OS reaps it.
         }
     }
 }
 
-/// Synchronously + durably write `state` to `path`, blocking until it lands. Used for the
-/// final save on explicit `kill-server` (where the coalescing async queue could drop the
-/// latest snapshot behind an in-flight one) — this guarantees the LATEST layout is durable.
+/// Synchronously and durably write `state`. Used for the final save on `kill-server`, where the
+/// coalescing async queue could drop the latest snapshot behind an in-flight one.
 pub fn save_blocking(path: &std::path::Path, state: &PersistState) -> std::io::Result<()> {
     write_durably(path, state)
 }
 
-/// Monotonic sequence for UNIQUE temp file names, so two writers in the same process (the
-/// periodic autosave thread + a bounded final save on `kill-server`) never share a temp path
-/// and can't truncate/rename/remove each other's file.
+/// Monotonic sequence for UNIQUE temp file names, so concurrent writers in one process (the
+/// autosave thread and a bounded final save) never share a temp path.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Durably write `state` to `path`: temp file → `fsync` → rename → `fsync` parent dir. The
-/// temp file is UNIQUE per write (`…json.<pid>.<seq>.tmp`) so concurrent writers don't
-/// collide; it is removed on any error so a failed write leaves no orphan.
+/// Durably write `state` to `path`: temp file, `fsync`, rename, `fsync` parent dir. The temp
+/// file is UNIQUE per write (`...json.<pid>.<seq>.tmp`) and removed on any error.
 fn write_durably(path: &std::path::Path, state: &PersistState) -> std::io::Result<()> {
     write_bytes_durably(path, &serialize(state)?)
 }
@@ -350,17 +311,16 @@ fn write_bytes_durably(path: &std::path::Path, json: &[u8]) -> std::io::Result<(
             let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
         f.write_all(json)?;
-        f.sync_all()?; // the bytes are on disk before the rename
+        f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
-        // fsync the directory so the rename itself survives power loss. Propagate a failure
-        // here — otherwise we'd report a durable save that the rename might not survive.
+        // Propagate a failure: otherwise we'd report a durable save the rename might not survive.
         let dir = std::fs::File::open(parent)?;
         dir.sync_all()?;
         Ok(())
     })();
     if res.is_err() {
-        let _ = std::fs::remove_file(&tmp); // don't leave an orphan on failure
+        let _ = std::fs::remove_file(&tmp);
     }
     res
 }
@@ -475,7 +435,6 @@ mod tests {
     fn oversized_file_is_rejected_before_parsing() {
         let p =
             std::env::temp_dir().join(format!("copad-mux-test-big-{}.json", std::process::id()));
-        // Valid-ish JSON prefix but way over the size cap → must be ignored, not parsed.
         let big = vec![b' '; (MAX_FILE_BYTES + 1) as usize];
         std::fs::write(&p, big).unwrap();
         assert!(load_from(&p).is_none());
@@ -508,19 +467,16 @@ mod tests {
         saver.request(sample());
         settle();
         let first = inode(&p).expect("first save lands");
-        // Same layout, later timestamp: no new temp-file + rename, so the same inode.
         saver.request(PersistState {
             saved_at: sample().saved_at + 15,
             ..sample()
         });
         settle();
         assert_eq!(inode(&p), Some(first));
-        // Gone from disk: written again even though nothing changed.
         std::fs::remove_file(&p).unwrap();
         saver.request(sample());
         settle();
         assert_eq!(load_from(&p), Some(sample()));
-        // A changed snapshot is written (a new inode from the rename).
         let before = inode(&p);
         let mut changed = sample();
         changed.active_session += 1;

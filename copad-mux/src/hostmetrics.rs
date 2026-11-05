@@ -1,26 +1,18 @@
-//! Host machine metrics for the status surfaces — CPU, memory, GPU, load.
+//! Host machine metrics for the status surfaces: CPU, memory, GPU, load.
 //!
-//! **The interface lives here; a platform only implements [`imp::sample`].** Everything that
-//! could drift between platforms — the shape of a reading, what "absent" means, the poller,
-//! the formatting, the config — is written once in this module and in `hostpoll`. A port adds
-//! one `mod imp` and nothing else.
+//! A platform only implements [`imp::sample`]; the reading's shape, the poller, formatting and
+//! config live here and in `hostpoll`.
 //!
-//! Every field is an `Option`, and absent means **we could not read it**, never zero. A status
-//! bar that renders `cpu 0%` when the probe failed is worse than one that renders nothing: 0%
-//! is a claim about the machine.
+//! Every field is an `Option`, and absent means we could not read it, never zero: a status bar
+//! rendering `cpu 0%` after a failed probe makes a false claim about the machine.
 //!
-//! Platform status:
-//! * **macOS** — implemented. CPU and memory come from mach in-process (`host_statistics` /
-//!   `host_statistics64`), whose structs the `libc` crate already declares, so nothing is
-//!   hand-transcribed. GPU comes from `ioreg`, the one subprocess, kept off the render loop
-//!   and polled at a slower cadence than the rest.
-//! * **Linux** — implemented and verified on hardware. CPU and memory are plain `/proc` reads;
-//!   GPU comes from `sysfs` where amdgpu/i915 expose it, and otherwise from `nvidia-smi`, the
-//!   one subprocess, gated on the NVIDIA module existing and killed on a deadline so a wedged
-//!   driver cannot freeze the readings that share its thread.
-//! * **Anything else** — every field `None`, which every surface already handles.
+//! * macOS: CPU and memory come from mach in-process; GPU from `ioreg`, the one subprocess,
+//!   kept off the render loop and polled more slowly.
+//! * Linux: CPU and memory from `/proc`; GPU from sysfs (amdgpu/i915), else `nvidia-smi`, gated
+//!   on the NVIDIA module existing and killed on a deadline so a wedged driver cannot freeze the
+//!   readings that share its thread.
+//! * Anything else: every field `None`.
 
-/// One reading of the host. All fields optional; see the module note on absence.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct HostMetrics {
     /// Busy percentage across all cores, 0..100, averaged over the interval between the last
@@ -31,32 +23,24 @@ pub struct HostMetrics {
     /// (active + wired + compressed) and Linux's `MemAvailable` complement.
     pub mem_used: Option<u64>,
     pub mem_total: Option<u64>,
-    /// GPU busy percentage, 0..100.
     pub gpu: Option<f64>,
-    /// 1-minute load average.
     pub load1: Option<f64>,
 }
 
 impl HostMetrics {
-    /// Nothing could be read at all — the surfaces render nothing rather than a row of dashes.
     pub fn is_empty(&self) -> bool {
         self.cpu.is_none() && self.mem_used.is_none() && self.gpu.is_none() && self.load1.is_none()
     }
 
-    /// Memory as a percentage, when both halves are known.
     pub fn mem_pct(&self) -> Option<f64> {
         let (used, total) = (self.mem_used?, self.mem_total?);
         (total > 0).then(|| used as f64 * 100.0 / total as f64)
     }
 }
 
-/// CPU tick counters carried between samples, so a platform can compute a rate. Opaque to
-/// everything but [`imp`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CpuTicks {
-    /// Ticks spent doing work (user + system + nice).
     pub busy: u64,
-    /// Ticks in total (busy + idle + iowait + …).
     pub total: u64,
 }
 
@@ -71,7 +55,6 @@ pub fn cpu_percent(prev: CpuTicks, now: CpuTicks) -> Option<f64> {
     Some((busy as f64 * 100.0 / total as f64).clamp(0.0, 100.0))
 }
 
-/// The 1-minute load average. POSIX, so it is shared rather than per-platform.
 pub fn load1() -> Option<f64> {
     let mut avg = [0f64; 3];
     // SAFETY: `getloadavg` writes at most `nelem` doubles into the array we hand it.
@@ -79,13 +62,9 @@ pub fn load1() -> Option<f64> {
     (n >= 1).then_some(avg[0])
 }
 
-/// Read the host. `prev` carries the CPU counters forward so a RATE can be computed; the
-/// caller owns it (the poller thread).
 pub fn sample(prev: &mut CpuTicks, want_gpu: bool) -> HostMetrics {
     imp::sample(prev, want_gpu)
 }
-
-// ===== macOS =====================================================================
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -103,23 +82,13 @@ mod imp {
         }
     }
 
-    /// Aggregate CPU ticks via `host_statistics(HOST_CPU_LOAD_INFO)`. The payload is a flat
-    /// `[natural_t; CPU_STATE_MAX]` that `libc` declares for us — there is no nested union to
-    /// transcribe, which is what makes this safe to do by hand where other mach info calls
-    /// are not.
-    /// The host port, acquired ONCE.
+    /// The host port, acquired ONCE: `mach_host_self()` returns a send right and every call
+    /// adds a reference that must be balanced with `mach_port_deallocate`. Calling it per
+    /// sample leaked one reference every two seconds. Holding one for the process's life needs
+    /// no deallocation, and the poller is the only caller.
     ///
-    /// `mach_host_self()` returns a send RIGHT, and every call adds a reference that must be
-    /// balanced with `mach_port_deallocate`. Calling it per sample leaked one reference every
-    /// two seconds — measured growing 2 → 3 → 4 on successive calls — which on a server that
-    /// runs for weeks is tens of thousands of references against a port that is never released.
-    ///
-    /// Holding one for the process's life is the standard fix and needs no deallocation: the
-    /// port dies with the process, and the poller is the only caller.
-    ///
-    /// `libc::mach_host_self` is deprecated in favour of the `mach2` crate. Kept rather than
-    /// taking a new dependency: if libc ever removes it the build fails loudly, which is the
-    /// right failure for a migration that is a one-line swap.
+    /// `libc::mach_host_self` is deprecated in favour of the `mach2` crate; kept to avoid a
+    /// new dependency.
     #[allow(deprecated)]
     pub(super) fn host_port() -> libc::mach_port_t {
         static PORT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -190,9 +159,8 @@ mod imp {
         }
     }
 
-    /// GPU busy via `ioreg`. The ONE subprocess in this module — there is no public in-process
-    /// API for it — so the poller runs it at a slower cadence than the rest, and never on the
-    /// render loop (decision #88).
+    /// GPU busy via `ioreg`: the ONE subprocess in this module (no public in-process API), so
+    /// the poller runs it at a slower cadence and never on the render loop (decision #88).
     fn gpu() -> Option<f64> {
         for class in ["AGXAccelerator", "IOAccelerator"] {
             let out = std::process::Command::new("ioreg")
@@ -207,8 +175,6 @@ mod imp {
         None
     }
 }
-
-// ===== Linux =====================================================================
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -238,20 +204,18 @@ mod imp {
         super::parse_meminfo(&text)
     }
 
-    /// How long `nvidia-smi` gets before it is killed. It reads in ~25 ms here; a wedged
-    /// driver makes it hang indefinitely, and this thread also carries CPU, memory and load.
+    /// How long `nvidia-smi` gets before it is killed; a wedged driver makes it hang.
     const NVIDIA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// AMD and Intel expose a busy percentage in sysfs; NVIDIA exposes it nowhere under
-    /// `/proc` or `/sys` and needs `nvidia-smi`. Sysfs goes first because it costs no fork.
+    /// AMD and Intel expose a busy percentage in sysfs; NVIDIA needs `nvidia-smi`. Sysfs goes
+    /// first because it costs no fork.
     fn gpu() -> Option<f64> {
         sysfs_gpu().or_else(nvidia_gpu)
     }
 
-    /// The BUSIEST card, not the first one that answers: a machine with integrated plus
-    /// discrete graphics lists both, and enumeration order is arbitrary — reading the first
-    /// reports the idle iGPU while the dGPU is pinned. Connector entries (`card1-DP-1`) share
-    /// their card's `device`, so a card can be seen several times; a max does not care.
+    /// The BUSIEST card, not the first that answers: with integrated plus discrete graphics
+    /// enumeration order is arbitrary. Connector entries (`card1-DP-1`) share their card's
+    /// `device`, so a card can be seen several times; a max does not care.
     fn sysfs_gpu() -> Option<f64> {
         std::fs::read_dir("/sys/class/drm")
             .ok()?
@@ -263,9 +227,8 @@ mod imp {
             .reduce(f64::max)
     }
 
-    /// Gated on the NVIDIA kernel module being loaded, which is a `stat` rather than a fork:
-    /// a host with neither an amdgpu/i915 sysfs reading nor an NVIDIA card must not spawn a
-    /// process every GPU tick forever just to fail.
+    /// Gated on the NVIDIA kernel module being loaded (a `stat`, not a fork), so a host with no
+    /// NVIDIA card does not spawn a process every GPU tick just to fail.
     fn nvidia_gpu() -> Option<f64> {
         if !std::path::Path::new("/proc/driver/nvidia/gpus").exists() {
             return None;
@@ -281,14 +244,11 @@ mod imp {
     }
 }
 
-// ===== everything else ===========================================================
-
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::{CpuTicks, HostMetrics, load1};
 
     pub fn sample(_prev: &mut CpuTicks, _want_gpu: bool) -> HostMetrics {
-        // `getloadavg` is POSIX, so even an unported platform reports something honest.
         HostMetrics {
             load1: load1(),
             ..HostMetrics::default()
@@ -296,12 +256,8 @@ mod imp {
     }
 }
 
-// ===== parsers, shared so they are testable on any host ==========================
-
-/// `"Device Utilization %"=11` out of an `ioreg` dump.
-///
-/// Lives outside the macOS module on purpose: a parser that can only be compiled on the
-/// platform it parses for cannot be tested by anyone else's CI.
+/// `"Device Utilization %"=11` out of an `ioreg` dump. Lives outside the macOS module so other
+/// platforms' CI can test it.
 pub fn parse_ioreg_utilization(text: &str) -> Option<f64> {
     let key = "\"Device Utilization %\"=";
     let i = text.find(key)? + key.len();
@@ -312,23 +268,14 @@ pub fn parse_ioreg_utilization(text: &str) -> Option<f64> {
     digits.parse::<f64>().ok().map(|v| v.clamp(0.0, 100.0))
 }
 
-/// The aggregate `cpu` line of `/proc/stat` → tick counters.
+/// The aggregate `cpu` line of `/proc/stat` to tick counters. Field order:
+/// `user nice system idle iowait irq softirq steal guest guest_nice`; trailing fields are
+/// optional across kernel versions and absent means zero.
 ///
-/// Field order is fixed by the kernel:
-/// `user nice system idle iowait irq softirq steal guest guest_nice`.
-///
-/// Two accounting rules that are easy to get wrong, and the first version got both:
-/// * **`iowait` is idle time, not work.** Counting it as busy is the classic way to report a
-///   disk-bound box as CPU-pegged.
-/// * **`irq` and `softirq` ARE work.** Excluding them while leaving them in the denominator
-///   undercounts: an interval spent entirely servicing interrupts reported ~0%.
-/// * **`guest` and `guest_nice` are already included in `user`/`nice`** by the kernel, so
-///   summing every field double-counts them. An interval spent wholly in a guest reported 50%.
-///
-/// Trailing fields are optional across kernel versions, so anything present is used and
-/// anything absent is simply zero.
-///
-/// See `kernel/sched/cputime.c`.
+/// * `iowait` is idle time, not work (counting it reports a disk-bound box as pegged).
+/// * `irq` and `softirq` ARE work (excluding them undercounts an interrupt-bound interval).
+/// * `guest` and `guest_nice` are already included in `user`/`nice` by the kernel (see
+///   `kernel/sched/cputime.c`), so summing every field double-counts them.
 pub fn parse_proc_stat(text: &str) -> Option<CpuTicks> {
     let line = text.lines().find(|l| l.starts_with("cpu "))?;
     let vals: Vec<u64> = line
@@ -344,7 +291,7 @@ pub fn parse_proc_stat(text: &str) -> Option<CpuTicks> {
     let (irq, softirq, steal) = (at(5), at(6), at(7));
     let (guest, guest_nice) = (at(8), at(9));
     // `user`/`nice` already contain the guest ticks; subtract them so they are not counted
-    // twice, saturating because a truncated or synthetic line may not be self-consistent.
+    // twice (saturating: a truncated line may not be self-consistent).
     let user = user.saturating_sub(guest);
     let nice = nice.saturating_sub(guest_nice);
     let busy = user + nice + system + irq + softirq + steal + guest + guest_nice;
@@ -354,32 +301,24 @@ pub fn parse_proc_stat(text: &str) -> Option<CpuTicks> {
     })
 }
 
-/// `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits` → the busiest card.
-///
-/// One line per GPU, so this takes the max rather than the first line, for the same reason the
-/// sysfs walk does. `[N/A]` — what nvidia-smi prints for a card that does not report
-/// utilization — must yield nothing rather than 0: a 0 is a claim that the GPU is idle.
+/// `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits` -> the busiest card.
+/// `[N/A]` (a card that does not report utilization) must yield nothing rather than 0.
 pub fn parse_nvidia_smi(text: &str) -> Option<f64> {
     text.lines()
         .filter_map(|l| l.trim().parse::<f64>().ok())
-        // `"inf"` and `"nan"` parse as f64, and `clamp` on a NaN returns NaN rather than a
-        // bound, so a junk line would otherwise poison the whole reading.
+        // `"inf"` and `"nan"` parse as f64 and `clamp` on NaN returns NaN, which would poison
+        // the whole reading.
         .filter(|v| v.is_finite())
         .map(|v| v.clamp(0.0, 100.0))
         .reduce(f64::max)
 }
 
-/// Run a command and return its stdout, killing it if it outstays `deadline`.
+/// Run a command and return its stdout, killing it if it outstays `deadline`, so a wedged probe
+/// cannot freeze the poller thread (which also carries CPU, memory and load).
 ///
-/// A probe must not be able to hang the poller: that one thread also carries CPU, memory and
-/// load, so a single wedged subprocess would freeze every reading — permanently, since nothing
-/// else ever times it out. `std::process` has no timed wait and this is the only call site, so
-/// the loop is cheaper than a dependency.
-///
-/// **Only for commands whose output fits the pipe buffer.** Nothing drains stdout until the
-/// child exits, so a chatty command would block writing and then be killed at the deadline.
-/// That is why macOS's `ioreg` probe, whose dump runs to tens of kilobytes, keeps using
-/// `output()` and is NOT routed through here.
+/// Only for commands whose output fits the pipe buffer: nothing drains stdout until the child
+/// exits. That is why macOS's `ioreg` probe, whose dump runs to tens of kilobytes, uses
+/// `output()` instead.
 #[cfg(target_os = "linux")]
 fn run_with_deadline(cmd: &mut std::process::Command, deadline: Duration) -> Option<String> {
     use std::io::Read;
@@ -396,14 +335,12 @@ fn run_with_deadline(cmd: &mut std::process::Command, deadline: Duration) -> Opt
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if start.elapsed() >= deadline => {
-                // Reaping matters on the timeout path too: an un-`wait`ed child keeps its pid
-                // reserved and its end of the pipe open.
+                // Reap on the timeout path too: an un-`wait`ed child keeps its pid and pipe.
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
-            // Output is a few bytes, so it sits in the pipe buffer and leaving it undrained
-            // until the child exits cannot deadlock.
+            // Output is a few bytes, so it fits the pipe buffer and cannot deadlock.
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => return None,
         }
@@ -413,9 +350,6 @@ fn run_with_deadline(cmd: &mut std::process::Command, deadline: Duration) -> Opt
     Some(out)
 }
 
-/// `/proc/meminfo` → `(used, total)` bytes, using `MemAvailable` (the kernel's own estimate of
-/// what a new allocation could get) rather than `MemFree`, which excludes reclaimable cache
-/// and so reports almost every Linux box as out of memory.
 pub fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
     let kb = |key: &str| -> Option<u64> {
         text.lines()
@@ -430,34 +364,27 @@ pub fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
     Some((total.saturating_sub(avail) * 1024, total * 1024))
 }
 
-// ===== the poller ================================================================
-
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// How often the host is sampled. Also the CPU averaging window, since the percentage is the
-/// rate between consecutive samples.
+/// How often the host is sampled; also the CPU averaging window.
 pub const TICK: Duration = Duration::from_secs(2);
 
-/// Sample the GPU every Nth tick. It is the only reading that costs a subprocess, and a GPU
-/// busy figure does not need 2-second resolution in a status bar.
+/// Sample the GPU every Nth tick: it is the only reading that costs a subprocess.
 const GPU_EVERY: u32 = 5;
 
-/// How long one read keeps the poller sampling. Its readers are the top bar (off by
-/// default; it reads on every frame it draws) and `comux host`; with neither, the poller
-/// sleeps instead of sampling — and forking `ioreg` — every two seconds for nobody.
+/// How long one read keeps the poller sampling. With no reader (the top bar, `comux host`) the
+/// poller sleeps instead of forking `ioreg` every two seconds for nobody.
 const WANTED_FOR: Duration = Duration::from_secs(30);
 
 pub struct Poll {
     metrics: Mutex<HostMetrics>,
-    /// Until when someone wants readings. `None` = never asked.
     wanted_until: Mutex<Option<Instant>>,
     wake: Condvar,
 }
 
 pub type Shared = Arc<Poll>;
 
-/// A handle that never updates — the client, and any path with no server.
 pub fn idle() -> Shared {
     Arc::new(Poll {
         metrics: Mutex::new(HostMetrics::default()),
@@ -467,15 +394,13 @@ pub fn idle() -> Shared {
 }
 
 /// The latest reading, and a request to keep sampling for a while. Poison-safe: a panicked
-/// poller degrades to "no reading", which every surface already handles, rather than taking
-/// the render loop down with it.
+/// poller degrades to "no reading" instead of taking the render loop down.
 pub fn read(shared: &Shared) -> HostMetrics {
     if let Ok(mut w) = shared.wanted_until.lock() {
         let was_idle = w.is_none_or(|t| t <= Instant::now());
         *w = Some(Instant::now() + WANTED_FOR);
         if was_idle {
-            // Whatever is cached is from before the poller went to sleep — possibly hours
-            // old. Drop it HERE, before answering, so this read already says "no reading"
+            // The cache may be hours old. Drop it HERE so this read already says "no reading"
             // (and `comux host` waits for a fresh one) instead of passing it off as current.
             if let Ok(mut m) = shared.metrics.lock() {
                 *m = HostMetrics::default();
@@ -486,8 +411,8 @@ pub fn read(shared: &Shared) -> HostMetrics {
     shared.metrics.lock().map(|g| *g).unwrap_or_default()
 }
 
-/// Block until someone wants readings. Returns whether it had to wait (the counters are then
-/// a whole idle period old).
+/// Block until someone wants readings. Returns whether it had to wait (the counters are then a
+/// whole idle period old).
 fn wait_wanted(shared: &Poll) -> bool {
     let Ok(mut w) = shared.wanted_until.lock() else {
         return false;
@@ -515,9 +440,8 @@ pub fn spawn() -> Shared {
             let mut n: u32 = 0;
             loop {
                 if wait_wanted(&out) || n == 0 {
-                    // Prime the CPU counters so the first reading after a wake is a real
-                    // rate rather than an average over however long nobody was asking (the
-                    // stale reading itself was dropped by the `read` that woke us).
+                    // Prime the CPU counters so the first reading after a wake is a real rate
+                    // rather than an average over the idle period.
                     let _ = sample(&mut ticks, false);
                     n = 0;
                 }
@@ -525,8 +449,8 @@ pub fn spawn() -> Shared {
                 let want_gpu = n.is_multiple_of(GPU_EVERY);
                 let m = sample(&mut ticks, want_gpu);
                 if let Ok(mut g) = out.metrics.lock() {
-                    // A skipped GPU tick must not ERASE the last GPU reading — absent means
-                    // "could not read", and "we did not look this time" is not that.
+                    // A skipped GPU tick must not ERASE the last GPU reading: absent means
+                    // "could not read", not "did not look".
                     let gpu = if want_gpu { m.gpu } else { g.gpu };
                     *g = HostMetrics { gpu, ..m };
                 }
@@ -547,25 +471,16 @@ mod tests {
             cpu: Some(55.0),
             ..HostMetrics::default()
         };
-        // Never asked before (= idle): the cached value is not passed off as current.
         assert_eq!(read(&p).cpu, None);
-        // Asked recently: a reading the poller stored is returned as is.
         p.metrics.lock().unwrap().cpu = Some(12.0);
         assert_eq!(read(&p).cpu, Some(12.0));
-        // Lapsed again: dropped again.
         *p.wanted_until.lock().unwrap() = Some(Instant::now());
         assert_eq!(read(&p).cpu, None);
     }
 
-    /// The host port must be acquired ONCE however many samples are taken.
-    ///
-    /// `mach_host_self()` hands back a send right and every call adds a reference that is
-    /// never balanced; the first version called it twice per sample, so a server running for
-    /// weeks accumulated tens of thousands of references on a port it never released. Measured
-    /// on this machine: three naive calls moved the count 2 → 5.
-    ///
-    /// Asserts on the REAL port refcount rather than on "we called a cached function", because
-    /// the bug was invisible at the Rust level — the code looked perfectly ordinary.
+    /// The host port must be acquired ONCE however many samples are taken: every
+    /// `mach_host_self()` call adds a send-right reference that is never balanced. Asserts on
+    /// the REAL port refcount, since the leak is invisible at the Rust level.
     #[test]
     #[cfg(target_os = "macos")]
     fn sampling_does_not_leak_a_mach_port_reference() {
@@ -599,8 +514,6 @@ mod tests {
 
     #[test]
     fn a_cpu_percentage_needs_two_points() {
-        // The first sample has nothing to diff against: reporting it would publish the
-        // machine's LIFETIME average as its current load.
         assert_eq!(cpu_percent(CpuTicks::default(), CpuTicks::default()), None);
         let a = CpuTicks {
             busy: 100,
@@ -615,7 +528,6 @@ mod tests {
 
     #[test]
     fn counters_that_go_backwards_yield_nothing() {
-        // A counter reset (or a reordered read) must not produce a huge or negative figure.
         let a = CpuTicks {
             busy: 100,
             total: 1000,
@@ -625,18 +537,15 @@ mod tests {
             total: 500,
         };
         assert_eq!(cpu_percent(a, b), None);
-        // Neither must a stalled clock divide by zero.
         assert_eq!(cpu_percent(a, a), None);
     }
 
     #[test]
     fn proc_stat_counts_interrupt_work_but_not_iowait() {
-        // user nice system idle iowait irq softirq steal
         let s = "cpu  100 20 30 1000 500 1 2 3\ncpu0 1 1 1 1\n";
         let t = parse_proc_stat(s).unwrap();
-        // irq + softirq + steal are WORK. The first version of this function excluded them
-        // while leaving them in the denominator, and THIS TEST asserted 150 — it pinned the
-        // bug rather than the behaviour, which is how it survived review-by-testing.
+        // irq + softirq + steal are WORK (excluding them while leaving them in the denominator
+        // undercounts).
         assert_eq!(t.busy, 156, "user+nice+system+irq+softirq+steal");
         // iowait is idle: counting it as busy reports a disk-bound box as pegged.
         assert_eq!(t.total, 1656, "busy + idle + iowait");
@@ -645,10 +554,8 @@ mod tests {
 
     #[test]
     fn guest_ticks_are_not_counted_twice() {
-        // The kernel already folds guest into user and guest_nice into nice. Summing every
-        // field double-counts them: this line is 100% guest, and the naive version called it
-        // 50% busy.
-        // user nice system idle iowait irq softirq steal guest guest_nice
+        // The kernel already folds guest into user and guest_nice into nice; this line is 100%
+        // guest and summing every field reported 50% busy.
         let s = "cpu  100 10 0 0 0 0 0 0 100 10\n";
         let t = parse_proc_stat(s).unwrap();
         assert_eq!(t.busy, 110, "guest is inside user; it must be counted once");
@@ -658,8 +565,7 @@ mod tests {
 
     #[test]
     fn a_kernel_without_the_trailing_fields_still_parses() {
-        // `steal`/`guest`/`guest_nice` arrived over successive kernel versions; absent is 0,
-        // not a refusal.
+        // `steal`/`guest`/`guest_nice` arrived over successive kernel versions; absent is 0.
         let t = parse_proc_stat("cpu  10 0 5 85\n").unwrap();
         assert_eq!((t.busy, t.total), (15, 100));
     }
@@ -669,7 +575,6 @@ mod tests {
         assert_eq!(parse_proc_stat("cpu  1 2 3\n"), None);
         assert_eq!(parse_proc_stat("intr 1 2 3 4\n"), None);
         assert_eq!(parse_proc_stat(""), None);
-        // `cpu0` is a per-core line and must not be mistaken for the aggregate.
         assert_eq!(parse_proc_stat("cpu0 1 2 3 4\n"), None);
     }
 
@@ -679,13 +584,11 @@ mod tests {
         let (used, total) = parse_meminfo(s).unwrap();
         assert_eq!(total, 16_384_000 * 1024);
         assert_eq!(used, 8_192_000 * 1024, "used = total - MemAvailable");
-        // `MemFree` alone would call this box 98.8% full while half its memory is reclaimable.
         assert!(used * 100 / total < 60);
     }
 
     #[test]
     fn meminfo_falls_back_to_free_on_an_old_kernel() {
-        // MemAvailable arrived in Linux 3.14; before that MemFree is all there is.
         let s = "MemTotal:       1000 kB\nMemFree:         400 kB\n";
         assert_eq!(parse_meminfo(s), Some((600 * 1024, 1000 * 1024)));
         assert_eq!(
@@ -700,21 +603,18 @@ mod tests {
         let s = r#"  "PerformanceStatistics" = {"Tiler Utilization %"=6,"Device Utilization %"=11,"x"=0}"#;
         assert_eq!(parse_ioreg_utilization(s), Some(11.0));
         assert_eq!(parse_ioreg_utilization("nothing here"), None);
-        // A value outside 0..100 is a bad reading, not a bad machine.
         assert_eq!(
             parse_ioreg_utilization(r#""Device Utilization %"=250"#),
             Some(100.0)
         );
-        // The key present but with no number must not parse as 0 — that would claim an idle
-        // GPU where we in fact read nothing.
+        // The key present with no number must not parse as 0 (an idle GPU).
         assert_eq!(parse_ioreg_utilization(r#""Device Utilization %"=x"#), None);
     }
 
     #[test]
     fn nvidia_smi_reports_the_busiest_card() {
         assert_eq!(parse_nvidia_smi("24\n"), Some(24.0));
-        // One line per GPU. Reading the first would report whichever card the driver happens
-        // to enumerate first, which is the same bug the sysfs walk had.
+        // One line per GPU: the busiest wins, not whichever the driver enumerates first.
         assert_eq!(parse_nvidia_smi("3\n91\n17\n"), Some(91.0));
         assert_eq!(
             parse_nvidia_smi(" 42 \n"),
@@ -725,16 +625,13 @@ mod tests {
 
     #[test]
     fn an_unsupported_card_is_absent_not_idle() {
-        // nvidia-smi prints `[N/A]` for a card that does not report utilization. Parsing that
-        // as 0 would claim an idle GPU where in fact we read none.
+        // `[N/A]` must not parse as 0, which would claim an idle GPU.
         assert_eq!(parse_nvidia_smi("[N/A]\n"), None);
         assert_eq!(parse_nvidia_smi(""), None);
         assert_eq!(parse_nvidia_smi("Failed to initialize NVML\n"), None);
-        // A readable card alongside an unreadable one still answers — the N/A must not poison
-        // the reading, and `inf`/`nan` (which do parse as f64) must not either.
+        // The N/A must not poison the reading, and neither must `inf`/`nan` (which parse as f64).
         assert_eq!(parse_nvidia_smi("[N/A]\n55\n"), Some(55.0));
         assert_eq!(parse_nvidia_smi("nan\ninf\n7\n"), Some(7.0));
-        // Out of range is a bad reading, not a bad machine.
         assert_eq!(parse_nvidia_smi("250\n"), Some(100.0));
         assert_eq!(parse_nvidia_smi("-5\n"), Some(0.0));
     }
@@ -749,8 +646,8 @@ mod tests {
             Some("41\n")
         );
 
-        // The reason the deadline exists: this thread also carries CPU, memory and load, so a
-        // probe allowed to hang would freeze every reading forever.
+        // This thread also carries CPU, memory and load, so a hanging probe would freeze every
+        // reading forever.
         let start = std::time::Instant::now();
         let mut hang = std::process::Command::new("sleep");
         hang.arg("30");
@@ -764,7 +661,6 @@ mod tests {
             start.elapsed()
         );
 
-        // A command that is not installed is an absent reading, not a panic.
         let mut missing = std::process::Command::new("copad-no-such-binary-exists");
         assert_eq!(
             run_with_deadline(&mut missing, Duration::from_secs(1)),
@@ -804,9 +700,8 @@ mod tests {
         if let Some(p) = m.mem_pct() {
             assert!((0.0..=100.0).contains(&p), "mem out of range: {p}");
         }
-        // A host that ADVERTISES a readable GPU must yield one. Conditioned on the host rather
-        // than asserted outright, so the same test is meaningful on a machine with no GPU
-        // probe at all instead of encoding whichever workstation last ran it.
+        // A host that ADVERTISES a readable GPU must yield one. Conditioned on the host so the
+        // test is meaningful on a machine with no GPU probe.
         #[cfg(target_os = "linux")]
         if std::path::Path::new("/proc/driver/nvidia/gpus").exists()
             || std::fs::read_dir("/sys/class/drm")

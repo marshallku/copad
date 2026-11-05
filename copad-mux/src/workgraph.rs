@@ -1,38 +1,25 @@
-//! The work graph of one agent conversation (decisions #204): which files it read, edited,
-//! wrote and searched, the commands it ran, the subagents it spawned, and the order it did it
-//! in — built from the agent's own transcript, kept on disk, and sliced for the L0 `graph`
-//! topic and the `graph` command.
+//! The work graph of one agent conversation (decisions #204), built incrementally from the
+//! agent's transcripts (Claude's, plus each subagent's; Codex's rollout), saved to
+//! `<state dir>/graphs/<tool>-<conversation>.json`, and sliced for the L0 `graph` topic and the
+//! `graph` command.
 //!
-//! **Sources.** Claude: the transcript `agentpoll` resolved (`assistant` `tool_use` blocks,
-//! settled by the matching `tool_result`), plus each subagent's own transcript under
-//! `<session>/subagents/agent-*.jsonl`, found by its `.meta.json` (`toolUseId` names the
-//! spawning call). Codex: the rollout's completed `CommandExecution` items (`parsed_cmd` says
-//! which reads and searches a command was), the results of `apply_patch` tool calls (`Success. Updated the
-//! following files:`), `UserMessage` and `task_complete`. Codex subagents are not seen.
+//! Only outcomes count: a Claude call is a PENDING step until its result arrives; only an ok
+//! result adds to a file's counters, a failed one marks the step failed. Patch INPUT text is
+//! never read as an edit. A Claude `Bash` call, and a Codex command whose `parsed_cmd` gives up
+//! or that writes, is read by [`crate::shellcmd`]; a part its exit status does not vouch for
+//! settles `unknown` (drawn, never counted).
 //!
-//! **Shell commands.** A Claude `Bash` call, and a Codex command whose `parsed_cmd` gives up or
-//! that writes, is read by [`crate::shellcmd`]: one step per file it read, searched, edited,
-//! wrote or deleted, plus a `Run` step when part of it was not understood. A part its exit
-//! status does not vouch for settles `unknown` (drawn, never counted).
+//! Identity: file and subagent ids are never reused or evicted. Once a graph holds
+//! [`MAX_FILES`] / [`MAX_SUBS`] new ones are not admitted (the step is kept without them and
+//! counted); past [`MAX_STEPS`] the OLDEST steps are dropped. `gen` is minted whenever a graph
+//! starts from nothing, so a reader of an earlier graph of the same conversation can tell it
+//! is looking at another one.
 //!
-//! **Only outcomes count.** A Claude call is a PENDING step until its result arrives; only an
-//! ok result adds to the file's counters, a failed one marks the step failed. Codex records
-//! are already complete. Patch INPUT text is never read as an edit.
-//!
-//! **Identity.** File and subagent ids are minted in discovery order and never reused or
-//! evicted; once a graph holds [`MAX_FILES`] / [`MAX_SUBS`] new ones are not admitted (the
-//! step is kept without them and counted). Steps carry a rising `seq`; past [`MAX_STEPS`] the
-//! OLDEST are dropped. `gen` is minted whenever a graph starts from nothing, so a reader of an
-//! earlier graph of the same conversation can tell it is looking at another one.
-//!
-//! **Reading.** Each source is read incrementally from its committed offset (the end of the
-//! last complete line consumed) with a per-call byte budget; a trailing partial line waits in
-//! memory for the rest, and a line longer than [`MAX_LINE`] is skipped rather than stalling
-//! the reader. A source whose file was replaced (other inode) or shrank rebuilds the graph.
-//!
-//! **On disk.** `<state dir>/graphs/<tool>-<conversation>.json`, the whole graph together with
-//! each source's committed offset and a hash of the 4 KiB before it, written atomically. A
-//! saved graph is resumed only when EVERY source still matches; otherwise it is rebuilt.
+//! Reading: each source is read incrementally from its committed offset (the end of the last
+//! complete line consumed); a trailing partial line waits in memory, and a line longer than
+//! [`MAX_LINE`] is skipped rather than stalling the reader. A source whose file was replaced
+//! (other inode) or shrank rebuilds the graph, and a saved graph is resumed only when EVERY
+//! source still matches its inode, offset and 4 KiB hash.
 
 use copad_mux_proto::graph::{
     AgentGraph, GraphCounts, GraphFile, GraphPage, GraphStep, GraphSub, Outcome, Settled, StepKind,
@@ -43,32 +30,22 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-/// Files (and search directories) one conversation admits.
 pub const MAX_FILES: usize = 2000;
-/// Subagents one conversation admits.
 pub const MAX_SUBS: usize = 64;
-/// Steps kept; older ones are dropped and counted.
 pub const MAX_STEPS: usize = 4000;
 /// Calls waiting for their result. Past this the oldest is settled `unknown`.
 const MAX_PENDING: usize = 256;
-/// Results (and subagent ends) that arrived before what they settle, kept to be matched.
 const MAX_UNMATCHED: usize = 128;
-/// Settlements the overview carries.
 const SETTLED_KEPT: usize = 64;
-/// A transcript line longer than this is skipped.
 pub const MAX_LINE: usize = 8 << 20;
-/// Longest label (char-boundary cut).
 const MAX_LABEL: usize = 80;
 /// Longest path kept; a longer one is cut (and still a distinct identity by its prefix).
 const MAX_PATH: usize = 1024;
-/// How much of the file before a committed offset its hash covers.
 const HASH_SPAN: u64 = 4096;
-/// The on-disk format.
 const FORMAT: u32 = 2;
 /// File effects one shell command contributes; the rest are counted as omitted.
 const MAX_SHELL_EFFECTS: usize = 16;
 
-/// One transcript a graph reads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Source {
     pub path: PathBuf,
@@ -81,7 +58,6 @@ pub struct Source {
     /// FNV-1a of the [`HASH_SPAN`] bytes before `offset`, recorded at save time.
     #[serde(default)]
     pub hash: u64,
-    /// Bytes read past `offset` that do not end in a newline yet.
     #[serde(skip)]
     carry: Vec<u8>,
     /// Discarding an oversized line up to its newline.
@@ -89,10 +65,8 @@ pub struct Source {
     skipping: bool,
 }
 
-/// What reading a source found.
 #[derive(Debug, PartialEq)]
 pub enum Read_ {
-    /// Complete lines (possibly none), and how many bytes were read to get them.
     Lines(Vec<String>, usize),
     /// The file is gone, shrank or was replaced: the graph must start over.
     Rebuild,
@@ -107,7 +81,6 @@ impl Source {
         }
     }
 
-    /// Read up to `budget` new bytes and return the complete lines among them.
     pub fn read(&mut self, budget: usize) -> std::io::Result<Read_> {
         let mut f = match std::fs::File::open(&self.path) {
             Ok(f) => f,
@@ -138,7 +111,6 @@ impl Source {
         Ok(Read_::Lines(self.feed(&buf), read))
     }
 
-    /// Fold freshly read bytes in; returns the lines they completed.
     fn feed(&mut self, mut bytes: &[u8]) -> Vec<String> {
         let mut lines = Vec::new();
         if self.skipping {
@@ -166,7 +138,6 @@ impl Source {
                 &self.carry[..]
             };
             let n = line.len() as u64 + 1;
-            // Over the cap even though it ended within this read: skipped like the rest.
             if !line.is_empty() && line.len() <= MAX_LINE {
                 lines.push(String::from_utf8_lossy(line).into_owned());
             }
@@ -176,7 +147,6 @@ impl Source {
         }
         let rest = &bytes[start..];
         if self.carry.len() + rest.len() > MAX_LINE {
-            // An oversized line: drop what we hold of it and skip to its end.
             self.offset += (self.carry.len() + rest.len()) as u64;
             self.carry.clear();
             self.skipping = true;
@@ -186,12 +156,10 @@ impl Source {
         lines
     }
 
-    /// Record the hash of the bytes before `offset`, for resuming.
     fn stamp(&mut self) {
         self.hash = span_hash(&self.path, self.offset).unwrap_or(0);
     }
 
-    /// Whether a saved source still describes its file.
     fn still_valid(&self) -> bool {
         let Ok(meta) = std::fs::metadata(&self.path) else {
             return self.offset == 0;
@@ -228,7 +196,6 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
-/// A call waiting for its result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PendingCall {
     /// Every step the call made (a shell command can make several), with what settling it
@@ -247,7 +214,6 @@ struct PendingEffect {
     on_ok: Outcome,
 }
 
-/// A result that arrived before what it settles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Unmatched {
     id: String,
@@ -259,7 +225,6 @@ struct Unmatched {
     ended: Option<String>,
 }
 
-/// One conversation's graph and the state of reading it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvGraph {
     format: u32,
@@ -267,12 +232,10 @@ pub struct ConvGraph {
     pub conversation: String,
     #[serde(rename = "gen")]
     pub generation: String,
-    /// The agent's working directory, for relative paths and `display`.
     pub cwd: String,
     files: Vec<GraphFile>,
     /// Index `i` is subagent id `i + 1`.
     subs: Vec<GraphSub>,
-    /// Spawning call id → subagent id.
     sub_keys: HashMap<String, u32>,
     steps: VecDeque<GraphStep>,
     next_seq: u64,
@@ -302,7 +265,6 @@ pub struct ConvGraph {
     home: String,
 }
 
-/// Mint a generation: unique per process and across restarts.
 fn mint_gen() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
@@ -348,12 +310,10 @@ impl ConvGraph {
         }
     }
 
-    /// The transcript the graph was built from.
     pub fn main_path(&self) -> &Path {
         &self.sources[0].path
     }
 
-    /// Fold one transcript line in, from the source of `agent`.
     pub fn ingest(&mut self, line: &str, agent: u32) {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             return;
@@ -368,8 +328,6 @@ impl ConvGraph {
             self.counts.subagents = self.subs.len() as u32;
         }
     }
-
-    // ---- Claude ---------------------------------------------------------------------------
 
     fn ingest_claude(&mut self, v: &Value, agent: u32) {
         // The main file can carry a subagent's records too; its own file is where they count.
@@ -492,8 +450,6 @@ impl ConvGraph {
         self.track(id, call);
     }
 
-    /// A `Bash` call: a step per file effect its command has ([`crate::shellcmd`]), plus a
-    /// `Run` step when part of it is not understood (or it touches no file).
     fn claude_bash(&mut self, id: &str, input: &Value, cwd: &str, at: i64, agent: u32) {
         let s = |k: &str| input.get(k).and_then(Value::as_str);
         let command = s("command").unwrap_or_default();
@@ -556,7 +512,6 @@ impl ConvGraph {
         );
     }
 
-    /// Wait for the result of call `id`.
     fn track(&mut self, id: &str, call: PendingCall) {
         if id.is_empty() {
             return;
@@ -589,7 +544,6 @@ impl ConvGraph {
         }
     }
 
-    /// A user record's text: a prompt, a slash command, a subagent's end, or furniture.
     fn claude_text(&mut self, text: &str, at: i64, agent: u32) {
         let t = text.trim_start();
         if let Some(rest) = t.strip_prefix("<task-notification>") {
@@ -601,7 +555,6 @@ impl ConvGraph {
             return;
         }
         if agent != 0 {
-            // A subagent's first message is its task, already the spawn's label.
             return;
         }
         let label = if let Some(name) = between(t, "<command-name>", "</command-name>") {
@@ -635,8 +588,6 @@ impl ConvGraph {
         });
     }
 
-    /// A subagent's transcript was found (its `.meta.json`): create the subagent if its spawn
-    /// has not been read yet, and start reading its file.
     pub fn found_subagent(
         &mut self,
         call_id: &str,
@@ -655,7 +606,6 @@ impl ConvGraph {
         self.rev += 1;
     }
 
-    /// The subagent spawned by `call_id`, creating it (admission permitting).
     fn sub_for(
         &mut self,
         call_id: &str,
@@ -733,7 +683,6 @@ impl ConvGraph {
         }
     }
 
-    /// A call's result: settle its step and apply what it did.
     fn settle(&mut self, call_id: &str, outcome: Outcome, at: i64, launched: bool) {
         let Some(p) = self.pending.remove(call_id) else {
             if !call_id.is_empty() {
@@ -761,7 +710,6 @@ impl ConvGraph {
         if let Some(sub) = p.spawned
             && !launched
         {
-            // A spawn that waited for its subagent: the result is its end.
             let status = if outcome == Outcome::Ok {
                 "completed"
             } else {
@@ -792,7 +740,6 @@ impl ConvGraph {
         self.rev += 1;
     }
 
-    /// Add what an ok step did to the counters.
     fn apply(&mut self, kind: StepKind, file: Option<u32>, at: i64) {
         let c = &mut self.counts;
         match kind {
@@ -815,8 +762,6 @@ impl ConvGraph {
         }
         self.rev += 1;
     }
-
-    // ---- Codex ----------------------------------------------------------------------------
 
     fn ingest_codex(&mut self, v: &Value) {
         let at = v
@@ -1054,8 +999,6 @@ impl ConvGraph {
         }
     }
 
-    // ---- shared ---------------------------------------------------------------------------
-
     fn push_step(&mut self, mut step: GraphStep) -> u64 {
         step.seq = self.next_seq;
         self.next_seq += 1;
@@ -1074,7 +1017,6 @@ impl ConvGraph {
         seq
     }
 
-    /// The file at `path` (absolute, or relative to the cwd), admitting it if there is room.
     fn file_for(&mut self, path: &str, at: i64) -> Option<u32> {
         let abs = normalize(&self.cwd, path);
         if let Some(id) = self.file_index.get(&abs) {
@@ -1098,10 +1040,6 @@ impl ConvGraph {
         Some(id)
     }
 
-    // ---- slices ---------------------------------------------------------------------------
-
-    /// The overview with at most `files` files, `steps` steps and `subs` subagents (plus every
-    /// record the chosen steps reference).
     pub fn overview(&self, files: usize, steps: usize, subs: usize) -> AgentGraph {
         let chosen: Vec<GraphStep> = self.steps.iter().rev().take(steps).rev().cloned().collect();
         let (files, subs) = self.referenced(&chosen, files, subs);
@@ -1137,14 +1075,12 @@ impl ConvGraph {
         self.steps.front().map_or(0, |s| s.seq)
     }
 
-    /// The newest `files` files and `subs` subagents, plus those `steps` reference.
     fn referenced(
         &self,
         steps: &[GraphStep],
         files: usize,
         subs: usize,
     ) -> (Vec<GraphFile>, Vec<GraphSub>) {
-        // The steps' own files first, then the most recent others up to `files` in all.
         let mut fids: Vec<u32> = steps.iter().filter_map(|s| s.file).collect();
         fids.sort_unstable();
         fids.dedup();
@@ -1167,7 +1103,6 @@ impl ConvGraph {
             .filter(|id| *id != 0)
             .collect();
         sids.extend(self.subs.iter().rev().take(subs).map(|s| s.id));
-        // A subagent's parent chain, so its edge has somewhere to go.
         let mut i = 0;
         while i < sids.len() {
             let parent = self.subs.get(sids[i] as usize - 1).map_or(0, |s| s.parent);
@@ -1233,9 +1168,6 @@ impl ConvGraph {
         }
     }
 
-    // ---- disk -----------------------------------------------------------------------------
-
-    /// The graph's file in `dir`.
     pub fn file_name(tool: &str, conversation: &str) -> Option<String> {
         let safe = |s: &str| {
             !s.is_empty()
@@ -1246,7 +1178,6 @@ impl ConvGraph {
         (safe(tool) && safe(conversation)).then(|| format!("{tool}-{conversation}.json"))
     }
 
-    /// Write the graph to `dir` atomically, 0600 in a 0700 directory.
     pub fn save(&mut self, dir: &Path) -> std::io::Result<()> {
         let Some(name) = Self::file_name(&self.tool, &self.conversation) else {
             return Ok(());
@@ -1266,7 +1197,6 @@ impl ConvGraph {
         std::fs::rename(&tmp, dir.join(&name))
     }
 
-    /// The saved graph for this conversation, if it still matches every file it read.
     pub fn load(dir: &Path, tool: &str, conversation: &str, transcript: &Path) -> Option<Self> {
         let name = Self::file_name(tool, conversation)?;
         let data = std::fs::read(dir.join(name)).ok()?;
@@ -1291,7 +1221,6 @@ impl ConvGraph {
     }
 }
 
-/// Delete saved graphs older than `days`, then the oldest beyond `keep`.
 pub fn prune(dir: &Path, days: u32, keep: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -1351,7 +1280,6 @@ fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_default()
 }
 
-/// `text` cut to [`MAX_LABEL`] chars, on a char boundary, one line.
 fn cut(text: &str) -> String {
     let one = text.lines().next().unwrap_or_default().trim();
     match one.char_indices().nth(MAX_LABEL) {
@@ -1403,7 +1331,6 @@ pub fn normalize(cwd: &str, path: &str) -> String {
     s[..end].to_string()
 }
 
-/// `abs` relative to `cwd` when under it, else `~/…` under `home`, else as is.
 pub fn display(abs: &str, cwd: &str, home: &str) -> String {
     let under = |root: &str| {
         let root = root.trim_end_matches('/');
@@ -1421,7 +1348,6 @@ pub fn display(abs: &str, cwd: &str, home: &str) -> String {
     abs.to_string()
 }
 
-/// RFC 3339 (`2026-11-03T16:40:43.083Z`, `…+09:00`) → UNIX milliseconds.
 pub fn parse_ts_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || !(b[10] == b'T' || b[10] == b' ') {
@@ -1646,7 +1572,6 @@ mod tests {
             ),
             0,
         );
-        // Launched in the background: the launch settles, the subagent goes on.
         g.ingest(
             &result("a1", false, T0).replacen(
                 "{",
@@ -1681,7 +1606,6 @@ mod tests {
         let o = g.overview(32, 24, 8);
         assert_eq!(o.subagents[0].status, "completed");
         assert!(o.subagents[0].ended_ms.is_some());
-        // A foreground spawn ends with its result.
         g.ingest(&call("a2", "Task", r#"{"description":"Quick"}"#, T0), 0);
         g.ingest(&result("a2", false, T1), 0);
         assert_eq!(g.overview(32, 24, 8).subagents[1].status, "completed");
@@ -1745,7 +1669,6 @@ mod tests {
         assert_eq!(g.files.len(), MAX_FILES);
         assert_eq!(g.omitted_files, 3);
         assert_eq!(g.steps.back().unwrap().file, None);
-        // A known path still maps to its id.
         g.ingest(&call("again", "Read", r#"{"file_path":"/r/f0"}"#, T0), 0);
         assert_eq!(g.steps.back().unwrap().file, Some(0));
     }
@@ -1763,7 +1686,6 @@ mod tests {
         assert_eq!(o.dropped_before, 10);
         assert_eq!(o.oldest_seq, 11);
         assert_eq!(o.files.len(), 1);
-        // Pending overflow settled the oldest calls as unknown.
         assert!(g.pending.len() <= MAX_PENDING);
         assert!(g.settled.iter().all(|s| s.outcome == Outcome::Unknown));
     }
@@ -1792,7 +1714,6 @@ mod tests {
         assert_eq!((p.page_first_seq, p.page_last_seq), (6, 15));
         let p = g.page(Some(6), 10, 1 << 20);
         assert_eq!((p.page_first_seq, p.next_before), (1, None));
-        // A small byte budget trims the oldest end and says where to continue.
         let p = g.page(None, 25, 2000);
         assert!(p.steps.len() < 25 && p.page_last_seq == 25);
         assert_eq!(p.next_before, Some(p.page_first_seq));
@@ -1918,7 +1839,6 @@ mod tests {
             (0, 1),
             "shown, not counted"
         );
-        // A failed call fails every part.
         g.ingest(&bash("b2", "cat b.rs && rm c.rs", "/r"), 0);
         g.ingest(&result("b2", true, T1), 0);
         let k = kinds(&g);
@@ -2003,9 +1923,7 @@ mod tests {
         };
         // Codex calls this a read; it also writes `b`.
         g.ingest(&item("cat a > b", &[("read", "a")]), 0);
-        // Codex gave up on the pipeline.
         g.ingest(&item("sed -n 1,9p c | head -3", &[("unknown", "")]), 0);
-        // Fully understood by parsed_cmd: used as before.
         g.ingest(&item("sed -n 1,9p d", &[("read", "d")]), 0);
         g.ingest(
             &item("sed -i '' 's/a/b/' e && cargo test", &[("unknown", "")]),
@@ -2036,7 +1954,6 @@ mod tests {
         assert!(s.skipping);
         assert_eq!(s.feed(b"xx\n{\"c\":3}\n"), vec!["{\"c\":3}".to_string()]);
         assert_eq!(s.offset, 16 + MAX_LINE as u64 + 1 + 3 + 8);
-        // An oversized line that ENDS within the read that completes it is skipped too.
         let mut s = Source::new(PathBuf::new(), 0);
         assert!(s.feed(&vec![b'y'; MAX_LINE]).is_empty());
         assert!(!s.skipping);

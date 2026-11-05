@@ -1,11 +1,5 @@
-//! Cheap git-branch lookup for the sidebar `spaces` subtitle — reads `.git/HEAD`
-//! directly (no `git` subprocess), walking up from a directory and following a
-//! worktree `.git` file. Returns the branch name, or a short SHA for a detached HEAD.
-
 use std::path::Path;
 
-/// The branch (or short detached SHA) of the repo containing `start`, or `None` if
-/// `start` isn't inside a git repo.
 pub fn branch(start: &Path) -> Option<String> {
     let mut dir = start;
     loop {
@@ -14,9 +8,7 @@ pub fn branch(start: &Path) -> Option<String> {
             return parse_head(&std::fs::read_to_string(git.join("HEAD")).ok()?);
         }
         if git.is_file() {
-            // A worktree/submodule: `.git` is a file `gitdir: <path>` → HEAD lives
-            // there. A relative gitdir is relative to THIS dir (git's rule), so
-            // `dir.join` — which keeps an absolute path as-is — resolves both.
+            // `.git` file: `gitdir: <path>`, relative to THIS dir; `join` keeps absolute as-is.
             let content = std::fs::read_to_string(&git).ok()?;
             let gitdir = content.lines().next()?.strip_prefix("gitdir:")?.trim();
             let head = dir.join(gitdir).join("HEAD");
@@ -26,9 +18,8 @@ pub fn branch(start: &Path) -> Option<String> {
     }
 }
 
-/// The checkout containing `start`: its top directory and whether it is a LINKED worktree
-/// (`git worktree add`), told apart from a submodule or a separate git dir — all three use a
-/// `.git` FILE — by its gitdir living under the main repo's `worktrees/`.
+/// A linked worktree, a submodule and a separate git dir all use a `.git` FILE; a linked
+/// worktree is told apart by its gitdir living under the main repo's `worktrees/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repo {
     pub root: std::path::PathBuf,
@@ -61,8 +52,6 @@ pub fn repo(start: &Path) -> Option<Repo> {
     }
 }
 
-/// Parse a `.git/HEAD` payload: `ref: refs/heads/<branch>` → branch; else (detached)
-/// the first 8 chars of the raw object id.
 fn parse_head(head: &str) -> Option<String> {
     let head = head.trim();
     if head.is_empty() {

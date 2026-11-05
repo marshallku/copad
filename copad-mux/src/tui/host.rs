@@ -1,8 +1,6 @@
-//! The L0 topic values (decisions #166): what a host UI needs to draw comux's chrome
-//! natively, computed off the same state the TUI chrome renders from. Each builder returns a
-//! COMPLETE topic value; the server serializes it and publishes only when the string changes,
-//! so nothing here may carry a value that moves on its own (no "for N seconds" — a status
-//! carries the moment it began instead).
+//! The L0 topic values (decisions #166). The server publishes a topic only when its serialized
+//! string changes, so nothing here may carry a value that moves on its own (no "for N
+//! seconds"): a status carries the moment it began instead.
 
 use super::*;
 use crate::control::Resp;
@@ -10,7 +8,6 @@ use crate::term::Snapshot;
 use copad_mux_proto as l0;
 
 impl App {
-    /// `tree`: sessions → tabs → panes, in the sidebar's session order.
     pub fn host_tree(&self) -> l0::Tree {
         let sessions = self
             .session_ids()
@@ -90,7 +87,6 @@ impl App {
         }
     }
 
-    /// `agents`: every agent pane, in sidebar order.
     pub fn host_agents(&self) -> l0::Agents {
         let focused = self.focused_terminal();
         let agents = self
@@ -121,7 +117,6 @@ impl App {
         l0::Agents { agents }
     }
 
-    /// `notifications`: the `Ctrl-b a` center, newest first.
     pub fn host_notifications(&self) -> l0::Notifications {
         let items = self
             .notifications
@@ -148,7 +143,6 @@ impl App {
         }
     }
 
-    /// `status`: everything the status bar shows besides the tabs.
     pub fn host_status(&self) -> l0::Status {
         let usage = self.host_usage();
         l0::Status {
@@ -175,21 +169,14 @@ impl App {
             return false;
         }
         self.host_hidden = (sidebar, status);
-        // The content area changed size: same path as a sidebar toggle.
         self.reflow();
         true
     }
 
-    /// Every outcome line flashed since the last call — each becomes a reliable `flash`
-    /// event, so a message that expires (or is replaced) between two publications still
-    /// reaches a host that hid the status bar.
     pub fn take_flashes(&mut self) -> Vec<l0::Flash> {
         std::mem::take(&mut self.flash_log)
     }
 
-    /// `notif-read`: mark one notification (or all) read. Returns how many changed.
-    /// Remove entry `id` (with `same_pane`, every entry from its pane), or all of them.
-    /// Returns how many went; an unknown id removes nothing.
     pub(super) fn notif_dismiss(&mut self, id: Option<u64>, same_pane: bool) -> usize {
         let before = self.notifications.len();
         match id {
@@ -229,9 +216,6 @@ impl App {
 }
 
 impl App {
-    /// The usage readout as the TUI draws it (decisions #182): the windows `usage_windows`
-    /// selects, each with its reset in the `usage_reset` style, and — for the paged layout —
-    /// the carousel's pages and the page on screen. `None` when the readout is off or empty.
     fn host_usage(&self) -> Option<l0::Usage> {
         use crate::usagepoll::{PageKind, PageUnit};
         if self.cfg.usage == UsageStyle::Off {
@@ -242,7 +226,6 @@ impl App {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
-        // One page per window = every selected window, in the readout's order.
         let windows: Vec<l0::UsageWindow> = u
             .pages(sel, PageUnit::Window, self.cfg.usage_reset)
             .into_iter()
@@ -313,7 +296,6 @@ const PREVIEW_MAX_ROWS: u16 = 200;
 const PREVIEW_MAX_COLS: u16 = 400;
 
 impl App {
-    /// `pane-preview` (decisions #180): what the TUI switcher previews, for a host to draw.
     pub(super) fn pane_preview(&self, target: &str, rows: Option<u16>, cols: Option<u16>) -> Resp {
         let Some(term) = self.resolve_pane_target(target) else {
             return Resp::err_code("not_found", format!("unknown pane '{target}'"));
@@ -344,10 +326,6 @@ fn run_color(c: CellColor) -> Option<l0::RunColor> {
     }
 }
 
-/// `snap` as styled runs: bottom-anchored on its last row with content (or the cursor) like
-/// the TUI preview, at most `rows` × `cols`. Equal-styled cells merge, wide-glyph spacers are
-/// skipped, a wide glyph whose second column would fall past `cols` is dropped, and trailing
-/// unstyled blanks are trimmed.
 pub(super) fn preview_lines(snap: &Snapshot, rows: usize, cols: usize) -> Vec<Vec<l0::Run>> {
     let last_used = snap
         .cells
@@ -397,7 +375,6 @@ pub(super) fn preview_lines(snap: &Snapshot, rows: usize, cols: usize) -> Vec<Ve
                     }),
                 }
             }
-            // Trailing blanks only show when something paints them.
             while let Some(r) = runs.last_mut() {
                 if r.bg.is_some() || r.reverse || r.underline {
                     break;
@@ -463,10 +440,8 @@ mod preview_tests {
             ["three", "ab漢"],
             "the newest rows, not the top of the screen"
         );
-        // The wide glyph's second column would fall past the crop: it is dropped whole.
         let lines = preview_lines(&s, 1, 3);
         assert_eq!(text(&lines[0]), "ab");
-        // A painted background is content: its blanks stay.
         let s = snap(10, 2, b"x\x1b[44m   \x1b[0m");
         assert_eq!(text(&preview_lines(&s, 1, 10)[0]), "x   ");
     }

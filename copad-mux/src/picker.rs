@@ -1,18 +1,10 @@
-//! A tiny inline fuzzy picker for the `comux` CLI — the "you forgot the argument"
-//! affordance. `comux worktree rm` (or `select-session`, `focus`, …) with no target
-//! used to be a usage error; now it lists the live candidates and lets you type to
-//! narrow them, fzf-style, so you don't have to run `worktree list` and copy a path.
+//! A tiny inline fuzzy picker for the `comux` CLI: a control verb given no target lists the
+//! live candidates and lets you type to narrow them.
 //!
-//! Deliberately NOT the ratatui switcher from [`crate::tui`]: this runs in a plain
-//! shell, not inside an attached client, so it draws INLINE (a few lines below the
-//! prompt, erased on exit) instead of entering the alternate screen. Inline rendering
-//! keeps the shell's scrollback intact and sidesteps the alt-screen enter/leave
-//! residue class of bugs entirely (troubleshooting.md).
-//!
-//! I/O split: it draws to **stderr** and reads keys through crossterm (which reads
-//! `/dev/tty` on Unix), so stdout stays clean for `--json` / pipes. Callers gate on
-//! [`interactive`] first — a non-terminal stderr or `--json` keeps the old usage
-//! error, so scripts fail fast instead of blocking on a prompt nobody can see.
+//! It draws INLINE on **stderr** rather than in the alternate screen, which keeps the shell's
+//! scrollback intact, and stdout stays clean for `--json` / pipes. Callers gate on
+//! [`interactive`] first: a non-terminal stderr or `--json` keeps the usage error, so scripts
+//! fail fast instead of blocking on a prompt nobody can see.
 
 use std::io::{self, IsTerminal, Write};
 
@@ -22,9 +14,8 @@ use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_m
 use crossterm::{cursor, queue};
 use unicode_width::UnicodeWidthChar;
 
-/// One selectable row. `label` is the identity the user thinks in (a branch, a session
-/// name, a pane command); `detail` is dim context (path, counts, status). Both are
-/// fuzzy-matched, so typing a branch OR a status narrows the list.
+/// One selectable row. `label` is the identity the user thinks in; `detail` is dim context.
+/// Both are fuzzy-matched.
 #[derive(Debug, Clone)]
 pub struct Item {
     pub label: String,
@@ -39,7 +30,6 @@ impl Item {
         }
     }
 
-    /// What the filter matches against — label and detail as one string.
     fn haystack(&self) -> String {
         if self.detail.is_empty() {
             self.label.clone()
@@ -49,14 +39,11 @@ impl Item {
     }
 }
 
-/// Most rows shown at once. The block is inline, so it must stay small enough to feel
-/// like a prompt rather than take over the terminal; it also shrinks further on a
-/// short terminal (see [`view_rows`]).
+/// Most rows shown at once; the inline block must stay prompt-sized.
 const MAX_ROWS: usize = 12;
 
-/// Case-insensitive SUBSEQUENCE match (fzf-style): every char of `needle` appears in
-/// `hay` in order. An empty needle matches everything. Shared with the TUI's `Ctrl-f`
-/// switcher so both filters behave identically.
+/// Case-insensitive subsequence match (fzf-style), shared with the TUI's `Ctrl-f` switcher so
+/// both filters behave identically.
 pub fn fuzzy_match(needle: &str, hay: &str) -> bool {
     let hay = hay.to_ascii_lowercase();
     let mut chars = hay.chars();
@@ -66,27 +53,22 @@ pub fn fuzzy_match(needle: &str, hay: &str) -> bool {
         .all(|nc| chars.any(|hc| hc == nc))
 }
 
-/// True when the picker may be opened at all: stderr (where it draws) is a real
-/// terminal. Callers ALSO refuse in `--json` mode — a machine-readable invocation must
-/// never turn into a prompt.
+/// True when stderr (where the picker draws) is a terminal. Callers also refuse in `--json`
+/// mode: a machine-readable invocation must never turn into a prompt.
 pub fn interactive() -> bool {
     io::stderr().is_terminal()
 }
 
-/// Show the picker and return the index into `items` the user chose, or `None` if they
-/// cancelled (`Esc` / `Ctrl-c`). `Err` only for a terminal I/O failure — the caller
-/// treats that as "could not prompt", not as a selection.
+/// Returns the chosen index into `items`, or `None` if cancelled (`Esc` / `Ctrl-c`). `Err`
+/// only for a terminal I/O failure, which the caller treats as "could not prompt".
 ///
-/// The screen guard erases the block and restores cooked mode on ANY exit path
-/// (including a panic), so the shell prompt comes back exactly as it was.
+/// The screen guard erases the block and restores cooked mode on any exit, panics included.
 pub fn pick(title: &str, items: &[Item]) -> Result<Option<usize>, String> {
     if items.is_empty() {
         return Ok(None);
     }
     let mut screen = Screen::enter().map_err(|e| format!("terminal: {e}"))?;
     let mut query = String::new();
-    // `sel` and `offset` index the FILTERED list; both reset whenever the query changes
-    // so a narrowed list always starts at its first row.
     let mut sel = 0usize;
     let mut offset = 0usize;
     loop {
@@ -135,14 +117,12 @@ pub fn pick(title: &str, items: &[Item]) -> Result<Option<usize>, String> {
     }
 }
 
-/// Indices of `items` matching `query`: rows whose LABEL matches first, then rows that
-/// only matched on their detail — each group in the original listing order (which is
-/// meaningful: pane/tab/session indices), so the ordering is stable and predictable.
+/// Indices of `items` matching `query`: rows whose LABEL matches first, then rows that only
+/// matched on their detail, each group in listing order (the indices are meaningful).
 ///
-/// The two groups exist because detail text is boilerplate-heavy (`1 tabs · 1 panes`),
-/// and a subsequence filter matches boilerplate readily: typing `alp` for session
-/// `alpha` also matched `loc**al**  1 tabs · 1 **p**anes` and — being earlier in the
-/// list — put the selection on the WRONG row. Label matches must outrank that.
+/// Detail text is boilerplate-heavy (`1 tabs · 1 panes`) and a subsequence filter matches it
+/// readily: `alp` for session `alpha` also matched `local  1 tabs · 1 panes` and, being earlier
+/// in the list, selected the wrong row.
 fn filter(items: &[Item], query: &str) -> Vec<usize> {
     let mut by_label = Vec::new();
     let mut by_detail = Vec::new();
@@ -157,8 +137,6 @@ fn filter(items: &[Item], query: &str) -> Vec<usize> {
     by_label
 }
 
-/// Scroll the window so `sel` stays visible, moving by the minimum amount (the list
-/// only shifts when the selection would leave the window).
 fn scroll_offset(sel: usize, offset: usize, view: usize) -> usize {
     let view = view.max(1);
     if sel < offset {
@@ -170,15 +148,11 @@ fn scroll_offset(sel: usize, offset: usize, view: usize) -> usize {
     }
 }
 
-/// Rows to show: [`MAX_ROWS`], shrunk on a short terminal so the header + query line +
-/// the shell prompt still fit (never 0, so there is always something to pick from).
 fn view_rows() -> usize {
     let rows = terminal::size().map(|(_, r)| r as usize).unwrap_or(24);
     MAX_ROWS.min(rows.saturating_sub(3)).max(1)
 }
 
-/// What a key press means. Split out from the loop so the bindings are unit-testable
-/// without a terminal.
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Accept,
@@ -235,7 +209,6 @@ fn truncate(s: &str, width: usize) -> String {
     if s.chars().map(col).sum::<usize>() <= limit {
         return s.to_string();
     }
-    // Truncating: the ellipsis itself costs one column, so the content gets one less.
     let content = limit - 1;
     let mut used = 0usize;
     let mut out = String::new();
@@ -255,7 +228,6 @@ fn truncate(s: &str, width: usize) -> String {
 /// drop it erases every line it drew and restores the terminal. Drop runs on unwind
 /// too, so a panic mid-pick can't leave the shell in raw mode.
 struct Screen {
-    /// Lines currently drawn below the cursor's home position.
     drawn: u16,
 }
 
@@ -335,8 +307,8 @@ impl Screen {
             queue!(
                 out,
                 SetAttribute(Attribute::Dim),
-                // Truncated like every other row: an untruncated literal wraps on a very
-                // narrow terminal and adds a physical line `drawn` doesn't count.
+                // Truncated like every other row: an untruncated literal wraps on a very narrow terminal and
+                // adds a physical line `drawn` doesn't count.
                 Print(truncate("  (no match)", width)),
                 SetAttribute(Attribute::Reset),
                 Print("\r\n")
@@ -352,8 +324,6 @@ impl Screen {
             } else {
                 format!("{arrow} {}  {}", it.label, it.detail)
             };
-            // Reverse video for the selection: theme-agnostic, so it reads correctly on
-            // whatever colors the user's shell already uses.
             if selected {
                 queue!(out, SetAttribute(Attribute::Reverse))?;
             }
@@ -392,13 +362,13 @@ mod tests {
 
     #[test]
     fn fuzzy_match_is_case_insensitive_subsequence() {
-        assert!(fuzzy_match("", "anything")); // empty matches all
+        assert!(fuzzy_match("", "anything"));
         assert!(fuzzy_match("api", "api-server"));
-        assert!(fuzzy_match("api", "API-Server")); // case-insensitive
-        assert!(fuzzy_match("aps", "api-server")); // subsequence (a..p..s)
-        assert!(fuzzy_match("cld", "claude")); // c..l..d
+        assert!(fuzzy_match("api", "API-Server"));
+        assert!(fuzzy_match("aps", "api-server"));
+        assert!(fuzzy_match("cld", "claude"));
         assert!(!fuzzy_match("xyz", "claude"));
-        assert!(!fuzzy_match("sa", "api-server")); // order matters (no 's' before 'a')
+        assert!(!fuzzy_match("sa", "api-server"));
     }
 
     #[test]
@@ -409,9 +379,7 @@ mod tests {
             item("main", "/home/u/repo"),
         ];
         assert_eq!(filter(&items, ""), vec![0, 1, 2]);
-        // matched on the label
         assert_eq!(filter(&items, "login"), vec![0]);
-        // matched on the detail only
         assert_eq!(filter(&items, "live"), vec![1]);
         assert!(filter(&items, "zzz").is_empty());
     }
@@ -430,10 +398,10 @@ mod tests {
     #[test]
     fn scroll_offset_moves_only_when_selection_leaves_the_window() {
         assert_eq!(scroll_offset(0, 0, 3), 0);
-        assert_eq!(scroll_offset(2, 0, 3), 0); // still visible
-        assert_eq!(scroll_offset(3, 0, 3), 1); // scrolled down by one
-        assert_eq!(scroll_offset(1, 4, 3), 1); // jumped back up above the window
-        assert_eq!(scroll_offset(5, 0, 0), 5); // degenerate view treated as 1
+        assert_eq!(scroll_offset(2, 0, 3), 0);
+        assert_eq!(scroll_offset(3, 0, 3), 1);
+        assert_eq!(scroll_offset(1, 4, 3), 1);
+        assert_eq!(scroll_offset(5, 0, 0), 5);
     }
 
     #[test]
@@ -455,7 +423,6 @@ mod tests {
             key_action(&key(KeyCode::Char('n'), KeyModifiers::CONTROL)),
             Action::Down
         );
-        // A bare letter is FILTER input, never motion (that's the TUI switcher's job).
         assert_eq!(
             key_action(&key(KeyCode::Char('j'), KeyModifiers::NONE)),
             Action::Insert('j')
@@ -478,14 +445,12 @@ mod tests {
                 .sum::<usize>()
         };
         assert_eq!(truncate("abc", 10), "abc");
-        // The ellipsis is part of the budget, and the LAST column always stays empty —
-        // writing into it arms deferred auto-wrap, which would break the erase math.
+        // The last column stays empty, ellipsis included: writing into it arms deferred
+        // auto-wrap, which breaks the erase math.
         assert_eq!(truncate("abcdef", 4), "ab…");
         assert!(cols(&truncate("abcdef", 4)) < 4);
-        // Wide glyphs count as two columns.
         assert_eq!(truncate("한글", 4), "한…");
         assert!(cols(&truncate("한글자", 6)) < 6);
-        // Degenerate widths render nothing rather than something that must wrap.
         assert_eq!(truncate("abc", 1), "");
         assert_eq!(truncate("abc", 0), "");
     }

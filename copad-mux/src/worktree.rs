@@ -1,15 +1,11 @@
-//! Git-worktree engine for `comux worktree {create,list,rm}` — the standalone,
-//! `State`-free core (ported from `~/dev/tmx`, minus tmux). It shells out to `git`,
-//! places a new worktree as a SIBLING of the repo's MAIN worktree named
-//! `{repo}-{branch}`, and runs a configured per-repo post-create hook. The
-//! control/TUI layers add comux sessions + live-session safety on top; nothing here
-//! touches `State`, so it is unit-testable against a throwaway `git init` repo.
+//! Git-worktree engine for `comux worktree {create,list,rm,land}`: the `State`-free core, so it
+//! is unit-testable against a throwaway `git init` repo. A new worktree is a SIBLING of the
+//! repo's MAIN worktree, named `{repo}-{branch}`.
 //!
-//! Identity is anchored on git, never on the bare computed path: naming is
-//! non-injective (`feat/x` and `feat-x` both render to `feat-x`), so callers compare
-//! the *registered* worktree's canonical path + checked-out branch, and this module
-//! parses `git worktree list --porcelain -z` (NUL-delimited, unquoted paths) so paths
-//! with spaces / non-UTF-8 bytes survive intact.
+//! Identity is anchored on git, never on the computed path: naming is non-injective (`feat/x`
+//! and `feat-x` both render to `feat-x`), so callers compare the registered worktree's
+//! canonical path + checked-out branch. `git worktree list --porcelain -z` is parsed so paths
+//! with spaces / non-UTF-8 bytes survive.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
@@ -19,25 +15,20 @@ use std::process::Command;
 /// name), `{branch}` (branch with `/` → `-`).
 pub const DEFAULT_NAMING: &str = "{repo}-{branch}";
 
-/// One entry from `git worktree list --porcelain`.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub path: PathBuf,
     /// Short branch name (`refs/heads/` stripped), or `None` when detached/bare.
     pub branch: Option<String>,
-    /// The main (first) worktree — never a removal target.
     pub is_main: bool,
-    /// `git worktree lock`ed — refuse removal up front.
     pub locked: bool,
 }
 
-/// The computed placement for a new worktree (from [`plan_path`]).
 #[derive(Debug, Clone)]
 pub struct Planned {
     pub main_root: PathBuf,
     pub repo_name: String,
     pub dir_name: String,
-    /// `main_root.parent()/dir_name` — a validated plain sibling directory.
     pub worktree_path: PathBuf,
 }
 
@@ -70,7 +61,6 @@ pub fn canonical_or_lexical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Render the directory name for `{repo}`/`{branch}` (empty pattern → default).
 pub fn render_naming(pattern: &str, repo: &str, branch: &str) -> String {
     let effective = if pattern.trim().is_empty() {
         DEFAULT_NAMING
@@ -97,9 +87,7 @@ fn validate_dir_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// Compute where a new worktree for `branch` should live, from an already-fetched
-/// entry list (so callers make a single `git worktree list` call and reuse it for the
-/// identity/recovery checks).
+/// Compute where a new worktree for `branch` should live, from an already-fetched entry list.
 pub fn plan_path(entries: &[Entry], naming: &str, branch: &str) -> Result<Planned, String> {
     if branch.trim().is_empty() {
         return Err("branch name is required".into());
@@ -128,9 +116,7 @@ pub fn plan_path(entries: &[Entry], naming: &str, branch: &str) -> Result<Planne
     })
 }
 
-/// `git -C <repo_root> worktree add -b <branch> <worktree_path> [<from>]`. Creates the
-/// worktree AND a new branch; git's own output goes to our stderr. This is the sole
-/// durable side effect of a create — succeeds iff `git worktree add` succeeds.
+/// Creates the worktree AND a new branch; git's own output goes to our stderr.
 pub fn add(repo_root: &Path, worktree_path: &Path, branch: &str, from: &str) -> Result<(), String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
@@ -171,7 +157,6 @@ pub fn run_hook(script: &str, worktree_path: &Path) -> Option<String> {
     }
 }
 
-/// `git -C <repo_root> worktree remove [--force] <path>`.
 pub fn remove(repo_root: &Path, path: &Path, force: bool) -> Result<(), String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo_root).args(["worktree", "remove"]);
@@ -191,7 +176,6 @@ pub fn remove(repo_root: &Path, path: &Path, force: bool) -> Result<(), String> 
     Ok(())
 }
 
-/// `git -C <repo_root> branch -d|-D <branch>` (`-D` when `force`).
 pub fn delete_branch(repo_root: &Path, branch: &str, force: bool) -> Result<(), String> {
     let flag = if force { "-D" } else { "-d" };
     let out = Command::new("git")
@@ -206,7 +190,6 @@ pub fn delete_branch(repo_root: &Path, branch: &str, force: bool) -> Result<(), 
     Ok(())
 }
 
-/// Parse `git worktree list` into entries (marks the first/main worktree).
 pub fn list_entries(repo_root: &Path) -> Result<Vec<Entry>, String> {
     let out = Command::new("git")
         .arg("-C")
@@ -223,9 +206,8 @@ pub fn list_entries(repo_root: &Path) -> Result<Vec<Entry>, String> {
     Ok(parse_porcelain_z(&out.stdout))
 }
 
-/// Parse the NUL-delimited porcelain stream. Attributes are `key[ value]` tokens; an
-/// empty token ends a record. Paths are taken as raw bytes (git's `-z` disables
-/// quoting) so spaces / non-UTF-8 survive.
+/// Parse the NUL-delimited porcelain stream: `key[ value]` tokens, an empty token ends a
+/// record. Paths are raw bytes (git's `-z` disables quoting).
 fn parse_porcelain_z(data: &[u8]) -> Vec<Entry> {
     struct Build {
         path: PathBuf,
@@ -275,11 +257,10 @@ fn parse_porcelain_z(data: &[u8]) -> Vec<Entry> {
                     b.locked = true;
                 }
             }
-            _ => {} // HEAD / detached / bare — nothing else is needed here.
+            _ => {}
         }
     }
     flush(&mut cur, &mut entries);
-    // git always lists the main worktree first; express that as the main marker.
     if let Some(first) = entries.first_mut() {
         first.is_main = true;
     }
@@ -348,25 +329,19 @@ pub fn validate_removal(
     Ok(entry)
 }
 
-// --- landing a worktree's branch (`comux worktree land`, decisions #149) ---
-
-/// How a worktree's branch is brought into the main worktree's branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
     /// Rebase the branch onto the destination, then fast-forward the destination. Linear
     /// history; refused for a branch carrying merge commits (a plain rebase drops them).
     Rebase,
-    /// A merge commit on the destination (`--no-ff --no-edit`).
     Merge,
 }
 
-/// Everything `land` resolved up front, pinned so a later step can tell if the world moved.
 #[derive(Debug, Clone)]
 pub struct LandPlan {
     pub main: PathBuf,
     pub worktree: PathBuf,
     pub branch: String,
-    /// The main worktree's branch at planning time, and its tip then.
     pub into: String,
     pub into_tip: String,
     pub strategy: Strategy,
@@ -374,8 +349,6 @@ pub struct LandPlan {
     pub ahead: u32,
 }
 
-/// Run git as a non-interactive tool: no prompt, no editor, nothing on stdin. Returns
-/// trimmed stdout, or an error carrying git's own stderr.
 fn git_out(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .arg("-C")
@@ -394,7 +367,6 @@ fn git_out(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The branch `dir` has checked out, or `None` when detached.
 pub fn current_branch(dir: &Path) -> Result<Option<String>, String> {
     let out = Command::new("git")
         .arg("-C")
@@ -430,7 +402,6 @@ pub fn operation_in_progress(dir: &Path) -> Result<Option<&'static str>, String>
     Ok(None)
 }
 
-/// Whether `dir` has changes: tracked always, untracked (non-ignored) too when asked.
 pub fn is_dirty(dir: &Path, untracked: bool) -> Result<bool, String> {
     let mode = if untracked {
         "--untracked-files=normal"
@@ -524,7 +495,7 @@ pub fn plan_land(main: &Path, target: &Entry, strategy: Strategy) -> Result<Land
 /// rewritten branch in place, and that has to be said, not hidden.
 pub fn perform_land(plan: &LandPlan) -> Result<(), String> {
     if plan.ahead == 0 {
-        return Ok(()); // already contained: nothing to bring in
+        return Ok(());
     }
     let pinned = || -> Result<(), String> {
         let now = current_branch(&plan.main)?;
@@ -745,11 +716,9 @@ mod tests {
             canonical_or_lexical(&planned.worktree_path)
         );
 
-        // resolve by branch and by path both hit the linked worktree.
         assert!(resolve_target(&after, "feat/x", &repo).is_ok());
         assert!(resolve_target(&after, planned.worktree_path.to_str().unwrap(), &repo).is_ok());
         assert!(resolve_target(&after, "nope", &repo).is_err());
-        // the main worktree is never a target.
         assert!(resolve_target(&after, "main", &repo).is_err());
 
         remove(&repo, &planned.worktree_path, false).unwrap();
@@ -788,15 +757,11 @@ mod tests {
             },
         ];
         let elsewhere = Path::new("/tmp");
-        // main is never removable.
         assert!(validate_removal(&entries, "main", elsewhere, false).is_err());
-        // happy path.
         assert!(validate_removal(&entries, "feat-x", elsewhere, false).is_ok());
-        // -d on a detached worktree is rejected up front.
         assert!(validate_removal(&entries, "/dev/copad-detached", elsewhere, true).is_err());
         // locked is refused (even a later --force at the git level won't reach it).
         assert!(validate_removal(&entries, "locked", elsewhere, false).is_err());
-        // refusing removal of the worktree the caller is inside.
         let inside = Path::new("/dev/copad-feat-x/src");
         assert!(validate_removal(&entries, "feat-x", inside, false).is_err());
     }
@@ -809,9 +774,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- land ---
-
-    /// A main repo plus a linked worktree on `feat` with one new revision in it.
     fn repo_and_worktree() -> (PathBuf, PathBuf) {
         let main = init_repo();
         let wt = main.with_file_name(format!(
@@ -840,7 +802,6 @@ mod tests {
     #[test]
     fn rebase_land_fast_forwards_main_and_the_branch_is_then_deletable() {
         let (main, wt) = repo_and_worktree();
-        // main moved on too, so the rebase has something to do.
         std::fs::write(main.join("other.txt"), "x").unwrap();
         git(&main, &["add", "-A"]);
         git(&main, &["commit", "-qm", "main moved"]);
@@ -918,7 +879,6 @@ mod tests {
         git(&main, &["commit", "-qm", "late"]);
         let err = perform_land(&plan).unwrap_err();
         assert!(err.contains("moved since planning"), "{err}");
-        // A branch with commits not on main is never deleted.
         let err = delete_landed_branch(&main, "feat", "main").unwrap_err();
         assert!(err.contains("kept"), "{err}");
     }
@@ -939,7 +899,6 @@ mod tests {
         let (main, wt) = repo_and_worktree();
         let plan = plan_land(&main, &entry_for(&main, &wt), Strategy::Rebase).unwrap();
         perform_land(&plan).unwrap();
-        // A second worktree on the same branch (git allows it with --force).
         let other = wt.with_file_name(format!(
             "{}-again",
             wt.file_name().unwrap().to_string_lossy()

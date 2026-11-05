@@ -8,7 +8,6 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// The input modes of the pane a key is for.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct KeyModes {
     /// `DECCKM`: unmodified arrows / Home / End as `SS3` (`ESC O A`) instead of `CSI`.
@@ -81,7 +80,6 @@ pub fn unalias_legacy_c0(k: KeyEvent) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(ch), k.modifiers)
 }
 
-/// The unshifted key of a shifted ASCII symbol on a US keyboard (`!` → `1`).
 fn us_unshifted(ch: char) -> Option<char> {
     const SHIFTED: &str = "!@#$%^&*()_+{}|:\"<>?~";
     const BASE: &str = "1234567890-=[]\\;',./`";
@@ -93,7 +91,6 @@ fn utf8(ch: char) -> Vec<u8> {
     ch.encode_utf8(&mut s).as_bytes().to_vec()
 }
 
-/// `CSI code [; mods] u`.
 fn csi_u(code: u32, mods: KeyModifiers) -> Vec<u8> {
     let m = mod_param(mods);
     if m == 1 {
@@ -103,7 +100,6 @@ fn csi_u(code: u32, mods: KeyModifiers) -> Vec<u8> {
     }
 }
 
-/// A cursor-style key with a final letter: arrows, Home, End, F1–F4.
 fn letter_key(fin: char, mods: KeyModifiers, ss3: bool) -> Vec<u8> {
     let m = mod_param(mods);
     if m > 1 {
@@ -115,7 +111,6 @@ fn letter_key(fin: char, mods: KeyModifiers, ss3: bool) -> Vec<u8> {
     }
 }
 
-/// A `CSI n ~` key: Insert, Delete, PgUp, PgDn, F5–F12.
 fn tilde_key(n: u8, mods: KeyModifiers) -> Vec<u8> {
     let m = mod_param(mods);
     if m > 1 {
@@ -131,7 +126,6 @@ pub fn encode(code: KeyCode, mods: KeyModifiers, modes: KeyModes) -> Option<Vec<
     let alt = mods.contains(KeyModifiers::ALT);
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let sup = mods.contains(KeyModifiers::SUPER);
-    // Legacy: Alt is an ESC in front of the key's own bytes.
     let meta = |mut v: Vec<u8>| {
         if alt {
             v.insert(0, 0x1b);
@@ -314,7 +308,6 @@ mod tests {
         };
         assert_eq!(encode(KeyCode::Up, N, m).unwrap(), b"\x1bOA");
         assert_eq!(encode(KeyCode::Home, N, m).unwrap(), b"\x1bOH");
-        // A modified key keeps the CSI form (xterm does the same).
         assert_eq!(encode(KeyCode::Up, C, m).unwrap(), b"\x1b[1;5A");
         assert_eq!(encode(KeyCode::PageUp, N, m).unwrap(), b"\x1b[5~");
     }
@@ -334,7 +327,6 @@ mod tests {
         assert_eq!(kitty(KeyCode::Char('C'), C | S), b"\x1b[99;6u");
         assert_eq!(kitty(KeyCode::Char('x'), A), b"\x1b[120;3u");
         assert_eq!(kitty(KeyCode::Char(' '), C), b"\x1b[32;5u");
-        // Plain and shifted text stays text.
         assert_eq!(kitty(KeyCode::Char('a'), N), b"a");
         assert_eq!(kitty(KeyCode::Char('A'), S), b"A");
         assert_eq!(kitty(KeyCode::Char('!'), S), b"!");
@@ -346,7 +338,6 @@ mod tests {
         assert_eq!(kitty(KeyCode::Char('"'), C), b"\x1b[39;6u");
         assert_eq!(kitty(KeyCode::Char('a'), A | S), b"\x1b[97;4u");
         assert_eq!(legacy(KeyCode::Char('a'), A | S), b"\x1bA");
-        // Named keys keep their legacy forms.
         assert_eq!(kitty(KeyCode::Left, C), b"\x1b[1;5D");
         assert_eq!(kitty(KeyCode::F(5), N), b"\x1b[15~");
         // No SS3 under the kitty protocol, application cursor mode or not.

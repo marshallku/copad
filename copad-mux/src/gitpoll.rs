@@ -28,16 +28,11 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// One repo's working-tree state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GitStat {
-    /// `branch.head` from `git status` (the branch, or `(detached)`).
     pub head: String,
-    /// `branch.oid`: the commit checked out (`(initial)` on an unborn branch).
     pub oid: String,
-    /// Tracked entries changed in the index or the worktree, including conflicts.
     pub changed: u32,
-    /// Untracked entries (a new directory counts once, `--untracked-files=normal`).
     pub untracked: u32,
     pub ahead: u32,
     pub behind: u32,
@@ -53,7 +48,6 @@ impl GitStat {
     }
 }
 
-/// A published reading and when it was taken.
 #[derive(Debug, Clone)]
 pub struct Reading {
     pub stat: GitStat,
@@ -61,11 +55,9 @@ pub struct Reading {
 }
 
 impl Reading {
-    /// Whether this reading may be shown for a repo currently on `branch`: taken on that
-    /// branch, and recently enough that it is not a frozen picture of a repo the poller has
-    /// since been unable to read.
-    /// `branch` is what `gitinfo::branch` displays: the branch name, or for a detached HEAD
-    /// the commit's first 8 hex digits — matched against `branch.oid`.
+    /// Whether this reading may be shown for a repo currently on `branch` (what
+    /// `gitinfo::branch` displays; a detached HEAD is matched against `branch.oid`): taken on
+    /// that branch, and recent enough not to be a frozen picture of an unreadable repo.
     pub fn fresh_for(&self, branch: &str) -> bool {
         let same = if self.stat.head == "(detached)" {
             !branch.is_empty() && self.stat.oid.starts_with(branch)
@@ -76,7 +68,6 @@ impl Reading {
     }
 }
 
-/// The poller's shared state (opaque outside this module).
 #[derive(Default)]
 pub struct Inner {
     wanted: Vec<PathBuf>,
@@ -85,26 +76,20 @@ pub struct Inner {
 
 pub type Shared = Arc<Mutex<Inner>>;
 
-/// How often the poller wakes.
 const TICK: Duration = Duration::from_secs(1);
-/// The least time between two reads of one repo.
 const MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// A repo whose read took longer than this is read less often ([`MAX_INTERVAL`] at most).
 const SLOW_READ: Duration = Duration::from_millis(800);
 const MAX_INTERVAL: Duration = Duration::from_secs(60);
-/// Wall time one tick may spend running git, across all repos.
 const TICK_BUDGET: Duration = Duration::from_secs(2);
-/// Per-command deadline.
 const DEADLINE: Duration = Duration::from_secs(3);
 /// A reading older than this is not shown (the repo has failed to read since).
 const STALE_AFTER: Duration = Duration::from_secs(90);
 
-/// A handle that never updates — tests and any path with no server.
 pub fn idle() -> Shared {
     Arc::new(Mutex::new(Inner::default()))
 }
 
-/// Tell the poller which repo roots to read. Roots no longer wanted are dropped.
 pub fn set_wanted(shared: &Shared, mut wanted: Vec<PathBuf>) {
     wanted.sort();
     wanted.dedup();
@@ -114,7 +99,6 @@ pub fn set_wanted(shared: &Shared, mut wanted: Vec<PathBuf>) {
     }
 }
 
-/// The latest reading for `root`, if any.
 pub fn reading(shared: &Shared, root: &Path) -> Option<Reading> {
     shared.lock().ok()?.seen.get(root).cloned()
 }
@@ -133,14 +117,12 @@ pub fn publish(shared: &Shared, root: PathBuf, stat: GitStat) {
     }
 }
 
-/// Start the poller thread.
 pub fn spawn() -> Shared {
     let shared = idle();
     let out = shared.clone();
     let _ = std::thread::Builder::new()
         .name("git-poll".into())
         .spawn(move || {
-            // Per root: when it is next due, and its current interval.
             let mut due: HashMap<PathBuf, (Instant, Duration)> = HashMap::new();
             loop {
                 std::thread::sleep(TICK);
@@ -200,7 +182,6 @@ pub fn spawn() -> Shared {
     shared
 }
 
-/// Read `root`'s state with two git runs. `None` when either fails or times out.
 pub fn read_stat(root: &Path) -> Option<GitStat> {
     let status = run_git(
         root,
@@ -234,7 +215,6 @@ pub fn read_stat(root: &Path) -> Option<GitStat> {
     Some(stat)
 }
 
-/// Run `git -C root <args>` as a well-behaved guest (see the module docs).
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     for (k, _) in std::env::vars_os() {
@@ -312,7 +292,6 @@ fn run_guarded(mut cmd: Command, deadline_in: Duration) -> Option<String> {
     (!timed_out && status.success()).then_some(out?)
 }
 
-/// Whether `pid` (our child) has exited, WITHOUT reaping it.
 fn exited_unreaped(pid: u32) -> bool {
     // SAFETY: `waitid` writes only into `info`; WNOWAIT leaves the child waitable.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -334,7 +313,6 @@ fn exited_unreaped(pid: u32) -> bool {
     got != 0
 }
 
-/// Parse `git status --porcelain=v2 --branch` (not `-z`: one record per line).
 pub fn parse_status(s: &str) -> GitStat {
     let mut st = GitStat::default();
     for line in s.lines() {
@@ -524,7 +502,6 @@ mod tests {
         );
     }
 
-    /// A real repository, when `git` is installed: the end-to-end contract of `read_stat`.
     #[test]
     fn reads_a_real_repo() {
         if Command::new("git").arg("--version").output().is_err() {
