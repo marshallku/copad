@@ -1,22 +1,16 @@
-//! Config-driven `event → action` automation.
+//! Config-driven `event -> action` automation (`docs/workflow-runtime.md`).
 //!
-//! v1 design (see `docs/workflow-runtime.md`):
-//! - Triggers are declared declaratively in TOML / JSON as `[[triggers]]`.
-//! - `when` matches an event kind (glob) plus optional payload-field equality.
-//! - `params` may contain `{event.X}` / `{context.X}` interpolation tokens.
-//!   Payload keys (`event.<key>`) win; the top-level event fields
-//!   `kind`, `source`, `timestamp_ms` are the fallback so triggers can
-//!   reach event metadata without polluting plugin payloads.
-//! - Action invocations go through an `Arc<dyn TriggerSink>`. Default impl
-//!   on `ActionRegistry` gives synchronous error semantics for registered
-//!   actions. Platforms can plug a wider sink (e.g. `copad-linux`'s
-//!   `LiveTriggerSink` falls through to `socket::dispatch`, which gives
-//!   ASYNCHRONOUS error visibility for legacy match-arm commands). Either
-//!   way, errors are surfaced — one bad trigger cannot poison the dispatcher.
+//! Triggers are declared as `[[triggers]]` in TOML/JSON. `when` matches an event kind (glob)
+//! plus optional payload-field equality. `params` may contain `{event.X}` / `{context.X}`
+//! tokens; payload keys win, with the top-level event fields `kind`, `source`, `timestamp_ms`
+//! as fallback. Actions go through an `Arc<dyn TriggerSink>`: the `ActionRegistry` impl gives
+//! synchronous error semantics, while a wider platform sink (copad-linux's `LiveTriggerSink`
+//! falls through to `socket::dispatch`) gives asynchronous error visibility for legacy
+//! match-arm commands. Either way errors are surfaced and one bad trigger cannot poison the
+//! dispatcher.
 //!
-//! This module is the pure primitive — no bus subscription, no config
-//! loading, no thread management. The platform layer is responsible for
-//! pumping events into `dispatch()`.
+//! This is the pure primitive: no bus subscription, config loading or threads. The platform
+//! layer pumps events into `dispatch()`.
 
 use crate::action_registry::{ActionRegistry, ActionResult};
 use crate::condition;
@@ -40,54 +34,41 @@ impl TriggerSink for ActionRegistry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Trigger {
     pub name: String,
-    /// Event-driven source. Mutually exclusive with `cron`. Exactly
-    /// one of `when` / `cron` must be set; validation in
-    /// `set_triggers` drops triggers that violate the invariant.
+    /// Event-driven source, mutually exclusive with `cron`; exactly one must be set (`set_triggers`
+    /// drops triggers that violate this).
     #[serde(default)]
     pub when: Option<WhenSpec>,
-    /// Cron-driven source — 6-field schedule (`sec min hr dom mon dow`,
-    /// chrono-Local timezone). Compiled by the daemon's
-    /// `CronScheduler`; core only validates exclusivity here and
-    /// rejects cron-incompatible options. v1 limits: `condition`,
-    /// `await`, and `{event.*}`/`{action_result.*}` interpolation
-    /// tokens in `params` are disallowed for cron triggers (no
-    /// originating event to evaluate against). Documented in
-    /// `docs/workflow-runtime.md`.
+    /// Cron-driven source: 6-field schedule (`sec min hr dom mon dow`, chrono-Local), compiled by
+    /// the daemon's `CronScheduler`. Core only validates exclusivity and rejects cron-incompatible
+    /// options: `condition`, `await` and `{event.*}`/`{action_result.*}` tokens in `params` (no
+    /// originating event). See `docs/workflow-runtime.md`.
     #[serde(default)]
     pub cron: Option<String>,
     pub action: String,
     #[serde(default)]
     pub params: Value,
-    /// Optional predicate evaluated AFTER `when` matches. See `crate::condition`
-    /// for grammar; eval errors are logged and treated as no-match.
+    /// Predicate evaluated AFTER `when` matches (grammar in `crate::condition`); eval errors are
+    /// logged and treated as no-match.
     #[serde(default)]
     pub condition: Option<String>,
-    /// Optional async-correlation clause; see `AwaitClause` and
-    /// docs/workflow-runtime.md "Async correlation".
     #[serde(default)]
     pub r#await: Option<AwaitClause>,
-    /// Trust-boundary opt-ins. Absent block = both flags `false`:
-    /// trigger ignores `External`-origin events and refuses to invoke
-    /// privileged actions. See `docs/harness-integration.md`
-    /// § "Trust boundary".
+    /// Trust-boundary opt-ins. An absent block means both flags `false`: the trigger ignores
+    /// `External`-origin events and refuses privileged actions (`docs/harness-integration.md`
+    /// "Trust boundary").
     #[serde(default)]
     pub security: SecurityBlock,
 }
 
 impl Trigger {
-    /// True iff this trigger fires on a cron schedule (vs an event).
-    /// Used by the daemon scheduler to filter; `TriggerEngine::dispatch`
-    /// already skips cron triggers via `matches()` returning false.
     pub fn is_cron(&self) -> bool {
         self.cron.is_some()
     }
 }
 
-/// Two-axis trust opt-in. Default-deny: a freshly authored trigger
-/// fires only on internal events and cannot run privileged actions.
-/// Wiring a hook-published event to a `system.spawn` action requires
-/// the user to explicitly flip both flags, making the trust decision
-/// visible in the trigger TOML diff.
+/// Two-axis trust opt-in, default-deny: a new trigger fires only on internal events and cannot
+/// run privileged actions. Wiring a hook-published event to `system.spawn` requires flipping
+/// both flags, which makes the trust decision visible in the trigger TOML diff.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SecurityBlock {
     #[serde(default)]
@@ -96,24 +77,17 @@ pub struct SecurityBlock {
     pub allow_privileged: bool,
 }
 
-/// Static list of action names that may execute arbitrary code or
-/// mutate state outside the daemon's sandbox. Triggers may invoke
-/// these only if `[security] allow_privileged = true`. Initial set
-/// is just `system.spawn` (intercepted before the registry —
-/// see `daemon_trigger_sink::handle_system_spawn`); extend as new
-/// privileged actions land (e.g. `git.worktree_add` with arbitrary
-/// paths, `kb.write` outside the KB root).
+/// Action names that may execute arbitrary code or mutate state outside the daemon's sandbox;
+/// triggers may invoke them only with `[security] allow_privileged = true`. Currently just
+/// `system.spawn` (intercepted before the registry, see `daemon_trigger_sink::handle_system_spawn`).
 pub fn is_privileged_action(action: &str) -> bool {
     matches!(action, "system.spawn")
 }
 
-/// Shared invariant check for event-vs-cron source. Both core's
-/// `set_triggers` and the daemon's `CronScheduler::reload` route
-/// through this so a config rejected by one is rejected by the other —
-/// no silent drift between engine-visible triggers and scheduler-visible
-/// triggers. Returns a human-readable reason on rejection so call sites
-/// can log it verbatim. Does NOT parse the cron schedule itself; that's
-/// the daemon scheduler's job (the `cron` crate dep lives there).
+/// Shared event-vs-cron invariant check: core's `set_triggers` and the daemon's
+/// `CronScheduler::reload` both use it so a config rejected by one is rejected by the other.
+/// Returns a loggable reason on rejection. Does not parse the cron schedule (the `cron` crate
+/// dep lives in the daemon).
 pub fn validate_source_invariants(t: &Trigger) -> Result<(), String> {
     match (&t.when, &t.cron) {
         (None, None) => Err("missing both `when` and `cron` — exactly one source required".into()),
@@ -149,13 +123,9 @@ pub fn validate_source_invariants(t: &Trigger) -> Result<(), String> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AwaitClause {
     pub event_kind: String,
-    /// Field equality on the awaited event's payload. Each value is
-    /// interpolated against the originating event before matching.
     #[serde(default)]
     pub payload_match: Map<String, Value>,
     pub timeout_seconds: u64,
-    /// `abort` drops the pending entry; `fire_with_default` synthesizes the
-    /// awaited event with `null` so downstream chains run with missing data.
     #[serde(default)]
     pub on_timeout: TimeoutPolicy,
 }
@@ -170,18 +140,17 @@ pub enum TimeoutPolicy {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WhenSpec {
-    /// Glob pattern matched against `event.kind`.
     pub event_kind: String,
-    /// `#[serde(flatten)]`: any other keys in the `[when]` table become
-    /// payload-equality requirements (e.g. `channel = "alerts"`).
+    /// `#[serde(flatten)]`: other keys in the `[when]` table become payload-equality requirements
+    /// (e.g. `channel = "alerts"`).
     #[serde(flatten)]
     pub payload_match: Map<String, Value>,
 }
 
 impl Trigger {
     pub fn matches(&self, event: &Event) -> bool {
-        // Cron triggers have `when = None` and are invisible to bus
-        // dispatch — the daemon's `CronScheduler` invokes them directly.
+        // Cron triggers have `when = None` and are invisible to bus dispatch; the daemon's
+        // `CronScheduler` invokes them directly.
         let Some(when) = &self.when else { return false };
         if !pattern_matches(&when.event_kind, &event.kind) {
             return false;
@@ -200,30 +169,27 @@ impl Trigger {
     }
 }
 
-/// Engine-internal compiled form: each `Trigger.condition` is parsed once.
-/// Parse failures drop only the offending trigger (logged).
+/// Engine-internal compiled form: each `Trigger.condition` is parsed once; a parse failure drops
+/// only that trigger.
 #[derive(Debug, Clone)]
 struct CompiledTrigger {
     trigger: Trigger,
     condition: Option<condition::Expr>,
 }
 
-/// Two-phase state for await-bearing triggers. Dispatch lands here first;
-/// promotion to `PendingAwait` waits for `<action>.completed`, because blocking
-/// and plugin sinks return `Ok({queued: true})` synchronously BEFORE the
-/// action actually runs. See docs/workflow-runtime.md "Async correlation".
+/// Two-phase state for await-bearing triggers. Dispatch lands here first; promotion to
+/// `PendingAwait` waits for `<action>.completed`, because blocking and plugin sinks return
+/// `Ok({queued: true})` BEFORE the action runs (docs/workflow-runtime.md "Async correlation").
 struct PreflightAwait {
     trigger_name: String,
     action: String,
     await_event_kind: String,
-    /// Un-interpolated `payload_match` template. We can't interpolate yet
-    /// because `{action_result.<x>}` tokens need the `.completed` event's
-    /// payload, which arrives at promotion time, not registration.
+    /// Un-interpolated `payload_match`: `{action_result.<x>}` tokens need the `.completed`
+    /// payload, which only arrives at promotion.
     payload_match_template: Map<String, Value>,
     original_event: Event,
-    /// Dispatch context captured at register time. `{context.active_panel}`
-    /// / `{context.active_cwd}` tokens resolve at promotion using THIS
-    /// snapshot, not whatever the active panel is by then.
+    /// Dispatch context captured at register time; `{context.*}` tokens resolve against THIS
+    /// snapshot at promotion, not the then-active panel.
     original_context: Option<Context>,
     deadline: Instant,
     on_timeout: TimeoutPolicy,
@@ -232,16 +198,13 @@ struct PreflightAwait {
 struct PendingAwait {
     trigger_name: String,
     await_event_kind: String,
-    /// Fully interpolated at promotion using the original event AND the
-    /// action's return payload (carried by the `.completed` event). Match
-    /// against the incoming awaited event is pure JSON equality.
+    /// Interpolated at promotion from the original event and the action's return payload; match
+    /// against the awaited event is pure JSON equality.
     payload_match: Map<String, Value>,
-    /// Carried forward so the synthesized `<trigger_name>.awaited` event keeps
-    /// `{event.<orig>}` interpolation working downstream.
+    /// Carried forward so `{event.<orig>}` keeps working on the synthesized `.awaited` event.
     original_payload: Value,
-    /// `.completed` event payload. Propagated to the synthesized awaited
-    /// event under `action_result:` so downstream chains can read
-    /// `{event.action_result.<field>}`.
+    /// The `.completed` payload, propagated to the synthesized awaited event under
+    /// `action_result:` for `{event.action_result.<field>}`.
     action_result: Option<Value>,
     deadline: Instant,
     on_timeout: TimeoutPolicy,
@@ -252,8 +215,8 @@ pub struct TriggerEngine {
     sink: Arc<dyn TriggerSink>,
     preflight_awaits: RwLock<Vec<PreflightAwait>>,
     pending_awaits: RwLock<Vec<PendingAwait>>,
-    /// Bus for publishing `<trigger_name>.awaited`. `None` disables emission;
-    /// pending entries still register but no downstream chains can fire.
+    /// Bus for publishing `<trigger_name>.awaited`; `None` disables emission (pending entries
+    /// still register but no downstream chain can fire).
     publish_bus: Option<Arc<EventBus>>,
 }
 
@@ -278,16 +241,12 @@ impl TriggerEngine {
         }
     }
 
-    /// Trigger-list swap is atomic per-list (concurrent dispatch sees the old
-    /// or new full list, never half-applied). Per-trigger `condition` parse
-    /// failures drop only the offending trigger. Await pools are also cleared,
-    /// but under separate locks — and `dispatch` clones the trigger snapshot
-    /// before registering preflights, so any number of in-flight dispatches
-    /// that captured the OLD snapshot can still register old-generation
-    /// preflights after the clear. Hot-reload is best-effort cleanup, not a
-    /// hard isolation boundary; old `<name>.awaited` events may still fire
-    /// for events already in flight at swap time. Acceptable because triggers
-    /// are user-authored config, not a hot data path.
+    /// Swaps the trigger list atomically (concurrent dispatch sees the old or new full list).
+    /// A `condition` parse failure drops only that trigger. Await pools are cleared under
+    /// separate locks, and `dispatch` clones the trigger snapshot before registering preflights,
+    /// so in-flight dispatches holding the OLD snapshot can still register old-generation
+    /// preflights after the clear: hot-reload cleanup is best-effort, and old `<name>.awaited`
+    /// events may fire for events in flight at swap time.
     pub fn set_triggers(&self, triggers: Vec<Trigger>) {
         let compiled: Vec<CompiledTrigger> = triggers
             .into_iter()
@@ -324,10 +283,7 @@ impl TriggerEngine {
         self.triggers.read().unwrap().len()
     }
 
-    /// Cron-source triggers all satisfy `Trigger::is_cron()`. Used by
-    /// the daemon's `CronScheduler` to enumerate just the cron subset
-    /// after `set_triggers` (which validates + stores both event- and
-    /// cron-source triggers in the same list).
+    /// The cron subset of the list `set_triggers` stores, for the daemon's `CronScheduler`.
     pub fn cron_triggers(&self) -> Vec<Trigger> {
         self.triggers
             .read()
@@ -338,23 +294,13 @@ impl TriggerEngine {
             .collect()
     }
 
-    /// Direct action invocation for cron triggers — bypasses
-    /// `Trigger::matches` (cron triggers have `when = None` so they'd
-    /// never match) and skips event-driven trust gates that don't
-    /// apply (cron has no originating event, no `External` origin).
-    /// Still routes through the sink, so the registry's auto-publish
-    /// of `<action>.completed`/`.failed` fires normally — downstream
-    /// triggers chaining on those events work the same way as
-    /// event-driven dispatches.
-    ///
-    /// `allow_privileged` is honored here too: a cron trigger trying
-    /// to invoke `system.spawn` without opting in is rejected with a
-    /// warning, mirroring `dispatch()`.
-    ///
-    /// Returns the sink's `ActionResult` so the scheduler can log
-    /// dispatch failures (mostly diagnostic — sinks usually return
-    /// `Ok({queued: true})` synchronously regardless of action
-    /// success).
+    /// Direct action invocation for cron triggers. Bypasses `Trigger::matches` (cron triggers
+    /// have `when = None`) and the event-driven trust gates (no originating event, so no
+    /// `External` origin), but still routes through the sink so `<action>.completed`/`.failed`
+    /// auto-publish and chained triggers work as for event-driven dispatch. `allow_privileged`
+    /// is honored: an un-opted-in `system.spawn` is rejected with a warning, as in `dispatch()`.
+    /// Returns the sink's `ActionResult` for diagnostics only, since sinks usually return
+    /// `Ok({queued: true})` regardless of action success.
     pub fn dispatch_cron(&self, trigger: &Trigger, context: Option<&Context>) -> ActionResult {
         if is_privileged_action(&trigger.action) && !trigger.security.allow_privileged {
             log::warn!(
@@ -367,10 +313,8 @@ impl TriggerEngine {
                 trigger.name, trigger.action
             )));
         }
-        // No originating event → synthesize an empty event for the
-        // interpolation helper. Validation in `set_triggers` already
-        // rejected cron triggers with `{event.*}` / `{action_result.*}`
-        // tokens, so the empty-event substrate is sufficient.
+        // No originating event: synthesize an empty one. `set_triggers` already rejected cron
+        // triggers using `{event.*}` / `{action_result.*}` tokens.
         let synthetic = Event::new(
             format!("cron.{}", trigger.name),
             crate::action_registry::COMPLETION_EVENT_SOURCE,
@@ -389,37 +333,25 @@ impl TriggerEngine {
             .collect()
     }
 
-    /// Returns the count of triggers that fired (synchronous `Ok` from the
-    /// sink). Some sinks return `Ok` on queueing without waiting for the
-    /// underlying action — those failures are surfaced asynchronously by
-    /// the sink itself (non-`register_silent` registry actions auto-publish
-    /// `<action>.failed` on the bus; silent registry actions and legacy
-    /// match-arm sinks log instead).
+    /// Returns the count of triggers that fired (synchronous `Ok` from the sink). Sinks that
+    /// return `Ok` on queueing surface failures asynchronously: non-silent registry actions
+    /// auto-publish `<action>.failed`, while silent ones and legacy match-arm sinks log.
     pub fn dispatch(&self, event: &Event, context: Option<&Context>) -> usize {
-        // External-origin events are kept out of the await state
-        // machine entirely. Without this, a socket-driven `events.publish`
-        // could satisfy a pending await whose originating trigger never
-        // opted into `accept_external = true`, and the resulting
-        // synthesized `<trigger>.awaited` event (always tagged Internal)
-        // would let downstream triggers chain on external data without
-        // any opt-in. Per-pending origin policy (let external events
-        // satisfy awaits whose creator opted in) is a follow-up —
-        // tracked in docs/harness-integration.md known gaps.
-        // `.completed`/`.failed` events from the daemon's action
-        // registry are always Internal, so promotion isn't blocked by
-        // this gate.
+        // External-origin events stay out of the await state machine entirely: otherwise a
+        // socket-driven `events.publish` could satisfy a pending await whose trigger never set
+        // `accept_external`, and the synthesized `<trigger>.awaited` event (always Internal)
+        // would let downstream triggers chain on external data with no opt-in. Per-pending origin
+        // policy is a known gap (docs/harness-integration.md). Registry `.completed`/`.failed`
+        // events are always Internal, so promotion isn't blocked.
         if event.origin != Origin::External {
-            // Await-state passes run BEFORE iterating triggers: a trigger
-            // that fires action X on this event must not have its fresh
-            // preflight consumed by the same `X.completed` event we just
-            // used to promote.
+            // Await passes run BEFORE iterating triggers: a trigger firing action X on this event
+            // must not have its fresh preflight consumed by the same `X.completed` event.
             self.try_promote_or_drop_preflight(event);
             self.try_match_pending_awaits(event);
         }
 
-        // Snapshot the trigger list under a short read lock so a concurrent
-        // `set_triggers` can't observe partial iteration. Triggers are small
-        // and infrequent, so cloning is cheap.
+        // Snapshot under a short read lock so a concurrent `set_triggers` can't be observed
+        // mid-iteration; cloning is cheap.
         let snapshot: Vec<CompiledTrigger> = self.triggers.read().unwrap().clone();
         let mut fired = 0;
         for ct in &snapshot {
@@ -427,9 +359,8 @@ impl TriggerEngine {
             if !trigger.matches(event) {
                 continue;
             }
-            // Trust-boundary gates run BEFORE the user-supplied `condition`
-            // expression — a misconfigured condition that always returns true
-            // must still not subvert the origin/privilege opt-ins.
+            // Trust-boundary gates run BEFORE the user `condition`: a condition that always
+            // returns true must not subvert the origin/privilege opt-ins.
             if event.origin == Origin::External && !trigger.security.accept_external {
                 log::debug!(
                     "trigger {:?} skipping External-origin event {:?}: accept_external not set",
@@ -446,8 +377,7 @@ impl TriggerEngine {
                 );
                 continue;
             }
-            // Eval error is treated as no-match — safer than firing on a
-            // misconfigured condition.
+            // An eval error is no-match: safer than firing on a misconfigured condition.
             if let Some(expr) = &ct.condition {
                 match condition::eval(expr, event, context) {
                     Ok(true) => {}
@@ -491,10 +421,8 @@ impl TriggerEngine {
         fired
     }
 
-    /// Stores the un-interpolated `payload_match` template; interpolation
-    /// happens at promotion (`try_promote_or_drop_preflight`) so that
-    /// `{action_result.<x>}` tokens can resolve against the `.completed`
-    /// event's payload, not just the originating event.
+    /// Stores the un-interpolated `payload_match` template; interpolation happens at promotion so
+    /// `{action_result.<x>}` can resolve against the `.completed` payload.
     fn register_preflight_await(
         &self,
         trigger: &Trigger,
@@ -515,11 +443,10 @@ impl TriggerEngine {
         self.preflight_awaits.write().unwrap().push(preflight);
     }
 
-    /// Promote first matching preflight to pending on `<X>.completed`, drop
-    /// it on `<X>.failed`. Trust gate: only `event.source ==
-    /// COMPLETION_EVENT_SOURCE` advances state. FIFO match by action name
-    /// has a known invocation-correlation hazard when the same action runs
-    /// concurrently — see docs/workflow-runtime.md "Async correlation".
+    /// Promotes the first matching preflight on `<X>.completed`, drops it on `<X>.failed`. Only
+    /// `event.source == COMPLETION_EVENT_SOURCE` advances state. FIFO matching by action name
+    /// is hazardous when the same action runs concurrently (docs/workflow-runtime.md "Async
+    /// correlation").
     fn try_promote_or_drop_preflight(&self, event: &Event) {
         if event.source != crate::action_registry::COMPLETION_EVENT_SOURCE {
             return;
@@ -537,23 +464,16 @@ impl TriggerEngine {
         };
         let removed = pre.remove(idx);
         if !success {
-            // .failed: chain is broken at the action; don't promote.
             log::debug!(
                 "trigger {:?} preflight dropped on {action}.failed",
                 removed.trigger_name
             );
             return;
         }
-        // .completed: promote to pending. We DON'T re-set the deadline
-        // here — the original timeout window covers preflight + pending
-        // combined. If `.completed` arrived just before the deadline,
-        // the pending gets less time to match the awaited event; that's
-        // the user's contract for total wait.
-        //
-        // Interpolation runs HERE (not at register time) so the
-        // `payload_match` template can resolve `{action_result.<x>}`
-        // against the just-arrived `.completed` event's payload, in
-        // addition to the original event's `{event.<x>}`.
+        // .completed: promote to pending. The deadline is NOT reset: the original timeout covers
+        // preflight plus pending, so a late `.completed` leaves less time to match. Interpolation
+        // runs HERE so the template can resolve `{action_result.<x>}` against the just-arrived
+        // payload as well as `{event.<x>}`.
         let action_result = event.payload.clone();
         let mut interpolated_match = Map::new();
         for (k, v) in &removed.payload_match_template {
@@ -578,9 +498,8 @@ impl TriggerEngine {
         });
     }
 
-    /// Single-consumption: one incoming event resolves at most one pending
-    /// entry. When pendings share identical match criteria, only the oldest
-    /// fires — broadcasting would silently double-fire downstream chains.
+    /// Single-consumption: one incoming event resolves at most one pending entry; with identical
+    /// criteria only the oldest fires, since broadcasting would double-fire downstream chains.
     fn try_match_pending_awaits(&self, event: &Event) {
         let mut to_emit: Option<(String, Value)> = None;
         {
@@ -612,8 +531,8 @@ impl TriggerEngine {
                     &event.payload,
                     p.action_result.as_ref(),
                 );
-                // Don't publish under the lock — a subscriber calling back
-                // into the engine would deadlock against this write lock.
+                // Don't publish under the lock: a subscriber calling back into the engine would
+                // deadlock on this write lock.
                 to_emit = Some((awaited_kind_for(&p.trigger_name), synthesized));
             }
         }
@@ -624,9 +543,8 @@ impl TriggerEngine {
         }
     }
 
-    /// Drop expired entries from BOTH pools — total wait (preflight +
-    /// pending) shares one timeout window. Caller drives this on a timer;
-    /// the engine has no thread of its own.
+    /// Drops expired entries from BOTH pools (total wait shares one timeout window). The caller
+    /// drives this on a timer.
     pub fn sweep_pending_awaits(&self) {
         let now = Instant::now();
         let mut to_emit: Vec<(String, Value)> = Vec::new();
@@ -637,8 +555,7 @@ impl TriggerEngine {
                     return true;
                 }
                 if matches!(p.on_timeout, TimeoutPolicy::FireWithDefault) {
-                    // Preflight timeout: action never completed, so no
-                    // action_result is available — pass None.
+                    // Preflight timeout: the action never completed, so no action_result.
                     let synthesized =
                         build_awaited_payload(&p.original_event.payload, &Value::Null, None);
                     to_emit.push((awaited_kind_for(&p.trigger_name), synthesized));
@@ -685,10 +602,8 @@ fn awaited_kind_for(trigger_name: &str) -> String {
     format!("{trigger_name}.awaited")
 }
 
-/// Original event payload at top level, awaited payload nested under
-/// `await:`, action's return payload nested under `action_result:`.
-/// Downstream interpolation reads `{event.<orig>}`, `{event.await.<x>}`,
-/// and `{event.action_result.<x>}`.
+/// Original event payload at top level, awaited payload under `await:`, action's return payload
+/// under `action_result:`.
 fn build_awaited_payload(
     original: &Value,
     awaited: &Value,
@@ -704,22 +619,17 @@ fn build_awaited_payload(
             obj.insert("action_result".to_string(), ar.clone());
         }
         None => {
-            // The cloned original payload may already carry an
-            // `action_result` from an upstream chain. Drop it so a
-            // chain whose current action never completed can't leak
-            // the previous action's result to downstream
-            // `{event.action_result.*}` readers.
+            // The cloned payload may already carry an `action_result` from an upstream chain; drop
+            // it so an action that never completed can't leak the previous result downstream.
             obj.remove("action_result");
         }
     }
     Value::Object(obj)
 }
 
-/// Reduce trigger `event_kind` patterns to the minimal covering set so the
-/// platform layer subscribes once per "real" pattern. Rules:
-/// - `*` covers every pattern.
-/// - `foo.*` covers `foo.X`, `foo.X.Y`, and `foo.X.*`.
-/// - Exact patterns survive only when nothing in the set covers them.
+/// Reduce trigger `event_kind` patterns to the minimal covering set so the platform layer
+/// subscribes once per real pattern: `*` covers everything, `foo.*` covers `foo.X`, `foo.X.Y`
+/// and `foo.X.*`, exact patterns survive only when uncovered.
 pub fn covering_patterns<I, S>(patterns: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -751,12 +661,10 @@ fn pattern_covers(broader: &str, narrower: &str) -> bool {
         return false;
     };
     if let Some(narr_prefix) = narrower.strip_suffix(".*") {
-        // `prefix.*` covers `prefix.X.*`, `prefix.X.Y.*`, etc.
         narr_prefix.len() > prefix.len()
             && narr_prefix.starts_with(prefix)
             && narr_prefix.as_bytes()[prefix.len()] == b'.'
     } else {
-        // `prefix.*` covers `prefix.X`, `prefix.X.Y`, etc. (exact targets)
         narrower.len() > prefix.len()
             && narrower.starts_with(prefix)
             && narrower.as_bytes()[prefix.len()] == b'.'
@@ -794,10 +702,9 @@ fn interpolate_value_with(
     }
 }
 
-/// Type-preserving variant of `interpolate_value` for `payload_match` values:
-/// a string that is exactly `{<token>}` resolves to the raw JSON `Value`
-/// (so `count = "{event.count}"` matches `Value::Number(42)`, not
-/// `Value::String("42")`). Mixed templates still string-coerce.
+/// Type-preserving `interpolate_value` for `payload_match`: a string that is exactly `{<token>}`
+/// resolves to the raw JSON `Value` (`count = "{event.count}"` matches `Number(42)`, not
+/// `String("42")`); mixed templates still string-coerce.
 fn interpolate_value_typed(
     template: &Value,
     event: &Event,
@@ -862,10 +769,8 @@ fn resolve_token_value(
     None
 }
 
-/// Owned-`Value` view of the top-level `Event` fields that mirror the
-/// wire encoding (`kind`, `source`, `timestamp_ms`). Consulted only when
-/// `event.payload` lacks the requested key — payload wins so existing
-/// configs whose payload shadows these names keep their meaning.
+/// Owned view of the top-level `Event` fields mirroring the wire encoding (`kind`, `source`,
+/// `timestamp_ms`), consulted only when the payload lacks the key, so payload keys keep winning.
 fn event_top_level_value(field: &str, event: &Event) -> Option<Value> {
     match field {
         "kind" => Some(Value::String(event.kind.clone())),
@@ -891,16 +796,14 @@ fn interpolate_string(
             if let Some(val) = resolve_token(token, event, context, action_result) {
                 result.push_str(&val);
             } else {
-                // Unresolvable token: keep the literal `{token}` so misconfigured
-                // triggers fail loudly in their target action rather than
-                // silently substituting empty string.
+                // Unresolvable token: keep the literal `{token}` so a misconfigured trigger fails
+                // loudly in its target action instead of silently substituting empty.
                 result.push('{');
                 result.push_str(token);
                 result.push('}');
             }
             rest = &after_open[close_rel + 1..];
         } else {
-            // Unclosed `{` — append the remainder verbatim.
             result.push_str(&rest[open..]);
             return result;
         }
@@ -943,8 +846,8 @@ fn resolve_token(
     None
 }
 
-/// Walk a dot-separated path into a JSON `Value`. Stops at the first
-/// non-object hop — array/index access is intentionally unsupported.
+/// Walk a dot-separated path into a JSON `Value`; stops at the first non-object hop (array
+/// indexing is unsupported).
 fn resolve_dot_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = root;
     for seg in path.split('.') {
@@ -1073,7 +976,6 @@ mod tests {
         });
         let good = mk_cron_trigger("good", "0 * * * * *", "noop");
         engine.set_triggers(vec![bad, good]);
-        // Only `good` survives validation; `bad` is dropped with a warning.
         assert_eq!(engine.count(), 1);
         assert_eq!(engine.names(), vec!["good"]);
     }
@@ -1169,19 +1071,14 @@ mod tests {
             ),
             None,
         );
-        // event.source resolves from payload (we publish "test" as source but
-        // tokens look up payload, not the top-level Event::source field).
         assert_eq!(result["id"], json!("abc"));
         assert_eq!(result["msg"], json!("got abc from x"));
     }
 
-    /// Security property: interpolation is SINGLE-PASS. A substituted
-    /// value that itself contains `{...}` tokens (e.g. a Slack-captured
-    /// todo body flowing into `claude.start`'s prompt via
-    /// `{event.assembled_prompt}`) must be emitted verbatim, never
-    /// re-expanded — otherwise external text could pull `{context.*}` /
-    /// other `{event.*}` values into the output. A future interpolator
-    /// rewrite (e.g. repeat-until-stable replacement) would break this.
+    /// Security property: interpolation is SINGLE-PASS. A substituted value that itself contains
+    /// `{...}` (e.g. a Slack-captured todo body flowing into `claude.start`'s prompt) must be
+    /// emitted verbatim, never re-expanded, or external text could pull `{context.*}` / other
+    /// `{event.*}` values into the output.
     #[test]
     fn interpolation_is_single_pass_external_tokens_stay_literal() {
         let t = Trigger {
@@ -1206,14 +1103,11 @@ mod tests {
             ),
             None,
         );
-        // Substituted once, embedded braces preserved verbatim.
         assert_eq!(result["prompt"], json!(hostile_body));
     }
 
     #[test]
     fn interpolates_nested_event_paths() {
-        // Dot-path access through nested objects so
-        // `{event.await.text}` and `{event.action_result.thread_ts}` resolve.
         let t = Trigger {
             name: "t".into(),
             when: Some(WhenSpec {
@@ -1246,11 +1140,8 @@ mod tests {
 
     #[test]
     fn dot_path_unresolved_keeps_literal_for_safety() {
-        // When a dot-path bottoms out (missing intermediate object,
-        // or non-object hop), the resolver returns None. The
-        // interpolator preserves the literal `{token}` so a
-        // misconfigured trigger surfaces as a visible action error
-        // rather than silently substituting empty.
+        // A dot-path that bottoms out (missing intermediate object or non-object hop) keeps the
+        // literal `{token}`, so a misconfigured trigger shows up as a visible action error.
         let t = Trigger {
             name: "t".into(),
             when: Some(WhenSpec {
@@ -1487,7 +1378,6 @@ mod tests {
             r#await: None,
             security: SecurityBlock::default(),
         }]);
-        // Should not panic. fired count is 0 because the action returned Err.
         let fired = engine.dispatch(&evt("any", json!({})), None);
         assert_eq!(fired, 0);
     }
@@ -1511,8 +1401,6 @@ mod tests {
         let fired = engine.dispatch(&evt("any", json!({})), None);
         assert_eq!(fired, 0);
     }
-
-    // -- Condition integration --
 
     fn trig_with_condition(name: &str, condition: Option<&str>) -> Trigger {
         Trigger {
@@ -1545,7 +1433,6 @@ mod tests {
             "skip-declined",
             Some(r#"event.my_response_status != "declined""#),
         )]);
-        // Declined event: trigger should NOT fire.
         let fired = engine.dispatch(
             &evt(
                 "calendar.event_imminent",
@@ -1555,7 +1442,6 @@ mod tests {
         );
         assert_eq!(fired, 0);
         assert_eq!(count.load(Ordering::SeqCst), 0);
-        // Accepted event: trigger SHOULD fire.
         let fired = engine.dispatch(
             &evt(
                 "calendar.event_imminent",
@@ -1578,7 +1464,6 @@ mod tests {
                 Ok(json!(null))
             });
         }
-        // `>` on a non-numeric payload field — eval errors at runtime.
         engine.set_triggers(vec![trig_with_condition(
             "bad-cond",
             Some(r#"event.title > "5""#),
@@ -1590,8 +1475,7 @@ mod tests {
             ),
             None,
         );
-        // Eval error → safe default is "doesn't match" — fire count
-        // stays zero rather than firing on a misconfigured condition.
+        // An eval error means no-match, not firing on a misconfigured condition.
         assert_eq!(fired, 0);
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
@@ -1611,7 +1495,6 @@ mod tests {
             trig_with_condition("good", None),
             trig_with_condition("broken", Some("foo == bar baz")), // garbage
         ]);
-        // Only the good trigger should be live.
         assert_eq!(engine.count(), 1);
         assert_eq!(engine.names(), vec!["good".to_string()]);
         let fired = engine.dispatch(&evt("calendar.event_imminent", json!({})), None);
@@ -1634,7 +1517,6 @@ mod tests {
             "only-when-panel-1",
             Some(r#"context.active_panel == "panel-1""#),
         )]);
-        // Wrong panel → skip
         let ctx_other = Context {
             active_panel: Some("panel-9".into()),
             active_cwd: None,
@@ -1642,7 +1524,6 @@ mod tests {
         };
         engine.dispatch(&evt("calendar.event_imminent", json!({})), Some(&ctx_other));
         assert_eq!(count.load(Ordering::SeqCst), 0);
-        // Right panel → fire
         let ctx = Context {
             active_panel: Some("panel-1".into()),
             active_cwd: None,
@@ -1700,7 +1581,6 @@ mod tests {
         assert_eq!(engine.count(), 1);
         engine.dispatch(&evt("a", json!({})), None);
         engine.dispatch(&evt("b", json!({})), None);
-        // No further bumps: a/b triggers are gone.
         assert_eq!(count.load(Ordering::SeqCst), 2);
         engine.dispatch(&evt("c", json!({})), None);
         assert_eq!(count.load(Ordering::SeqCst), 3);
@@ -1727,7 +1607,6 @@ mod tests {
 
     #[test]
     fn covering_glob_subsumes_deeper_glob() {
-        // `foo.*` covers `foo.bar.*` (both globs, latter is narrower).
         let out = covering_patterns(vec!["foo.*", "foo.bar.*"]);
         assert_eq!(out, vec!["foo.*"]);
     }
@@ -1748,8 +1627,7 @@ mod tests {
 
     #[test]
     fn covering_does_not_match_substring_namespaces() {
-        // `panel.*` must NOT cover `panelfoo` or `panelfoo.bar` — the dot
-        // separator is significant.
+        // `panel.*` must NOT cover `panelfoo` or `panelfoo.bar`: the dot is significant.
         let mut out = covering_patterns(vec!["panel.*", "panelfoo.bar"]);
         out.sort();
         assert_eq!(out, vec!["panel.*".to_string(), "panelfoo.bar".to_string()]);
@@ -1771,9 +1649,7 @@ mod tests {
         assert_eq!(t.action, "plugin.notion.open_event_doc");
         let when = t.when.as_ref().expect("event-source trigger has when");
         assert_eq!(when.event_kind, "calendar.event_imminent");
-        // The non-`event_kind` field under `[when]` becomes a payload match.
         assert_eq!(when.payload_match["minutes"], json!(10));
-        // `params` interpolates as a normal Value tree.
         assert_eq!(t.params["event_id"], json!("{event.id}"));
         assert_eq!(t.params["lead_minutes"], json!(10));
     }
@@ -1786,7 +1662,6 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
 
-        // step1 returns a payload that step2 will interpolate from.
         registry.register("step1", |params| {
             Ok(json!({
                 "echoed": params,
@@ -1794,8 +1669,7 @@ mod tests {
             }))
         });
 
-        // step2 records the params it was invoked with so we can
-        // assert the chain wired the data through correctly.
+        // step2 records its params so we can assert the chain wired the data through.
         let step2_calls: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let recorder = step2_calls.clone();
@@ -1835,19 +1709,11 @@ mod tests {
             },
         ]);
 
-        // Subscribe to the bus before dispatching so we can drive
-        // trigger-b ourselves on whatever the registry publishes.
-        // Pattern matches the platform layer's pump loop.
         let rx = bus.subscribe_unbounded("step1.completed");
 
-        // Fire the originating event manually. trigger-a fires
-        // step1; the registry then auto-publishes
-        // step1.completed; we read it from the bus and re-dispatch
-        // through engine.dispatch(), which fires trigger-b.
         let originating = Event::new("user.kicked_off", "test", json!({"id": "abc"}));
         engine.dispatch(&originating, None);
 
-        // Pull the completion event the registry published.
         let completion = match rx.recv_timeout(Duration::from_millis(200)) {
             RecvOutcome::Event(e) => e,
             other => panic!("expected step1.completed, got {other:?}"),
@@ -1855,8 +1721,6 @@ mod tests {
         assert_eq!(completion.kind, "step1.completed");
         assert_eq!(completion.payload["marker"], "from-step1");
 
-        // Re-pump: feed the completion event through the engine.
-        // Trigger-b matches and runs step2.
         engine.dispatch(&completion, None);
 
         let step2_invocations = step2_calls.lock().unwrap();
@@ -1926,10 +1790,6 @@ mod tests {
         assert_eq!(recovery_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// 3-trigger chain: `todo.start_requested` → `git.worktree_add` →
-    /// `git.worktree_add.completed` → `claude.start`. Action mocks record
-    /// their interpolated params so we assert engine + bus + registry
-    /// plumbing without real subprocesses or a real git repo.
     #[test]
     fn worktree_add_chain_with_jira_branch() {
         use crate::event_bus::EventBus;
@@ -1938,18 +1798,9 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
 
-        // Captures so we can assert what each action received.
         let worktree_calls: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let claude_calls: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // Mock git.worktree_add — returns the canonical
-        // `{workspace, path, branch, base}` shape so the
-        // registry's auto-published `git.worktree_add.completed`
-        // carries the same payload trigger-3 will interpolate.
-        // Mirrors the real plugin's sanitize_jira semantics so
-        // the test asserts the lowercased branch flows through
-        // to claude.start (NOT just that the flag was set on
-        // the params).
         {
             let recorder = worktree_calls.clone();
             registry.register("git.worktree_add", move |params| {
@@ -1982,9 +1833,6 @@ mod tests {
             });
         }
 
-        // Mock claude.start — records params; returns a stub matching
-        // the real response shape so chained triggers have data to
-        // interpolate from.
         {
             let recorder = claude_calls.clone();
             registry.register("claude.start", move |params| {
@@ -2003,7 +1851,6 @@ mod tests {
 
         let engine = TriggerEngine::new(registry as Arc<dyn TriggerSink>);
         engine.set_triggers(vec![
-            // Trigger 1: with-jira branch
             Trigger {
                 name: "with-jira".into(),
                 when: Some(WhenSpec {
@@ -2015,11 +1862,8 @@ mod tests {
                 params: json!({
                     "workspace": "{event.workspace}",
                     "branch": "{event.linked_jira}",
-                    // NOTE: the engine doesn't yet have a
-                    // sanitize_jira flag because the production
-                    // chain delegates that to the git plugin.
-                    // We still pass `sanitize_jira = true`
-                    // through interpolation so the captured
+                    // The engine has no sanitize_jira flag (the production chain delegates it to
+                    // the git plugin); it is still passed through interpolation so the captured
                     // params reflect the real-world TOML.
                     "sanitize_jira": true,
                 }),
@@ -2058,13 +1902,8 @@ mod tests {
             },
         ]);
 
-        // Subscribe to the chained event before dispatching so
-        // we can manually re-pump it through the engine. In the
-        // live system, copad-linux's pump_state drains
-        // `git.worktree_add.completed` once per GTK tick.
         let rx = bus.subscribe_unbounded("git.worktree_add.completed");
 
-        // Fire originating event with linked_jira set.
         let originating = Event::new(
             "todo.start_requested",
             "test",
@@ -2077,15 +1916,12 @@ mod tests {
         );
         engine.dispatch(&originating, None);
 
-        // Trigger 1 fired (with-jira), trigger 2 skipped (cond false).
         let calls = worktree_calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "only the with-jira trigger should run");
         assert_eq!(calls[0]["workspace"], "myrepo");
         assert_eq!(calls[0]["branch"], "PROJ-456");
         assert_eq!(calls[0]["sanitize_jira"], true);
 
-        // Re-pump the auto-emitted git.worktree_add.completed
-        // through the engine so trigger-3 fires on it.
         let completion = match rx.recv_timeout(Duration::from_millis(200)) {
             crate::event_bus::RecvOutcome::Event(e) => e,
             other => panic!("expected git.worktree_add.completed, got {other:?}"),
@@ -2098,17 +1934,12 @@ mod tests {
             1,
             "claude.start should have been invoked once"
         );
-        // workspace_path comes from the worktree result's path,
-        // and the path was computed AFTER the mock applied
-        // sanitize_jira's lowercasing — same shape as the real
-        // plugin.
         assert_eq!(
             claude_seen[0]["workspace_path"], "/tmp/wt/proj-456",
             "claude.start should receive the LOWERCASED worktree path"
         );
     }
 
-    /// Same chain, no `linked_jira` → branch is `todo-<id>`.
     #[test]
     fn worktree_add_chain_without_jira_branch() {
         use crate::event_bus::EventBus;
@@ -2196,8 +2027,6 @@ mod tests {
 
         let rx = bus.subscribe_unbounded("git.worktree_add.completed");
 
-        // No linked_jira in payload (omitted entirely; the
-        // todo plugin emits null in this case).
         let originating = Event::new(
             "todo.start_requested",
             "test",
@@ -2225,8 +2054,6 @@ mod tests {
         assert_eq!(claude_seen[0]["workspace_path"], "/tmp/wt/todo-T-20260427");
     }
 
-    /// Pin `examples/triggers/vision-flow-3.toml` so a renamed field or
-    /// DSL change can't silently break the shipped reference config.
     #[test]
     fn vision_flow_3_example_toml_parses_cleanly() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2244,18 +2071,14 @@ mod tests {
         let parsed: File =
             toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
 
-        // Sanity: 3 active triggers (the optional log row is commented out).
         assert_eq!(parsed.triggers.len(), 3);
         let names: Vec<&str> = parsed.triggers.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"vision3-start-with-jira"));
         assert!(names.contains(&"vision3-start-without-jira"));
         assert!(names.contains(&"vision3-claude-after-worktree"));
 
-        // The condition strings must compile under the same
-        // condition DSL the engine uses — set_triggers calls
-        // condition::parse() and silently drops triggers whose
-        // condition fails to parse. Catch that here so the
-        // example doesn't silently fail in the field.
+        // The condition strings must compile under the engine's DSL: `set_triggers` silently
+        // drops triggers whose condition fails to parse.
         let bus_sink = ActionRegistry::new();
         let engine = TriggerEngine::new(Arc::new(bus_sink));
         engine.set_triggers(parsed.triggers);
@@ -2266,9 +2089,6 @@ mod tests {
         );
     }
 
-    /// Phase 24.4: pin `plugins/pilot/triggers.example.toml` so the shipped
-    /// event→goal reference stays valid, and prove a `ci.failed` event
-    /// interpolates into a correct `pilot.add` call end-to-end.
     #[test]
     fn pilot_enqueue_example_toml_parses_and_interpolates() {
         use crate::event_bus::Event;
@@ -2291,19 +2111,16 @@ mod tests {
         assert_eq!(parsed.triggers.len(), 3);
         assert!(parsed.triggers.iter().all(|t| t.action == "pilot.add"));
 
-        // All three compile under the engine (no condition::parse drops).
         let engine = TriggerEngine::new(Arc::new(ActionRegistry::new()));
         engine.set_triggers(parsed.triggers.clone());
         assert_eq!(engine.count(), 3);
 
-        // The CI-failure trigger interpolates event payload into pilot.add params.
         let ci = parsed
             .triggers
             .iter()
             .find(|t| t.name == "ci-failure-to-pilot-goal")
             .expect("ci-failure-to-pilot-goal present");
-        // ci.failed is socket-injected (External) — without this opt-in the
-        // TriggerEngine would silently skip it, so pin it here.
+        // ci.failed is socket-injected (External): without this opt-in the engine would skip it.
         assert!(
             ci.security.accept_external,
             "external-event triggers must set accept_external = true"
@@ -2342,11 +2159,6 @@ mod tests {
         parsed.triggers
     }
 
-    /// Phase 14.3: pin `plugins/llm/triggers.example.toml` and drive its
-    /// DM-summarize chain through the engine end-to-end — slack.dm fires
-    /// llm.complete, the `.completed` event promotes AND satisfies the
-    /// await in one dispatch, and the synthesized `.awaited` event lands
-    /// the summary in kb.append's interpolated params.
     #[test]
     fn llm_chain_example_drives_engine_end_to_end() {
         use crate::event_bus::EventBus;
@@ -2399,8 +2211,6 @@ mod tests {
         );
         assert_eq!(engine.preflight_await_count(), 1);
 
-        // Feed the bus events back into the engine — same bridge the
-        // copad-linux pump provides at runtime.
         let completed = completed_rx
             .try_recv()
             .expect("llm.complete.completed on bus");
@@ -2422,10 +2232,6 @@ mod tests {
         );
     }
 
-    /// Phase 14.3: pin the calendar meeting-prep auto-open chain
-    /// (deferred since Phase 10) — `calendar.event_imminent` ensures the
-    /// note, the await carries kb.ensure's `path` result, and
-    /// webview.open receives the file:// URL.
     #[test]
     fn calendar_meeting_prep_chain_example_drives_engine_end_to_end() {
         use crate::event_bus::EventBus;
@@ -2474,11 +2280,9 @@ mod tests {
         let completed_rx = bus.subscribe("kb.ensure.completed");
         let awaited_rx = bus.subscribe("meeting-prep-open-note.awaited");
 
-        // An ordinary recurring meeting: rule 1 (meeting-prep-common,
-        // await-less kb.ensure) fires alongside the chain — the realistic
-        // both-enabled path. The chain's await still resolves correctly:
-        // both completions carry identical params/results, so per-action
-        // FIFO pairing is harmless here (as the example file documents).
+        // An ordinary recurring meeting: rule 1 (await-less kb.ensure) fires alongside the chain.
+        // Both completions carry identical params/results, so per-action FIFO pairing is harmless
+        // here (as the example file documents).
         engine.dispatch(
             &evt(
                 "calendar.event_imminent",
@@ -2490,8 +2294,6 @@ mod tests {
         );
         assert_eq!(engine.preflight_await_count(), 1);
 
-        // Two kb.ensure dispatches → two completion events; feed both back
-        // (first promotes + matches, second is a no-op promote).
         let mut completions = 0;
         while let Some(completed) = completed_rx.try_recv() {
             engine.dispatch(&completed, None);
@@ -2508,9 +2310,7 @@ mod tests {
             assert_eq!(calls[0]["mode"], "tab");
         }
 
-        // The weekly 1:1 must NOT create/open a per-event note — rule 2
-        // owns it (rolling note). Pins the exclusion the chain shares
-        // with rule 1.
+        // The weekly 1:1 must NOT create/open a per-event note: rule 2 owns it (rolling note).
         engine.dispatch(
             &evt(
                 "calendar.event_imminent",
@@ -2528,7 +2328,6 @@ mod tests {
         assert_eq!(opened.lock().unwrap().len(), 1, "no second webview.open");
     }
 
-    /// `git.worktree_add.failed` must NOT fire claude.start.
     #[test]
     fn worktree_add_chain_halts_on_failure() {
         use crate::event_bus::EventBus;
@@ -2579,38 +2378,25 @@ mod tests {
             },
         ]);
 
-        // Subscribe to BOTH possible chained events to confirm
-        // only `failed` was emitted, not `completed`.
         let completed_rx = bus.subscribe_unbounded("git.worktree_add.completed");
         let failed_rx = bus.subscribe_unbounded("git.worktree_add.failed");
 
         engine.dispatch(&Event::new("todo.start_requested", "test", json!({})), None);
 
-        // failed event lands.
         let failed = match failed_rx.recv_timeout(Duration::from_millis(200)) {
             crate::event_bus::RecvOutcome::Event(e) => e,
             other => panic!("expected failed event, got {other:?}"),
         };
         assert_eq!(failed.kind, "git.worktree_add.failed");
 
-        // completed event does NOT land.
         match completed_rx.recv_timeout(Duration::from_millis(50)) {
             crate::event_bus::RecvOutcome::Timeout => {}
             other => panic!("completed event should NOT fire on Err: {other:?}"),
         }
 
-        // claude.start never invoked.
         engine.dispatch(&failed, None);
         assert_eq!(claude_calls.load(Ordering::SeqCst), 0);
     }
-
-    // -- await primitive --
-    //
-    // The shape under test: a trigger with `await` registers a pending
-    // entry on action success, then drains when an event matching the
-    // await's `event_kind` + interpolated `payload_match` arrives.
-    // The synthesized `<trigger_name>.awaited` payload exposes the
-    // matched event's payload under `await` for downstream interpolation.
 
     fn mk_engine_with_bus() -> (
         Arc<ActionRegistry>,
@@ -2641,12 +2427,6 @@ mod tests {
 
     #[test]
     fn await_registers_preflight_on_dispatch_then_promotes_on_completed() {
-        // Two-phase: dispatch lands in preflight; `<action>.completed`
-        // promotes to pending. Without the `.completed` event the
-        // entry never arms (which is the whole point — sink Ok is
-        // unreliable for blocking actions).
-        // `mk_engine_with_bus` doesn't enable completion fan-out, so
-        // construct directly with a registry that has the bus wired.
         let bus2 = Arc::new(crate::event_bus::EventBus::new());
         let reg2 = Arc::new(ActionRegistry::with_completion_bus(bus2.clone()));
         reg2.register("noop", |_p| Ok(json!({"ok": true})));
@@ -2662,32 +2442,21 @@ mod tests {
                 on_timeout: TimeoutPolicy::Abort,
             },
         )]);
-        // We need the engine to also see the `noop.completed` event
-        // that the registry publishes synchronously. Subscribe a
-        // receiver, drain it, and re-dispatch into the engine — same
-        // pattern copad-linux's pump uses.
         let completed_rx = bus2.subscribe("noop.completed");
         engine.dispatch(&evt("todo.start_requested", json!({"id": "T-1"})), None);
-        // Preflight registered, no pending yet.
         assert_eq!(engine.preflight_await_count(), 1);
         assert_eq!(engine.pending_await_count(), 0);
-        // The registry already published `noop.completed` on the bus.
-        // Drain it and feed back into engine.dispatch — that's how
-        // copad-linux's pump bridges between bus and engine.
         let completed = match completed_rx.try_recv() {
             Some(e) => e,
             None => panic!("expected noop.completed on bus"),
         };
         engine.dispatch(&completed, None);
-        // Now pending is armed.
         assert_eq!(engine.preflight_await_count(), 0);
         assert_eq!(engine.pending_await_count(), 1);
     }
 
     #[test]
     fn await_does_not_register_when_action_fails_synchronously() {
-        // Sync registry failure: sink returns Err immediately.
-        // Preflight never gets staged, pending never armed.
         let (reg, engine, _bus) = mk_engine_with_bus();
         reg.register("fails", |_p| Err(invalid_params("boom".to_string())));
         engine.set_triggers(vec![trig_with_await(
@@ -2708,12 +2477,6 @@ mod tests {
 
     #[test]
     fn await_preflight_dropped_on_synthetic_failed_event() {
-        // Direct exercise of the `<X>.failed` drop branch: stage a
-        // preflight (success path), then dispatch a synthetic
-        // `<action>.failed` event. The preflight should be dropped.
-        // Models the behavior copad-linux's pump produces when a
-        // blocking action returns Ok({queued: true}) sync and later
-        // emits `<action>.failed` async via the supervisor.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -2729,15 +2492,9 @@ mod tests {
                 on_timeout: TimeoutPolicy::Abort,
             },
         )]);
-        // Drain the success completion the registry published (we
-        // don't want it to promote our preflight; we want to test
-        // the .failed drop path explicitly).
         let _ = bus.subscribe("noop.completed").try_recv();
         engine.dispatch(&evt("todo.start_requested", json!({})), None);
         assert_eq!(engine.preflight_await_count(), 1);
-        // Dispatch a synthetic .failed sourced as the real registry
-        // would (action_registry::COMPLETION_EVENT_SOURCE) so the
-        // trust check accepts it.
         let failed = Event::new(
             "noop.failed",
             crate::action_registry::COMPLETION_EVENT_SOURCE,
@@ -2771,12 +2528,9 @@ mod tests {
             &evt("todo.start_requested", json!({"id": "T-1", "title": "x"})),
             None,
         );
-        // Pump the registry's completion event into the engine.
         let completed = completed_rx.try_recv().expect("noop.completed");
         engine.dispatch(&completed, None);
-        // Awaited event arrives.
         engine.dispatch(&evt("slack.dm", json!({"text": "PROJ-42"})), None);
-        // Synthesized event published.
         let received = match rx.recv_timeout(Duration::from_millis(50)) {
             crate::event_bus::RecvOutcome::Event(e) => e,
             other => panic!("expected awaited event, got {other:?}"),
@@ -2812,7 +2566,6 @@ mod tests {
         engine.dispatch(&evt("todo.start_requested", json!({"user": "U_M"})), None);
         let completed = completed_rx.try_recv().expect("noop.completed");
         engine.dispatch(&completed, None);
-        // Wrong user — must NOT match.
         engine.dispatch(
             &evt("slack.dm", json!({"user": "U_OTHER", "text": "no"})),
             None,
@@ -2822,7 +2575,6 @@ mod tests {
             1,
             "non-matching event must leave pending intact"
         );
-        // Right user — must match.
         engine.dispatch(
             &evt("slack.dm", json!({"user": "U_M", "text": "yes"})),
             None,
@@ -2856,7 +2608,6 @@ mod tests {
         let completed = completed_rx.try_recv().expect("noop.completed");
         engine.dispatch(&completed, None);
         assert_eq!(engine.pending_await_count(), 1);
-        // Sleep a tick past the deadline so Instant::now() > deadline.
         std::thread::sleep(Duration::from_millis(5));
         engine.sweep_pending_awaits();
         assert_eq!(engine.pending_await_count(), 0);
@@ -2899,10 +2650,8 @@ mod tests {
 
     #[test]
     fn payload_match_interpolates_action_result_token() {
-        // `payload_match = { thread_ts = "{action_result.ts}" }` —
-        // resolves against the `.completed` event's payload at
-        // promotion time, then matches a subsequent awaited event
-        // whose `thread_ts` equals the captured value.
+        // `payload_match = { thread_ts = "{action_result.ts}" }` resolves against the `.completed`
+        // payload at promotion, then matches an awaited event with that `thread_ts`.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("slack_post", |_p| Ok(json!({"ts": "1700.500"})));
@@ -2932,11 +2681,9 @@ mod tests {
         engine.dispatch(&completed, None);
         assert_eq!(engine.pending_await_count(), 1);
 
-        // Wrong ts: no match, pending stays.
         engine.dispatch(&evt("slack.reply", json!({"thread_ts": "9999.000"})), None);
         assert_eq!(engine.pending_await_count(), 1);
 
-        // Correct ts: pending fires, awaited event published.
         engine.dispatch(
             &evt(
                 "slack.reply",
@@ -2955,11 +2702,9 @@ mod tests {
 
     #[test]
     fn action_result_token_missing_field_keeps_match_open() {
-        // `.completed` payload has no `ts` field — the typed
-        // interpolation returns the raw `"{action_result.ts}"`
-        // literal (fail-loud posture). The pending entry therefore
-        // never matches a real ts, which is the safer behavior than
-        // matching `null` and firing on garbage.
+        // The `.completed` payload has no `ts`, so the typed interpolation keeps the literal
+        // `"{action_result.ts}"` (fail loud); the entry never matches a real ts, which is safer
+        // than matching `null`.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("slack_post", |_p| Ok(json!({})));
@@ -2985,19 +2730,14 @@ mod tests {
         engine.dispatch(&evt("todo.start_requested", json!({})), None);
         let completed = completed_rx.try_recv().expect("slack_post.completed");
         engine.dispatch(&completed, None);
-        // Real reply with any ts — still shouldn't match because the
-        // literal `{action_result.ts}` is what we're comparing against.
         engine.dispatch(&evt("slack.reply", json!({"thread_ts": "1700.500"})), None);
         assert_eq!(engine.pending_await_count(), 1);
     }
 
     #[test]
     fn payload_match_interpolates_context_token_captured_at_register() {
-        // `{context.active_panel}` resolved at dispatch time used to
-        // work before action_result was added. The refactor now
-        // captures context at register-time so the same template
-        // still resolves at promotion — even though by then the active
-        // panel may have changed.
+        // `{context.active_panel}` is captured at register time so the template still resolves
+        // at promotion, when the active panel may have changed.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -3047,15 +2787,11 @@ mod tests {
 
     #[test]
     fn timeout_with_default_does_not_leak_upstream_action_result() {
-        // If the firing event is itself a synthesized `*.awaited` event
-        // from an upstream chain, its payload already carries an
-        // `action_result` field. Our chain's preflight then expires
-        // without its own action ever completing — the synthesized
-        // timeout event must NOT leak the upstream action_result, or
-        // downstream `{event.action_result.*}` reads the wrong action.
+        // If the firing event is itself a synthesized `*.awaited` from an upstream chain, its
+        // payload already carries an `action_result`. When this chain's preflight expires without
+        // its action completing, the timeout event must NOT leak that upstream result.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
-        // Action never completes — we never publish .completed.
         reg.register("stalled", |_p| Ok(json!({})));
         let engine = TriggerEngine::with_publish_bus(reg, bus.clone());
         engine.set_triggers(vec![trig_with_await(
@@ -3078,7 +2814,6 @@ mod tests {
             }),
         );
         engine.dispatch(&upstream, None);
-        // No .completed for `stalled`; preflight times out.
         std::thread::sleep(Duration::from_millis(5));
         engine.sweep_pending_awaits();
         let received = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -3094,13 +2829,7 @@ mod tests {
 
     #[test]
     fn sweep_drops_preflight_when_action_never_completes() {
-        // A trigger fires its action, but `<action>.completed` never
-        // arrives (legacy match-arm action that doesn't go through
-        // the registry, or stalled action). Preflight expires and
-        // is dropped.
         let bus = Arc::new(crate::event_bus::EventBus::new());
-        // No completion bus on this registry so noop.completed is
-        // never published — simulates the legacy/stalled case.
         let reg = Arc::new(ActionRegistry::new());
         reg.register("noop", |_p| Ok(json!({})));
         let engine = TriggerEngine::with_publish_bus(reg, bus.clone());
@@ -3125,10 +2854,8 @@ mod tests {
 
     #[test]
     fn one_event_satisfies_only_one_pending_when_criteria_overlap() {
-        // Two preflights with identical match criteria: a single
-        // matching event should resolve only ONE of them. Broadcasting
-        // one reply to multiple concurrent prompts would silently
-        // double-fire downstream chains.
+        // Two preflights with identical match criteria: one matching event resolves only ONE,
+        // since broadcasting one reply to several prompts would double-fire downstream chains.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -3169,9 +2896,7 @@ mod tests {
         let c2 = completed_rx.try_recv().expect("completion 2");
         engine.dispatch(&c2, None);
         assert_eq!(engine.pending_await_count(), 2);
-        // ONE matching event arrives.
         engine.dispatch(&evt("reply", json!({"user": "U_M", "text": "hi"})), None);
-        // First-staged pending fires; second remains.
         let received = match rx_1.recv_timeout(Duration::from_millis(50)) {
             crate::event_bus::RecvOutcome::Event(e) => e,
             other => panic!("expected ask-1.awaited, got {other:?}"),
@@ -3186,10 +2911,8 @@ mod tests {
 
     #[test]
     fn promote_drop_ignores_events_not_sourced_from_action_registry() {
-        // An event with kind `noop.completed` but source != "copad.action"
-        // (e.g. a user-published event mimicking the suffix) must NOT
-        // advance the await state machine. Only the registry's
-        // synthetic completion fan-out is trusted.
+        // `noop.completed` with source != "copad.action" (e.g. a user-published look-alike) must
+        // NOT advance the await state machine; only the registry's completion fan-out is trusted.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -3205,13 +2928,10 @@ mod tests {
                 on_timeout: TimeoutPolicy::Abort,
             },
         )]);
-        // Drain the real completion the registry will publish.
         let _ = bus.subscribe("noop.completed").try_recv();
         engine.dispatch(&evt("todo.start_requested", json!({})), None);
         assert_eq!(engine.preflight_await_count(), 1);
-        // Synthetic event with the right kind but WRONG source.
         let spoofed = evt("noop.completed", json!({}));
-        // `evt` helper sets source = "test", so this is the spoof shape.
         assert_eq!(spoofed.source, "test");
         engine.dispatch(&spoofed, None);
         assert_eq!(
@@ -3224,12 +2944,8 @@ mod tests {
 
     #[test]
     fn await_payload_match_preserves_numeric_types() {
-        // payload_match = { count = "{event.count}" } where event.count
-        // is a number (not a string) must compare against awaited.count
-        // as a number. interpolate_value would have coerced to
-        // Value::String("42") and missed Value::Number(42) on the
-        // awaited side. interpolate_value_typed unwraps the single
-        // token and preserves the raw JSON Value.
+        // `payload_match = { count = "{event.count}" }` with a numeric event.count must compare as
+        // a number: `interpolate_value` would give `String("42")` and miss `Number(42)`.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -3252,7 +2968,6 @@ mod tests {
         engine.dispatch(&evt("todo.start_requested", json!({"count": 42})), None);
         let completed = completed_rx.try_recv().expect("noop.completed");
         engine.dispatch(&completed, None);
-        // Awaited event with count=42 (number, not string) — must match.
         engine.dispatch(&evt("reply", json!({"count": 42, "text": "ok"})), None);
         let received = match rx.recv_timeout(Duration::from_millis(50)) {
             crate::event_bus::RecvOutcome::Event(e) => e,
@@ -3263,10 +2978,9 @@ mod tests {
 
     #[test]
     fn dispatching_completion_does_not_consume_freshly_registered_preflight() {
-        // Round-3 ordering fix: a dispatch event of `X.completed` that
-        // also matches a trigger which fires action X must NOT have
-        // its newly-registered preflight consumed by the same event.
-        // The preflight should wait for a FUTURE completion.
+        // A dispatched `X.completed` that also matches a trigger firing action X must not have
+        // its newly registered preflight consumed by that same event; it waits for a FUTURE
+        // completion.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -3282,9 +2996,6 @@ mod tests {
                 on_timeout: TimeoutPolicy::Abort,
             },
         )]);
-        // Manually feed a `noop.completed` event in. Trigger fires
-        // (action = noop), registers preflight. The same event must
-        // NOT immediately promote its own preflight.
         let synthetic_completed = evt("noop.completed", json!({"ok": true}));
         engine.dispatch(&synthetic_completed, None);
         assert_eq!(
@@ -3297,10 +3008,8 @@ mod tests {
 
     #[test]
     fn set_triggers_clears_in_flight_await_state() {
-        // Round-3 hot-reload contract: replacing the trigger list
-        // must also drop preflight + pending entries that referenced
-        // the old config. Otherwise a removed trigger could still
-        // emit `<old_name>.awaited` after reload.
+        // Replacing the trigger list must also drop preflight + pending entries from the old
+        // config, or a removed trigger could still emit `<old_name>.awaited` after reload.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -3321,7 +3030,6 @@ mod tests {
         let completed = completed_rx.try_recv().expect("noop.completed");
         engine.dispatch(&completed, None);
         assert_eq!(engine.pending_await_count(), 1);
-        // Reload with a different trigger set.
         engine.set_triggers(vec![]);
         assert_eq!(engine.preflight_await_count(), 0);
         assert_eq!(engine.pending_await_count(), 0);
@@ -3366,13 +3074,11 @@ mod tests {
         let completed_rx = bus.subscribe("noop.completed");
         engine.dispatch(&evt("todo.a", json!({"id": "A"})), None);
         engine.dispatch(&evt("todo.b", json!({"id": "B"})), None);
-        // Both preflights staged; promote both via two completed events.
         let c1 = completed_rx.try_recv().expect("first noop.completed");
         engine.dispatch(&c1, None);
         let c2 = completed_rx.try_recv().expect("second noop.completed");
         engine.dispatch(&c2, None);
         assert_eq!(engine.pending_await_count(), 2);
-        // Reply matching B's id only.
         engine.dispatch(&evt("reply", json!({"id": "B", "text": "ok-B"})), None);
         match rx_b.recv_timeout(Duration::from_millis(50)) {
             crate::event_bus::RecvOutcome::Event(e) => {
@@ -3380,15 +3086,12 @@ mod tests {
             }
             other => panic!("expected ask-b.awaited, got {other:?}"),
         }
-        // ask-a should NOT have fired.
         match rx_a.recv_timeout(Duration::from_millis(20)) {
             crate::event_bus::RecvOutcome::Timeout => {}
             other => panic!("ask-a.awaited should NOT fire: {other:?}"),
         }
         assert_eq!(engine.pending_await_count(), 1);
     }
-
-    // ----- Trust-boundary gates -----
 
     fn trig_for_action(name: &str, action: &str, kind: &str, security: SecurityBlock) -> Trigger {
         Trigger {
@@ -3455,9 +3158,8 @@ mod tests {
 
     #[test]
     fn internal_origin_event_fires_without_accept_external() {
-        // Default-deny applies to External only; the absence of a
-        // security block must not break in-tree triggers that consume
-        // plugin-published events (which are always Internal).
+        // Default-deny applies to External only; a missing security block must not break in-tree
+        // triggers consuming plugin-published (Internal) events.
         let (reg, engine) = mk_engine();
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
@@ -3478,10 +3180,8 @@ mod tests {
 
     #[test]
     fn privileged_action_dropped_when_allow_privileged_false() {
-        // system.spawn is not in the registry — it's intercepted by
-        // daemon_trigger_sink. The fan-out gate must drop BEFORE the
-        // sink even sees the action, so the privilege check works
-        // regardless of which sink is wired in.
+        // system.spawn is intercepted by daemon_trigger_sink, not the registry. The fan-out gate
+        // must drop BEFORE the sink sees the action so the check works with any sink.
         let (reg, engine) = mk_engine();
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
@@ -3529,9 +3229,8 @@ mod tests {
 
     #[test]
     fn external_and_privileged_require_both_opt_ins() {
-        // Hook event → system.spawn is the canonical dangerous combo
-        // from harness-integration.md. Verify the two gates compose:
-        // only when BOTH flags are true does the action fire.
+        // Hook event to system.spawn is the canonical dangerous combo (harness-integration.md):
+        // the action fires only when BOTH flags are true.
         let (reg, engine) = mk_engine();
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
@@ -3567,9 +3266,7 @@ mod tests {
 
     #[test]
     fn security_block_defaults_when_absent_in_toml() {
-        // Triggers authored without `[security]` must round-trip with
-        // both flags false — matches the documented "default-deny"
-        // posture.
+        // A trigger without `[security]` round-trips with both flags false (default-deny).
         let t: Trigger = toml::from_str(
             r#"
             name = "t"
@@ -3611,11 +3308,9 @@ mod tests {
 
     #[test]
     fn external_event_cannot_satisfy_pending_await() {
-        // Codex round-3 C1: without this gate, a socket-driven publish
-        // could match a pending await registered by an internal trigger
-        // chain, synthesizing an Internal-origin `<trigger>.awaited`
-        // event that downstream non-accept_external triggers would
-        // happily fire on.
+        // Without this gate a socket-driven publish could match a pending await registered by an
+        // internal chain, synthesizing an Internal-origin `<trigger>.awaited` that downstream
+        // non-accept_external triggers would fire on.
         let bus = Arc::new(crate::event_bus::EventBus::new());
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
         reg.register("noop", |_p| Ok(json!({})));
@@ -3640,9 +3335,7 @@ mod tests {
         engine.dispatch(&c, None);
         assert_eq!(engine.pending_await_count(), 1);
 
-        // External `reply` matching the pending's payload should NOT
-        // satisfy the await. Pending stays alive; no awaited event
-        // fires.
+        // An External `reply` matching the pending's payload must not satisfy the await.
         let external_reply =
             Event::new("reply", "client.99", json!({"id": "X"})).with_origin(Origin::External);
         engine.dispatch(&external_reply, None);
@@ -3656,7 +3349,6 @@ mod tests {
             "pending must remain unconsumed when only external events arrive"
         );
 
-        // Sanity: an Internal reply still works.
         engine.dispatch(&evt("reply", json!({"id": "X"})), None);
         match rx_awaited.recv_timeout(Duration::from_millis(50)) {
             crate::event_bus::RecvOutcome::Event(_) => {}

@@ -1,24 +1,17 @@
-//! C-ABI bridge wrapping `alacritty_terminal::Term` + its PTY event
-//! loop. Consumers are `copad-macos`'s renderer for now; the FFI is
-//! deliberately host-agnostic so other UIs can attach later.
-//!
-//! See `docs/macos-renderer-migration-plan.md` §D3 for the ABI
-//! contract and §Phase 2 for what's wired here.
+//! C-ABI bridge wrapping `alacritty_terminal::Term` and its PTY event loop. Host-agnostic;
+//! `copad-macos` is the current consumer. ABI contract: `docs/macos-renderer-migration-plan.md`
+//! section D3.
 //!
 //! Pointer ownership:
 //!
-//! - `*mut CopadHandle` / `*mut CopadSnapshot` — heap allocations
-//!   owned by Rust; free with the matching `_destroy` function
-//!   exactly once. Passing NULL to `_destroy` is a no-op.
-//! - Borrowed `*const CopadRun` / `*const u8` from snapshot
-//!   accessors — valid until `copad_snapshot_destroy`.
-//! - Static strings (`copad_term_version`) — valid for program
-//!   lifetime, no free required.
+//! - `*mut CopadHandle` / `*mut CopadSnapshot` are Rust heap allocations; free with the matching
+//!   `_destroy` exactly once (NULL is a no-op).
+//! - Borrowed `*const CopadRun` / `*const u8` from snapshot accessors are valid until
+//!   `copad_snapshot_destroy`.
+//! - Static strings (`copad_term_version`) live for the program; no free.
 //!
-//! Threading: `Arc<FairMutex<Term>>` is shared between the PTY reader
-//! thread (alacritty's `EventLoop`) and snapshot callers. Snapshots
-//! lock briefly, copy out the visible rows, then release; renderers
-//! consume them without holding the lock.
+//! Threading: `Arc<FairMutex<Term>>` is shared between alacritty's PTY reader thread and
+//! snapshot callers. Snapshots lock briefly, copy out the visible rows, then release.
 
 use copad_graphics as graphics;
 use std::collections::HashMap;
@@ -46,10 +39,8 @@ use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
-/// Mirrors §D3 of the migration plan. `#[repr(C)]` so the layout is
-/// stable across the FFI boundary. Per-cell allocation is avoided by
-/// referencing into the row's contiguous utf8 buffer via
-/// `utf8_offset` + `utf8_len`.
+/// `#[repr(C)]` for a stable FFI layout. Cells reference the row's contiguous utf8 buffer via
+/// `utf8_offset` + `utf8_len` to avoid per-cell allocation.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CopadRun {
@@ -63,8 +54,7 @@ pub struct CopadRun {
     pub underline_style: u8,
     pub reserved: u8,
     pub underline_color_rgba: u32,
-    /// 1-based index into the snapshot's `hyperlinks` vec; 0 means no
-    /// OSC 8 link on this run. Renderer resolves the URI via
+    /// 1-based index into the snapshot's `hyperlinks` (0 = no OSC 8 link); resolve via
     /// `copad_snapshot_hyperlink_uri`.
     pub hyperlink_id: u32,
 }
@@ -81,7 +71,6 @@ pub mod flags {
     pub const WIDE_TRAILING: u16 = 1 << 8;
 }
 
-/// Cursor position + style reported by `copad_snapshot_cursor`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CopadCursor {
@@ -92,16 +81,10 @@ pub struct CopadCursor {
     pub _reserved: u16,
 }
 
-/// Active selection bounds reported by `copad_snapshot_selection`.
-/// Both end_row and end_col are INCLUSIVE — alacritty's
-/// `SelectionRange` is inclusive on both ends, and the Swift renderer
-/// needs to honor that when painting the highlight (otherwise the
-/// last selected cell goes unhighlighted, visible on any single-line
-/// drag or word selection).
-///
-/// When `present == 0`, the other fields are meaningless. `is_block`
-/// is 1 for `SelectionType::Block` selections (deferred for v1 — only
-/// Simple / Semantic / Lines wired today), 0 otherwise.
+/// Active selection bounds from `copad_snapshot_selection`. end_row and end_col are INCLUSIVE
+/// (alacritty's `SelectionRange`); the renderer must honor that or the last selected cell goes
+/// unhighlighted. When `present == 0` the other fields are meaningless. `is_block` is 1 for
+/// `SelectionType::Block` (not wired in v1).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CopadSelectionRange {
@@ -114,12 +97,9 @@ pub struct CopadSelectionRange {
     pub _reserved: u16,
 }
 
-/// Current in-terminal search match in viewport coordinates. Shape
-/// mirrors `CopadSelectionRange` (minus `is_block`, which doesn't
-/// apply to substring/regex matches). `present == 0` means no
-/// active match — either the search was cleared or the most recent
-/// `search_next` returned no hit. Multi-row matches (rare — happens
-/// when the pattern crosses an autowrap) carry both endpoints.
+/// Current find match in viewport coordinates, like `CopadSelectionRange` minus `is_block`.
+/// `present == 0` means cleared or the last `search_next` found nothing. Multi-row matches
+/// (pattern crossing an autowrap) carry both endpoints.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CopadSearchRange {
@@ -131,73 +111,43 @@ pub struct CopadSearchRange {
     pub _reserved: [u8; 3],
 }
 
-/// Opaque heap-allocated UTF-8 byte buffer. Returned by FFI methods
-/// that hand the caller a copy of terminal content (selection,
-/// scrollback). Free with `copad_string_destroy` exactly once.
-/// Pairing the destroy function with the type avoids the "ptr+len
-/// without capacity" UB trap of raw `Vec<u8>` round-tripping.
+/// Heap-allocated UTF-8 buffer handed to the caller (selection, scrollback). Free with
+/// `copad_string_destroy` exactly once; the paired type avoids the ptr+len-without-capacity UB
+/// of raw `Vec<u8>` round-tripping.
 pub struct CopadString {
     data: Box<[u8]>,
 }
 
-/// Custom `EventListener` for `alacritty_terminal::Term`. Captures
-/// the events the renderer actually needs to react to (OSC 52
-/// clipboard writes for now; OSC 52 reads, title changes, and bell
-/// can land here later). Most events are dropped on purpose —
-/// alacritty fires them frequently and our renderer doesn't need
-/// most of them.
+/// `EventListener` for `alacritty_terminal::Term`. Captures only what the renderer needs (OSC 52
+/// writes, PTY replies, child exit); the rest is dropped on purpose.
 #[derive(Clone)]
 struct CopadListener {
-    /// Most-recent OSC 52 clipboard-store request. Single-slot is
-    /// fine: bursts of OSC 52 are rare, and the renderer polls every
-    /// vsync. Older pending requests get coalesced — matches the
-    /// "last write wins" semantics most emulators have.
+    /// Single slot, last write wins; the renderer polls every vsync.
     pending_clipboard: Arc<std::sync::Mutex<Option<String>>>,
-    /// Late-bound sender into the PTY write path. Used to forward
-    /// `Event::PtyWrite` (terminal replies — DSR cursor position,
-    /// DA terminal attributes, color queries, etc.) back to the
-    /// child process. `None` until `copad_term_create` injects the
-    /// sender after `EventLoop::channel()` — until then PtyWrite
-    /// events are dropped, which is correct (no listener wired yet
-    /// means no startup queries to answer).
+    /// Sender into the PTY write path, for `Event::PtyWrite` replies (DSR, DA, colour queries).
+    /// `None` until `copad_term_create` injects it after `EventLoop::channel()`; earlier events
+    /// are dropped, which is fine since no startup query can be pending.
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
-    /// Active palette for OSC 4 (`\e]4;n;?\e\\`) and OSC 10/11/12
-    /// (foreground / background / cursor) color queries. Indexed by
-    /// `vte::ansi::NamedColor as usize` — 0-15 = ANSI 8 normal + 8
-    /// bright, 16-255 = 256-color cube, 256 = foreground, 257 =
-    /// background, 258 = cursor. Entries the host hasn't populated
-    /// (`copad_term_set_palette_entry`) make `ColorRequest` no-op
-    /// instead of replying with a stale alacritty default — apps then
-    /// fall back to their own defaults rather than getting a wrong
-    /// answer.
+    /// Palette for OSC 4 and OSC 10/11/12 queries, indexed by `vte::ansi::NamedColor as usize`:
+    /// 0-15 ANSI, 16-255 cube, 256 fg, 257 bg, 258 cursor. Unpopulated entries
+    /// (`copad_term_set_palette_entry`) make `ColorRequest` a no-op rather than answering with a
+    /// stale alacritty default.
     palette: Arc<std::sync::Mutex<HashMap<usize, Rgb>>>,
-    /// One-shot latch: set when alacritty's EventLoop observes
-    /// `Event::ChildExit` (the PTY child — typically the user's
-    /// shell — terminated). Polled by the FFI's
-    /// `copad_term_take_child_exit` so the renderer can broadcast
-    /// `panel.exited` on the bus. Atomic + clear-on-take: a second
-    /// poll after the first returns false even though the underlying
-    /// signal is permanent.
+    /// One-shot latch set on `Event::ChildExit`. Polled by `copad_term_take_child_exit` so the
+    /// renderer can broadcast `panel.exited`; clear-on-take.
     child_exited: Arc<std::sync::atomic::AtomicBool>,
     /// Image switch + cell pixel size, shared with the kitty graphics handler (decisions #189).
     graphics: Arc<graphics::Shared>,
-    /// Grid size in cells, for `CSI 14 t` / `CSI 16 t` replies (alacritty hands us only a
-    /// formatter).
+    /// Grid size in cells for `CSI 14 t` / `CSI 16 t` replies (alacritty gives only a formatter).
     grid_size: Arc<Mutex<(u16, u16)>>,
 }
 
-/// Catppuccin Mocha defaults — same palette
-/// `copad_core::theme::Theme::default()` exposes. Duplicated here as
-/// `(index, r, g, b)` rows to avoid pulling copad-core into the
-/// otherwise-lean copad-term crate. Used to pre-seed the palette
-/// inside `CopadListener::new` so a child shell that emits an OSC 4
-/// query in the race window between `copad_term_create` returning
-/// and Swift calling `copad_term_set_palette_entry` still gets a
-/// reasonable answer (Mocha colors) rather than no-reply. Host
-/// override-on-theme-apply still wins.
+/// Catppuccin Mocha defaults, same as `copad_core::theme::Theme::default()`, duplicated as
+/// `(index, r, g, b)` to keep copad-core out of this crate. Pre-seeds the palette so an OSC 4
+/// query in the window between `copad_term_create` returning and the host calling
+/// `copad_term_set_palette_entry` still gets an answer. Host overrides win.
 #[rustfmt::skip]
 const DEFAULT_PALETTE_ROWS: &[(usize, u8, u8, u8)] = &[
-    // 0-7 normal ANSI
     (0,  0x45, 0x47, 0x5a),
     (1,  0xf3, 0x8b, 0xa8),
     (2,  0xa6, 0xe3, 0xa1),
@@ -206,7 +156,6 @@ const DEFAULT_PALETTE_ROWS: &[(usize, u8, u8, u8)] = &[
     (5,  0xf5, 0xc2, 0xe7),
     (6,  0x94, 0xe2, 0xd5),
     (7,  0xba, 0xc2, 0xde),
-    // 8-15 bright
     (8,  0x58, 0x5b, 0x70),
     (9,  0xf3, 0x8b, 0xa8),
     (10, 0xa6, 0xe3, 0xa1),
@@ -215,7 +164,6 @@ const DEFAULT_PALETTE_ROWS: &[(usize, u8, u8, u8)] = &[
     (13, 0xf5, 0xc2, 0xe7),
     (14, 0x94, 0xe2, 0xd5),
     (15, 0xa6, 0xad, 0xc8),
-    // NamedColor::Foreground / Background / Cursor (vte indices)
     (256, 0xcd, 0xd6, 0xf4),
     (257, 0x1e, 0x1e, 0x2e),
     (258, 0x89, 0xb4, 0xfa),
@@ -255,10 +203,8 @@ impl CopadListener {
         *self.sender.lock().unwrap() = Some(sender);
     }
 
-    /// Common path used by `Event::PtyWrite` + `Event::ColorRequest`
-    /// to write bytes back to the child shell. Silent no-op when the
-    /// sender hasn't been injected yet (extremely early-boot only —
-    /// no query reaches us before `copad_term_create` returns).
+    /// Writes bytes back to the child for `Event::PtyWrite` + `Event::ColorRequest`. No-op until
+    /// the sender is injected (no query can arrive before `copad_term_create` returns).
     fn send_to_pty(&self, bytes: Vec<u8>) {
         if let Some(sender) = self.sender.lock().unwrap().as_ref() {
             let _ = sender.send(Msg::Input(bytes.into()));
@@ -269,39 +215,24 @@ impl CopadListener {
 impl EventListener for CopadListener {
     fn send_event(&self, event: Event) {
         match event {
-            // CLIPBOARD (OSC 52 `c`) only. PRIMARY (`p`) is a separate,
-            // low-consequence X11 buffer with no macOS equivalent, so aliasing
-            // it onto NSPasteboard would let a program clobber the real
-            // clipboard through a selector that means something else. Ignored
-            // rather than aliased — same call comux makes in `term.rs`.
+            // CLIPBOARD (OSC 52 `c`) only. PRIMARY (`p`) is a low-consequence X11 buffer with no
+            // macOS equivalent; aliasing it to NSPasteboard would let a program clobber the real
+            // clipboard through a selector meaning something else. Same call as comux's `term.rs`.
             Event::ClipboardStore(ClipboardType::Selection, _) => {}
             Event::ClipboardStore(ClipboardType::Clipboard, text) => {
-                // Drop the previous pending request if any (last write
-                // wins). The renderer takes it on the next tick via
-                // `copad_term_take_clipboard_request`.
+                // Last write wins; the renderer takes it via `copad_term_take_clipboard_request`.
                 *self.pending_clipboard.lock().unwrap() = Some(text);
             }
             Event::PtyWrite(reply) => {
-                // alacritty_terminal already formatted the reply
-                // (`\e[<row>;<col>R` for DSR 6n, `\e[?62;22c` for DA 0c,
-                // etc.) — we just forward the bytes back to the child.
-                // Without this hop nvim logs `"Did not detect DSR
-                // response from terminal"` on startup and falls back
-                // to slower paths.
+                // Already formatted by alacritty (DSR 6n, DA 0c, ...); just forward. Without it
+                // nvim logs "Did not detect DSR response from terminal" and takes slower paths.
                 self.send_to_pty(reply.into_bytes());
             }
             Event::ColorRequest(index, format_reply) => {
-                // OSC 4 / 10 / 11 / 12 — apps query "what color does
-                // index N actually render as?" so they can pick
-                // contrast (e.g. nvim's `&background=dark`). alacritty
-                // hands us the formatter; we resolve the index against
-                // the host-supplied palette and feed the result back
-                // via the same Msg::Input path PtyWrite uses.
-                //
-                // No reply on miss: better than answering with a stale
-                // alacritty default that doesn't match what we actually
-                // draw on screen. Apps treat no-reply as "use my
-                // built-in default".
+                // OSC 4/10/11/12: apps ask what color an index renders as (e.g. nvim's
+                // `&background=dark`). Resolve against the host palette. No reply on a miss:
+                // a stale alacritty default would be wrong, and apps treat silence as "use my
+                // default".
                 let rgb = self.palette.lock().unwrap().get(&index).copied();
                 if let Some(rgb) = rgb {
                     let reply = format_reply(rgb);
@@ -309,26 +240,21 @@ impl EventListener for CopadListener {
                 }
             }
             Event::ChildExit(_status) => {
-                // Shell exited. Flip the latched flag so the renderer
-                // can poll-pull this on its next `displayLinkFired`
-                // tick and broadcast `panel.exited` to the bus —
-                // matching the cross-platform cleanup contract
-                // (`copad-core::context` clears per-panel cwd / active
-                // state on this event). Latch (vs. counter) is fine:
-                // ChildExit fires at most once per Term lifetime.
+                // Latch the flag; the renderer polls it and broadcasts `panel.exited`
+                // (`copad-core::context` clears per-panel cwd / active state on it). A latch is
+                // fine: ChildExit fires at most once per Term.
                 self.child_exited.store(true, Ordering::Relaxed);
             }
-            // `CSI 14 t` / `CSI 16 t`: image tools size their output with these. Only once the
-            // host has said how big a cell is — a 1x1 answer would be worse than none.
+            // `CSI 14 t` / `CSI 16 t`: image tools size output with these. Only answered once
+            // the host reported a cell size; a 1x1 answer would be worse than none.
             Event::TextAreaSizeRequest(format_reply)
                 if self.graphics.cell_width.load(Ordering::Relaxed) != 0 =>
             {
                 self.send_to_pty(format_reply(self.window_size()).into_bytes());
             }
             _ => {
-                // Title / Bell / MouseCursorDirty / CursorBlinkingChange /
-                // Wakeup / Exit — intentionally dropped; the renderer
-                // doesn't react to them today.
+                // Title / Bell / MouseCursorDirty / CursorBlinkingChange / Wakeup / Exit:
+                // intentionally dropped.
             }
         }
     }
@@ -340,60 +266,34 @@ struct Row {
 }
 
 pub struct CopadHandle {
-    /// Shared between the PTY reader thread (alacritty's EventLoop)
-    /// and snapshot callers. Lock duration must stay short on the
-    /// snapshot path so the reader thread isn't starved.
+    /// Shared with alacritty's reader thread; keep lock duration short on the snapshot path so
+    /// the reader isn't starved.
     term: Arc<FairMutex<Term<CopadListener>>>,
-    /// Listener clone we keep here so the FFI can poll for pending
-    /// OSC 52 / future events without having to lock the term.
     listener: CopadListener,
-    /// Sender into the event loop's mpsc — drives input writes,
-    /// resize, and shutdown.
     sender: EventLoopSender,
-    /// Reader thread that owns the PTY + parser loop. Joined in
-    /// `copad_term_destroy` after sending `Msg::Shutdown`.
+    /// Owns the PTY + parser loop; joined in `copad_term_destroy` after `Msg::Shutdown`.
     io_thread: Option<JoinHandle<(EventLoop<Pty, CopadListener>, State)>>,
-    /// PID of the PTY's child process (typically the user's login
-    /// shell). Captured at handle construction so `copad_term_child_cwd`
-    /// can query the kernel for the shell's current working directory
-    /// without having to thread the Pty handle out of the alacritty
-    /// EventLoop. Falls stale if the shell exits — `proc_pidinfo`
-    /// returns an error in that case and the FFI returns NULL.
+    /// Child PID (typically the login shell), captured at construction so `copad_term_child_cwd`
+    /// can query the kernel without the Pty handle. Stale after exit: `proc_pidinfo` errors and
+    /// the FFI returns NULL.
     child_pid: i32,
-    /// Last observed hash of the cursor row's renderable content plus
-    /// cursor metadata (style/blink/show). Used by
-    /// `copad_term_take_damage` to catch three classes of changes the
-    /// line-bounds filter would otherwise drop: (1) cursor-cell
-    /// mutation collapsing to `(line, col, col)` damage — same shape
-    /// as alacritty's unconditional `damage_cursor` hint; (2) zero-
-    /// width combining marks (alacritty's `Term::input` skips
-    /// `damage_point` on that branch); (3) DECSCUSR / `\e[?25l/h`
-    /// cursor metadata transitions that produce zero grid damage.
+    /// Hash of the cursor row's renderable content plus cursor style/blink/show, for
+    /// `copad_term_take_damage`. Catches changes the line-bounds filter drops: cursor-cell
+    /// mutation collapsing to `(line, col, col)` damage, zero-width combining marks (Term::input
+    /// skips `damage_point`), and DECSCUSR / `\e[?25l/h` transitions with no grid damage.
     last_redraw_state_hash: AtomicU64,
-    /// Last observed `Grid::display_offset()`. The per-row damage path
-    /// uses this to detect scroll into / out of history — alacritty's
-    /// damage tracking only fires on writes to the live region, but a
-    /// scroll changes what every viewport row DISPLAYS. Diverging from
-    /// the previous offset promotes the result to Full damage (every
-    /// viewport row is different content).
+    /// Last `Grid::display_offset()`. Alacritty damage only fires for live-region writes, but a
+    /// scroll changes what every row displays; a changed offset promotes to Full damage.
     last_display_offset: AtomicI32,
-    /// Last observed selection range, in viewport coordinates. Damage-
-    /// rows callers need the union of (old ∪ new) so that a selection
-    /// SHRINK or CLEAR repaints the rows that were highlighted last
-    /// frame — `selection_range_for_ffi` only exposes the current
-    /// range, so without remembering the previous we'd leave stale
-    /// surface2 overlay painted on cells that are no longer selected.
+    /// Last selection range in viewport coordinates. Damage callers need old-union-new so a
+    /// selection shrink or clear repaints rows highlighted last frame.
     last_selection_range: Mutex<CopadSelectionRange>,
-    /// In-terminal find state. `pattern`/`case_sensitive` cache the
-    /// last compiled regex so back-to-back next/prev calls reuse the
-    /// `RegexSearch` (build is non-trivial — alacritty constructs four
-    /// lazy DFAs internally). `current_match` is the alacritty grid
-    /// range of the most recent hit; `None` until the first
-    /// `search_next` succeeds. All three are owned by the same Mutex
-    /// so the snapshot path can read them atomically.
+    /// In-terminal find state. `pattern`/`case_sensitive` cache the compiled regex so
+    /// back-to-back next/prev reuse the `RegexSearch` (building four lazy DFAs is costly).
+    /// All fields share one Mutex so the snapshot path reads them atomically.
     search_state: Mutex<SearchState>,
-    /// The settings that live in alacritty's `Config`, so one setter can never reset the
-    /// other — `set_options` takes the WHOLE config.
+    /// The settings that live in alacritty's `Config`; kept together because `set_options`
+    /// takes the WHOLE config and one setter must not reset another.
     options: Mutex<TermOptions>,
     /// kitty virtual placements, which Unicode placeholder cells show (decisions #194).
     virtuals: graphics::Virtuals,
@@ -428,7 +328,6 @@ impl TermOptions {
 /// The most scrollback a pane may keep; `[terminal] scrollback` is clamped to it.
 pub const MAX_SCROLLBACK: usize = 100_000;
 
-/// Apply `change` to the handle's options and hand the whole config to the terminal.
 fn apply_options(h: &CopadHandle, change: impl FnOnce(&mut TermOptions)) {
     let config = {
         let Ok(mut o) = h.options.lock() else {
@@ -440,17 +339,15 @@ fn apply_options(h: &CopadHandle, change: impl FnOnce(&mut TermOptions)) {
     h.term.lock().set_options(config);
 }
 
-/// Per-handle search bookkeeping. `regex` is the compiled
-/// `RegexSearch` matching `pattern` under the `case_sensitive`
-/// flag; we rebuild only when the user-facing query changes.
+/// Per-handle search bookkeeping. `regex` matches `pattern` under `case_sensitive`; rebuilt only
+/// when the query changes.
 #[derive(Default)]
 struct SearchState {
     regex: Option<alacritty_terminal::term::search::RegexSearch>,
     pattern: String,
     case_sensitive: bool,
-    /// Most recent hit in alacritty grid coordinates (NOT viewport).
-    /// Viewport mapping happens at snapshot time so a scroll into
-    /// history correctly hides / repositions the highlight.
+    /// In alacritty grid coordinates (NOT viewport); mapped at snapshot time so scrolling into
+    /// history repositions the highlight.
     current_match: Option<std::ops::RangeInclusive<Point>>,
 }
 
@@ -459,14 +356,10 @@ pub struct CopadSnapshot {
     rows: Vec<Row>,
     cursor: CopadCursor,
     selection: CopadSelectionRange,
-    /// Current in-terminal find match, projected into viewport
-    /// coordinates the same way `selection` is. `present == 0` when
-    /// no find is active or the active match scrolled out of view.
+    /// Find match in viewport coordinates; `present == 0` when none or scrolled out of view.
     search_match: CopadSearchRange,
-    /// OSC 8 hyperlink URIs visible in this snapshot. The per-run
-    /// `hyperlink_id` is 1-based index into this vec (0 = no link).
-    /// Deduped by alacritty's `Hyperlink::id` so a hyperlink spanning
-    /// many cells only stores its URI once.
+    /// OSC 8 URIs visible in this snapshot; a run's `hyperlink_id` is a 1-based index (0 = none).
+    /// Deduped by alacritty's `Hyperlink::id`.
     hyperlinks: Vec<String>,
     /// Visible image runs in draw order, and the images they index (held so the pixel pointers
     /// handed out stay valid until the snapshot is destroyed).
@@ -475,7 +368,7 @@ pub struct CopadSnapshot {
 }
 
 /// One image a snapshot's runs draw from. `pixels` is premultiplied RGBA8, `width * height * 4`
-/// bytes, borrowed from the snapshot. `key` is unique per decoded image for the process — cache
+/// bytes, borrowed from the snapshot. `key` is unique per decoded image for the process: cache
 /// GPU uploads by it.
 #[repr(C)]
 pub struct CopadGraphicImage {
@@ -485,12 +378,8 @@ pub struct CopadGraphicImage {
     pub pixels: *const u8,
 }
 
-/// Create a terminal handle: spawn a PTY running the requested shell
-/// (or the user's `$SHELL`), construct an `alacritty_terminal::Term`
-/// at the given size, hand both to an `EventLoop` running in a
-/// dedicated thread. Returns NULL on shell-spawn failure (e.g. shell
-/// path missing).
-///
+/// Spawns a PTY running `shell` (or the user's `$SHELL`) under an `alacritty_terminal::Term`
+/// driven by an `EventLoop` thread. Returns NULL on shell-spawn failure.
 /// # Safety
 ///
 /// `shell` and `cwd` may be NULL or point to valid C strings. They
@@ -508,15 +397,12 @@ pub unsafe extern "C" fn copad_term_create(
     let safe_rows = rows.max(1);
 
     let mut tty_opts = TtyOptions::default();
-    // Stamp panel identity + GUI socket into the child shell's env.
-    // Pair: `COPAD_PANEL_ID` lets the in-shell `copad-cwd` hook
-    // route `chpwd` notifications to the right panel; `COPAD_SOCKET`
-    // tells `coctl` which Unix socket to dial. Without the socket
-    // env the hook short-circuits because `coctl` would otherwise
-    // hit the well-known daemon path (not our per-instance GUI socket
-    // owning the panel).
-    // SAFETY: caller contract — panel_id / socket_path, if non-null, are
-    // NUL-terminated UTF-8 strings valid for the call.
+    // Stamp panel identity and GUI socket into the child's env: `COPAD_PANEL_ID` routes the
+    // `copad-cwd` hook's `chpwd` notifications to the right panel; `COPAD_SOCKET` makes `coctl`
+    // dial our per-instance GUI socket rather than the well-known daemon path (without it the
+    // hook short-circuits).
+    // SAFETY: caller contract: panel_id / socket_path, if non-null, are NUL-terminated UTF-8
+    // strings valid for the call.
     let panel_id_str: Option<String> = if panel_id.is_null() {
         None
     } else {
@@ -539,67 +425,41 @@ pub unsafe extern "C" fn copad_term_create(
     if let Some(s) = &socket_str {
         tty_opts.env.insert("COPAD_SOCKET".into(), s.clone());
     }
-    // Force a known-good TERM for the child shell. Without this we
-    // inherit whatever the parent process had (e.g. `xterm-ghostty`
-    // when Copad.app was launched from a Ghostty-bootstrapped GUI
-    // session). Foreign terminfo entries that aren't in the macOS
-    // system DB make zsh fall back through unrelated entries
-    // (`'network': unknown terminal type` on this user's box) and
-    // can mis-emit cursor / clear sequences, surfacing as duplicated
-    // keystrokes on screen. xterm-256color is always present, gives
-    // us 256-colour support, and is what every other terminal
-    // emulator we ship alongside (alacritty / iterm2 / Terminal.app)
-    // exports by default.
+    // Force a known TERM: an inherited foreign one (e.g. `xterm-ghostty`) missing from the
+    // macOS terminfo DB makes zsh fall back through unrelated entries and mis-emit cursor/clear
+    // sequences, showing duplicated keystrokes. xterm-256color is always present.
     tty_opts.env.insert("TERM".into(), "xterm-256color".into());
-    // Who the pane is talking to, for programs that pick features by terminal name (yazi's
-    // image driver); the app removes any other terminal's identity it was started with.
+    // For programs that pick features by terminal name (yazi's image driver); the app removes
+    // any other terminal's identity it was started with.
     tty_opts.env.insert("TERM_PROGRAM".into(), "copad".into());
     tty_opts.env.insert(
         "TERM_PROGRAM_VERSION".into(),
         env!("CARGO_PKG_VERSION").into(),
     );
-    // Match Ghostty: inject a default UTF-8 locale into the PTY child
-    // when none was inherited. Copad.app launched from Finder /
-    // Spotlight / Dock comes up with launchd's environment, which has
-    // no LANG / LC_*. /etc/zprofile sets LANG=C.UTF-8 but only for
-    // login shells — tmux pane shells and other non-login children
-    // can therefore land in plain `C`, and tmux's per-client UTF-8
-    // probe at attach time inherits whatever the launching shell had.
-    // Ghostty injects LANG by default so its users never see this;
-    // without the same injection here, Unicode glyphs (powerline,
-    // Nerd Font icons, the Claude Code banner) get rendered as `_`
-    // placeholders in non-login children. Skip when the parent already
-    // specifies any locale so explicit user choice (launchctl setenv,
-    // wrapper script) is preserved.
+    // Inject a default UTF-8 locale when none was inherited (as Ghostty does). Copad.app from
+    // Finder/Dock has launchd's environment with no LANG/LC_*, and /etc/zprofile only sets it
+    // for login shells, so non-login children (tmux panes) land in plain `C` and Unicode
+    // glyphs (powerline, Nerd Font icons) render as `_`. An explicit parent locale is kept.
     if std::env::var_os("LANG").is_none()
         && std::env::var_os("LC_ALL").is_none()
         && std::env::var_os("LC_CTYPE").is_none()
     {
         tty_opts.env.insert("LANG".into(), "C.UTF-8".into());
     }
-    // Parse the requested login shell (may be NULL — then alacritty falls
-    // back to the system default shell).
+    // May be NULL; alacritty then falls back to the system default shell.
     let shell_prog: Option<String> = if shell.is_null() {
         None
     } else {
-        // SAFETY: caller contract — non-null pointer is a NUL-terminated C string.
         unsafe { CStr::from_ptr(shell) }
             .to_str()
             .ok()
             .map(str::to_owned)
     };
     if let Some(sh) = shell_prog {
-        // Spawn the configured shell as a LOGIN shell (`-l`), matching
-        // Terminal.app / iTerm2 / alacritty's own default-shell path. Copad.app
-        // launched from Finder / Dock / Spotlight inherits launchd's minimal
-        // PATH (`/usr/bin:/bin:/usr/sbin:/sbin`); only a login shell runs
-        // `/etc/zprofile` + `~/.zprofile` (where Homebrew's `brew shellenv`
-        // seeds `/opt/homebrew/bin`) BEFORE `~/.zshrc`. Without `-l`, a
-        // non-login shell skips `~/.zprofile`, so any early `.zshrc` check that
-        // probes PATH (e.g. `command -v gdate`) fails and downstream commands
-        // break — the classic "works after `exec zsh`, fails on a fresh pane".
-        // `-l` is accepted by zsh/bash/fish/dash/tcsh; interactivity is still
-        // auto-detected from the attached PTY, so no `-i` is needed.
+        // LOGIN shell (`-l`): Copad.app from Finder/Dock inherits launchd's minimal PATH, and
+        // only a login shell runs `/etc/zprofile` + `~/.zprofile` (Homebrew's `brew shellenv`)
+        // before `~/.zshrc`. Without it an early `.zshrc` PATH probe fails ("works after
+        // `exec zsh`, fails on a fresh pane"). `-l` is accepted by zsh/bash/fish/dash/tcsh.
         tty_opts.shell = Some(Shell::new(sh, vec!["-l".to_string()]));
     }
     if !cwd.is_null()
@@ -611,23 +471,19 @@ pub unsafe extern "C" fn copad_term_create(
     let listener = CopadListener::new();
     *listener.grid_size.lock().unwrap() = (safe_cols, safe_rows);
     listener.graphics.enabled.store(true, Ordering::Relaxed);
-    // Cell pixels stay 1x1 until the renderer reports them (`copad_term_set_cell_pixels`).
     let window_size = listener.window_size();
 
     let pty = match tty::new(&tty_opts, window_size, 0) {
         Ok(p) => p,
         Err(_) => return ptr::null_mut(),
     };
-    // Capture child PID before handing pty to EventLoop. EventLoop
-    // consumes pty (and reaps the child on Shutdown), but the PID we
-    // capture here stays valid for `proc_pidinfo` queries until the
-    // shell actually exits — at which point the syscall just returns
-    // an error and `copad_term_child_cwd` returns NULL.
+    // Capture before the pty moves into EventLoop (which reaps the child on Shutdown). The pid
+    // stays valid for `proc_pidinfo` until the shell exits, then `copad_term_child_cwd` returns NULL.
     let child_pid = pty.child().id() as i32;
 
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
-    // `kitty_keyboard` makes alacritty_terminal keep the per-screen flag stacks and answer
-    // `CSI ? u`; the GUI encodes keys against those flags via `copad_term_encode_key`.
+    // `kitty_keyboard` keeps per-screen flag stacks and answers `CSI ? u`; the GUI encodes keys
+    // against them via `copad_term_encode_key`.
     let config = TermOptions::default().config();
     let mut term = Term::new(config, &term_size, listener.clone());
     let mut images = graphics::Graphics::new(listener.graphics.clone(), {
@@ -645,12 +501,9 @@ pub unsafe extern "C" fn copad_term_create(
         Err(_) => return ptr::null_mut(),
     };
     let sender = event_loop.channel();
-    // Late-bind the listener's reply path. `EventLoop::channel()` is
-    // only available after `EventLoop::new` succeeds, so the listener
-    // can't carry the sender at construction time. PtyWrite events
-    // fired before this line (extremely unlikely — the event loop is
-    // still on `spawn()`) silently drop, which is harmless because no
-    // child shell has produced a query yet.
+    // Late-bound: `EventLoop::channel()` exists only after `EventLoop::new`, so the listener
+    // can't hold the sender at construction. Earlier PtyWrite events drop harmlessly (no child
+    // query yet).
     listener.set_sender(sender.clone());
     let io_thread = event_loop.spawn();
 
@@ -669,15 +522,9 @@ pub unsafe extern "C" fn copad_term_create(
     }))
 }
 
-/// macOS only — query the PTY child's current working directory via
-/// `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. Returns a heap-allocated
-/// NUL-terminated UTF-8 string the caller must free with
-/// `copad_string_destroy`, or NULL if the shell has exited / the
-/// syscall failed / the platform isn't macOS. Cheaper than parsing
-/// OSC 7 from the PTY byte stream (which alacritty_terminal's vte
-/// handler doesn't currently surface) and works even when the shell
-/// doesn't emit OSC 7 at all — the kernel always knows the cwd of
-/// any live process.
+/// macOS only: the PTY child's cwd via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. Returns a
+/// NUL-terminated UTF-8 string to free with `copad_string_destroy`, or NULL if the shell has
+/// exited, the syscall failed, or the platform isn't macOS. Works without OSC 7 from the shell.
 ///
 /// # Safety
 ///
@@ -690,11 +537,9 @@ pub unsafe extern "C" fn copad_term_child_cwd(handle: *mut CopadHandle) -> *mut 
     };
     #[cfg(target_os = "macos")]
     {
-        // EPERM on un-entitled dev builds — `proc_pidinfo(
-        // PROC_PIDVNODEPATHINFO)` requires either same audit token,
-        // root, or `com.apple.private.security.proc-info` (Apple-
-        // signed only). Falls through to caller's initialCwd fallback
-        // until install-macos.sh embeds an entitlement plist.
+        // EPERM on un-entitled dev builds: `proc_pidinfo(PROC_PIDVNODEPATHINFO)` needs the same
+        // audit token, root, or the Apple-signed-only `com.apple.private.security.proc-info`.
+        // The caller falls back to its initialCwd until install-macos.sh embeds an entitlement.
         let Some(cwd) = macos_child_cwd(h.child_pid) else {
             return ptr::null_mut();
         };
@@ -727,9 +572,8 @@ fn macos_child_cwd(pid: i32) -> Option<String> {
     if n <= 0 {
         return None;
     }
-    // `vip_path` is `[[c_char; 32]; 32]` — flatten then trim at the
-    // first NUL. The kernel guarantees NUL-termination within
-    // MAXPATHLEN (1024) bytes.
+    // `vip_path` is `[[c_char; 32]; 32]`; flatten and trim at the first NUL (the kernel
+    // guarantees NUL-termination within MAXPATHLEN).
     let raw: &[u8] = unsafe {
         std::slice::from_raw_parts(
             info.pvi_cdir.vip_path.as_ptr().cast::<u8>(),
@@ -743,8 +587,7 @@ fn macos_child_cwd(pid: i32) -> Option<String> {
     std::str::from_utf8(&raw[..end]).ok().map(str::to_owned)
 }
 
-/// Free a handle. Sends `Msg::Shutdown`, joins the reader thread,
-/// drops the Term. Safe to pass NULL.
+/// Frees a handle: sends `Msg::Shutdown`, joins the reader, drops the Term. NULL is safe.
 ///
 /// # Safety
 ///
@@ -755,37 +598,30 @@ pub unsafe extern "C" fn copad_term_destroy(handle: *mut CopadHandle) {
         return;
     }
     let mut handle = unsafe { Box::from_raw(handle) };
-    // Best-effort shutdown — if the reader already exited (e.g. PTY
-    // child died), the send fails but join still cleans up.
+    // Best-effort: if the reader already exited the send fails but join still cleans up.
     let _ = handle.sender.send(Msg::Shutdown);
-    // The join runs on a detached thread, never on the caller (the main
-    // thread, from the view controller's deinit). Joining hands back
-    // alacritty's `EventLoop`, whose `Pty::drop` SIGHUPs the shell and
-    // then `waitpid`s with NO timeout, so a shell that survives the
-    // SIGHUP (a `zsh -l` still sourcing its rc files) froze the whole
-    // app until it exited. Same fix as comux's `PaneTerm::drop`.
+    // The join runs on a detached thread, never the caller (the main thread, via the view
+    // controller's deinit). Joining returns alacritty's `EventLoop`, whose `Pty::drop` SIGHUPs
+    // the shell then `waitpid`s with NO timeout, so a shell that survives SIGHUP (e.g. `zsh -l`
+    // still sourcing rc files) would freeze the app. Same fix as comux's `PaneTerm::drop`.
     if let Some(jh) = handle.io_thread.take() {
         let pid = handle.child_pid;
         std::thread::spawn(move || reap(jh, pid));
     }
 }
 
-/// How long a closed terminal's shell gets to exit on SIGHUP before
-/// it is SIGKILLed.
+/// How long a closed terminal's shell gets to exit on SIGHUP before SIGKILL.
 const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Join the io-thread, then SIGHUP the shell and SIGKILL it after
-/// [`REAP_GRACE`] if it is still running, before the `Pty` (whose
-/// drop `waitpid`s) goes. Signals go out only after the join and only
-/// while the shell is un-reaped: alacritty reaps a shell that exits on
-/// its own (the event loop's `try_wait`), and once the io-thread has
-/// returned nothing but this thread can reap it, so the pid cannot be
+/// Joins the io-thread, then SIGHUPs the shell and SIGKILLs it after [`REAP_GRACE`] if still
+/// running, before the `Pty` (whose drop `waitpid`s) goes. Signals go out only after the join
+/// and only while the shell is un-reaped: alacritty reaps a shell that exits on its own, and
+/// once the io-thread has returned only this thread can reap it, so the pid cannot be
 /// recycled under us. Mirrors comux's `term::reap`.
 fn reap<T>(io_thread: JoinHandle<T>, pid: i32) {
     let joined = io_thread.join();
     #[cfg(target_os = "macos")]
     if pid > 1 && unreaped(pid) {
-        // SAFETY: plain signal syscalls against our own un-reaped child.
         unsafe { libc::kill(pid, libc::SIGHUP) };
         let deadline = std::time::Instant::now() + REAP_GRACE;
         while unreaped(pid) && std::time::Instant::now() < deadline {
@@ -800,14 +636,12 @@ fn reap<T>(io_thread: JoinHandle<T>, pid: i32) {
     drop(joined);
 }
 
-/// Whether our child `pid` is still running and un-reaped, without
-/// reaping it (`WNOWAIT`): an exited child is a zombie with its status
-/// pending, a reaped one is `ECHILD`.
+/// Whether our child `pid` is still running and un-reaped, checked without reaping (`WNOWAIT`):
+/// an exited child is a zombie with status pending, a reaped one is `ECHILD`.
 #[cfg(target_os = "macos")]
 fn unreaped(pid: i32) -> bool {
-    // SAFETY: a zeroed siginfo_t is a valid out-buffer; with `WNOHANG`
-    // and no state change it stays zeroed, so `si_signo` tells
-    // "still running" from "exited".
+    // SAFETY: a zeroed siginfo_t is a valid out-buffer; with `WNOHANG` and no state change it
+    // stays zeroed, so `si_signo` tells "still running" from "exited".
     unsafe {
         let mut info: libc::siginfo_t = std::mem::zeroed();
         let rc = libc::waitid(
@@ -820,8 +654,7 @@ fn unreaped(pid: i32) -> bool {
     }
 }
 
-/// Feed input bytes to the PTY. The reader thread picks them up via
-/// the event-loop channel.
+/// Feeds input bytes to the PTY via the event-loop channel.
 ///
 /// # Safety
 ///
@@ -838,22 +671,10 @@ pub unsafe extern "C" fn copad_term_input(handle: *mut CopadHandle, bytes: *cons
     let _ = h.sender.send(Msg::Input(slice.to_vec().into()));
 }
 
-/// Resize the PTY + Term grid. `cell_width`/`cell_height` left at 1
-/// since this FFI is headless; real pixel sizes land when a renderer
-/// attaches.
-///
-/// # Safety
-///
-/// `handle` must be NULL or a valid pointer returned by
-/// `copad_term_create` and not yet destroyed.
-/// Populate one entry in the OSC color-query palette consulted by
-/// `Event::ColorRequest` replies. Index follows `vte::ansi::NamedColor`:
-/// 0-15 ANSI (normal + bright), 16-255 256-color cube, 256 foreground,
-/// 257 background, 258 cursor. Re-calling for the same index overwrites
-/// the previous value (use on theme hot-reload). Indices the host never
-/// populates produce no reply on OSC 4 / 10 / 11 / 12 — apps then fall
-/// back to their built-in defaults, which is safer than answering with
-/// a color we don't actually draw.
+/// Populates one entry of the OSC colour-query palette used by `Event::ColorRequest`. Index
+/// follows `vte::ansi::NamedColor`: 0-15 ANSI, 16-255 cube, 256 fg, 257 bg, 258 cursor.
+/// Re-calling overwrites (theme hot-reload). Unpopulated indices produce no reply, so apps use
+/// their own defaults rather than a colour we don't draw.
 ///
 /// # Safety
 ///
@@ -870,8 +691,7 @@ pub unsafe extern "C" fn copad_term_set_palette_entry(
     if handle.is_null() {
         return -1;
     }
-    // SAFETY: caller contract — handle came from `copad_term_create`
-    // and has not been freed.
+    // SAFETY: caller contract: handle came from `copad_term_create` and is not freed.
     let h = unsafe { &*handle };
     h.listener
         .palette
@@ -881,11 +701,8 @@ pub unsafe extern "C" fn copad_term_set_palette_entry(
     0
 }
 
-/// Resize the terminal grid. Clamps zero dimensions to 1 so the PTY
-/// always sees a positive `winsize`. Pixel dimensions reuse the cell
-/// count as a coarse approximation — alacritty only cares about the
-/// cell grid for input handling; pixel-aware apps (`stty size`-style
-/// queries) get column/row values and ignore the px fields.
+/// Resizes the terminal grid, clamping zero dimensions to 1 so the PTY always sees a positive
+/// `winsize`. Its pixel size comes from the host-reported cell size (1x1 until reported).
 ///
 /// # Safety
 ///
@@ -901,82 +718,49 @@ pub unsafe extern "C" fn copad_term_resize(handle: *mut CopadHandle, cols: u16, 
 
     *h.listener.grid_size.lock().unwrap() = (safe_cols, safe_rows);
     let ws = h.listener.window_size();
-    // `Msg::Resize` only forwards to `pty.on_resize` (so the child
-    // process sees SIGWINCH). The Term grid is a separate resize and
-    // must be done explicitly under the term lock — alacritty's own
-    // app does this in `WindowContext::on_resize`.
+    // `Msg::Resize` only SIGWINCHes the child via `pty.on_resize`; the Term grid is a separate
+    // resize and must be done explicitly under the term lock (as alacritty's `on_resize` does).
     let _ = h.sender.send(Msg::Resize(ws));
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
     h.term.lock().resize(term_size);
 }
 
-/// Query whether the terminal grid has been damaged since the last
-/// call. Returns `true` if any cell changed; `false` if the grid is
-/// byte-for-byte what the renderer already drew. Always resets the
-/// internal damage state so the next call only sees what changed
-/// AFTER this one.
+/// Whether the grid was damaged since the last call; always resets damage state. Intended loop:
+/// display tick, `copad_term_take_damage`, then `copad_term_snapshot` + redraw if true.
 ///
-/// The renderer's intended loop:
-///   CADisplayLink tick → `copad_term_take_damage` → if false, skip;
-///   if true, `copad_term_snapshot` + redraw.
-///
-/// Cursor-only filter: `alacritty_terminal::Term::damage` unconditionally
-/// marks the current cursor cell on every call (a hint for renderers
-/// that paint a blinking cursor). That makes the raw signal "always
-/// damaged," which defeats the gate. We instead treat damage as "real"
-/// only when it covers ANY cell other than exactly the cursor's
-/// single-cell point — cursor *movement* still counts because the
-/// damage region then includes the previous cursor cell, widening
-/// beyond left==right==cursor.col.
+/// Cursor-only filter: `Term::damage` always marks the cursor cell (a hint for blinking-cursor
+/// renderers), which would make the signal permanently true. Damage counts only when it covers
+/// more than the cursor's single cell; cursor movement still counts since the region then
+/// includes the previous cursor cell.
 ///
 /// # Safety
 ///
-/// `handle` must be NULL or a valid pointer returned by
-/// `copad_term_create` and not yet destroyed.
+/// `handle` must be NULL or a valid pointer returned by `copad_term_create` and not yet
+/// destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copad_term_take_damage(handle: *mut CopadHandle) -> bool {
-    // Thin wrapper over `copad_term_take_damage_rows`: any non-zero
-    // outcome (Full=-1 OR rows>0) means the renderer needs to repaint.
-    // Single bookkeeping path so the two FFI entries can't disagree
-    // about prev-state — callers MUST NOT call both in the same frame
-    // (the rows variant advances `last_*` state too).
+    // Wrapper over `copad_term_take_damage_rows`: any non-zero outcome needs a repaint. Callers
+    // MUST NOT call both entries in one frame; the rows variant advances the `last_*` state too.
     let mut buf: [u16; 1] = [0];
     let result = unsafe { copad_term_take_damage_rows(handle, buf.as_mut_ptr(), buf.len() as u16) };
     result != 0
 }
 
-/// Outcome of the per-row damage drain. Separate from the FFI
-/// signature so the test helper has a typed result, and so the
-/// orchestration in [`copad_term_take_damage_rows`] doesn't recompute
-/// "is full" from a magic integer.
+/// Outcome of the per-row damage drain, typed so the orchestration doesn't decode a magic integer.
 enum DamageRowsOutcome {
-    /// Whole viewport must redraw (display_offset shifted, or
-    /// alacritty reported `TermDamage::Full`, or the dirty row count
-    /// would exceed the caller's buffer cap).
+    /// Whole viewport must redraw (display_offset shifted, `TermDamage::Full`, or more dirty
+    /// rows than the caller's buffer holds).
     Full,
-    /// Distinct viewport row indices that need repaint, written into
-    /// the caller-provided buffer in unspecified order. `count` is in
-    /// `0..=cap`.
+    /// Distinct dirty viewport rows written to the caller's buffer, unordered; `0..=cap`.
     Count(u16),
 }
 
-/// Drain alacritty's per-row damage iterator into the caller's buffer,
-/// merged with three damage sources alacritty's bounds filter can't
-/// surface on its own:
-/// * cursor-row content / cursor metadata (combining marks, DECSCUSR,
-///   blink toggle) — caught via the `hash_redraw_state` mechanism;
-/// * scrollback offset change — every viewport row maps to different
-///   content, so we promote to `Full`;
-/// * selection union (old ∪ new) — `selection_range_for_ffi` only
-///   exposes the CURRENT range; without remembering the previous one
-///   a SHRINK / CLEAR would leave stale `surface2` overlay painted on
-///   rows no longer selected.
-///
-/// Extracted from the FFI shim so unit tests can drive a synthetic
-/// `Term<VoidListener>` without standing up a real PTY EventLoop. The
-/// caller threads in the previous-state values + receives the updated
-/// ones in the return; the FFI shim writes them back to the handle's
-/// atomic / mutex fields.
+/// Drains alacritty's per-row damage iterator into the caller's buffer, merged with sources its
+/// bounds filter can't surface: cursor-row content/metadata (via `hash_redraw_state`),
+/// scrollback offset change (promotes to `Full`), and the selection union old-and-new (a
+/// shrink or clear must repaint rows no longer selected). Split from the FFI shim so tests can
+/// use a synthetic `Term<VoidListener>`; previous state goes in and updated state comes back in
+/// the return for the shim to write to the handle.
 fn compute_damage_rows<L: EventListener>(
     term: &mut Term<L>,
     prev_display_offset: i32,
@@ -989,12 +773,8 @@ fn compute_damage_rows<L: EventListener>(
     let current_selection = selection_range_for_ffi(term);
     let current_cursor_hash = hash_redraw_state(term, cursor_point);
 
-    // Scroll into / out of history — every viewport row's content
-    // changes. No point computing per-row damage; the partial iterator
-    // would only reflect cell writes since the last call (which lag the
-    // viewport-display change), so we'd under-report and leave stale
-    // pixels. Reset alacritty's damage so the next non-scrolling frame
-    // starts clean.
+    // Scrolling into/out of history changes every row. Per-row damage would lag the viewport
+    // change and under-report, leaving stale pixels, so go Full and reset alacritty's damage.
     if prev_display_offset != current_offset {
         term.reset_damage();
         return (
@@ -1010,11 +790,8 @@ fn compute_damage_rows<L: EventListener>(
     let cursor_line = cursor_point.line.0.max(0) as usize;
     let cursor_col = cursor_point.column.0;
 
-    // Collect dirty rows into a small bitmap. u16 row indices in the
-    // 0..=screen_lines range — a fixed 256-bit bitmap covers anything
-    // reasonable a terminal would render in viewport rows. Out-of-range
-    // returns `Full` (the caller's buffer can't hold the row list).
-    let mut dirty_bitmap: [u64; 4] = [0; 4]; // 256 rows
+    // Dirty rows go in a fixed 256-bit bitmap; out-of-range returns `Full`.
+    let mut dirty_bitmap: [u64; 4] = [0; 4];
     let bitmap_max_row: usize = 256;
     let mut full = false;
 
@@ -1030,20 +807,13 @@ fn compute_damage_rows<L: EventListener>(
         alacritty_terminal::term::TermDamage::Full => full = true,
         alacritty_terminal::term::TermDamage::Partial(iter) => {
             for d in iter {
-                // Skip the cursor-cell-only damage hint alacritty emits
-                // unconditionally on every `damage()` call. The cursor
-                // case is handled by `cursor_state_changed` below, which
-                // catches the cases that matter (movement, style change,
-                // content mutation under the cursor).
+                // Skip the cursor-cell-only hint alacritty emits on every `damage()` call; the
+                // cursor is handled by `cursor_state_changed` below.
                 if d.line == cursor_line && d.left == cursor_col && d.right == cursor_col {
                     continue;
                 }
-                // alacritty grid line indices are NON-negative for the
-                // live region (`damage()` only reports the live area —
-                // scrollback writes don't fire damage events). Map to
-                // viewport row via display_offset — since we already
-                // bailed on offset change above, `current_offset` is
-                // stable for the rest of this call.
+                // `damage()` only reports the live region (scrollback writes fire nothing); map
+                // to a viewport row via `current_offset`, stable since the offset-change bail.
                 let viewport_row = d.line as i32 + current_offset;
                 if viewport_row < 0 || viewport_row as usize >= screen_lines {
                     continue;
@@ -1066,11 +836,8 @@ fn compute_damage_rows<L: EventListener>(
         );
     }
 
-    // Cursor row dirty (cursor moved / blinked / DECSCUSR / combining
-    // mark). The cursor row's VIEWPORT index uses the same offset map
-    // as snapshot rows + the FFI cursor row reported by snapshot, so a
-    // user scrolled past the live cursor doesn't get a stray "row 0"
-    // dirty.
+    // Cursor row dirty. Its viewport index uses the same offset map as snapshot rows, so a user
+    // scrolled past the live cursor doesn't get a stray "row 0".
     if cursor_state_changed {
         let cursor_viewport_row = cursor_point.line.0 + current_offset;
         if cursor_viewport_row >= 0 && (cursor_viewport_row as usize) < screen_lines {
@@ -1078,10 +845,7 @@ fn compute_damage_rows<L: EventListener>(
         }
     }
 
-    // Selection union: any row that WAS or IS in the highlight rect
-    // needs repaint. Without the OLD union, shrinking the selection
-    // would leave painted surface2 overlay on rows that no longer
-    // belong to the range.
+    // Selection union: old and new rows both repaint, or a shrink leaves stale overlay.
     for sel in [&prev_selection, &current_selection] {
         if sel.present != 1 {
             continue;
@@ -1096,9 +860,7 @@ fn compute_damage_rows<L: EventListener>(
         }
     }
 
-    // Flatten bitmap → caller's u16 array, writing distinct rows. Once
-    // we run out of buffer cap, promote to Full — easier for the
-    // renderer to handle than a "partial list" with unknown gaps.
+    // Past the buffer cap, promote to Full rather than hand back a partial list with gaps.
     let cap = out.len();
     let mut count: usize = 0;
     for (word_idx, word) in dirty_bitmap.iter().enumerate() {
@@ -1128,27 +890,18 @@ fn compute_damage_rows<L: EventListener>(
     )
 }
 
-/// Per-row damage drain — viewport row indices that need repaint
-/// since the last call. Returns:
-/// * `-1` — Full repaint required (scrollback offset changed,
-///   alacritty signaled `TermDamage::Full`, or the dirty list exceeded
-///   `cap`); the renderer should redraw the whole view.
-/// * `0..=cap` — exact dirty row count. The first `count` `u16` slots
-///   of `out_buf` hold distinct viewport row indices, in unspecified
-///   order; rows beyond `count` are untouched.
-///
-/// Idempotent in the "no events fired since last call" case: returns
-/// `0` and leaves the buffer untouched. Resets alacritty's damage
-/// state at the end so the next call only sees subsequent changes.
+/// Per-row damage drain: viewport rows needing repaint since the last call. Returns `-1` for
+/// Full repaint (scrollback offset changed, `TermDamage::Full`, or more dirty rows than `cap`),
+/// else the count `0..=cap`; the first `count` u16 slots of `out_buf` hold distinct row indices
+/// in unspecified order. Returns `0` with the buffer untouched when nothing changed. Resets
+/// alacritty's damage state.
 ///
 /// # Safety
 ///
-/// * `handle` must be NULL or a valid pointer returned by
-///   `copad_term_create` and not yet destroyed.
-/// * `out_buf` must point to writable storage for at least `cap`
-///   `u16` slots when `cap > 0`. When `cap == 0` it MAY be null —
-///   the function returns `-1` immediately (the buffer can't hold
-///   any rows, equivalent to "promote to full").
+/// * `handle` must be NULL or a valid pointer returned by `copad_term_create` and not yet
+///   destroyed.
+/// * `out_buf` must point to writable storage for `cap` `u16` slots when `cap > 0`; with
+///   `cap == 0` it MAY be null and the function returns `-1` immediately.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copad_term_take_damage_rows(
     handle: *mut CopadHandle,
@@ -1159,9 +912,7 @@ pub unsafe extern "C" fn copad_term_take_damage_rows(
         return 0;
     };
     if cap == 0 {
-        // No room to write rows — caller can't ever receive partial
-        // damage. Drain the damage state anyway so the next non-zero-
-        // cap call sees a clean slate.
+        // No room for rows: drain the damage state anyway so the next call starts clean.
         let mut term = h.term.lock();
         term.reset_damage();
         return -1;
@@ -1176,10 +927,8 @@ pub unsafe extern "C" fn copad_term_take_damage_rows(
     let prev_cursor_hash = h.last_redraw_state_hash.load(Ordering::Relaxed);
 
     let mut term = h.term.lock();
-    // SAFETY: caller contract — `out_buf` points to `cap` writable u16
-    // slots. We hold the term lock for the duration so no concurrent
-    // FFI call can race on the same buffer (the caller is expected to
-    // be a single render thread on the GUI side).
+    // SAFETY: caller contract: `out_buf` has `cap` writable u16 slots. The term lock is held,
+    // so concurrent FFI calls can't race on it (the caller is a single render thread).
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf, cap as usize) };
     let (outcome, new_offset, new_selection, new_cursor_hash) = compute_damage_rows(
         &mut term,
@@ -1203,14 +952,9 @@ pub unsafe extern "C" fn copad_term_take_damage_rows(
     }
 }
 
-/// Project `term.selection` (if any) into the FFI-friendly inclusive-
-/// bounds struct the renderer paints from. Returns the default
-/// (present=0) when there's no selection or it doesn't resolve to a
-/// range (e.g. empty drag, viewport scrolled past the selection).
-///
-/// Generic over `EventListener` so the damage-rows computation can
-/// run against the synthetic `Term<VoidListener>` used by unit tests
-/// while the public FFI path stays on `Term<CopadListener>`.
+/// Projects `term.selection` into the inclusive-bounds struct the renderer paints from; default
+/// (present=0) when there is none or it doesn't resolve (empty drag, scrolled past). Generic
+/// over `EventListener` so tests can use `Term<VoidListener>`.
 fn selection_range_for_ffi<L: EventListener>(term: &Term<L>) -> CopadSelectionRange {
     let Some(sel) = term.selection.as_ref() else {
         return CopadSelectionRange::default();
@@ -1255,18 +999,11 @@ fn selection_range_for_ffi<L: EventListener>(term: &Term<L>) -> CopadSelectionRa
     }
 }
 
-/// Hash every renderable field the snapshot path will expose: cursor
-/// row contents, cursor metadata (pos/style/blink/visibility), active
-/// selection bounds, and scrollback offset. Used by
-/// `compute_damage_rows` to catch grid-invisible state transitions
-/// (DECSCUSR, selection start/extend/clear, blink toggle) and the
-/// cursor-row content cases the line-bounds filter would otherwise
-/// collapse with the unconditional `damage_cursor` hint.
-///
-/// Caller already holds the term lock — no extra synchronization
-/// needed. Out-of-range cursor returns a fixed sentinel so the
-/// comparison is still stable. Generic over `EventListener` so unit
-/// tests can drive a `Term<VoidListener>`.
+/// Hashes everything the snapshot path exposes: cursor row contents, cursor pos/style/blink/
+/// visibility, selection bounds and scrollback offset. Lets `compute_damage_rows` catch changes
+/// the line-bounds filter collapses under the unconditional `damage_cursor` hint (DECSCUSR,
+/// selection start/extend/clear, blink). Caller holds the term lock. An out-of-range cursor
+/// hashes to a fixed sentinel. Generic over `EventListener` for `Term<VoidListener>` tests.
 fn hash_redraw_state<L: EventListener>(term: &Term<L>, cursor: Point) -> u64 {
     let line = cursor.line;
     if line.0 < 0 || (line.0 as usize) >= term.screen_lines() {
@@ -1319,17 +1056,8 @@ fn hash_redraw_state<L: EventListener>(term: &Term<L>, cursor: Point) -> u64 {
     hasher.finish()
 }
 
-/// Hash every renderable field the snapshot path will expose: cursor
-/// row contents, cursor metadata (pos/style/blink/visibility), and
-/// active selection bounds. Used by `copad_term_take_damage` to
-/// catch grid-invisible state transitions (DECSCUSR, selection
-/// start/extend/clear) and the cursor-row content cases the line-
-/// bounds filter would otherwise collapse with the unconditional
-/// `damage_cursor` hint.
-///
-/// Take a snapshot of the visible viewport. Lock duration is bounded
-/// by the time it takes to walk `rows × cols` cells and copy them
-/// into the snapshot's owned buffers.
+/// Takes a snapshot of the visible viewport. Lock duration is bounded by walking `rows x cols`
+/// cells and copying them into the snapshot's owned buffers.
 ///
 /// # Safety
 ///
@@ -1346,20 +1074,14 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
     let rows_count = term.screen_lines() as u16;
     let grid = term.grid();
 
-    // Hyperlink dedup map: `(id, uri)` → 1-based index into
-    // `hyperlinks`. Keying by id alone is unsafe because explicit
-    // OSC 8 ids ARE preserved by alacritty (only missing ids get
-    // auto-generated unique values), so two distinct URIs can share
-    // an id. Pairing them in the key keeps each URI its own slot.
+    // Dedup key is `(id, uri)`, not id alone: alacritty preserves explicit OSC 8 ids, so two
+    // distinct URIs can share one.
     let mut hyperlinks: Vec<String> = Vec::new();
     let mut hyperlink_index_by_key: std::collections::HashMap<(String, String), u32> =
         std::collections::HashMap::new();
 
-    // Viewport mapping: when the user has scrolled into history,
-    // `display_offset > 0` and viewport row 0 maps to live line
-    // `-display_offset`. alacritty's `Grid: Index<Line>` walks into
-    // scrollback for negative line values directly, so the snapshot
-    // ends up describing whatever the user is currently looking at.
+    // When scrolled into history, viewport row 0 maps to live line `-display_offset`; Grid
+    // indexing walks into scrollback for negative lines, so the snapshot is what the user sees.
     let display_offset = grid.display_offset() as i32;
 
     let mut snapshot_rows = Vec::with_capacity(rows_count as usize);
@@ -1376,10 +1098,8 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
     }
 
     let cursor_point = term.grid().cursor.point;
-    // `cursor_style()` honors DECSCUSR + vi-mode overrides; SHOW_CURSOR
-    // gates whether anything renders. HollowBlock collapses to Block
-    // here — the renderer draws hollow-on-blur as a separate concern
-    // (window focus state, not a TUI request).
+    // `cursor_style()` honors DECSCUSR and vi-mode; SHOW_CURSOR gates rendering. HollowBlock
+    // collapses to Block: hollow-on-blur is window focus state, drawn by the renderer.
     let cs = term.cursor_style();
     let show_cursor = term
         .mode()
@@ -1394,13 +1114,9 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
             CursorShape::Underline => 3,
         }
     };
-    // Cursor row needs the same display_offset mapping as the snapshot
-    // rows. When the user has scrolled into history, the cursor may
-    // sit outside the visible viewport — clamp the displayed style to
-    // `0` (hidden) for those cases so we don't draw a stray block on
-    // top of scrollback content. Position is still emitted (renderer
-    // can clip however it likes); `style = 0` is the canonical
-    // "don't draw" signal.
+    // Same display_offset mapping as the rows. Scrolled into history the cursor can sit outside
+    // the viewport: `style = 0` (hidden) so no stray block is drawn over scrollback. Position
+    // is still emitted.
     let cursor_viewport_row = cursor_point.line.0 + display_offset;
     let cursor_visible = cursor_viewport_row >= 0 && (cursor_viewport_row as u16) < rows_count;
     let cursor = CopadCursor {
@@ -1426,12 +1142,9 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
 
     drop(term);
 
-    // Project the active find match into viewport coordinates. Locked
-    // strictly AFTER the term lock is released so the global lock
-    // order matches `copad_term_search_next` (search_state THEN term).
-    // Without that ordering the two paths could AB-BA deadlock when
-    // the renderer and find run concurrently. Stale match (rows
-    // scrolled out of view) collapses to `present == 0`.
+    // Locked strictly AFTER the term lock is released so lock order matches
+    // `copad_term_search_next` (search_state THEN term); otherwise they could AB-BA deadlock.
+    // A match scrolled out of view collapses to `present == 0`.
     let search_match = search_match_for_ffi(&h.search_state, display_offset, rows_count, cols);
 
     Box::into_raw(Box::new(CopadSnapshot {
@@ -1446,11 +1159,8 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
     }))
 }
 
-/// Project the current find match (stored in alacritty grid coords)
-/// into the viewport-coord range the renderer paints from. Returns
-/// the empty range when there's no active match or when the match
-/// sits entirely outside the visible viewport — same shape contract
-/// as `selection_range_for_ffi`.
+/// Projects the find match (alacritty grid coords) into the viewport range the renderer
+/// paints; empty if there is no match or it is entirely off-screen.
 fn search_match_for_ffi(
     state: &Mutex<SearchState>,
     display_offset: i32,
@@ -1470,26 +1180,17 @@ fn search_match_for_ffi(
     if end_view < 0 || start_view > last_row {
         return CopadSearchRange::default();
     }
-    // Clip rows to the visible range. When an endpoint is off-screen
-    // the visible boundary row is logically a "middle row" of the
-    // match — wrap-spanning matches paint the FULL row width on every
-    // row except the original first/last. So if start clipped from a
-    // negative line, the new first visible row should start at col 0
-    // (its actual match content begins at the row's left edge from
-    // the prior wrap, not at the off-screen start column). Same on
-    // the end side: if end clipped from past last_row, the new last
-    // visible row should extend through the last column.
+    // Clip to the visible range. A clipped endpoint makes the boundary row a "middle row" of
+    // the wrapped match, which paints the full row width: a start clipped above begins at col 0,
+    // an end clipped below runs through the last column.
     let (start_row_clamped, start_col_clamped) = if start_view < 0 {
         (0u16, 0u16)
     } else {
         (start_view as u16, range.start().column.0 as u16)
     };
     let (end_row_clamped, end_col_clamped) = if end_view > last_row {
-        // Match extends past the bottom of the viewport — the new
-        // last visible row is logically a "middle row" of the
-        // original wrap, so it paints from col 0 through the
-        // viewport's rightmost column. `cols - 1` is that index
-        // (clamped to 0 for the degenerate cols == 0 case).
+        // Match extends below the viewport: the last visible row is a "middle row" of the wrap,
+        // painting col 0 through the rightmost column (`cols - 1`, 0 if cols == 0).
         (last_row as u16, cols.saturating_sub(1))
     } else {
         (end_view as u16, range.end().column.0 as u16)
@@ -1504,13 +1205,10 @@ fn search_match_for_ffi(
     }
 }
 
-/// Walk a single display line into a `Row`. Groups consecutive cells
-/// with identical attributes AND identical single-byte ASCII char into
-/// one run so the renderer makes one CTLine per span instead of per
-/// cell — the dominant cost on idle/scrollback frames where most cells
-/// are spaces. The aggregation is intentionally conservative:
-/// uniform-ASCII only (so the cursor-cell glyph re-render picks any
-/// byte and gets the right char), no wide chars, no combining marks.
+/// Walks one display line into a `Row`, grouping consecutive cells with identical attributes
+/// AND the same single-byte ASCII char into one run, so the renderer makes one CTLine per span
+/// (idle/scrollback frames are mostly spaces). Deliberately conservative: uniform ASCII only,
+/// so the cursor-cell glyph re-render gets the right char; no wide chars or combining marks.
 fn walk_row(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     line: Line,
@@ -1520,10 +1218,8 @@ fn walk_row(
 ) -> Row {
     let mut utf8: Vec<u8> = Vec::new();
     let mut runs: Vec<CopadRun> = Vec::new();
-    // Side-channel: for each pushed run, the ASCII byte every cell in
-    // that run shares — or None if the run is non-uniform (multi-byte
-    // char, combining marks, wide char, or mixed contents). Only
-    // Some-valued entries can be extended by `try_extend_last_run`.
+    // Per run, the ASCII byte all its cells share, or None if non-uniform (multi-byte, combining,
+    // wide or mixed). Only Some entries can be extended by `try_extend_last_run`.
     let mut run_uniform: Vec<Option<u8>> = Vec::new();
     let mut col: u16 = 0;
 
@@ -1531,10 +1227,7 @@ fn walk_row(
         let point = Point::new(line, Column(col as usize));
         let cell = &grid[point];
 
-        // Wide-char trailing cells (the "right half" of a CJK glyph
-        // emitted alongside the leading half) carry no glyph and
-        // shouldn't generate a run of their own — they're absorbed
-        // by the leading half's run.
+        // Trailing half of a wide char carries no glyph; the leading half's run absorbs it.
         if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
             col += 1;
             continue;
@@ -1552,10 +1245,8 @@ fn walk_row(
         }
 
         let (fg, bg) = (color_to_rgba(cell.fg), color_to_rgba(cell.bg));
-        // `cell.underline_color()` can return any AnsiColor variant
-        // (Spec from `\e[58;2;…m`, Indexed from `\e[58;5;Nm`, or a
-        // named palette color), so route it through the same encoder
-        // as fg/bg instead of dropping non-Spec values.
+        // `underline_color()` can be Spec (`\e[58;2;...m`), Indexed or a named colour, so use
+        // the fg/bg encoder rather than dropping non-Spec values.
         let underline_color = cell.underline_color().map(color_to_rgba).unwrap_or(0);
         let underline_style = underline_style(cell.flags);
         let hyperlink_id = cell
@@ -1572,10 +1263,8 @@ fn walk_row(
             })
             .unwrap_or(0);
 
-        // Aggregation eligibility: single-cell, ASCII char, no
-        // combining marks. Multi-byte chars, wide chars, and cells
-        // with combining marks each get their own run so cursor-cell
-        // glyph extraction stays a simple "pick the run's bytes".
+        // Aggregation eligibility: single-cell ASCII with no combining marks. Anything else gets
+        // its own run so cursor-cell glyph extraction stays "pick the run's bytes".
         let has_zw = cell.zerowidth().is_some_and(|z| !z.is_empty());
         let cell_byte: Option<u8> = if span_cols == 1 && !has_zw && cell.c.is_ascii() {
             Some(cell.c as u8)
@@ -1593,8 +1282,7 @@ fn walk_row(
             && last.underline_style == underline_style
             && last.hyperlink_id == hyperlink_id
         {
-            // Extend the previous run by one column. utf8 stays
-            // uniform because we appended the same byte.
+            // Extend by one column; utf8 stays uniform since the same byte is appended.
             utf8.push(b);
             last.utf8_len += 1;
             last.end_col += 1;
@@ -1609,9 +1297,8 @@ fn walk_row(
             utf8.push(b' ');
         } else {
             utf8.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-            // Combining marks live in CellExtra.zerowidth — fold them
-            // into the same run's utf8 so CoreText shapes them with
-            // their base glyph.
+            // Combining marks (CellExtra.zerowidth) fold into the run's utf8 so CoreText shapes
+            // them with their base glyph.
             for combine in cell.zerowidth().unwrap_or(&[]) {
                 utf8.extend_from_slice(combine.encode_utf8(&mut buf).as_bytes());
             }
@@ -1675,30 +1362,24 @@ fn cell_flags_to_ffi(f: CellFlags) -> u16 {
         out |= flags::STRIKE;
     }
     if f.contains(CellFlags::HIDDEN) { /* nothing in our flag set; renderer can decide */ }
-    // ALL_UNDERLINES covers single/double/curly/dotted/dashed; we
-    // collapse to the UNDERLINE bit for Phase 2 (style enum at
-    // `CopadRun::underline_style` carries the variant).
+    // ALL_UNDERLINES covers every variant; the UNDERLINE bit is collapsed here and
+    // `CopadRun::underline_style` carries which one.
     if f.intersects(CellFlags::ALL_UNDERLINES) {
         out |= flags::UNDERLINE;
     }
     out
 }
 
-/// Encoding scheme for the `fg_rgba` / `bg_rgba` u32 fields. The high
-/// byte is a tag that disambiguates three color kinds without growing
-/// the ABI:
+/// Encoding of the `fg_rgba` / `bg_rgba` u32 fields; the high byte tags the kind:
 ///
-/// - `0x00_00_00_00` — default (renderer materializes to theme fg/bg).
-/// - `0x01_00_00_NN` — indexed palette color (N in 0..255). Swift
-///   resolves 0-15 from `theme.palette`, 16-231 from the 6×6×6 xterm
-///   color cube, 232-255 from the 24-step grayscale ramp.
-/// - `0xFF_RR_GG_BB` — direct RGB. Always opaque (alpha forced to 1
-///   on decode) because terminal cells don't have a meaningful alpha.
+/// - `0x00_00_00_00`: default (renderer uses theme fg/bg).
+/// - `0x01_00_00_NN`: indexed palette colour N. Swift resolves 0-15 from `theme.palette`,
+///   16-231 from the 6x6x6 xterm cube, 232-255 from the 24-step grayscale ramp.
+/// - `0xFF_RR_GG_BB`: direct RGB, always opaque.
 ///
-/// Tag-based discrimination is required because the older "alpha=0
-/// means indexed" trick ambiguated against RGB colors whose R channel
-/// is 0 (`\\e[38;2;0;200;255m` and similar), which silently routed
-/// them through the indexed path. Other tag values are reserved.
+/// A tag is needed because the older "alpha=0 means indexed" trick was ambiguous with RGB
+/// colours whose R channel is 0 (`\\e[38;2;0;200;255m`), which went down the indexed path. Other
+/// tag values are reserved.
 const TAG_INDEXED: u32 = 0x01_00_00_00;
 const TAG_DIRECT: u32 = 0xFF_00_00_00;
 
@@ -1716,12 +1397,9 @@ fn color_to_rgba(color: AnsiColor) -> u32 {
     }
 }
 
-/// Map `NamedColor` variants the SGR parser hands us into ANSI
-/// palette indices the Swift side already knows how to resolve. Keeps
-/// the bright/dim variants honest (bright red is index 9, not 1) so
-/// `printf '\033[91mhi'` actually renders bright. Returns `None` for
-/// non-palette named colors (DimFg, Cursor, …) so the caller can fall
-/// back to the default sentinel.
+/// Maps `NamedColor` to ANSI palette indices the Swift side resolves, keeping bright/dim
+/// honest (bright red is 9, not 1). `None` for non-palette colors (DimFg, Cursor, ...) so the
+/// caller uses the default sentinel.
 fn named_to_indexed(named: NamedColor) -> Option<u8> {
     let idx: u8 = match named {
         NamedColor::Black => 0,
@@ -1745,7 +1423,6 @@ fn named_to_indexed(named: NamedColor) -> Option<u8> {
     Some(idx)
 }
 
-/// Free a snapshot.
 ///
 /// # Safety
 ///
@@ -1783,9 +1460,8 @@ pub unsafe extern "C" fn copad_snapshot_cols(snap: *const CopadSnapshot) -> u16 
     s.cols
 }
 
-/// Borrowed pointer to the row's run array. Valid until
-/// `copad_snapshot_destroy`. Returns 0 if row is out of range;
-/// `*out_runs` set to NULL in that case.
+/// Borrowed pointer to the row's run array, valid until `copad_snapshot_destroy`. Returns 0 and
+/// sets `*out_runs` to NULL if the row is out of range.
 ///
 /// # Safety
 ///
@@ -1811,8 +1487,7 @@ pub unsafe extern "C" fn copad_snapshot_row_runs(
     row_data.runs.len()
 }
 
-/// Borrowed pointer to the row's utf8 bytes + length. Same lifetime.
-///
+/// Borrowed pointer to the row's utf8 bytes + length; same lifetime.
 /// # Safety
 ///
 /// `out_len` must point to writable storage for one `usize`.
@@ -1841,8 +1516,6 @@ pub unsafe extern "C" fn copad_snapshot_row_utf8(
     }
 }
 
-/// Fill `*out` with the snapshot's cursor state.
-///
 /// # Safety
 ///
 /// `out` must point to writable storage for one `CopadCursor`.
@@ -1857,8 +1530,7 @@ pub unsafe extern "C" fn copad_snapshot_cursor(snap: *const CopadSnapshot, out: 
     unsafe { *out = s.cursor };
 }
 
-/// Fill `*out` with the snapshot's active selection bounds. Renderer
-/// checks `out.present` to decide whether to paint a highlight.
+/// Fills `*out` with the active selection bounds; check `out.present`.
 ///
 /// # Safety
 ///
@@ -1877,10 +1549,8 @@ pub unsafe extern "C" fn copad_snapshot_selection(
     unsafe { *out = s.selection };
 }
 
-/// Copy out the current find match in viewport coordinates. The
-/// renderer reads this every frame so it can paint the highlight
-/// underneath glyphs. `present == 0` means no active match — caller
-/// should skip the highlight pass.
+/// Copies out the current find match in viewport coordinates, read every frame to paint the
+/// highlight under glyphs. `present == 0` means no match.
 ///
 /// # Safety
 ///
@@ -1899,13 +1569,8 @@ pub unsafe extern "C" fn copad_snapshot_search_match(
     unsafe { *out = s.search_match };
 }
 
-// ---------- In-terminal find ----------
-
-/// Backslash-escape regex metacharacters so the FFI's substring
-/// contract is honored. Mirrors the set the `regex` crate's
-/// `regex::escape` function escapes (we don't pull in `regex` just
-/// for this — alacritty uses `regex-automata` and we don't want to
-/// bring another regex crate transitively).
+/// Backslash-escapes regex metacharacters, like `regex::escape`, without pulling in the
+/// `regex` crate (alacritty uses `regex-automata`).
 fn escape_regex_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1936,28 +1601,17 @@ fn escape_regex_literal(s: &str) -> String {
     out
 }
 
-/// Find the next/previous match of `pattern` in the terminal grid +
-/// scrollback. Pattern is treated as a fixed string (special regex
-/// chars are escaped by the caller — copad doesn't expose regex to
-/// the find bar in v1).
+/// Finds the next/previous match of `pattern` in the grid and scrollback. `pattern` is a fixed
+/// string (the caller escapes regex chars; the find bar exposes no regex in v1).
 ///
-/// `case_sensitive == false` wraps the pattern in `(?i:...)` so
-/// alacritty's regex_automata engine matches without case. `forward`
-/// chooses `regex_search_right` (next) vs `regex_search_left` (prev).
-/// Search starts after the current match's end (forward) / before
-/// its start (backward); with no current match it starts at the
-/// term cursor — that's where the user is logically looking. Wraps
-/// around the grid boundaries (`(start, end)` covers the full
-/// scrollback + live region).
+/// `case_sensitive == false` wraps it in `(?i:...)`; `forward` picks `regex_search_right` vs
+/// `regex_search_left`. The search starts after the current match's end (forward) or before its
+/// start (backward), else at the term cursor, and wraps around the grid. On a hit it caches the
+/// match, scrolls the match-start row on-screen and returns `true`; on a miss it clears the
+/// cache and returns `false`.
 ///
-/// On a hit, updates the cached match + viewport-scrolls so the row
-/// containing the match start is on-screen; returns `true`. On miss,
-/// clears the cached match and returns `false`.
-///
-/// Cache reuse: if `(pattern, case_sensitive)` matches the last call,
-/// the compiled `RegexSearch` is reused — alacritty builds four
-/// lazy DFAs internally, so rebuilding on every keystroke would be
-/// wasteful.
+/// The compiled `RegexSearch` is reused when `(pattern, case_sensitive)` is unchanged, since
+/// alacritty builds four lazy DFAs per search.
 ///
 /// # Safety
 ///
@@ -1977,11 +1631,10 @@ pub unsafe extern "C" fn copad_term_search_next(
     if pattern.is_null() {
         return false;
     }
-    // SAFETY: caller contract — pattern is a NUL-terminated UTF-8 string.
+    // SAFETY: caller contract: pattern is a NUL-terminated UTF-8 string.
     let raw_pattern = match unsafe { CStr::from_ptr(pattern) }.to_str() {
         Ok(s) if !s.is_empty() => s,
         _ => {
-            // Empty / invalid pattern → clear and return.
             if let Ok(mut state) = h.search_state.lock() {
                 state.current_match = None;
             }
@@ -1994,17 +1647,12 @@ pub unsafe extern "C" fn copad_term_search_next(
         Err(_) => return false,
     };
 
-    // Substring semantics: escape regex metacharacters in the user's
-    // input so `.` `*` `(` `[` etc. match literally. Without this a
-    // user typing `foo.bar` would unexpectedly match `fooXbar`.
+    // Escape regex metacharacters so `foo.bar` doesn't match `fooXbar`.
     let escaped = escape_regex_literal(raw_pattern);
 
-    // Force case bias explicitly. Alacritty's RegexSearch::new applies
-    // SMART-CASE by default (case-insensitive iff the pattern has no
-    // uppercase), so `case_sensitive=true` on a lowercase query like
-    // "foo" would still match "FOO" without the `(?-i:...)` override.
-    // Wrap with the corresponding inline flag group so the user's
-    // toggle is load-bearing in both directions.
+    // Force case bias explicitly: alacritty's RegexSearch::new is SMART-CASE (insensitive iff no
+    // uppercase), so `case_sensitive=true` for "foo" would still match "FOO" without the
+    // `(?-i:...)` override.
     let cache_key_pattern = if case_sensitive {
         format!("(?-i:{escaped})")
     } else {
@@ -2019,20 +1667,14 @@ pub unsafe extern "C" fn copad_term_search_next(
                 state.regex = Some(r);
                 state.pattern = cache_key_pattern;
                 state.case_sensitive = case_sensitive;
-                // Query changed — the previously-cached match is from
-                // a different pattern and using it as the search
-                // origin would skip a valid hit at the same location
-                // (e.g. extending "abc" → "abcd" would step past
-                // the old "abc" match and miss the "abcd" that
-                // overlaps it). Reset so the next search starts at
-                // the term cursor instead.
+                // Query changed: the cached match is from another pattern, and stepping past it
+                // could skip a valid hit (extending "abc" to "abcd" would step past the "abc" match
+                // and miss the overlapping "abcd"). Reset so the search starts at the term cursor.
                 state.current_match = None;
             }
             Err(_) => {
-                // Invalid pattern (extremely rare for substring searches
-                // after our `(?i:...)`/`(?-i:...)` wrap — would mean
-                // unbalanced parentheses in user input). Bail without
-                // changing current_match so the previous highlight stays.
+                // Invalid pattern (only possible from unbalanced parens in user input despite the
+                // wrap): bail leaving current_match so the previous highlight stays.
                 return false;
             }
         }
@@ -2044,15 +1686,12 @@ pub unsafe extern "C" fn copad_term_search_next(
     let topmost_line = term.topmost_line();
     let bottommost_line = term.bottommost_line();
 
-    // Pick the search origin. With a cached match we step past its
-    // boundary in the chosen direction; without one we start at the
-    // term cursor so the first call after the user types "foo" finds
-    // the nearest "foo" to where they were looking.
+    // Origin: past the cached match's boundary in the chosen direction, else the term cursor so
+    // the first search finds the "foo" nearest where the user was looking.
     let cursor_point = term.grid().cursor.point;
     let start_point = match (forward, state.current_match.as_ref()) {
         (true, Some(m)) => {
-            // Step one cell past the match's end. If that overshoots
-            // the bottom-right corner of the grid, wrap to the top.
+            // Step one cell past the match end, wrapping to the top past the bottom-right corner.
             let mut p = *m.end();
             if p.column.0 + 1 >= cols {
                 p.column = Column(0);
@@ -2083,20 +1722,17 @@ pub unsafe extern "C" fn copad_term_search_next(
         (_, None) => cursor_point,
     };
 
-    // Search bounds: full grid (live + scrollback), each direction.
-    // `regex_search_*` take `&mut RegexSearch` — alacritty's lazy DFAs
-    // mutate internal cache state as they evaluate. Take the regex
-    // out of the Option for the duration of the search so we hold a
-    // single `&mut`, then put it back.
+    // Bounds are the full grid (live + scrollback). `regex_search_*` take `&mut RegexSearch`
+    // (lazy DFAs mutate cache state), so take the regex out of the Option for the search and
+    // put it back.
     let mut regex = state
         .regex
         .take()
         .expect("regex set above when cache_hit was false");
 
     let found = if forward {
-        // Forward search wraps: try from start_point to bottom; if
-        // nothing, retry from top to start_point. alacritty doesn't
-        // wrap natively, so we do two calls.
+        // Forward search wraps by hand (alacritty doesn't): start_point to bottom, then top to
+        // start_point.
         let bottom_right = Point {
             line: bottommost_line,
             column: Column(cols.saturating_sub(1)),
@@ -2107,8 +1743,7 @@ pub unsafe extern "C" fn copad_term_search_next(
                 line: topmost_line,
                 column: Column(0),
             };
-            // Wrap-around guard: don't return the same match twice in a
-            // row if the only match in the grid is at start_point.
+            // Don't return the same match twice if the only match is at start_point.
             let mut prev_end = start_point;
             if prev_end.column.0 == 0 {
                 prev_end.column = Column(cols.saturating_sub(1));
@@ -2147,30 +1782,22 @@ pub unsafe extern "C" fn copad_term_search_next(
             term.regex_search_left(&mut regex, prev_start, bottom_right)
         })
     };
-    // Hand the (now-mutated) regex back to the cache.
     state.regex = Some(regex);
-    // total_lines is read but unused below if the closure-based
-    // logic above changes — keep the binding to avoid an unused-let
-    // warning that would block clippy.
+    // Keeps the binding so the `let _` below avoids an unused warning that would block clippy.
     let _ = total_lines;
 
     state.current_match = found.clone();
 
-    // Scroll viewport so the match row is visible. alacritty's
-    // display_offset counts rows above the live region (0 = live
-    // bottom). For a match on line `L` (where negative L = scrollback,
-    // 0..screen_lines = live), the offset needed to bring L onto the
-    // bottom row is `(screen_lines-1) - L` clamped to [0,
-    // total_lines-screen_lines].
+    // Scroll the viewport to show the match row. display_offset counts rows above the live
+    // bottom (0 = live). For line `L` (negative = scrollback), bringing it to the bottom row
+    // needs `(screen_lines-1) - L`, clamped to [0, total_lines-screen_lines].
     if let Some(ref m) = found {
         let screen_lines = term.screen_lines() as i32;
         let match_line = m.start().line.0;
         let needed_offset = if match_line < 0 {
-            // Match in scrollback — show it at the top of the viewport.
             (-match_line) as usize
         } else if match_line >= screen_lines {
-            // Shouldn't happen (live region max is screen_lines-1),
-            // but be defensive.
+            // Shouldn't happen (live max is screen_lines-1); defensive.
             0
         } else {
             0 // Match already in live viewport.
@@ -2179,9 +1806,8 @@ pub unsafe extern "C" fn copad_term_search_next(
         let final_offset = needed_offset.min(max_offset);
         let current_offset = term.grid().display_offset();
         if current_offset != final_offset {
-            // alacritty exposes scroll via Term::scroll_display(Scroll).
-            // ::Top jumps to start of scrollback, ::Bottom to live,
-            // ::Lines(N) scrolls N lines (positive = into history).
+            // Scroll via Term::scroll_display: ::Top / ::Bottom / ::Lines(N) (positive = into
+            // history).
             let delta = final_offset as i32 - current_offset as i32;
             if delta != 0 {
                 term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
@@ -2192,8 +1818,7 @@ pub unsafe extern "C" fn copad_term_search_next(
     found.is_some()
 }
 
-/// Drop the cached regex + current match. The renderer's highlight
-/// vanishes on the next frame.
+/// Drops the cached regex and current match; the highlight vanishes next frame.
 ///
 /// # Safety
 ///
@@ -2211,22 +1836,16 @@ pub unsafe extern "C" fn copad_term_search_clear(handle: *mut CopadHandle) {
     }
 }
 
-// ---------- Selection control ----------
-
-/// Selection kind discriminator for `copad_term_selection_start`.
-/// Kept as named constants so Swift / future C consumers can mirror
-/// the contract; the SIMPLE variant is consumed via the match's
-/// fallback arm.
+/// Selection kind for `copad_term_selection_start`, as named constants for Swift/C consumers;
+/// SIMPLE is taken by the match's fallback arm.
 #[allow(dead_code)]
 const SELECTION_SIMPLE: u8 = 0;
 const SELECTION_SEMANTIC: u8 = 1;
 const SELECTION_LINES: u8 = 2;
 const SELECTION_BLOCK: u8 = 3;
 
-/// Side discriminator: 0 = Left of cell, 1 = Right. Mirrors
-/// alacritty's `Side` enum so the renderer can compute it from the
-/// pixel offset within the cell (left half → Left, right half → Right)
-/// without bringing the enum across FFI.
+/// Side of the cell: 0 = Left, 1 = Right (mirrors alacritty's `Side`), so the renderer can
+/// compute it from the pixel offset without bringing the enum across FFI.
 const SIDE_LEFT: u8 = 0;
 
 fn parse_side(side: u8) -> Side {
@@ -2238,12 +1857,9 @@ fn parse_side(side: u8) -> Side {
 }
 
 fn selection_point(term: &Term<CopadListener>, row: u16, col: u16) -> Point {
-    // Renderer passes viewport-relative row coordinates (row 0 = top
-    // of what's currently visible, regardless of scrollback). Convert
-    // to alacritty's absolute Line by subtracting display_offset —
-    // when scrolled back, viewport row 0 sits at Line(-display_offset).
-    // Without this, drag/click on scrolled-back content selects the
-    // live grid at the same row instead of what the user sees.
+    // The renderer passes viewport-relative rows; subtract display_offset to get alacritty's
+    // Line (scrolled back, row 0 is `Line(-display_offset)`). Otherwise drag/click on
+    // scrolled-back content selects the live grid at the same row.
     let display_offset = term.grid().display_offset() as i32;
     let line = Line(row as i32 - display_offset);
     let cols = term.columns();
@@ -2251,9 +1867,8 @@ fn selection_point(term: &Term<CopadListener>, row: u16, col: u16) -> Point {
     Point::new(line, column)
 }
 
-/// Start a new selection at (`row`, `col`). Replaces any existing
-/// selection. `kind` is `SELECTION_SIMPLE` / `SEMANTIC` / `LINES`;
-/// anything else falls back to simple.
+/// Starts a selection at (`row`, `col`), replacing any existing one. `kind` is
+/// `SELECTION_SIMPLE` / `SEMANTIC` / `LINES`; anything else is simple.
 ///
 /// # Safety
 ///
@@ -2281,8 +1896,7 @@ pub unsafe extern "C" fn copad_term_selection_start(
     term.selection = Some(Selection::new(ty, point, parse_side(side)));
 }
 
-/// Extend the current selection to `(row, col, side)`. No-op if there
-/// isn't a selection in progress.
+/// Extends the current selection to `(row, col, side)`; no-op if none is in progress.
 ///
 /// # Safety
 ///
@@ -2305,7 +1919,7 @@ pub unsafe extern "C" fn copad_term_selection_update(
     }
 }
 
-/// Clear the active selection.
+/// Clears the active selection.
 ///
 /// # Safety
 ///
@@ -2319,8 +1933,8 @@ pub unsafe extern "C" fn copad_term_selection_clear(handle: *mut CopadHandle) {
     h.term.lock().selection = None;
 }
 
-/// Select the entire visible viewport (Cmd+A). Uses a Simple
-/// selection from (0, 0) to (last_line, last_col).
+/// Selects the visible viewport (Cmd+A) as a Simple selection from (0, 0) to (last_line,
+/// last_col).
 ///
 /// # Safety
 ///
@@ -2332,12 +1946,9 @@ pub unsafe extern "C" fn copad_term_selection_all(handle: *mut CopadHandle) {
         return;
     };
     let mut term = h.term.lock();
-    // Select the currently-visible viewport — which, when the user is
-    // scrolled into history, means scrollback lines. Top of viewport is
-    // `Line(-display_offset)`; bottom is that plus `screen_lines - 1`.
-    // (Selecting ALL of scrollback regardless of scroll position is a
-    // different feature; matching iTerm2 / Terminal.app's Cmd+A: only
-    // what the user can see.)
+    // The visible viewport, which when scrolled into history is scrollback lines: top is
+    // `Line(-display_offset)`, bottom that plus `screen_lines - 1`. Matches iTerm2/Terminal.app
+    // Cmd+A (only what the user can see).
     let display_offset = term.grid().display_offset() as i32;
     let screen_lines = term.screen_lines() as i32;
     let top = Line(-display_offset);
@@ -2350,8 +1961,7 @@ pub unsafe extern "C" fn copad_term_selection_all(handle: *mut CopadHandle) {
     term.selection = Some(sel);
 }
 
-/// Heap-allocated UTF-8 buffer of the current selection. Returns NULL
-/// when nothing is selected. Caller must free with
+/// Heap-allocated UTF-8 copy of the current selection, or NULL when none. Free with
 /// `copad_string_destroy` exactly once.
 ///
 /// # Safety
@@ -2375,20 +1985,13 @@ pub unsafe extern "C" fn copad_term_selection_string(handle: *mut CopadHandle) -
     }))
 }
 
-/// Render the last `lines` rows of scrollback as plain text — `\n`
-/// between rows, no trailing newline. Mirrors SwiftTerm's
-/// `Terminal.getLine(row: -N..0)` walk so coctl `terminal.history`
-/// returns the same shape across both backends.
+/// Renders the last `lines` scrollback rows as plain text, `\n` between rows, no trailing
+/// newline, matching SwiftTerm's `getLine(row: -N..0)` walk so `terminal.history` has the same
+/// shape on both backends. Scrolling into history does not shift it: it is always the N rows
+/// above the original viewport top (`terminal.read` gives what is visible).
 ///
-/// When the user has scrolled into history (`display_offset > 0`), the
-/// result is still the N rows immediately above the *original*
-/// viewport top — NOT shifted to follow the scroll. Callers that want
-/// "the scrollback you can see right now" should use `terminal.read`.
-///
-/// Returns a non-NULL but length-0 `CopadString` when `lines == 0` or
-/// when no scrollback exists, so the Swift wrapper can return an empty
-/// `String` instead of `nil` and the JSON shape stays stable.
-/// Caller must free via `copad_string_destroy` exactly once.
+/// Returns a non-NULL zero-length `CopadString` when `lines == 0` or no scrollback exists, so
+/// the JSON shape stays stable. Free with `copad_string_destroy` exactly once.
 ///
 /// # Safety
 ///
@@ -2410,16 +2013,9 @@ pub unsafe extern "C" fn copad_term_history(
     }))
 }
 
-/// Walk `lines` rows of scrollback above the viewport top and join
-/// cell `c` chars into a plain-text string, oldest row first.
-/// Extracted from the FFI so unit tests can drive a synthetic Term
-/// without spinning up a real PTY EventLoop — same pattern
-/// `walk_row` / `selection_range_for_ffi` use.
-///
-/// Clamps `lines` to `grid.history_size()`; never panics on
-/// out-of-range scrollback indices. NUL cells render as `' '`
-/// (matches SwiftTerm's getLine extraction and the existing
-/// snapshot row-decode behavior).
+/// Joins `lines` rows of scrollback above the viewport top into plain text, oldest first. Split
+/// from the FFI so tests can use a synthetic Term. Clamps `lines` to `history_size()`; NUL
+/// cells render as `' '`.
 fn read_history_text(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     cols: usize,
@@ -2429,7 +2025,6 @@ fn read_history_text(
     if take == 0 || cols == 0 {
         return String::new();
     }
-    // Capacity hint: one char per cell + one '\n' per row except the last.
     let mut out = String::with_capacity(take * cols + take.saturating_sub(1));
     for i in (1..=take).rev() {
         let line = Line(-(i as i32));
@@ -2445,9 +2040,8 @@ fn read_history_text(
     out
 }
 
-/// Borrowed pointer to the string's bytes (NOT NUL-terminated).
-/// `*out_len` receives the byte length. Both are valid until
-/// `copad_string_destroy`.
+/// Borrowed pointer to the string's bytes (NOT NUL-terminated); `*out_len` is the byte length.
+/// Both are valid until `copad_string_destroy`.
 ///
 /// # Safety
 ///
@@ -2468,7 +2062,7 @@ pub unsafe extern "C" fn copad_string_bytes(
     s.data.as_ptr()
 }
 
-/// Free a `CopadString`. NULL-safe.
+/// Frees a `CopadString`. NULL-safe.
 ///
 /// # Safety
 ///
@@ -2482,12 +2076,8 @@ pub unsafe extern "C" fn copad_string_destroy(s: *mut CopadString) {
     let _ = unsafe { Box::from_raw(s) };
 }
 
-/// True if any of alacritty's mouse-reporting modes is active. Used
-/// by the renderer to defer to TUI mouse handlers (vim, less, htop,
-/// tmux) instead of consuming the drag for selection — the renderer
-/// only takes mouse events when this returns false OR the user holds
-/// Shift to explicitly override.
-///
+/// True if any mouse-reporting mode is active. The renderer then defers to the TUI (vim, less,
+/// htop, tmux) instead of consuming drags for selection, unless the user holds Shift.
 /// # Safety
 ///
 /// `handle` must be NULL or a valid pointer returned by
@@ -2508,21 +2098,16 @@ pub const COPAD_MOUSE_ENC_LEGACY: u8 = 1;
 pub const COPAD_MOUSE_ENC_SGR: u8 = 2;
 pub const COPAD_MOUSE_ENC_UTF8: u8 = 3;
 
-/// Mouse-event encoding currently negotiated by the TUI. The renderer
-/// uses this to choose the byte sequence for forwarded mouse events
-/// (scroll wheel today, click/drag in a later phase). Encodings are
-/// mutually exclusive on the term side, so this returns at most one.
+/// Mouse-event encoding negotiated by the TUI, for choosing the byte sequence of forwarded
+/// mouse events. Encodings are mutually exclusive, so at most one:
 ///
-///   0 = NONE (no mouse reporting active — do not forward)
+///   0 = NONE (no reporting; do not forward)
 ///   1 = LEGACY (X10 `\e[M<cb><cc><cr>`, coords offset by 32, max 223)
-///   2 = SGR    (`\e[<cb;cc;cr;{M|m}`, no coord cap — preferred)
-///   3 = UTF8   (`\e[M<cb><cc><cr>` with multi-byte coord support)
+///   2 = SGR    (`\e[<cb;cc;cr;{M|m}`, no coord cap; preferred)
+///   3 = UTF8   (`\e[M<cb><cc><cr>` with multi-byte coords)
 ///
-/// SGR is what tmux, vim, and modern programs negotiate by default
-/// alongside any reporting mode; LEGACY/UTF8 are fallbacks. The
-/// reporting-mode bit (CLICK / DRAG / MOTION) must also be on for
-/// this to return non-zero, matching `mouse_mode_active`.
-///
+/// Non-zero only if a reporting-mode bit (CLICK / DRAG / MOTION) is also on, as in
+/// `mouse_mode_active`.
 /// # Safety
 ///
 /// `handle` must be NULL or a valid pointer returned by
@@ -2552,20 +2137,16 @@ pub const COPAD_MOUSE_LEVEL_CLICK: u8 = 1;
 pub const COPAD_MOUSE_LEVEL_DRAG: u8 = 2;
 pub const COPAD_MOUSE_LEVEL_MOTION: u8 = 3;
 
-/// Highest mouse-reporting level currently negotiated by the TUI.
-/// The three xterm modes are mutually exclusive on the TUI side
-/// (turning one on clears the others), so we collapse to a single
-/// scalar instead of exposing the flag bitmask:
+/// Highest mouse-reporting level negotiated by the TUI. The xterm modes are mutually exclusive,
+/// so this is a scalar rather than the flag bitmask:
 ///
-///   0 = NONE (no reporting; renderer keeps mouse for selection)
-///   1 = CLICK   — `\e[?1000h` — press + release only
-///   2 = DRAG    — `\e[?1002h` — adds motion ONLY while a button is held
-///   3 = MOTION  — `\e[?1003h` — all motion, even with no buttons down
+///   0 = NONE (renderer keeps the mouse for selection)
+///   1 = CLICK   (`\e[?1000h`) press + release only
+///   2 = DRAG    (`\e[?1002h`) adds motion while a button is held
+///   3 = MOTION  (`\e[?1003h`) all motion
 ///
-/// `MOTION` implies `DRAG` implies `CLICK` for forwarding purposes —
-/// the renderer should always send press/release when any level is on,
-/// drag events at DRAG/MOTION, and bare-cursor motion only at MOTION.
-///
+/// MOTION implies DRAG implies CLICK: send press/release at any level, drag events at
+/// DRAG/MOTION, bare motion only at MOTION.
 /// # Safety
 ///
 /// `handle` must be NULL or a valid pointer returned by
@@ -2578,10 +2159,8 @@ pub unsafe extern "C" fn copad_term_mouse_report_level(handle: *mut CopadHandle)
     let term = h.term.lock();
     use alacritty_terminal::term::TermMode as M;
     let mode = term.mode();
-    // Highest active wins. alacritty_terminal masks the previous mode
-    // when a new one is enabled (see TermMode::set_named_private_mode),
-    // so in practice only one bit is set — but checking highest-first
-    // keeps the renderer robust against any future overlap.
+    // Highest wins. alacritty masks the previous mode on enable so only one bit is normally
+    // set; highest-first is robust to overlap.
     if mode.contains(M::MOUSE_MOTION) {
         COPAD_MOUSE_LEVEL_MOTION
     } else if mode.contains(M::MOUSE_DRAG) {
@@ -2593,10 +2172,8 @@ pub unsafe extern "C" fn copad_term_mouse_report_level(handle: *mut CopadHandle)
     }
 }
 
-/// True if the terminal has bracketed paste mode enabled (`\e[?2004h`).
-/// Renderer wraps Cmd+V'd text in `\e[200~ … \e[201~` when this is
-/// true so paste-aware programs (zsh, neovim with `set paste`, etc.)
-/// can distinguish pasted bytes from typed bytes.
+/// True if bracketed paste (`\e[?2004h`) is on: the renderer wraps pasted text in
+/// `\e[200~ ... \e[201~` so paste-aware programs can tell it from typing.
 ///
 /// # Safety
 ///
@@ -2613,8 +2190,8 @@ pub unsafe extern "C" fn copad_term_bracketed_paste_active(handle: *mut CopadHan
         .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
 }
 
-/// The kitty keyboard protocol flags the program on the visible screen negotiated (`CSI > flags
-/// u`), 0 when it negotiated none — keys then go out in the legacy encoding.
+/// The kitty keyboard protocol flags the visible screen negotiated (`CSI > flags u`); 0 when none,
+/// so keys go out in the legacy encoding.
 ///
 /// # Safety
 ///
@@ -2707,14 +2284,14 @@ unsafe fn ffi_str<'a>(ptr: *const u8, len: usize) -> &'a str {
     if ptr.is_null() || len == 0 {
         return "";
     }
-    // SAFETY: caller contract — `ptr` points to `len` readable bytes.
+    // SAFETY: caller contract, `ptr` points to `len` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     std::str::from_utf8(bytes).unwrap_or("")
 }
 
-/// Encode a key event for the kitty keyboard protocol the program negotiated. Returns
-/// `COPAD_KEY_TEXT` when the protocol is off (flags 0) or the key simply types its text,
-/// `COPAD_KEY_BYTES` with the bytes in `out`, or `COPAD_KEY_NOTHING`.
+/// Encodes a key event for the kitty keyboard protocol the program negotiated: `COPAD_KEY_TEXT`
+/// when the protocol is off (flags 0) or the key just types its text, `COPAD_KEY_BYTES` with
+/// the bytes in `out`, or `COPAD_KEY_NOTHING`.
 ///
 /// # Safety
 ///
@@ -2779,9 +2356,8 @@ pub unsafe extern "C" fn copad_term_encode_key(
     }
 }
 
-/// Scroll-direction discriminator for `copad_term_scroll`. Mirrors
-/// `alacritty_terminal::grid::Scroll` so the renderer doesn't have to
-/// bring the enum across the FFI.
+/// Scroll kind for `copad_term_scroll`, mirroring `alacritty_terminal::grid::Scroll` so the enum
+/// stays off the FFI.
 #[allow(dead_code)]
 const SCROLL_DELTA: u8 = 0;
 const SCROLL_PAGE_UP: u8 = 1;
@@ -2789,10 +2365,8 @@ const SCROLL_PAGE_DOWN: u8 = 2;
 const SCROLL_TOP: u8 = 3;
 const SCROLL_BOTTOM: u8 = 4;
 
-/// Scroll the visible viewport. `kind` is one of `SCROLL_*`; `delta`
-/// is only used for `SCROLL_DELTA` (lines; positive = older content
-/// scrolls into view, negative = newer). Page / Top / Bottom ignore
-/// `delta`.
+/// Scrolls the viewport. `kind` is one of `SCROLL_*`; `delta` applies only to `SCROLL_DELTA`
+/// (lines; positive brings older content into view).
 ///
 /// # Safety
 ///
@@ -2814,13 +2388,9 @@ pub unsafe extern "C" fn copad_term_scroll(handle: *mut CopadHandle, kind: u8, d
     h.term.lock().scroll_display(scroll);
 }
 
-/// Take the most-recent pending OSC 52 clipboard-store request (the
-/// `\e]52;c;<base64>\a` sequence programs use to push text into the
-/// system clipboard). Returns NULL if nothing is pending. Caller
-/// frees the returned string with `copad_string_destroy` and gates
-/// the actual NSPasteboard write on the user's `[security] osc52`
-/// policy. Single-slot semantics: bursts coalesce to "last write
-/// wins" — matches how VTE and iTerm2 handle the same case.
+/// Takes the pending OSC 52 clipboard-store request (`\e]52;c;<base64>\a`), or NULL. Free with
+/// `copad_string_destroy`; the caller gates the NSPasteboard write on `[security] osc52`.
+/// Single slot: a burst coalesces to the last write.
 ///
 /// # Safety
 ///
@@ -2841,12 +2411,9 @@ pub unsafe extern "C" fn copad_term_take_clipboard_request(
     }))
 }
 
-/// True iff the PTY child process (typically the user's shell) has
-/// exited since the last call. Clears the latch on read so a second
-/// poll after the first returns false. The renderer broadcasts
-/// `panel.exited` on the event bus when this returns true; consumers
-/// (copad-core ContextService, daemon subscribers) rely on that
-/// event to clear per-panel cwd / active-doc state.
+/// True iff the PTY child has exited since the last call; clears the latch on read. The
+/// renderer then broadcasts `panel.exited`, which copad-core ContextService and daemon
+/// subscribers use to clear per-panel cwd / active-doc state.
 ///
 /// # Safety
 ///
@@ -2862,9 +2429,8 @@ pub unsafe extern "C" fn copad_term_take_child_exit(handle: *mut CopadHandle) ->
         .swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Number of distinct OSC 8 hyperlink URIs visible in this snapshot.
-/// IDs handed back to the renderer in `CopadRun.hyperlink_id` are
-/// 1-based indices in `[1, count]`; 0 means "no hyperlink".
+/// Number of distinct OSC 8 URIs in this snapshot; `CopadRun.hyperlink_id` is a 1-based index
+/// in `[1, count]`, 0 meaning none.
 ///
 /// # Safety
 ///
@@ -2878,10 +2444,8 @@ pub unsafe extern "C" fn copad_snapshot_hyperlink_count(snap: *const CopadSnapsh
     s.hyperlinks.len() as u32
 }
 
-/// Borrowed pointer to the URI bytes for the given 1-based hyperlink
-/// id. Returns NULL + sets `*out_len = 0` when the id is out of
-/// range. Lifetime matches the snapshot — copy out before calling
-/// `copad_snapshot_destroy`.
+/// Borrowed pointer to the URI bytes for a 1-based hyperlink id, valid until the snapshot is
+/// destroyed (copy first). NULL with `*out_len = 0` when out of range.
 ///
 /// # Safety
 ///
@@ -2972,8 +2536,8 @@ pub unsafe extern "C" fn copad_snapshot_graphic_image(
     true
 }
 
-/// The pane gained or lost keyboard focus. A program that asked for focus reports (`CSI ? 1004 h`
-/// — nvim, Claude Code, tmux) gets `CSI I` / `CSI O`; the terminal's own focus flag follows too.
+/// The pane gained or lost keyboard focus. A program that asked for focus reports
+/// (`CSI ? 1004 h`) gets `CSI I` / `CSI O`; the terminal's own focus flag follows.
 ///
 /// # Safety
 ///
@@ -2998,8 +2562,8 @@ pub unsafe extern "C" fn copad_term_set_focused(handle: *mut CopadHandle, focuse
     }
 }
 
-/// `[terminal] images`: whether programs may draw images (the kitty graphics protocol). Off,
-/// every graphics command is ignored without a reply, so programs see no support.
+/// `[terminal] images`: whether programs may draw kitty-graphics images. Off, every graphics
+/// command is ignored without a reply, so programs see no support.
 ///
 /// # Safety
 ///
@@ -3014,8 +2578,8 @@ pub unsafe extern "C" fn copad_term_set_images(handle: *mut CopadHandle, enabled
     }
 }
 
-/// The cell size in device pixels: what images are sized against, what `TIOCGWINSZ` reports
-/// and what `CSI 14 t` / `CSI 16 t` answer. Call on creation and on every font / scale change.
+/// The cell size in device pixels: what images are sized against and what `TIOCGWINSZ` and
+/// `CSI 14 t` / `CSI 16 t` report. Call on creation and on every font or scale change.
 ///
 /// # Safety
 ///
@@ -3035,7 +2599,6 @@ pub unsafe extern "C" fn copad_term_set_cell_pixels(
     if (old_width, old_height) == (width, height) {
         return;
     }
-    // The PTY learns the new pixel size (and the child a SIGWINCH) like on a resize.
     let _ = h.sender.send(Msg::Resize(h.listener.window_size()));
 }
 
@@ -3083,10 +2646,8 @@ mod color_encoding_tests {
         assert_eq!(color_to_rgba(AnsiColor::Indexed(255)), TAG_INDEXED | 255);
     }
 
-    /// Regression test for the original bug: RGB colors with R=0 used
-    /// to be mis-decoded as indexed (the high byte was 0, which the old
-    /// Swift decoder read as "indexed palette"). Now they carry the
-    /// 0xFF direct tag so the decoder can disambiguate.
+    /// Regression: RGB with R=0 was mis-decoded as indexed (high byte 0); it now carries the
+    /// 0xFF direct tag.
     #[test]
     fn rgb_with_zero_red_does_not_collide_with_indexed() {
         let skyblue = color_to_rgba(AnsiColor::Spec(Rgb {
@@ -3110,26 +2671,21 @@ mod color_encoding_tests {
         assert_eq!(red, TAG_DIRECT | (255 << 16));
 
         let black = color_to_rgba(AnsiColor::Spec(Rgb { r: 0, g: 0, b: 0 }));
-        // Pure-black RGB stays distinguishable from "default" via the tag.
         assert_eq!(black, TAG_DIRECT);
         assert_ne!(black, 0);
     }
 
     #[test]
     fn named_unmappable_falls_back_to_default() {
-        // DimFg, Cursor, etc. aren't in the 16-color palette; the
-        // encoder collapses them to the default sentinel so the
-        // renderer picks the theme foreground.
+        // DimFg, Cursor etc. aren't in the 16-colour palette and collapse to the default.
         assert_eq!(
             color_to_rgba(AnsiColor::Named(NamedColor::DimForeground)),
             0
         );
     }
 
-    /// Underline color goes through the same encoder as fg/bg now, so
-    /// `\e[58;5;Nm` (indexed) and `\e[58;2;…m` (direct) both round-trip
-    /// through the renderer instead of the indexed branch silently
-    /// becoming "use fg".
+    /// Underline colour uses the fg/bg encoder, so indexed (`\e[58;5;Nm`) and direct
+    /// (`\e[58;2;...m`) round-trip instead of becoming "use fg".
     #[test]
     fn underline_color_uses_same_encoding_as_fg() {
         assert_eq!(
@@ -3167,7 +2723,6 @@ mod color_encoding_tests {
         let styles: Vec<u8> = row.runs.iter().take(6).map(|r| r.underline_style).collect();
         assert_eq!(styles, vec![1, 2, 3, 4, 5, 0]);
 
-        // SGR 58 colours every style alike.
         for style in 1..=5 {
             let mut term = Term::new(Config::default(), &TermSize::new(12, 2), VoidListener);
             let seq = format!("\x1b[58;2;255;0;0m\x1b[4:{style}mab");
@@ -3195,13 +2750,9 @@ mod history_tests {
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Handler;
 
-    /// Build a Term wide enough for 4 columns and a 4-row viewport, with
-    /// a generous scrollback buffer. Caller drives content via
-    /// `<Term as Handler>::input` + `linefeed` / `carriage_return`.
+    /// A 4x4 Term with generous scrollback; drive content via `Handler::input`.
     fn fixture_term() -> Term<VoidListener> {
         let size = TermSize::new(4, 4);
-        // Bump scrollback so push_lines tests can exercise it without
-        // tripping the default cap.
         let cfg = Config {
             scrolling_history: 32,
             ..Default::default()
@@ -3209,15 +2760,11 @@ mod history_tests {
         Term::new(cfg, &size, VoidListener)
     }
 
-    /// Push N rows, each labeled "rXX" left-aligned in the 4-col cells.
-    /// Drives the parser via Handler::input + linefeed + carriage_return
-    /// so the grid + scrollback wire up exactly as they would for live
-    /// PTY bytes.
+    /// Pushes N rows labeled "rXX" via Handler::input + linefeed + carriage_return, so the grid
+    /// and scrollback wire up as for live PTY bytes.
     fn push_lines<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, n: usize) {
         for i in 1..=n {
-            // 4-col label: "r" + two-digit index + space. For N > 99 the
-            // labels still fit because alacritty wraps at col 4 (we
-            // explicitly avoid that case in tests).
+            // 4-col label "rNN "; avoids N > 99, where alacritty would wrap at col 4.
             let label = format!("r{i:02} ");
             for ch in label.chars().take(4) {
                 Handler::input(term, ch);
@@ -3236,18 +2783,16 @@ mod history_tests {
         let mut term = Term::new(opts(true, 20).config(), &TermSize::new(4, 4), VoidListener);
         push_lines(&mut term, 60);
         assert_eq!(term.grid().history_size(), 20);
-        // Toggling the other option keeps the limit (it used to reset to alacritty's 10 000).
+        // Toggling the other option keeps the limit.
         term.set_options(opts(false, 20).config());
         push_lines(&mut term, 60);
         assert_eq!(term.grid().history_size(), 20);
-        // Lowering drops the oldest lines at once; raising again does not bring them back.
         term.set_options(opts(false, 5).config());
         assert_eq!(term.grid().history_size(), 5);
         term.set_options(opts(false, 30).config());
         assert_eq!(term.grid().history_size(), 5);
         push_lines(&mut term, 10);
         assert_eq!(term.grid().history_size(), 15);
-        // Zero keeps nothing but the screen.
         term.set_options(opts(false, 0).config());
         push_lines(&mut term, 10);
         assert_eq!(term.grid().history_size(), 0);
@@ -3297,10 +2842,8 @@ mod history_tests {
     #[test]
     fn clamps_to_history_size_without_panic() {
         let mut term = fixture_term();
-        // Push 6 rows into a 4-row viewport. Linefeed after the last input
-        // leaves the cursor on the empty bottom row, so the live viewport
-        // holds rows {r04, r05, r06, ""} and scrollback ends up with
-        // {r01, r02, r03} = 3 rows.
+        // 6 rows into a 4-row viewport: the trailing linefeed leaves the cursor on an empty
+        // bottom row, so the viewport is {r04, r05, r06, ""} and scrollback {r01, r02, r03}.
         push_lines(&mut term, 6);
         let history_size = term.grid().history_size();
         assert_eq!(
@@ -3308,7 +2851,6 @@ mod history_tests {
             "expected 3 scrollback rows from 6 pushes in a 4-row viewport"
         );
         let text = read_history_text(term.grid(), term.columns(), 100);
-        // 3 rows joined by 2 newlines, no trailing newline.
         assert_eq!(text.matches('\n').count(), 2);
         let row_count = text.split('\n').count();
         assert_eq!(row_count, 3);
@@ -3317,9 +2859,8 @@ mod history_tests {
     #[test]
     fn returns_oldest_first_and_excludes_viewport() {
         let mut term = fixture_term();
-        // 10 pushes into a 4-row viewport. Cursor ends on the empty
-        // bottom row, viewport holds {r08, r09, r10, ""} and scrollback
-        // contains r01..r07. Last 3 scrollback rows = r05, r06, r07.
+        // 10 pushes into a 4-row viewport: viewport {r08, r09, r10, ""}, scrollback r01..r07, so
+        // the last 3 scrollback rows are r05..r07.
         push_lines(&mut term, 10);
         let text = read_history_text(term.grid(), term.columns(), 3);
         let lines: Vec<&str> = text.split('\n').collect();
@@ -3331,7 +2872,6 @@ mod history_tests {
             lines[1]
         );
         assert!(lines[2].starts_with("r07"), "third line was {:?}", lines[2]);
-        // Viewport content must not bleed in.
         assert!(!text.contains("r08"));
         assert!(!text.contains("r10"));
     }
@@ -3339,14 +2879,11 @@ mod history_tests {
     #[test]
     fn nul_cells_render_as_space() {
         let mut term = fixture_term();
-        // Single-char row leaves cols 1..3 as NUL cells in scrollback.
         Handler::input(&mut term, 'X');
         Handler::linefeed(&mut term);
         Handler::carriage_return(&mut term);
-        // Push more rows so "X" gets pushed into scrollback.
         push_lines(&mut term, 5);
         let text = read_history_text(term.grid(), term.columns(), 6);
-        // The very first scrollback row (oldest) is the bare "X" row.
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!(
             lines[0], "X   ",
@@ -3389,36 +2926,29 @@ mod damage_rows_tests {
         CopadSelectionRange::default()
     }
 
-    /// First call after any writes must report the damaged rows (the
-    /// shell prompt etc.) — alacritty starts every Term with
-    /// TermDamage::Full pending until first reset_damage, which our
-    /// path consumes. We assert the Full→Count transition is sane.
+    /// The first call after writes must report damage: alacritty starts every Term with
+    /// TermDamage::Full pending until the first reset.
     #[test]
     fn initial_full_damage_drains_to_full_or_rows() {
         let mut term = fixture_term();
         type_text(&mut term, "hi");
         let mut buf = [0u16; 16];
         let (outcome, _, _, _) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
-        // Either Full or some rows — but not Count(0): the writes
-        // should produce SOME damage signal.
+        // Not Count(0): the writes must produce some damage signal.
         match outcome {
             DamageRowsOutcome::Full => {}
             DamageRowsOutcome::Count(n) => assert!(n >= 1, "expected >=1 dirty row, got 0"),
         }
     }
 
-    /// After a clean drain, an idle term reports zero dirty rows. The
-    /// cursor-cell-only damage hint alacritty re-asserts on every
-    /// `damage()` call must be filtered out — otherwise an idle
-    /// terminal would force a redraw every vsync.
+    /// An idle term after a clean drain reports zero dirty rows; the cursor-cell hint alacritty
+    /// re-asserts on every `damage()` must be filtered out or an idle terminal redraws every vsync.
     #[test]
     fn idle_terminal_reports_zero_dirty_rows() {
         let mut term = fixture_term();
         type_text(&mut term, "x");
-        // Prime: consume initial damage.
         let mut buf = [0u16; 16];
         let (_, off1, sel1, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
-        // Now idle: re-call with the updated prev state.
         let (outcome, _, _, _) = compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
         match outcome {
             DamageRowsOutcome::Count(0) => {}
@@ -3427,8 +2957,7 @@ mod damage_rows_tests {
         }
     }
 
-    /// Cap=0 → Full (caller has no room to receive partial damage,
-    /// so we drain alacritty's state and signal a full repaint).
+    /// Cap=0 gives Full: no room for partial damage, so drain state and signal full repaint.
     #[test]
     fn zero_cap_returns_full_and_drains_damage() {
         let mut term = fixture_term();
@@ -3438,10 +2967,8 @@ mod damage_rows_tests {
         assert!(matches!(outcome, DamageRowsOutcome::Full));
     }
 
-    /// Scrollback offset change → Full. Even if the live region had
-    /// no writes, every viewport row maps to different content.
-    /// Drive this by pushing enough rows to fill scrollback, then
-    /// passing a stale prev_display_offset.
+    /// A scrollback offset change gives Full even with no live writes; driven with a stale
+    /// prev_display_offset.
     #[test]
     fn display_offset_change_promotes_to_full() {
         let mut term = fixture_term();
@@ -3450,28 +2977,22 @@ mod damage_rows_tests {
             Handler::linefeed(&mut term);
             Handler::carriage_return(&mut term);
         }
-        // Drain initial damage.
         let mut buf = [0u16; 16];
         let (_, off1, sel1, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
-        // Now claim the previous offset was different — simulates a
-        // scroll-back action having happened between calls.
+        // Claim the previous offset differed, as after a scroll-back.
         let (outcome, _, _, _) = compute_damage_rows(&mut term, off1 + 1, sel1, hash1, &mut buf);
         assert!(matches!(outcome, DamageRowsOutcome::Full));
     }
 
-    /// Selection union: a previously-present selection on row 1 that
-    /// has since cleared must still report row 1 dirty so the
-    /// surface2 overlay gets repainted off the cells. Simulates the
-    /// "shrink / clear" path codex round-1 C1 flagged.
+    /// Selection union: a cleared selection on row 1 must still report row 1 dirty so the
+    /// overlay is repainted off those cells.
     #[test]
     fn old_selection_rows_remain_dirty_after_clear() {
         let mut term = fixture_term();
         type_text(&mut term, "data");
         let mut buf = [0u16; 16];
-        // Prime: cleanly drained, no selection.
         let (_, off1, _, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
-        // Build a synthetic "prev selection on row 1, cols 0..=3" that
-        // the renderer would have painted last frame.
+        // Synthetic prev selection on row 1, cols 0..=3, as painted last frame.
         let prev = CopadSelectionRange {
             start_row: 1,
             start_col: 0,
@@ -3482,8 +3003,7 @@ mod damage_rows_tests {
             _reserved: 0,
         };
         let (outcome, _, new_sel, _) = compute_damage_rows(&mut term, off1, prev, hash1, &mut buf);
-        // Current term has no selection — new_sel.present == 0 — but
-        // the union must include row 1 from the prev selection.
+        // No current selection, but the union must still include row 1 from prev.
         assert_eq!(new_sel.present, 0);
         match outcome {
             DamageRowsOutcome::Count(n) => {
@@ -3497,21 +3017,16 @@ mod damage_rows_tests {
         }
     }
 
-    /// Cursor metadata change (we synthesize via a stale prev_cursor_hash
-    /// of 0) must report the cursor's viewport row dirty even when
-    /// alacritty's per-row iterator only emits the cursor-cell hint
-    /// (which compute_damage_rows filters out).
+    /// A changed cursor hash (stale prev of 0) must dirty the cursor's viewport row even when
+    /// alacritty only emits the cursor-cell hint, which compute_damage_rows filters out.
     #[test]
     fn cursor_state_change_marks_cursor_row_dirty() {
         let mut term = fixture_term();
         type_text(&mut term, "abc");
-        // Prime to clear initial damage but DON'T cache hash —
-        // pass 0 as prev_cursor_hash so the second call sees a change.
+        // Pass 0 as prev_cursor_hash so the second call sees a change.
         let mut buf = [0u16; 16];
         let (_, off1, sel1, _) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
-        // Re-call: alacritty has nothing in its damage iter (idle),
-        // but our prev_cursor_hash differs from current → mark cursor
-        // row dirty.
+        // Idle in alacritty, but the differing prev_cursor_hash must mark the cursor row dirty.
         let cursor_row = term.grid().cursor.point.line.0;
         assert!(cursor_row >= 0);
         let cursor_row_u16 = cursor_row as u16;
@@ -3528,17 +3043,13 @@ mod damage_rows_tests {
         }
     }
 
-    /// Damage tracking resets after each drain: a write → drain → idle
-    /// cycle leaves Count(0) on the idle call. Guards against the
-    /// "reset_damage not called" regression.
+    /// Damage resets after each drain: write, drain, idle leaves Count(0).
     #[test]
     fn damage_drain_is_idempotent() {
         let mut term = fixture_term();
         type_text(&mut term, "first");
         let mut buf = [0u16; 16];
         let (_, off1, sel1, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
-        // Same prev state immediately reused: nothing changed since
-        // last drain, expect Count(0).
         let (outcome, _, _, _) = compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
         assert!(
             matches!(outcome, DamageRowsOutcome::Count(0)),
@@ -3546,20 +3057,17 @@ mod damage_rows_tests {
         );
     }
 
-    /// Buffer cap overflow → Full. Verify by claiming cap=1 with at
-    /// least two distinct dirty rows queued via writes that span them.
+    /// Buffer cap overflow gives Full (cap=1 with at least two dirty rows).
     #[test]
     fn cap_overflow_promotes_to_full() {
         let mut term = fixture_term();
-        // Two distinct rows: write row 0, advance to row 1, write more.
         type_text(&mut term, "a");
         Handler::linefeed(&mut term);
         Handler::carriage_return(&mut term);
         type_text(&mut term, "b");
         let mut buf = [0u16; 1];
         let (outcome, _, _, _) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
-        // Either Full directly from alacritty (initial-state path),
-        // or via cap overflow. Both are correct.
+        // Full either directly from alacritty or via cap overflow; both are correct.
         assert!(matches!(outcome, DamageRowsOutcome::Full));
     }
 }
@@ -3595,7 +3103,7 @@ mod search_match_projection_tests {
 
     #[test]
     fn match_in_live_viewport_projects_with_zero_offset() {
-        // Match on grid line 5, cols 2..=7. No scroll → display_offset=0.
+        // Grid line 5, cols 2..=7, no scroll.
         let state = make_state((5, 2), (5, 7));
         let out = search_match_for_ffi(&state, 0, 24, 80);
         assert_eq!(out.present, 1);
@@ -3607,9 +3115,7 @@ mod search_match_projection_tests {
 
     #[test]
     fn match_in_scrollback_with_user_scroll_appears_at_top() {
-        // Match on grid line -3 (3 rows into scrollback). User scrolled
-        // back 5 rows (display_offset = 5). Viewport row should be
-        // -3 + 5 = 2.
+        // Grid line -3 with display_offset 5 gives viewport row 2.
         let state = make_state((-3, 0), (-3, 3));
         let out = search_match_for_ffi(&state, 5, 24, 80);
         assert_eq!(out.present, 1);
@@ -3619,8 +3125,7 @@ mod search_match_projection_tests {
 
     #[test]
     fn match_above_viewport_collapses_to_absent() {
-        // Match on line -10, user only scrolled 3 → viewport row = -7.
-        // Off-screen, present=0.
+        // Line -10 scrolled 3 gives viewport row -7: off-screen.
         let state = make_state((-10, 0), (-10, 3));
         let out = search_match_for_ffi(&state, 3, 24, 80);
         assert_eq!(out.present, 0);
@@ -3628,7 +3133,7 @@ mod search_match_projection_tests {
 
     #[test]
     fn match_below_viewport_collapses_to_absent() {
-        // Match on line 30, rows_count=24 → viewport row 30, out of range.
+        // Line 30 with rows_count=24 is out of range.
         let state = make_state((30, 0), (30, 3));
         let out = search_match_for_ffi(&state, 0, 24, 80);
         assert_eq!(out.present, 0);
@@ -3636,29 +3141,22 @@ mod search_match_projection_tests {
 
     #[test]
     fn multi_row_match_clips_endpoints_to_viewport() {
-        // Match spans line -2..=1 (4 rows). Viewport (24 rows × 80 cols,
-        // no scroll): start clamps to row 0 (was -2), end stays at row 1.
-        // The original start row (-2) is off-screen, so the new first
-        // VISIBLE row is logically a "middle row" of the wrap — start_col
-        // becomes 0 (paints from the left edge through the continuation
-        // wrap), NOT the original off-screen start column (10).
+        // Match spans line -2..=1. The off-screen start row makes the first VISIBLE row a "middle
+        // row" of the wrap: start_col becomes 0, NOT the original column (10).
         let state = make_state((-2, 10), (1, 5));
         let out = search_match_for_ffi(&state, 0, 24, 80);
         assert_eq!(out.present, 1);
         assert_eq!(out.start_row, 0);
         assert_eq!(out.end_row, 1);
         assert_eq!(out.start_col, 0, "clipped start row should begin at col 0");
-        // End row IS the original end (row 1, in-viewport), so its
-        // end_col carries through unchanged.
+        // The end row is the original end, so end_col carries through.
         assert_eq!(out.end_col, 5);
     }
 
     #[test]
     fn multi_row_match_clipped_at_bottom_extends_to_viewport_right() {
-        // Match spans line 22..=30 (10 rows). Viewport (24 rows × 80
-        // cols): start stays at row 22 with its real start col, end
-        // clips to row 23 with end_col extended through col 79 (the
-        // viewport's rightmost column).
+        // Match spans line 22..=30 in a 24x80 viewport: end clips to row 23 and extends through
+        // col 79.
         let state = make_state((22, 4), (30, 5));
         let out = search_match_for_ffi(&state, 0, 24, 80);
         assert_eq!(out.present, 1);
@@ -3690,9 +3188,8 @@ mod clipboard_policy_tests {
         );
     }
 
-    /// OSC 52 `p` — PRIMARY — is DROPPED, not aliased onto the pasteboard. macOS has no
-    /// PRIMARY, so honoring `p` would let a program clobber the real clipboard through a
-    /// selector that means something much weaker (decisions #101; comux does the same).
+    /// OSC 52 `p` (PRIMARY) is DROPPED, not aliased onto the pasteboard: macOS has no PRIMARY,
+    /// so honoring it would let a program clobber the real clipboard (decisions #101).
     #[test]
     fn primary_selection_is_dropped_not_aliased() {
         let l = CopadListener::new();
@@ -3703,8 +3200,7 @@ mod clipboard_policy_tests {
         assert_eq!(*l.pending_clipboard.lock().unwrap(), None);
     }
 
-    /// Last write wins — the renderer drains at most one per tick, so a burst must not
-    /// queue up stale payloads ahead of the newest one.
+    /// Last write wins: a burst must not queue stale payloads ahead of the newest.
     #[test]
     fn later_clipboard_store_replaces_the_pending_one() {
         let l = CopadListener::new();
@@ -3751,15 +3247,13 @@ mod osc52_parse_tests {
         Term::new(Config::default(), &TermSize::new(20, 5), listener)
     }
 
-    /// End-to-end through the ANSI parser, not just `send_event`: the bytes a shell's
-    /// `printf '\033]52;c;<b64>\a'` puts on the PTY must land in `pending_clipboard`,
-    /// which is what the renderer's display-link drains into the policy gate.
+    /// Through the ANSI parser: a shell's `printf '\033]52;c;<b64>\a'` must land in
+    /// `pending_clipboard`.
     #[test]
     fn osc52_clipboard_escape_reaches_pending_clipboard() {
         let listener = CopadListener::new();
         let mut term = term_with(listener.clone());
         let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::default();
-        // base64("copad") = "Y29wYWQ="
         for b in b"\x1b]52;c;Y29wYWQ=\x07" {
             parser.advance(&mut term, &[*b]);
         }
@@ -3828,7 +3322,6 @@ mod kitty_keyboard_tests {
         assert_eq!(kitty_flags(*t.mode()), copad_keys::flags::ALL);
         feed(&mut t, b"\x1b[<u");
         assert_eq!(kitty_flags(*t.mode()), 1);
-        // The alternate screen has its own stack.
         feed(&mut t, b"\x1b[?1049h");
         assert_eq!(kitty_flags(*t.mode()), 0);
         feed(&mut t, b"\x1b[?1049l");

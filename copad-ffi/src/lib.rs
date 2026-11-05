@@ -1,11 +1,9 @@
-//! C-ABI bridge from `copad_core` to platform UIs that can't link Rust
-//! directly (currently `copad-macos` via SwiftPM). Wraps `TriggerEngine`
-//! so the Swift host can load triggers, dispatch events, and receive
-//! action-fire callbacks without reimplementing engine semantics in Swift.
+//! C-ABI bridge from `copad_core` to platform UIs that can't link Rust directly (currently
+//! `copad-macos` via SwiftPM), wrapping `TriggerEngine`.
 //!
 //! Strings allocated on the Rust side and returned to C must be freed with
-//! `copad_ffi_free_string`; statics and thread-local error pointers must NOT.
-//! Errors are reported via `copad_ffi_last_error` (thread-local).
+//! `copad_ffi_free_string`; statics and thread-local error pointers must NOT. Errors are
+//! reported via `copad_ffi_last_error` (thread-local).
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -26,17 +24,14 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 thread_local! {
-    /// Per-thread last-error slot. Set by entry points whose failure modes
-    /// carry diagnostics (JSON parse, bad pointer, encoding errors); cleared
-    /// on their success paths. Trivial entry points (handle creation /
-    /// destruction, callback installation, count accessor) don't touch it.
+    /// Per-thread last-error slot, set by entry points with diagnosable failures and cleared on
+    /// their success paths. Trivial entry points don't touch it.
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn set_last_error<S: Into<String>>(message: S) {
     let cs = CString::new(message.into()).unwrap_or_else(|_| {
-        // Fallback for the (impossible) case where the message contains an
-        // interior NUL. Don't lose the failure signal entirely.
+        // Impossible interior NUL; don't lose the failure signal.
         CString::new("FFI error message contained a NUL byte").unwrap()
     });
     LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(cs));
@@ -52,9 +47,8 @@ pub extern "C" fn copad_ffi_version() -> *const c_char {
     c"copad-ffi 0.1.0".as_ptr()
 }
 
-/// Echo-with-`echoed_at`-timestamp round-trip. Returns a heap-allocated
-/// JSON string the caller must free with `copad_ffi_free_string`; NULL on
-/// failure with the message stored in `LAST_ERROR`.
+/// Echo-with-`echoed_at`-timestamp round-trip. Returns a heap-allocated JSON string (free with
+/// `copad_ffi_free_string`); NULL on failure with the message in `LAST_ERROR`.
 ///
 /// # Safety
 ///
@@ -96,8 +90,7 @@ pub unsafe extern "C" fn copad_ffi_call_json(input: *const c_char) -> *mut c_cha
     if let Value::Object(ref mut map) = parsed {
         map.insert("echoed_at".into(), json!(now_ms));
     } else {
-        // Non-object input is allowed but loses the echo metadata; wrap it
-        // so the response shape is always an object.
+        // Wrap non-object input so the response is always an object.
         parsed = json!({ "input": parsed, "echoed_at": now_ms });
     }
 
@@ -155,19 +148,15 @@ pub extern "C" fn copad_ffi_last_error() -> *const c_char {
     })
 }
 
-// ============================================================================
 // Engine FFI surface
-// ============================================================================
 
-/// Opaque from C — callers only ever see `*mut EngineHandle`.
 pub struct EngineHandle {
     engine: Arc<TriggerEngine>,
     _sink: Arc<FfiSink>,
 }
 
-/// Forwards trigger action dispatch into a host-registered C callback.
-/// Fire-and-forget: returns `{queued: true}` synchronously; real result
-/// arrives async via completion-event fan-out (same shape as `LiveTriggerSink`).
+/// Forwards trigger action dispatch into a host-registered C callback. Fire-and-forget: returns
+/// `{queued: true}`; the real result arrives via completion-event fan-out (as `LiveTriggerSink`).
 struct FfiSink {
     callback: std::sync::Mutex<Option<ActionCallback>>,
     /// Stored as `usize` (not `*mut c_void`) so `FfiSink` is `Send + Sync`.
@@ -189,17 +178,14 @@ impl TriggerSink for FfiSink {
         let cb_opt = *self.callback.lock().unwrap();
         let user = *self.user_data.lock().unwrap();
         let Some(cb) = cb_opt else {
-            // No callback registered yet — log and treat as "no sink available"
-            // so the engine doesn't keep retrying. Returning an Err here would
-            // be cleaner but ActionResult's Err type is ResponseError which
-            // requires a code/message — `{queued:false, reason:"no callback"}`
-            // in Ok keeps the engine moving without polluting the error path.
+            // No callback yet: treat as "no sink available" so the engine doesn't keep retrying.
+            // `{queued:false}` in Ok avoids polluting the error path (ActionResult's Err needs a
+            // code/message).
             eprintln!("[copad-ffi] dispatch_action({action}) but no Swift callback registered");
             return Ok(json!({ "queued": false, "reason": "no callback registered" }));
         };
-        // Hand-rolled CString ladder. CString::new fails on NUL bytes;
-        // for action names that's defensive (action keys are well-formed),
-        // for params it's the caller's problem if their JSON contains NULs.
+        // CString::new fails on NUL bytes: defensive for action names, the caller's problem for
+        // params.
         let action_cstr = match CString::new(action) {
             Ok(c) => c,
             Err(_) => {
@@ -219,9 +205,7 @@ impl TriggerSink for FfiSink {
                 });
             }
         };
-        // SAFETY: callback is a function pointer the host registered;
-        // user_data is the host-owned pointer the host promised to keep
-        // alive until destroy. Both the action and params CStrings live
+        // SAFETY: the host promised to keep `user_data` alive until destroy; both CStrings live
         // until end-of-function.
         unsafe {
             cb(
@@ -234,9 +218,6 @@ impl TriggerSink for FfiSink {
     }
 }
 
-/// Construct a fresh engine. The returned pointer must be passed to
-/// `copad_engine_destroy` exactly once, after all in-flight FFI calls
-/// into the engine have returned.
 #[unsafe(no_mangle)]
 pub extern "C" fn copad_engine_create() -> *mut EngineHandle {
     let sink = Arc::new(FfiSink {
@@ -251,6 +232,9 @@ pub extern "C" fn copad_engine_create() -> *mut EngineHandle {
     Box::into_raw(handle)
 }
 
+/// Destroy an engine from `copad_engine_create`; call exactly once, after all in-flight FFI calls
+/// into it have returned.
+///
 /// # Safety
 ///
 /// `handle` must come from `copad_engine_create` and not have been freed.
@@ -265,7 +249,7 @@ pub unsafe extern "C" fn copad_engine_destroy(handle: *mut EngineHandle) {
     let _ = unsafe { Box::from_raw(handle) };
 }
 
-/// Install or replace the action callback. `callback = NULL` clears the slot.
+/// Install or replace the action callback; `callback = NULL` clears the slot.
 ///
 /// # Safety
 ///
@@ -287,12 +271,10 @@ pub unsafe extern "C" fn copad_engine_set_action_callback(
     *h._sink.user_data.lock().unwrap() = user_data as usize;
 }
 
-/// Parse a JSON array of triggers and replace the engine's trigger set.
-/// JSON shape matches `copad_core::trigger::Trigger`'s Deserialize impl
-/// (mirrors TOML `[[triggers]]`). Returns the loaded count, or -1 on parse
-/// failure (message via `copad_ffi_last_error`). Hot-reload semantics —
-/// including the cross-lock race on await state — are documented at
-/// `TriggerEngine::set_triggers`.
+/// Parse a JSON array of triggers (the `Trigger` Deserialize shape, mirroring TOML
+/// `[[triggers]]`) and replace the engine's trigger set. Returns the loaded count, or -1 on
+/// parse failure (see `copad_ffi_last_error`). Hot-reload semantics, including the cross-lock
+/// race on await state, are documented at `TriggerEngine::set_triggers`.
 ///
 /// # Safety
 ///
@@ -325,25 +307,19 @@ pub unsafe extern "C" fn copad_engine_set_triggers(
 
 /// Dispatch an event; returns the count of triggers that fired.
 ///
-/// `source` stamps the synthesized `Event`. **Trust-boundary requirement**:
-/// when synthesizing an `<action>.completed` / `<action>.failed` event for
-/// await-chain promotion, `source` MUST be `COMPLETION_EVENT_SOURCE`
-/// (`"copad.action"`). Any other value causes `try_promote_or_drop_preflight`
-/// to return early and silently fail to advance await state. NULL defaults
-/// to `"macos.eventbus"`, which is correct for plain bus events but wrong
-/// for completion-event synthesis.
+/// `source` stamps the synthesized `Event`. Trust boundary: when synthesizing an
+/// `<action>.completed` / `<action>.failed` event for await-chain promotion, `source` MUST be
+/// `COMPLETION_EVENT_SOURCE` (`"copad.action"`), or `try_promote_or_drop_preflight` returns early
+/// and the await state silently never advances. NULL defaults to `"macos.eventbus"`, right for
+/// plain bus events but wrong for completion events.
 ///
-/// `origin` carries the trust-boundary tag the engine's `[security]
-/// accept_external` gate consumes (0 = Internal, 1 = External; any other
-/// value defaults to Internal as the safe choice). When the macOS GUI
-/// republishes a daemon-forwarded event, this MUST match the wire
-/// `origin` parsed from the bridge — otherwise an `External` event
-/// would launder into a trusted local trigger and bypass the gate.
+/// `origin` is the tag the `[security] accept_external` gate consumes (0 = Internal, 1 =
+/// External; anything else is Internal). When the macOS GUI republishes a daemon-forwarded event
+/// it MUST match the wire `origin` from the bridge, or an `External` event launders into a
+/// trusted local trigger.
 ///
-/// `context_json` is a `copad_core::context::Context` snapshot
-/// (`{active_panel: String?, active_cwd: String?}`); NULL or empty means
-/// no context (literal `{context.X}` tokens, null condition refs). Bad
-/// JSON falls back to no context rather than failing the dispatch.
+/// `context_json` is a `copad_core::context::Context` snapshot (`{active_panel, active_cwd}`);
+/// NULL or empty means no context, and bad JSON falls back to none rather than failing.
 ///
 /// # Safety
 ///
@@ -379,15 +355,11 @@ pub unsafe extern "C" fn copad_engine_dispatch_event(
         None
     } else {
         let s = unsafe { CStr::from_ptr(context_json) }.to_string_lossy();
-        // Empty / whitespace JSON also means "no context" — saves the
-        // Swift caller a NULL/empty-dict branching.
         if s.trim().is_empty() {
             None
         } else {
-            // Bad JSON falls back to None rather than failing the
-            // dispatch — context is best-effort, missing fields just
-            // mean `{context.X}` interpolations stay literal. Engine
-            // already handles `None` gracefully.
+            // Bad JSON falls back to None: context is best-effort and `{context.X}` stays
+            // literal.
             serde_json::from_str(&s).ok()
         }
     };
@@ -399,10 +371,8 @@ pub unsafe extern "C" fn copad_engine_dispatch_event(
     };
     let origin_tag = match origin {
         1 => copad_core::event_bus::Origin::External,
-        // 0 + any unknown value → safe default. Refusing the dispatch on
-        // a malformed origin would silently drop events at a protocol
-        // bump; routing to Internal keeps local triggers firing while
-        // the External path stays opt-in.
+        // 0 and any unknown value -> Internal. Refusing a malformed origin would silently drop
+        // events at a protocol bump; Internal keeps local triggers firing and External opt-in.
         _ => copad_core::event_bus::Origin::Internal,
     };
     let event = Event::new(kind, source_str, payload).with_origin(origin_tag);
@@ -411,8 +381,6 @@ pub unsafe extern "C" fn copad_engine_dispatch_event(
     fired as i32
 }
 
-/// Diagnostic accessor.
-///
 /// # Safety
 ///
 /// `handle` must come from `copad_engine_create`.
@@ -426,13 +394,7 @@ pub unsafe extern "C" fn copad_engine_count_triggers(handle: *mut EngineHandle) 
     h.engine.count() as i32
 }
 
-// ============================================================================
-// Theme FFI surface
-//
-// Read-only getters over `copad_core::theme::Theme`. Wire shape is the
-// struct's serde JSON (hex string colors); ownership follows the existing
-// `copad_ffi_free_string` convention.
-// ============================================================================
+// Theme FFI surface: read-only getters over `copad_core::theme::Theme`, as serde JSON.
 
 /// Look up a built-in theme by name and return its JSON representation.
 /// Returns NULL on unknown name with the name echoed in `LAST_ERROR`.
@@ -481,21 +443,12 @@ pub unsafe extern "C" fn copad_ffi_theme_get(name: *const c_char) -> *mut c_char
     cs.into_raw()
 }
 
-// ============================================================================
-// Notify FFI surface
-//
-// Lets macOS's in-process `ActionRegistry` reach the same `osascript`
-// notifier the daemon uses (`copad_core::notifier::platform_notifier`),
-// so `coctl call notify.show` works whether or not the daemon is up.
-// Mirrors Linux's `register_blocking_silent("notify.show", ...)` in
-// `copad-linux/src/window.rs`.
-// ============================================================================
+// Notify FFI surface: lets macOS's in-process `ActionRegistry` reach the same notifier the
+// daemon uses, so `coctl call notify.show` works with or without the daemon.
 
-/// Show a desktop notification via the platform notifier. `level` is
-/// 0=info (default), 1=warn, 2=error; anything else treated as info.
-/// Returns 0 on success, 1 when no notifier is available for this
-/// platform (silent no-op), -1 on validation / subprocess error (see
-/// `copad_ffi_last_error`).
+/// Show a desktop notification via the platform notifier. `level` is 0=info (default), 1=warn,
+/// 2=error; anything else is info. Returns 0 on success, 1 when no notifier exists for this
+/// platform (silent no-op), -1 on validation / subprocess error (see `copad_ffi_last_error`).
 ///
 /// # Safety
 ///
@@ -560,21 +513,13 @@ pub unsafe extern "C" fn copad_ffi_notify_show(
     }
 }
 
-// ============================================================================
-// Plugin manifest FFI surface
-//
-// Validation only — discovery (directory enumeration, duplicate-name winner
-// pick, dir retention for relative `exec` / panel files) stays on the
-// caller side because it varies per platform (Linux daemon vs macOS GUI
-// scan their own roots). Wire shape is `copad_core::plugin::PluginManifest`
-// serialized to JSON; `Activation` / `RestartPolicy` round-trip as the raw
-// `"onAction:kb.*"` / `"on-crash"` strings (see custom Serialize impls).
-// ============================================================================
+// Plugin manifest FFI surface: validation only. Discovery varies per platform, so it stays on
+// the caller side. `Activation` / `RestartPolicy` round-trip as their raw strings (custom
+// Serialize impls).
 
-/// Read `plugin.toml` at `path`, parse + validate against
-/// `copad_core::plugin::PluginManifest`. Returns a heap-allocated JSON
-/// string the caller must free with `copad_ffi_free_string`. Returns
-/// NULL on IO / parse failure with the diagnostic in `LAST_ERROR`.
+/// Read `plugin.toml` at `path`, parse + validate against `copad_core::plugin::PluginManifest`.
+/// Returns heap-allocated JSON (free with `copad_ffi_free_string`), or NULL on IO / parse failure
+/// with the diagnostic in `LAST_ERROR`.
 ///
 /// # Safety
 ///
@@ -614,17 +559,9 @@ pub unsafe extern "C" fn copad_ffi_plugin_validate_toml(path: *const c_char) -> 
     cs.into_raw()
 }
 
-// ============================================================================
-// Background FFI surface
-//
-// Read/write helpers over `copad_core::background`. Callers pass the
-// resolved paths so each platform keeps its own conventions
-// (Linux `~/.cache/...` legacy XDG vs macOS `~/Library/Caches/copad/...`).
-// ============================================================================
+// Background FFI surface: callers pass resolved paths so each platform keeps its own conventions.
 
-/// Construct a PathBuf from a C string pointer. NULL → None; invalid
-/// UTF-8 → None (matches the existing FFI convention of rejecting bad
-/// UTF-8 quietly rather than asserting).
+/// NULL or invalid UTF-8 -> None (bad UTF-8 is rejected quietly, per FFI convention).
 unsafe fn cstr_to_pathbuf(p: *const c_char) -> Option<PathBuf> {
     if p.is_null() {
         return None;
@@ -634,10 +571,8 @@ unsafe fn cstr_to_pathbuf(p: *const c_char) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-/// Pick a random image path from `primary_list`, falling back to
-/// `fallback_list` when primary is missing/unreadable (pass NULL for no
-/// fallback). Returns a heap-allocated NUL-terminated path the caller
-/// must free with `copad_ffi_free_string`. Returns NULL when neither
+/// Pick a random image path from `primary_list`, falling back to `fallback_list` (NULL for none).
+/// Returns a heap-allocated path to free with `copad_ffi_free_string`, or NULL when neither
 /// list exists or every line is blank.
 ///
 /// # Safety
@@ -657,8 +592,7 @@ pub unsafe extern "C" fn copad_ffi_background_next_random(
     let paths = BackgroundPaths {
         primary_list: primary,
         fallback_list: fallback,
-        // Unused for this call — mode_file only matters for is_active /
-        // toggle. Pass an empty path rather than threading a third arg.
+        // mode_file only matters for is_active / toggle.
         mode_file: PathBuf::new(),
     };
     let Some(picked) = background::pick_random(&paths) else {
@@ -678,9 +612,8 @@ pub unsafe extern "C" fn copad_ffi_background_next_random(
     cs.into_raw()
 }
 
-/// Returns 1 if rotation mode is active, 0 if deactive, -1 on NULL /
-/// invalid UTF-8 (see `copad_ffi_last_error`). Missing mode file →
-/// active (1), matches Linux default.
+/// 1 if rotation mode is active, 0 if deactive, -1 on NULL / invalid UTF-8 (see
+/// `copad_ffi_last_error`). A missing mode file reads as active, like Linux.
 ///
 /// # Safety
 ///
@@ -695,9 +628,8 @@ pub unsafe extern "C" fn copad_ffi_background_is_active(mode_file: *const c_char
     if background::is_active(&path) { 1 } else { 0 }
 }
 
-/// Flip the rotation mode bit and persist. Returns the new state:
-/// 1 if now active, 0 if now deactive, -1 on NULL / invalid UTF-8.
-/// Creates the parent directory if missing.
+/// Flip the rotation mode bit and persist (creating the parent directory). Returns the new state:
+/// 1 active, 0 deactive, -1 on NULL / invalid UTF-8.
 ///
 /// # Safety
 ///
@@ -712,12 +644,10 @@ pub unsafe extern "C" fn copad_ffi_background_toggle(mode_file: *const c_char) -
     if background::toggle(&path) { 1 } else { 0 }
 }
 
-/// Remove every line exactly equal to `entry` from the wallpaper list at
-/// `list`. Returns 1 if something was removed, 0 if the entry wasn't
-/// present (or the list is missing), -1 on NULL / invalid UTF-8 / IO
-/// error (see `copad_ffi_last_error`). Backs `background.delete_current`
-/// on macOS — the rewrite is temp-file + rename in core so a crash can't
-/// truncate the catalog.
+/// Remove every line exactly equal to `entry` from the wallpaper list at `list`. Returns 1 if
+/// something was removed, 0 if not present (or no list), -1 on NULL / invalid UTF-8 / IO error.
+/// Backs macOS `background.delete_current`; core rewrites via temp-file + rename so a crash
+/// can't truncate the catalog.
 ///
 /// # Safety
 ///
@@ -751,19 +681,12 @@ pub unsafe extern "C" fn copad_ffi_background_remove_from_list(
     }
 }
 
-// ============================================================================
-// Session FFI surface
-//
-// Argless persistence over `copad_core::session`. Path is resolved in core
-// (`paths::state_dir() / "session.json"`), so both Linux and macOS land on
-// the platform's correct state dir without the wrapper having to thread a
-// path string through.
-// ============================================================================
+// Session FFI surface: argless persistence over `copad_core::session`; the path is resolved in
+// core (`paths::state_dir() / "session.json"`).
 
-/// Load the persisted session. Returns a heap-allocated JSON string the
-/// caller must free with `copad_ffi_free_string`. Returns NULL when no
-/// session file exists, the file fails to parse, version is unknown, or
-/// the saved tab list is empty — matching `copad_core::session::load`.
+/// Load the persisted session as a heap-allocated JSON string (free with
+/// `copad_ffi_free_string`). NULL when no file exists, it fails to parse, the version is unknown
+/// or the tab list is empty, matching `copad_core::session::load`.
 #[unsafe(no_mangle)]
 pub extern "C" fn copad_ffi_session_load() -> *mut c_char {
     let Some(session) = copad_core::session::load() else {
@@ -790,11 +713,9 @@ pub extern "C" fn copad_ffi_session_load() -> *mut c_char {
     cs.into_raw()
 }
 
-/// Persist a session snapshot. `json` must match the
-/// `copad_core::session::Session` schema. Returns 0 on success, -1 on
-/// NULL / non-UTF-8 / JSON parse failure (diagnostics via
-/// `copad_ffi_last_error`). Underlying IO errors are logged by core to
-/// stderr but still return 0 — matches Linux's best-effort save semantics.
+/// Persist a session snapshot; `json` must match `copad_core::session::Session`. Returns 0 on
+/// success, -1 on NULL / non-UTF-8 / JSON parse failure (see `copad_ffi_last_error`). IO errors
+/// are logged by core but still return 0 (best-effort save).
 ///
 /// # Safety
 ///
@@ -828,8 +749,7 @@ pub unsafe extern "C" fn copad_ffi_session_save(json: *const c_char) -> i32 {
     0
 }
 
-/// Remove the persisted session file (idempotent — `NotFound` is treated
-/// as success). Always returns 0; IO failures are logged to stderr.
+/// Remove the persisted session file (idempotent). Always returns 0; IO failures are logged.
 #[unsafe(no_mangle)]
 pub extern "C" fn copad_ffi_session_clear() -> i32 {
     copad_core::session::clear();
@@ -837,8 +757,7 @@ pub extern "C" fn copad_ffi_session_clear() -> i32 {
     0
 }
 
-/// Return a JSON array of built-in theme names. Caller must free the
-/// returned pointer with `copad_ffi_free_string`.
+/// Return a JSON array of built-in theme names.
 ///
 /// # Safety
 ///
@@ -867,23 +786,15 @@ pub extern "C" fn copad_ffi_theme_list() -> *mut c_char {
     cs.into_raw()
 }
 
-// ============================================================================
 // Browser Workbench (docs/browser-workbench-plan.md, decision #100)
 //
-// Three entry points, and deliberately only three. The browser DATA types are
-// fine for Swift to mirror — `Session.swift` already mirrors the whole session
-// model — but the browser RULES are not, because a second implementation of a
-// security rule is a second implementation that can be wrong on its own. Every
-// bug B1a fixed in `canonical_origin` (backslash authority smuggling,
-// percent-encoded token keys) still lived in the Swift copy this replaces.
-//
-// Each takes and returns one JSON object, in the established
-// `*mut c_char` / `copad_ffi_free_string` / `copad_ffi_last_error` shape.
-// ============================================================================
+// Deliberately only these entry points: the browser DATA types are fine for Swift to mirror, but
+// the browser RULES are not, since a second implementation of a security rule can be wrong on
+// its own (the `canonical_origin` bugs B1a fixed still lived in the Swift copy this replaces).
+// Each takes and returns one JSON object.
 
-/// Read a NUL-terminated UTF-8 JSON argument into a `serde_json::Value`.
-/// Shared by the browser entry points so each one's failure diagnostics
-/// name itself consistently.
+/// Read a NUL-terminated UTF-8 JSON argument into a `serde_json::Value`; shared by the browser
+/// entry points.
 ///
 /// # Safety
 ///
@@ -911,7 +822,6 @@ unsafe fn parse_json_arg(fn_name: &str, json: *const c_char) -> Option<Value> {
     }
 }
 
-/// Serialize a response value into an owned C string.
 fn json_response(fn_name: &str, value: &Value) -> *mut c_char {
     let serialized = match serde_json::to_string(value) {
         Ok(s) => s,
@@ -932,17 +842,15 @@ fn json_response(fn_name: &str, value: &Value) -> *mut c_char {
     }
 }
 
-/// `{ url, policy }` → `{ url, persist_title }`.
+/// `{ url, policy }` -> `{ url, persist_title }`.
 ///
-/// Applies `[browser] restore` to a live URL. An unknown `policy` string falls
-/// back to `origin` — the safe direction, matching `BrowserConfig::restore_policy`
-/// — because a typo must never silently widen what reaches disk.
+/// Applies `[browser] restore` to a live URL. An unknown `policy` falls back to `origin`, the
+/// safe direction (matches `BrowserConfig::restore_policy`): a typo must never widen what
+/// reaches disk.
 ///
-/// `persist_title` is returned because a page TITLE carries the same exposure as
-/// a URL ("Reset password for …"), and the caller must not re-derive it by
-/// comparing the raw policy string itself: `"ORIGIN"`, `" origin "` and a typo
-/// all resolve to origin-only HERE, and a second interpretation on the Swift
-/// side got that wrong. One parse, one answer.
+/// `persist_title` is returned because a page title carries the same exposure as a URL, and the
+/// caller must not re-derive it from the raw policy string: `"ORIGIN"`, `" origin "` and a typo
+/// all resolve to origin-only HERE, and a second interpretation in Swift got that wrong.
 ///
 /// # Safety
 ///
@@ -970,12 +878,11 @@ pub unsafe extern "C" fn copad_ffi_browser_canonicalize(json: *const c_char) -> 
     )
 }
 
-/// `{ pane }` → `{ pane, repairs }`.
+/// `{ pane }` -> `{ pane, repairs }`.
 ///
-/// Runs an untrusted `BrowserPaneSnap` through `browser::tabs::normalize`, which
-/// is what keeps a hand-edited or imported session document from becoming
-/// filesystem authority. `repairs` reports what had to be fixed so a caller can
-/// decide whether to tell the user.
+/// Runs an untrusted `BrowserPaneSnap` through `browser::tabs::normalize`, which keeps a
+/// hand-edited or imported session document from becoming filesystem authority. `repairs`
+/// reports what had to be fixed.
 ///
 /// # Safety
 ///
@@ -1014,17 +921,14 @@ pub unsafe extern "C" fn copad_ffi_browser_normalize(json: *const c_char) -> *mu
     )
 }
 
-/// `{ method, mode, profile_protected }` → `{ allowed, opaque_write, code?, message? }`.
+/// `{ method, mode, profile_protected }` -> `{ allowed, opaque_write, code?, message? }`.
 ///
-/// One call answers both questions a dispatcher has: may this run, and must its
-/// result be replaced with a page-independent one. Returning them together is
-/// what lets the caller re-ask cheaply at delivery time — and it must, because a
-/// read that was already in flight when a tab entered `protected` has to be
-/// suppressed rather than answered.
+/// One call answers both whether this may run and whether its result must be replaced with a
+/// page-independent one, so the caller can re-ask cheaply at delivery time (a read in flight
+/// when a tab entered `protected` must be suppressed).
 ///
-/// An unrecognised `mode` is treated as `protected`, i.e. the restrictive
-/// reading: a caller that cannot say what state a tab is in must not be told
-/// the tab is open for automation.
+/// An unrecognised `mode` is treated as `protected`: a caller that cannot say what state a tab
+/// is in must not be told it is open for automation.
 ///
 /// # Safety
 ///
@@ -1039,8 +943,7 @@ pub unsafe extern "C" fn copad_ffi_browser_authorize(json: *const c_char) -> *mu
     let method = input.get("method").and_then(Value::as_str).unwrap_or("");
     let mode = match input.get("mode").and_then(Value::as_str) {
         Some("automation") => browser::TabMode::Automation,
-        // Anything else — including a missing or misspelled value — reads as
-        // protected. Fail closed.
+        // Anything else, including a missing or misspelled value, fails closed.
         _ => browser::TabMode::Protected,
     };
     let profile_protected = input
@@ -1066,15 +969,11 @@ pub unsafe extern "C" fn copad_ffi_browser_authorize(json: *const c_char) -> *mu
     }
 }
 
-/// `{ tab_id, generation, data_hex }` → `{ ok }`.
+/// `{ tab_id, generation, data_hex }` -> `{ ok }`.
 ///
-/// Persist a tab's opaque back/forward + scroll blob as a NEW generation. The
-/// caller writes `session.json` referencing that generation only after this
-/// returns, so a crash between the two cannot pair old metadata with new
-/// history.
-///
-/// Hex rather than base64 because `copad-core` carries no base64 dependency and
-/// the workspace's only implementation is a private encoder with no decoder.
+/// Persist a tab's opaque back/forward + scroll blob as a NEW generation. The caller writes
+/// `session.json` referencing it only after this returns, so a crash between the two cannot pair
+/// old metadata with new history. Hex rather than base64: `copad-core` has no base64 decoder.
 ///
 /// # Safety
 ///
@@ -1108,11 +1007,10 @@ pub unsafe extern "C" fn copad_ffi_browser_history_write(json: *const c_char) ->
     }
 }
 
-/// `{ tab_id, generation }` → `{ data_hex }`.
+/// `{ tab_id, generation }` -> `{ data_hex }`.
 ///
-/// NULL when the blob is absent, unreadable, oversize, or a symlink was planted
-/// at its name — all of which the caller treats identically: fall back to a
-/// plain URL load rather than restoring a history it cannot trust.
+/// NULL when the blob is absent, unreadable, oversize, or a symlink was planted at its name; the
+/// caller falls back to a plain URL load rather than restoring history it cannot trust.
 ///
 /// # Safety
 ///
@@ -1141,11 +1039,10 @@ pub unsafe extern "C" fn copad_ffi_browser_history_read(json: *const c_char) -> 
     }
 }
 
-/// `{ live: [[tab_id, generation], …] }` → `{ removed }`.
+/// `{ live: [[tab_id, generation], ...] }` -> `{ removed }`.
 ///
-/// Reclaim superseded generations after a session has committed. Only files
-/// matching the exact blob grammar are candidates — this is not a directory
-/// wipe, so anything else that ends up there survives.
+/// Reclaim superseded generations after a session has committed. Only files matching the exact
+/// blob grammar are candidates, so anything else in the directory survives.
 ///
 /// # Safety
 ///
@@ -1183,12 +1080,10 @@ fn log_caps_from(input: &Value) -> browser::LogCaps {
     caps
 }
 
-/// `{ panel_id, kind, record, capture_bodies? }` → `{ written }`.
+/// `{ panel_id, kind, record, capture_bodies? }` -> `{ written }`.
 ///
-/// `written: false` means the record was DROPPED for exceeding the per-record
-/// cap even after shedding. It is reported rather than swallowed because a
-/// caller that treats a drop as success is silently under-reporting what the
-/// page did.
+/// `written: false` means the record was DROPPED for exceeding the per-record cap even after
+/// shedding; it is reported so a caller does not treat a drop as success.
 ///
 /// # Safety
 ///
@@ -1227,12 +1122,10 @@ pub unsafe extern "C" fn copad_ffi_browser_netlog_append(json: *const c_char) ->
     }
 }
 
-/// `{ panel_id, kind?, since?, tab_id?, level?, contains?, limit? }`
-/// → `{ records, coverage }`.
+/// `{ panel_id, kind?, since?, tab_id?, level?, contains?, limit? }` -> `{ records, coverage }`.
 ///
-/// `coverage` is returned on EVERY read, not documented once and forgotten:
-/// patching `fetch`/`XHR` is not a packet log, and an agent reading an empty
-/// list must not conclude "no request was made".
+/// `coverage` is returned on EVERY read: patching `fetch`/`XHR` is not a packet log, and an
+/// agent reading an empty list must not conclude "no request was made".
 ///
 /// # Safety
 ///
@@ -1277,7 +1170,6 @@ pub unsafe extern "C" fn copad_ffi_browser_netlog_read(json: *const c_char) -> *
     }
 }
 
-/// `{ panel_id }` → `{ removed }`.
 ///
 /// # Safety
 ///
@@ -1299,7 +1191,6 @@ pub unsafe extern "C" fn copad_ffi_browser_netlog_clear(json: *const c_char) -> 
     }
 }
 
-/// `{ origin? }` → `{ credentials }`. Metadata only — see `CredentialRef`.
 ///
 /// # Safety
 ///
@@ -1354,7 +1245,6 @@ pub unsafe extern "C" fn copad_ffi_browser_credentials_upsert(json: *const c_cha
     }
 }
 
-/// `{ credential_id }` → `{ removed }`.
 ///
 /// # Safety
 ///
@@ -1379,17 +1269,12 @@ pub unsafe extern "C" fn copad_ffi_browser_credentials_remove(json: *const c_cha
     }
 }
 
-/// `{ request, credential, live, target }` → `{ ok }` or NULL with the reason.
+/// `{ request, credential, live, target }` -> `{ ok }` or NULL with the reason.
 ///
-/// The credential-fill preconditions, evaluated by `copad_core` rather than
-/// re-implemented per platform. That matters more here than anywhere else in
-/// this surface: these are the checks that decide whether a password is written
-/// into a page, and a second implementation is a second thing that can be
-/// subtly wrong on its own.
-///
-/// `target` is the element as observed in the SAME synchronous step that will
-/// perform the injection — never a value captured earlier, because a page can
-/// swap the input or flip its `type` without navigating.
+/// The credential-fill preconditions, evaluated by `copad_core` so there is one implementation
+/// of the checks that decide whether a password is written into a page. `target` is the element
+/// as observed in the SAME synchronous step that performs the injection, never an earlier
+/// capture: a page can swap the input or flip its `type` without navigating.
 ///
 /// # Safety
 ///
@@ -1457,8 +1342,7 @@ pub unsafe extern "C" fn copad_ffi_browser_validate_fill(json: *const c_char) ->
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        // An unrecognised mode reads as Automation here, which REFUSES the
-        // fill — the restrictive direction.
+        // An unrecognised mode reads as Automation here, which REFUSES the fill.
         mode: match live_v.get("mode").and_then(Value::as_str) {
             Some("protected") => browser::TabMode::Protected,
             _ => browser::TabMode::Automation,
@@ -1494,11 +1378,9 @@ pub unsafe extern "C" fn copad_ffi_browser_validate_fill(json: *const c_char) ->
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// comux host (decisions #169): the macOS GUI draws comux's sidebar natively. No callback
-// crosses into Swift — the GUI polls `copad_muxhost_generation` and re-reads the state when it
-// moves, so a window closing can never race a call into freed Swift memory.
-// ---------------------------------------------------------------------------------------------
+// comux host (decisions #169): the macOS GUI draws comux's sidebar natively. No callback crosses
+// into Swift; the GUI polls `copad_muxhost_generation` and re-reads the state when it moves, so a
+// window closing can never race a call into freed Swift memory.
 
 /// Opaque handle to a running [`copad_core::muxhost::MuxHost`].
 pub struct MuxHostHandle(copad_core::muxhost::MuxHost);
@@ -1520,7 +1402,7 @@ fn into_c(s: String) -> *mut c_char {
 }
 
 /// Start a host on the LOCAL comux socket (`dest` NULL) or on `ssh -T <dest> comux proxy
-/// --stdio` (P4). Free with `copad_muxhost_destroy`.
+/// --stdio`. Free with `copad_muxhost_destroy`.
 ///
 /// # Safety
 /// `dest` must be NULL or a valid NUL-terminated string.
@@ -1547,7 +1429,6 @@ pub unsafe extern "C" fn copad_muxhost_destroy(h: *mut MuxHostHandle) {
     }
 }
 
-/// Moves whenever anything the GUI could show changed.
 ///
 /// # Safety
 /// `h` must be a live handle.
@@ -1583,7 +1464,6 @@ pub unsafe extern "C" fn copad_muxhost_unbind(h: *const MuxHostHandle, panel: *c
     }
 }
 
-/// The panels on screen, as a JSON array of panel ids.
 ///
 /// # Safety
 /// `h` live; `panels_json` a valid string.
@@ -1597,7 +1477,6 @@ pub unsafe extern "C" fn copad_muxhost_serve(h: *const MuxHostHandle, panels_jso
     }
 }
 
-/// The state as JSON (see `MuxHost::state_json`). Free with `copad_ffi_free_string`.
 ///
 /// # Safety
 /// `h` live.
@@ -1607,7 +1486,6 @@ pub unsafe extern "C" fn copad_muxhost_state_json(h: *const MuxHostHandle) -> *m
     unsafe { h.as_ref() }.map_or(ptr::null_mut(), |h| into_c(h.0.state_json().to_string()))
 }
 
-/// Run a comux control request (`{"cmd":…}` JSON).
 ///
 /// # Safety
 /// `h` live; `req_json` a valid string.
@@ -1621,7 +1499,6 @@ pub unsafe extern "C" fn copad_muxhost_command(h: *const MuxHostHandle, req_json
     }
 }
 
-/// Answer a delegated overlay with a STAYING choice: it stays shown until comux re-sends it.
 ///
 /// # Safety
 /// `h` live; `choice` a valid string.
@@ -1637,8 +1514,8 @@ pub unsafe extern "C" fn copad_muxhost_act(
     }
 }
 
-/// Whether `panel`'s comux client asked to focus the native sidebar (`Ctrl-b e`, decisions #181);
-/// 1 once per request, else 0.
+/// Whether `panel`'s comux client asked to focus the native sidebar (`Ctrl-b e`, decisions
+/// #181): 1 once per request, else 0.
 ///
 /// # Safety
 /// `h` live; `panel` a valid string.
@@ -1654,8 +1531,8 @@ pub unsafe extern "C" fn copad_muxhost_take_focus(
     }
 }
 
-/// Keep `consumer`'s preview of `pane` (`rows` × `cols`) fresh; `pane` NULL stops it
-/// (decisions #180). The result is in the state JSON under `previews.<consumer>`.
+/// Keep `consumer`'s preview of `pane` fresh; `pane` NULL stops it (decisions #180). The result
+/// is in the state JSON under `previews.<consumer>`.
 ///
 /// # Safety
 /// `h` live; `consumer` a valid string; `pane` NULL or a valid string.
@@ -1678,8 +1555,8 @@ pub unsafe extern "C" fn copad_muxhost_preview(
     }
 }
 
-/// What a window's work-graph page needs (`MuxHost::graph_json`, decisions #204) for
-/// `consumer`. Free with `copad_ffi_free_string`.
+/// What a window's work-graph page needs for `consumer` (decisions #204). Free with
+/// `copad_ffi_free_string`.
 ///
 /// # Safety
 /// `h` live; `consumer` a valid string.
@@ -1695,7 +1572,7 @@ pub unsafe extern "C" fn copad_muxhost_graph_json(
     }
 }
 
-/// Ask for a page of `token`'s work-graph history for `consumer`: the steps before `before`
+/// Ask for a page of `token`'s work-graph history for `consumer`: steps before `before`
 /// (negative = the newest), at most `limit` (0 or negative = comux's default).
 ///
 /// # Safety
@@ -1720,15 +1597,14 @@ pub unsafe extern "C" fn copad_muxhost_graph_history(
     }
 }
 
-/// The work-graph page, one self-contained HTML document (`copad_graph_web::page`). Free with
-/// `copad_ffi_free_string`.
+/// The work-graph page, one self-contained HTML document. Free with `copad_ffi_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn copad_graph_page() -> *mut c_char {
     into_c(copad_graph_web::page())
 }
 
-/// Ask comux to open one of its overlays (`what`: `new-session`, `resume`, `rename-session`,
-/// …) for `panel`'s client; `target` NULL = the active session/tab (decisions #172).
+/// Ask comux to open one of its overlays (`what`: `new-session`, `resume`, `rename-session`, ...)
+/// for `panel`'s client; `target` NULL = the active session/tab (decisions #172).
 ///
 /// # Safety
 /// `h` live; `panel`, `what` valid strings; `target` NULL or a valid string.
@@ -1748,7 +1624,7 @@ pub unsafe extern "C" fn copad_muxhost_open(
     }
 }
 
-/// Start a host on a REMOTE comux: `ssh -T <dest> <comux> proxy --stdio`. NULL when the
+/// Start a host on a REMOTE comux (`ssh -T <dest> <comux> proxy --stdio`); NULL when the
 /// destination or command is refused (see `copad_core::muxhost::valid_dest`).
 ///
 /// # Safety
@@ -1770,14 +1646,13 @@ pub unsafe extern "C" fn copad_muxhost_start_remote(
     }
 }
 
-/// A fresh binding tag for a remote tab. Free with `copad_ffi_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn copad_muxhost_new_remote_tag() -> *mut c_char {
     into_c(copad_core::muxhost::new_remote_tag())
 }
 
-/// The command a copad tab runs to attach the remote comux with `tag`. NULL when refused.
-/// Free with `copad_ffi_free_string`.
+/// The command a copad tab runs to attach the remote comux with `tag`; NULL when refused. Free
+/// with `copad_ffi_free_string`.
 ///
 /// # Safety
 /// All arguments valid strings.
@@ -1798,7 +1673,6 @@ pub unsafe extern "C" fn copad_muxhost_remote_attach_command(
     }
 }
 
-/// Answer a delegated overlay. `choice`/`text` NULL when absent; both NULL = cancelled.
 ///
 /// # Safety
 /// `h` live; `choice`, `text` NULL or valid strings.
@@ -1837,17 +1711,14 @@ pub unsafe extern "C" fn copad_muxhost_copad_tag(
 mod browser_ffi_tests {
     use super::*;
 
-    /// Call one of the browser entry points with a JSON literal and get the
-    /// response back as a parsed value, freeing the Rust allocation exactly
-    /// once — the same lifecycle the Swift facade implements.
+    /// Call a browser entry point with a JSON literal and parse the response, freeing the Rust
+    /// allocation exactly once as the Swift facade does.
     fn call(f: unsafe extern "C" fn(*const c_char) -> *mut c_char, input: &str) -> Option<Value> {
         let arg = CString::new(input).expect("test literal has no NUL");
-        // SAFETY: `arg` outlives the call; the returned pointer is freed below.
         let out = unsafe { f(arg.as_ptr()) };
         if out.is_null() {
             return None;
         }
-        // SAFETY: the entry points return a pointer from `CString::into_raw`.
         let owned = unsafe { CString::from_raw(out) };
         Some(serde_json::from_slice(owned.as_bytes()).expect("response is JSON"))
     }
@@ -1871,8 +1742,8 @@ mod browser_ffi_tests {
 
     #[test]
     fn canonicalize_says_whether_the_title_may_be_persisted() {
-        // A title carries the same exposure as a URL, and the caller must not
-        // re-derive this by comparing the raw policy string (codex review C1).
+        // A title carries the same exposure as a URL; the caller must not re-derive this from the
+        // raw policy string.
         for (policy, expected) in [("origin", false), ("url", true), ("full", true)] {
             let out = call(
                 copad_ffi_browser_canonicalize,
@@ -1881,8 +1752,7 @@ mod browser_ffi_tests {
             .expect("non-null");
             assert_eq!(out["persist_title"], expected, "{policy}");
         }
-        // Case and whitespace resolve HERE, so they cannot disagree with a
-        // second interpretation elsewhere.
+        // Case and whitespace resolve HERE, not in a second interpretation elsewhere.
         for weird in ["ORIGIN", " origin ", "nonsense"] {
             let out = call(
                 copad_ffi_browser_canonicalize,
@@ -1907,7 +1777,6 @@ mod browser_ffi_tests {
 
     #[test]
     fn canonicalize_carries_the_backslash_and_percent_fixes_across_the_boundary() {
-        // The two bugs the deleted Swift copy still had.
         let bs = call(
             copad_ffi_browser_canonicalize,
             r#"{"url":"https://example.com\\reset\\SECRET","policy":"origin"}"#,
@@ -1970,8 +1839,7 @@ mod browser_ffi_tests {
 
     #[test]
     fn authorize_reads_an_unknown_mode_as_protected() {
-        // Fail closed: a caller that cannot say what state a tab is in must not
-        // be told the tab is open for automation.
+        // Fail closed.
         for body in [
             r#"{"method":"webview.get_content","mode":"bogus"}"#,
             r#"{"method":"webview.get_content"}"#,
@@ -1991,7 +1859,6 @@ mod browser_ffi_tests {
             assert!(call(f, "{not json").is_none());
             assert!(!last_error_string().is_empty());
         }
-        // A NULL pointer is a caller bug, not a parse failure — also NULL out.
         // SAFETY: passing NULL is exactly the case under test.
         assert!(unsafe { copad_ffi_browser_normalize(ptr::null()) }.is_null());
     }
@@ -2002,11 +1869,8 @@ mod browser_ffi_tests {
         assert!(call(copad_ffi_browser_normalize, r#"{}"#).is_none());
     }
 
-    // ---- history blobs ----
-    //
-    // These touch the filesystem through `state_dir()`, so they redirect HOME /
-    // XDG_STATE_HOME and serialize on a lock, the same shape `copad-core`'s own
-    // history tests use.
+    // History tests touch the filesystem through `state_dir()`, so they redirect HOME /
+    // XDG_STATE_HOME and serialize on a lock.
 
     static HISTORY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2129,8 +1993,8 @@ mod browser_ffi_tests {
                 r#"{"tab_id":"tab-a","generation":1,"data_hex":"00"}"#,
             )
             .expect("write");
-            // Entries that are not [string, number] pairs are skipped, not
-            // guessed at — the blob is simply unreferenced and reclaimed.
+            // Entries that are not [string, number] pairs are skipped; the blob is unreferenced
+            // and reclaimed.
             let out = call(
                 copad_ffi_browser_history_gc,
                 r#"{"live":[["tab-a"],42,{"tab_id":"tab-a"}]}"#,
@@ -2139,8 +2003,6 @@ mod browser_ffi_tests {
             assert_eq!(out["removed"], 1);
         });
     }
-
-    // ---- netlog ----
 
     #[test]
     fn netlog_records_round_trip_with_declared_coverage() {
@@ -2159,7 +2021,6 @@ mod browser_ffi_tests {
             .expect("non-null");
             assert_eq!(out["records"].as_array().unwrap().len(), 1);
             assert_eq!(out["records"][0]["text"], "boom");
-            // Every read says what the capture can and cannot see.
             assert_eq!(out["coverage"], "js+navigation");
         });
     }
@@ -2226,8 +2087,6 @@ mod browser_ffi_tests {
         if p.is_null() {
             return String::new();
         }
-        // SAFETY: `copad_ffi_last_error` returns a pointer to a thread-local
-        // CString owned by Rust; we only read it.
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
 }

@@ -1,14 +1,9 @@
-//! Action registry: name → handler map shared by socket dispatch, plugin
-//! RPC, and triggers.
+//! Action registry: name to handler map shared by socket dispatch, plugin RPC and triggers.
 //!
-//! Panic semantics for this whole module: every dispatch path
-//! (`invoke` / `try_invoke` / `try_dispatch`) calls the handler before
-//! completion-event fan-out and before any continuation. A panic in the
-//! handler unwinds past both — no `<action>.completed`/`.failed` is
-//! published, and any `Responder` is dropped uncalled. `try_dispatch`'s
-//! `bool` return assumes worker-thread spawn succeeds (panics on OS
-//! failure, which is rare). Handlers that need the bus to see a failure
-//! must catch and convert to `Err` themselves.
+//! Panic semantics: every dispatch path (`invoke` / `try_invoke` / `try_dispatch`) runs the
+//! handler before completion fan-out and any continuation, so a handler panic unwinds past both:
+//! no `<action>.completed`/`.failed` is published and any `Responder` is dropped uncalled.
+//! Handlers that need the bus to see a failure must catch the panic and return `Err`.
 
 use crate::event_bus::{Event as BusEvent, EventBus};
 use crate::protocol::ResponseError;
@@ -19,36 +14,30 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub type ActionResult = Result<Value, ResponseError>;
 pub type ActionFn = Arc<dyn Fn(Value) -> ActionResult + Send + Sync + 'static>;
-/// `try_dispatch` continuation. Fires inline for sync handlers, on a worker
-/// thread for `register_blocking`. Panic semantics: see module preamble.
+/// `try_dispatch` continuation: inline for sync handlers, on a worker for `register_blocking`.
 pub type Responder = Box<dyn FnOnce(ActionResult) + Send + 'static>;
 
-/// Trust-boundary stamp on auto-published completion events. Subscribers
-/// (notably `TriggerEngine::try_promote_or_drop_preflight`) gate on this
-/// to distinguish registry-synthesized events from plugin-emitted ones
-/// that happen to share a `<x>.completed` kind.
+/// Trust-boundary stamp on auto-published completion events; subscribers (notably
+/// `TriggerEngine::try_promote_or_drop_preflight`) use it to tell registry-synthesized events
+/// from plugin-emitted ones with the same `<x>.completed` kind.
 pub const COMPLETION_EVENT_SOURCE: &str = "copad.action";
 
 struct Entry {
     handler: ActionFn,
-    /// `try_dispatch` runs `true` handlers on a worker thread so callers
-    /// on time-sensitive threads (GTK pump, socket dispatcher) don't stall.
+    /// Run on a worker thread by `try_dispatch` so time-sensitive callers (GTK pump, socket
+    /// dispatcher) don't stall.
     blocking: bool,
-    /// Suppresses completion-event fan-out. Set for high-frequency internal
-    /// actions whose `.completed` would dwarf real workflow events.
+    /// Suppresses completion-event fan-out, for high-frequency internal actions.
     silent: bool,
 }
 
 pub struct ActionRegistry {
     entries: RwLock<HashMap<String, Entry>>,
-    /// When set, non-silent dispatches publish `<action>.completed` (Ok) or
-    /// `<action>.failed` (Err) BEFORE the caller's `Responder` fires.
-    /// `None` disables fan-out (default for unit tests).
+    /// When set, non-silent dispatches publish `<action>.completed` (Ok) or `<action>.failed`
+    /// (Err) BEFORE the caller's `Responder` fires.
     completion_bus: Option<Arc<EventBus>>,
-    /// When set, blocking handlers dispatch through a bounded worker pool
-    /// instead of `std::thread::spawn`. Saturation surfaces as an
-    /// `overloaded` error response. `None` keeps the legacy unbounded
-    /// behavior — kept as a fallback for callers that haven't migrated.
+    /// When set, blocking handlers use a bounded worker pool instead of `std::thread::spawn`;
+    /// saturation yields an `overloaded` error. `None` keeps the unbounded fallback.
     pool: Mutex<Option<Arc<ThreadPool>>>,
 }
 
@@ -61,14 +50,9 @@ impl ActionRegistry {
         }
     }
 
-    /// Auto-publish `<action>.completed` / `<action>.failed` after every
-    /// non-silent dispatch (uniform across `invoke`/`try_invoke`/`try_dispatch`).
-    /// Silent actions registered via `register_silent` opt out of fan-out.
-    ///
-    /// Scope: only registry-routed actions emit. Legacy match-arm commands
-    /// served directly by `copad-linux::socket::dispatch` (the bulk of the
-    /// platform surface — tabs, splits, terminal/webview/panel control,
-    /// agent, etc.) bypass the registry entirely and don't emit.
+    /// Auto-publish `<action>.completed` / `<action>.failed` after every non-silent dispatch
+    /// (`invoke`/`try_invoke`/`try_dispatch`). Only registry-routed actions emit: legacy match-arm
+    /// commands in `copad-linux::socket::dispatch` bypass the registry.
     pub fn with_completion_bus(bus: Arc<EventBus>) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
@@ -77,23 +61,19 @@ impl ActionRegistry {
         }
     }
 
-    /// Routes blocking handlers through a bounded pool. Call once during
-    /// daemon startup before dispatch starts. A second call replaces the
-    /// pool (handy for tests) but `debug_assert`s the prior was unset.
+    /// Routes blocking handlers through a bounded pool. Call once at daemon startup before
+    /// dispatch; a second call replaces the pool but `debug_assert`s the prior was unset.
     pub fn with_pool(self: Arc<Self>, pool: Arc<ThreadPool>) -> Arc<Self> {
         let prev = self.pool.lock().unwrap().replace(pool);
         debug_assert!(prev.is_none(), "with_pool called twice");
         self
     }
 
-    /// Snapshot pool stats for observability (e.g., `daemon.info`).
-    /// `None` when no pool is wired.
     pub fn pool_stats(&self) -> Option<crate::thread_pool::PoolStats> {
         self.pool.lock().unwrap().as_ref().map(|p| p.stats())
     }
 
-    /// Sync handler; `try_dispatch` runs it inline. Use only for
-    /// microsecond-scale work (lookups, registry queries).
+    /// Sync handler, run inline by `try_dispatch`; microsecond-scale work only.
     pub fn register<F>(&self, name: impl Into<String>, handler: F)
     where
         F: Fn(Value) -> ActionResult + Send + Sync + 'static,
@@ -108,9 +88,8 @@ impl ActionRegistry {
         );
     }
 
-    /// Like `register` but suppresses completion-event fan-out. Use for
-    /// high-frequency internal actions (`system.ping`, `context.snapshot`)
-    /// whose `.completed` would dwarf real workflow events.
+    /// Like `register` but suppresses completion-event fan-out, for high-frequency internal
+    /// actions (`system.ping`, `context.snapshot`).
     pub fn register_silent<F>(&self, name: impl Into<String>, handler: F)
     where
         F: Fn(Value) -> ActionResult + Send + Sync + 'static,
@@ -125,9 +104,6 @@ impl ActionRegistry {
         );
     }
 
-    /// Handler may block (network I/O, plugin RPC, LLM). `try_dispatch`
-    /// spawns a worker so time-sensitive threads (GTK pump, socket
-    /// dispatcher) keep flowing. Same shape as `register`.
     pub fn register_blocking<F>(&self, name: impl Into<String>, handler: F)
     where
         F: Fn(Value) -> ActionResult + Send + Sync + 'static,
@@ -142,9 +118,8 @@ impl ActionRegistry {
         );
     }
 
-    /// `register_blocking` + silent. For high-frequency blocking work
-    /// (e.g. statusbar module ticks) where pool backpressure is needed
-    /// but completion-event fan-out would flood the bus.
+    /// `register_blocking` + silent, for high-frequency blocking work (statusbar module ticks)
+    /// that needs pool backpressure without flooding the bus.
     pub fn register_blocking_silent<F>(&self, name: impl Into<String>, handler: F)
     where
         F: Fn(Value) -> ActionResult + Send + Sync + 'static,
@@ -160,10 +135,8 @@ impl ActionRegistry {
     }
 
     pub fn invoke(&self, name: &str, params: Value) -> ActionResult {
-        // Clone out the handler Arc under the read lock, then drop the guard
-        // before running the handler. This keeps handler execution off the
-        // lock entirely so a handler may freely call `register`, `invoke`,
-        // or other registry methods without risking deadlock.
+        // Clone the handler out under the read lock and drop the guard before running it, so a
+        // handler may call `register`/`invoke` without deadlocking.
         let (handler, silent) = {
             let entries = self.entries.read().unwrap();
             entries
@@ -172,19 +145,16 @@ impl ActionRegistry {
                 .ok_or_else(|| not_found_error(name))?
         };
         let result = handler(params);
-        // Default TriggerSink resolves chained actions through this
-        // path; without publishing here, completion events for those
-        // chains would be silently lost.
+        // The default TriggerSink resolves chained actions through here; without publishing,
+        // their completion events would be lost.
         if !silent {
             publish_completion(self.completion_bus.as_deref(), name, &result);
         }
         result
     }
 
-    /// Like `invoke` but returns `None` for unregistered actions (no
-    /// `action_not_found` synth) so dispatchers can fall through.
-    /// Runs the handler INLINE regardless of `blocking`; time-sensitive
-    /// callers should use `try_dispatch` instead.
+    /// Like `invoke` but `None` for unregistered actions so dispatchers can fall through. Runs
+    /// the handler inline regardless of `blocking`; time-sensitive callers use `try_dispatch`.
     pub fn try_invoke(&self, name: &str, params: Value) -> Option<ActionResult> {
         let (handler, silent) = {
             let entries = self.entries.read().unwrap();
@@ -197,10 +167,8 @@ impl ActionRegistry {
         Some(result)
     }
 
-    /// Returns `true` if registered (caller need not handle `on_done`); `false`
-    /// if not registered, in which case `on_done` is dropped uncalled and the
-    /// caller falls through. Sync handlers run inline; blocking handlers run
-    /// on a worker. Panic semantics: see module preamble.
+    /// `true` if registered (the caller need not handle `on_done`); `false` if not, in which case
+    /// `on_done` is dropped uncalled. Sync handlers run inline, blocking ones on a worker.
     pub fn try_dispatch(self: &Arc<Self>, name: &str, params: Value, on_done: Responder) -> bool {
         let (handler, blocking, silent) = {
             let entries = self.entries.read().unwrap();
@@ -209,9 +177,8 @@ impl ActionRegistry {
                 None => return false,
             }
         };
-        // Capture the bits the completion publisher needs BEFORE
-        // moving handler/on_done into closures. None when no
-        // completion bus is wired OR the action is silent.
+        // Capture what the completion publisher needs BEFORE moving handler/on_done into
+        // closures; `None` with no completion bus or a silent action.
         let publish_bus = if silent {
             None
         } else {
@@ -229,15 +196,12 @@ impl ActionRegistry {
                     action_name,
                 });
                 if let Err(rejected) = pool.try_execute(job) {
-                    // Synchronous cancel on the caller thread: publishes
-                    // `<action>.failed` and fires on_done with an
-                    // `overloaded` error so no caller is ever orphaned.
+                    // Cancel synchronously on the caller thread: publishes `<action>.failed` and
+                    // fires on_done with `overloaded`, so no caller is orphaned.
                     rejected.cancel();
                 }
             } else {
-                // Legacy fallback: unbounded spawn. Production registries
-                // (copadd + copad-linux) all wire a pool now; this path
-                // remains for tests and embedders that don't.
+                // Unbounded spawn for tests and embedders that wire no pool.
                 std::thread::spawn(move || {
                     let result = handler(params);
                     publish_completion(publish_bus.as_deref(), &action_name, &result);
@@ -286,12 +250,9 @@ impl Default for ActionRegistry {
     }
 }
 
-/// Publish a synthetic `<action>.completed` (Ok) or `<action>.failed` (Err);
-/// no-op when `bus` is `None`. Called AFTER the handler returns, BEFORE the
-/// caller's `Responder` (or `invoke`/`try_invoke` return). Bus-level ordering
-/// only — when the downstream chained trigger actually fires depends on the
-/// platform pump cadence (copad-linux: next GTK tick). Semantically-correct
-/// chaining is guaranteed; same-tick chaining is not.
+/// Worker-pool job. `run` and `cancel` both publish the completion event after the handler (or
+/// overload error) and before the Responder fires. Chaining is correct, but same-tick chaining
+/// is not guaranteed: the downstream trigger fires on the platform pump cadence.
 struct DispatchJob {
     handler: ActionFn,
     params: Value,
@@ -328,11 +289,9 @@ fn publish_completion(bus: Option<&EventBus>, action: &str, result: &ActionResul
     publish_completion_unconditional(bus, action, result);
 }
 
-/// `<action>.completed` / `<action>.failed` with source `copad.action`.
-/// Identical shape to the registry's auto-publish — exposed so the legacy
-/// dispatch surfaces (copad-linux's `socket::dispatch` legacy match arms,
-/// copad-daemon's `dispatch_via_gui`) can fan out completion events
-/// without copy-pasting the formatting logic.
+/// `<action>.completed` / `<action>.failed` with source `copad.action`, the same shape as the
+/// registry's auto-publish; lets legacy dispatch surfaces (copad-linux `socket::dispatch`,
+/// copad-daemon `dispatch_via_gui`) fan out completion events too.
 pub fn publish_completion_unconditional(bus: &EventBus, action: &str, result: &ActionResult) {
     let (kind, payload) = match result {
         Ok(value) => (format!("{action}.completed"), value.clone()),
@@ -521,8 +480,6 @@ mod tests {
         assert_eq!(internal_error("x").code, "internal_error");
     }
 
-    // -- try_dispatch behavior --
-
     #[test]
     fn try_dispatch_returns_false_for_unknown() {
         let reg = Arc::new(ActionRegistry::new());
@@ -536,7 +493,6 @@ mod tests {
             }),
         );
         assert!(!dispatched);
-        // Callback must NOT fire when action isn't registered.
         assert_eq!(cb_fired.load(Ordering::SeqCst), 0);
     }
 
@@ -560,7 +516,6 @@ mod tests {
             );
             assert!(dispatched);
         }
-        // Sync handler: callback already fired before try_dispatch returned.
         assert_eq!(*observed.lock().unwrap(), Some(caller));
         assert_eq!(
             captured.lock().unwrap().as_ref().unwrap().as_ref().unwrap(),
@@ -595,14 +550,12 @@ mod tests {
             );
             assert!(dispatched);
         }
-        // try_dispatch returned in well under the handler's sleep —
-        // proving the caller wasn't blocked.
+        // Returned well under the handler's sleep: the caller wasn't blocked.
         assert!(
             start.elapsed() < Duration::from_millis(40),
             "try_dispatch returned in {:?}, expected < 40ms",
             start.elapsed()
         );
-        // Wait for the worker to finish.
         let deadline = Instant::now() + Duration::from_secs(2);
         while !*done.lock().unwrap() {
             assert!(Instant::now() < deadline, "worker never completed");
@@ -692,8 +645,6 @@ mod tests {
         assert!(!reg.is_blocking("missing"));
     }
 
-    // -- completion-event fan-out --
-
     #[test]
     fn try_dispatch_publishes_completed_on_ok() {
         let bus = Arc::new(EventBus::new());
@@ -744,13 +695,10 @@ mod tests {
                 }),
             );
         }
-        // Wait for the worker (event publication is from the
-        // worker thread, before on_done fires).
         let evt = rx
             .recv_timeout(Duration::from_millis(500))
             .expect_event("expected completion event from worker");
         assert_eq!(evt.kind, "slow.completed");
-        // and on_done eventually fires.
         let deadline = Instant::now() + Duration::from_secs(1);
         while !*done.lock().unwrap() {
             assert!(Instant::now() < deadline, "on_done never fired");
@@ -760,7 +708,6 @@ mod tests {
 
     #[test]
     fn registry_without_completion_bus_does_not_publish() {
-        // Bus-free shape for tests that don't need fan-out.
         let reg = Arc::new(ActionRegistry::new());
         reg.register("ping", |_| Ok(json!("pong")));
         let captured = Arc::new(Mutex::new(None::<ActionResult>));
@@ -772,8 +719,6 @@ mod tests {
                 *cap.lock().unwrap() = Some(r);
             }),
         );
-        // Nothing to assert about the bus (there isn't one); just
-        // confirm dispatch still works.
         assert_eq!(
             captured.lock().unwrap().as_ref().unwrap().as_ref().unwrap(),
             &json!("pong")
@@ -783,17 +728,13 @@ mod tests {
     #[test]
     fn silent_action_suppresses_fan_out() {
         let bus = Arc::new(EventBus::new());
-        // Subscribe BEFORE dispatching so even a single stray event
-        // would be observed.
         let rx = bus.subscribe_unbounded("system.ping.completed");
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus));
         reg.register_silent("system.ping", |_| Ok(json!({"status": "ok"})));
         for _ in 0..5 {
             reg.try_dispatch("system.ping", json!({}), Box::new(|_| {}));
         }
-        // No completion event should arrive within a short window.
-        // Use a small timeout — if fan-out leaked, recv_timeout
-        // would return Event almost immediately.
+        // No completion event may arrive; fan-out leaking would show up almost immediately.
         match rx.recv_timeout(Duration::from_millis(100)) {
             crate::event_bus::RecvOutcome::Timeout => {}
             other => panic!("silent action published an event: {other:?}"),
@@ -839,7 +780,6 @@ mod tests {
             "blocking_silent handler must run off the caller thread"
         );
 
-        // Silent: no completion event even after handler ran.
         match rx.recv_timeout(Duration::from_millis(50)) {
             crate::event_bus::RecvOutcome::Timeout => {}
             other => panic!("silent blocking action published an event: {other:?}"),
@@ -848,11 +788,8 @@ mod tests {
 
     #[test]
     fn completion_event_publishes_before_responder_runs_for_sync() {
-        // Order matters: a downstream trigger waiting on
-        // `<action>.completed` should see the event AT LEAST as
-        // soon as the original dispatcher's Responder fires —
-        // otherwise a chained trigger could miss the event in a
-        // tight loop.
+        // A downstream trigger waiting on `<action>.completed` must see the event no later than
+        // the Responder fires, or a chained trigger could miss it in a tight loop.
         let bus = Arc::new(EventBus::new());
         let rx = bus.subscribe_unbounded("seq.completed");
         let reg = Arc::new(ActionRegistry::with_completion_bus(bus));
@@ -866,23 +803,16 @@ mod tests {
                 o.lock().unwrap().push("on_done");
             }),
         );
-        // The publish call already happened by the time on_done
-        // ran (sync path). Pulling from the receiver should
-        // succeed without blocking.
         let evt = rx
             .recv_timeout(Duration::from_millis(50))
             .expect_event("expected sync-path event");
         order.lock().unwrap().push("event_seen");
         assert_eq!(evt.kind, "seq.completed");
-        // We can't compare publish-vs-on_done timestamps inside
-        // one process reliably, but we CAN confirm both happened.
         let observed = order.lock().unwrap().clone();
         assert!(observed.contains(&"on_done"));
         assert!(observed.contains(&"event_seen"));
     }
 
-    /// Test helper: turn `RecvOutcome` into a panic on
-    /// Timeout/Disconnected so tests stay terse.
     trait ExpectEvent {
         fn expect_event(self, msg: &str) -> crate::event_bus::Event;
     }
@@ -898,9 +828,8 @@ mod tests {
 
     #[test]
     fn register_blocking_overwrites_register_and_vice_versa() {
-        // A blocking-registered name can be replaced by a sync
-        // registration (and vice versa). The flag is part of the
-        // entry, not a separate index.
+        // A blocking-registered name can be replaced by a sync one and vice versa: the flag is
+        // part of the entry.
         let reg = ActionRegistry::new();
         reg.register("x", |_| Ok(json!("sync1")));
         assert!(!reg.is_blocking("x"));
@@ -938,17 +867,13 @@ mod tests {
         }
         let worker_id = observed.lock().unwrap().expect("handler must have run");
         assert_ne!(worker_id, caller, "handler should run on a pool worker");
-        // The pool worker name should be one of ours.
-        // (Can't inspect Thread::name() through ThreadId; just rely on
-        // ID inequality + the fact that try_dispatch returned.)
         drop(pool);
     }
 
     #[test]
     fn pool_saturation_yields_overloaded_response() {
         use crate::thread_pool::ThreadPool;
-        // 1 worker + 1 queue slot = at most 2 in flight; further work
-        // should be cancelled with `overloaded`.
+        // 1 worker + 1 queue slot = at most 2 in flight; the rest are cancelled `overloaded`.
         let pool = ThreadPool::new(1, 1);
         let bus = Arc::new(EventBus::new());
         let rx = bus.subscribe_unbounded("slowping.failed");
@@ -972,7 +897,6 @@ mod tests {
             );
             callbacks.push(());
         }
-        // All 6 callers must get a response (no orphans).
         let mut overloaded_count = 0;
         for rx in received {
             let result = rx.recv_timeout(Duration::from_secs(5)).expect("orphan");
@@ -986,7 +910,6 @@ mod tests {
             overloaded_count >= 3,
             "expected ≥3 overloaded; got {overloaded_count}"
         );
-        // And `<action>.failed` must publish for at least the overload count.
         let mut failed_events = 0;
         while let crate::event_bus::RecvOutcome::Event(_) =
             rx.recv_timeout(Duration::from_millis(50))

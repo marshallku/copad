@@ -1,28 +1,16 @@
-//! Opaque per-tab history blobs — the platform's serialized back/forward list
-//! and scroll position.
+//! Opaque per-tab history blobs: the platform's serialized back/forward list and scroll
+//! position (macOS `WKWebView.interactionState`, WebKitGTK `WebKitWebViewSessionState`). Neither
+//! is documented and both contain full URLs, so a blob is sensitive persistence, written only
+//! under `RestorePolicy::Full`, and every rule about where it lands lives here.
 //!
-//! macOS calls this `WKWebView.interactionState`; WebKitGTK calls it
-//! `WebKitWebViewSessionState`. Neither is documented in content, both certainly
-//! contain full URLs, and both may contain more. So a blob is **sensitive
-//! persistence**, written only under `RestorePolicy::Full`, and every rule about
-//! where it lands lives here rather than in either GUI.
-//!
-//! Four properties this module exists to guarantee:
-//!
-//! - **A session document is never filesystem authority.** The path is rebuilt
-//!   from a validated tab id and a generation number; no string that came out of
-//!   a session file is joined as a path, and a read refuses to follow a symlink
-//!   planted at the expected name.
-//! - **Generations are immutable.** Overwriting `<id>.bin` in place would
-//!   destroy the blob the *previous committed* session still references, so a
-//!   crash between writing the blob and writing `session.json` would pair old
-//!   metadata with new history. Each save writes a new generation; `gc` reclaims
-//!   the rest once a session has committed.
-//! - **Oversize is refused, never truncated.** A truncated `interactionState` is
-//!   not a shorter history, it is corruption that WebKit will fail to decode —
-//!   silently, which is the worst failure available here.
-//! - **`gc` is not a directory wipe.** It removes only files matching the exact
-//!   `<id>-<generation>.bin` grammar that no live tab references.
+//! - A session document is never filesystem authority: the path is rebuilt from a validated tab
+//!   id and generation, and reads refuse to follow a symlink planted at the expected name.
+//! - Generations are immutable: overwriting `<id>.bin` would destroy the blob the previous
+//!   committed session references. `gc` reclaims old ones after a session commits.
+//! - Oversize is refused, never truncated: a truncated `interactionState` fails to decode in
+//!   WebKit, silently.
+//! - `gc` removes only files matching the exact `<id>-<generation>.bin` grammar that no live tab
+//!   references.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -31,19 +19,16 @@ use std::path::{Path, PathBuf};
 
 use super::tabs::{history_dir, history_path, is_valid_tab_id};
 
-/// Ceiling on one blob. A real `interactionState` is single-digit KB even for a
-/// long history; 4 MiB is generous enough that a legitimate blob never trips it
-/// and small enough that a corrupt length can't force a huge allocation.
+/// Ceiling on one blob: a real `interactionState` is single-digit KB, and a corrupt length must
+/// not force a huge allocation.
 pub const MAX_BLOB_BYTES: usize = 4 * 1024 * 1024;
 
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
-/// Write a blob as a NEW generation.
-///
-/// temp → fsync → rename → parent fsync, so a reader either sees the previous
-/// generation or this one, never a half-written file. The caller writes
-/// `session.json` referencing the generation only after this returns.
+/// Write a blob as a NEW generation: temp, fsync, rename, parent fsync, so a reader sees the
+/// previous generation or this one, never a half-written file. Write `session.json` only after
+/// this returns.
 pub fn write(tab_id: &str, generation: u64, data: &[u8]) -> Result<(), String> {
     if data.len() > MAX_BLOB_BYTES {
         return Err(format!(
@@ -55,19 +40,14 @@ pub fn write(tab_id: &str, generation: u64, data: &[u8]) -> Result<(), String> {
         history_path(tab_id, generation).ok_or_else(|| format!("invalid tab id: {tab_id:?}"))?;
     let dir = history_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    // Best-effort tighten: an existing dir keeps whatever mode it had, and we
-    // would rather narrow it than leave a world-readable history directory.
+    // Best-effort: an existing dir keeps its mode; narrow it rather than leave it world-readable.
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE));
 
-    // The temp NAME is predictable, so its creation has to be hostile-proof:
-    // `O_EXCL | O_NOFOLLOW` refuses to open anything that already exists —
-    // including a symlink someone planted at that name, which a plain
-    // create+truncate would have followed and overwritten, and which the
-    // rename would then have installed as the history file itself. The
-    // read-side `O_NOFOLLOW` does nothing for this path.
+    // The temp name is predictable, so creation must be hostile-proof: `O_EXCL | O_NOFOLLOW`
+    // refuses anything already there, including a planted symlink that a plain create+truncate
+    // would follow and the rename would then install as the history file. The read-side
+    // `O_NOFOLLOW` does not cover this.
     let tmp = dir.join(format!(".{tab_id}-{generation}.bin.tmp"));
-    // A leftover from a crashed write is ours to clear; anything else fails the
-    // exclusive create below.
     let _ = fs::remove_file(&tmp);
     {
         let mut f = fs::OpenOptions::new()
@@ -82,11 +62,9 @@ pub fn write(tab_id: &str, generation: u64, data: &[u8]) -> Result<(), String> {
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     }
-    // NON-REPLACING rename. "Generations are immutable" was enforced only by
-    // the Swift counter always picking a fresh number — core itself would
-    // happily overwrite, so a caller that reused a generation (a bug, or a
-    // second process) would destroy the blob a committed session still points
-    // at. `rename_no_replace` makes the property hold here, where it is stated.
+    // NON-REPLACING rename: core must enforce immutable generations itself, since a caller that
+    // reused a generation (a bug, or a second process) would otherwise destroy the blob a
+    // committed session still points at.
     crate::fs_atomic::rename_no_replace(&tmp, &path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -97,18 +75,14 @@ pub fn write(tab_id: &str, generation: u64, data: &[u8]) -> Result<(), String> {
             format!("rename into {}: {e}", path.display())
         }
     })?;
-    // Durability of the rename itself.
     if let Ok(d) = fs::File::open(&dir) {
         let _ = d.sync_all();
     }
     Ok(())
 }
 
-/// Read a blob back.
-///
-/// `O_NOFOLLOW` plus a parent check: the filename is ours, but the *file* may
-/// have been replaced with a symlink pointing anywhere, and following it would
-/// turn "restore my tabs" into an arbitrary-file read.
+/// Read a blob back. `O_NOFOLLOW` plus a parent check: the file may have been replaced with a
+/// symlink pointing anywhere, which would turn "restore my tabs" into an arbitrary-file read.
 pub fn read(tab_id: &str, generation: u64) -> Result<Vec<u8>, String> {
     let path =
         history_path(tab_id, generation).ok_or_else(|| format!("invalid tab id: {tab_id:?}"))?;
@@ -133,8 +107,8 @@ pub fn read(tab_id: &str, generation: u64) -> Result<Vec<u8>, String> {
             meta.len()
         ));
     }
-    // Read one byte past the cap so a file that grew between stat and read is
-    // caught rather than silently truncated.
+    // Read one byte past the cap so a file that grew between stat and read is caught, not
+    // silently truncated.
     let mut buf = Vec::with_capacity(meta.len() as usize);
     f.take(MAX_BLOB_BYTES as u64 + 1)
         .read_to_end(&mut buf)
@@ -145,11 +119,8 @@ pub fn read(tab_id: &str, generation: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Remove blobs no live tab references. Returns how many were removed.
-///
-/// Only files matching `<id>-<generation>.bin` are candidates, so anything else
-/// that ends up in this directory is left alone — this is a reclaim pass, not a
-/// directory wipe.
+/// Remove blobs no live tab references; returns how many. Only files matching
+/// `<id>-<generation>.bin` are candidates, so anything else in the directory is left alone.
 pub fn gc(live: &[(String, u64)]) -> usize {
     let dir = history_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -172,11 +143,8 @@ pub fn gc(live: &[(String, u64)]) -> usize {
     removed
 }
 
-/// `<id>-<generation>.bin` → `(id, generation)`, or `None` for anything else.
-///
-/// The id itself is re-validated, so a file named `../evil-1.bin` (which cannot
-/// exist as a single directory entry, but a hostile archive extraction is not
-/// the only way files appear) is not treated as a blob.
+/// `<id>-<generation>.bin` to `(id, generation)`, or `None`. The id is re-validated so a hostile
+/// name like `../evil-1.bin` is not treated as a blob.
 fn parse_blob_name(name: &str) -> Option<(String, u64)> {
     let stem = name.strip_suffix(".bin")?;
     let (id, gen_str) = stem.rsplit_once('-')?;
@@ -187,22 +155,14 @@ fn parse_blob_name(name: &str) -> Option<(String, u64)> {
     Some((id.to_string(), generation))
 }
 
-/// Does a blob for this generation exist? Used by the GUI to decide between
-/// restoring history and falling back to a plain URL load.
 pub fn exists(tab_id: &str, generation: u64) -> bool {
     history_path(tab_id, generation)
         .map(|p| p.is_file())
         .unwrap_or(false)
 }
 
-// ---------------------------------------------------------------------------
-// Hex, because the blob has to cross a JSON FFI boundary
-// ---------------------------------------------------------------------------
-//
-// Not base64: `copad-core` carries no base64 dependency, and the workspace's
-// only implementation is a private ENCODER in the jira plugin with no decoder.
-// Adding a dependency or a second half-written codec to save a few KB on a
-// blob this size is the wrong trade.
+// Hex rather than base64 because the blob crosses a JSON FFI boundary: `copad-core` has no base64
+// dependency, and a second half-written codec to save a few KB is the wrong trade.
 
 pub fn hex_encode(data: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -226,10 +186,9 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    // `as_chunks::<2>()` rather than `chunks_exact(2)`: same split, but the chunk size is in
-    // the type, so `pair[0]`/`pair[1]` are compile-time-checked array indices instead of
-    // bounds-checked slice ones (clippy::chunks_exact_to_as_chunks). The odd-length guard
-    // above means the remainder is always empty, so it is discarded.
+    // `as_chunks::<2>()` rather than `chunks_exact(2)`: the chunk size is in the type, so
+    // `pair[0]`/`pair[1]` are compile-time-checked (clippy::chunks_exact_to_as_chunks). The
+    // odd-length guard above makes the remainder always empty.
     let (pairs, _) = bytes.as_chunks::<2>();
     for pair in pairs {
         let hi = hex_val(pair[0])?;
@@ -248,15 +207,13 @@ fn hex_val(b: u8) -> Result<u8, String> {
     }
 }
 
-/// Test seam: `history_dir()` reads `state_dir()`, which the tests below
-/// redirect by setting `HOME` / `XDG_STATE_HOME`. Exposed so a caller can
-/// assert confinement against the same directory this module computes.
+/// Test seam: `history_dir()` reads `state_dir()`, which tests redirect via `HOME` /
+/// `XDG_STATE_HOME`.
 pub fn dir() -> PathBuf {
     history_dir()
 }
 
-/// Is `path` inside the history directory? Used by tests and by callers that
-/// want to assert confinement before acting on a path they were handed.
+/// Is `path` inside the history directory? For asserting confinement before acting on a path.
 pub fn is_confined(path: &Path) -> bool {
     path.parent() == Some(history_dir().as_path())
 }
@@ -346,8 +303,6 @@ mod tests {
     #[test]
     fn a_symlink_planted_at_the_blob_name_is_not_followed() {
         let _s = Sandbox::new("symlink");
-        // Establish the directory, then replace the blob with a symlink to a
-        // secret elsewhere — "restore my tabs" must not become a file read.
         write("tab-a", 1, b"real").expect("write");
         let secret = dir().parent().unwrap().join("secret.txt");
         fs::write(&secret, b"TOP SECRET").unwrap();
@@ -363,8 +318,6 @@ mod tests {
     #[test]
     fn an_oversize_blob_is_refused_rather_than_truncated() {
         let _s = Sandbox::new("oversize");
-        // A truncated interactionState is corruption WebKit fails to decode
-        // silently, which is worse than not restoring at all.
         let big = vec![0u8; MAX_BLOB_BYTES + 1];
         let err = write("tab-a", 1, &big).unwrap_err();
         assert!(err.contains("over the"), "{err}");
@@ -383,14 +336,11 @@ mod tests {
         write("tab-a", 1, b"first").unwrap();
         let err = write("tab-a", 1, b"second").unwrap_err();
         assert!(err.contains("immutable"), "{err}");
-        // The committed session's blob is untouched.
         assert_eq!(read("tab-a", 1).unwrap(), b"first");
     }
 
     #[test]
     fn a_new_generation_leaves_the_previous_one_intact() {
-        // The crash window this exists to close: session.json still references
-        // generation 1 until it is rewritten.
         let _s = Sandbox::new("generations");
         write("tab-a", 1, b"one").unwrap();
         write("tab-a", 2, b"two").unwrap();
@@ -413,7 +363,6 @@ mod tests {
 
     #[test]
     fn gc_leaves_anything_that_is_not_a_blob_alone() {
-        // A reclaim pass, not a directory wipe.
         let _s = Sandbox::new("gc-foreign");
         write("tab-a", 1, b"x").unwrap();
         let stray = dir().join("notes.txt");
@@ -454,7 +403,6 @@ mod tests {
         assert!(hex_decode("abc").is_err());
         assert!(hex_decode("zz").is_err());
         assert!(hex_decode("00 11").is_err());
-        // Uppercase is accepted — some producers emit it.
         assert_eq!(hex_decode("FF").unwrap(), vec![0xff]);
     }
 

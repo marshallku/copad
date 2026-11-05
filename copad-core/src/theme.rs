@@ -1,17 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// A complete terminal color theme with semantic UI colors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
     pub name: String,
-    /// Terminal foreground (text color)
     pub foreground: String,
-    /// Terminal background
     pub background: String,
-    /// 16-color ANSI palette (8 normal + 8 bright)
     pub palette: [String; 16],
 
-    // UI semantic colors
     /// Darker background (tab header, panels)
     pub surface0: String,
     /// Slightly lighter than surface0 (hover bg)
@@ -33,7 +28,6 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Look up a built-in theme by name. Returns None if not found.
     pub fn by_name(name: &str) -> Option<Self> {
         match name {
             "catppuccin-mocha" => Some(catppuccin_mocha()),
@@ -50,7 +44,6 @@ impl Theme {
         }
     }
 
-    /// List all built-in theme names.
     pub fn list() -> &'static [&'static str] {
         &[
             "catppuccin-mocha",

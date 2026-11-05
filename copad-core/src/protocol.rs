@@ -8,8 +8,6 @@ pub struct Request {
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
-    /// Address a specific registered GUI for GUI-owned methods. Absent =
-    /// primary GUI. Ignored for daemon-owned methods.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_client_id: Option<String>,
 }
@@ -35,27 +33,21 @@ pub struct Event {
     #[serde(rename = "type")]
     pub event_type: String,
     pub data: serde_json::Value,
-    /// Provenance string — carried across the wire so the GUI's
-    /// `TriggerEngine::try_promote_or_drop_preflight` can match on it.
-    /// In particular, the action-registry-synthesized completion stamp
-    /// (`copad.action`) must survive the daemon→GUI round-trip so
-    /// chained workflows advance after a daemon-hosted plugin replies.
-    /// Absent on older wire clients; deserialized as `None`.
+    /// Provenance carried across the wire so `TriggerEngine::try_promote_or_drop_preflight` can
+    /// match it. The action-registry completion stamp (`copad.action`) must survive the
+    /// daemon-to-GUI round-trip so chained workflows advance after a daemon-hosted plugin replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Trust-boundary provenance. Mirrors `event_bus::Event.origin` so a
-    /// daemon-side `External` tag (set at `events.publish` ingest)
-    /// survives the daemon→GUI bridge crossing. Without this the GUI's
-    /// trigger engine couldn't gate `[security] accept_external` on
-    /// hook-published events — they'd arrive looking trusted. Serde
-    /// `#[default]` = `Internal` so older wire frames keep parsing as
-    /// the safe default. See decisions.md #37.
+    /// Trust-boundary provenance, mirroring `event_bus::Event.origin`: a daemon-side `External`
+    /// tag (set at `events.publish` ingest) must survive the bridge, or the GUI trigger engine
+    /// could not gate `[security] accept_external` and hook-published events would look trusted.
+    /// Missing on older frames, which parse as the safe `Internal` default (decisions #37).
     #[serde(default)]
     pub origin: crate::event_bus::Origin,
 }
 
-/// Daemon → GUI request. Discriminated from `Request` by the `invoke`
-/// field (vs `method`). GUI replies with a normal `Response` echoing `id`.
+/// Daemon to GUI request, discriminated from `Request` by the `invoke` field. The GUI replies
+/// with a normal `Response` echoing `id`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Invoke {
     pub id: String,
@@ -162,7 +154,6 @@ mod tests {
 
     #[test]
     fn old_request_format_still_parses() {
-        // Wire missing the optional target_client_id field.
         let s = r#"{"id":"x","method":"ping","params":{}}"#;
         let req: Request = serde_json::from_str(s).unwrap();
         assert!(req.target_client_id.is_none());

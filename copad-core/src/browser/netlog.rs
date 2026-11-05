@@ -1,35 +1,25 @@
-//! Network + console records an agent can read, and the limits on them.
+//! Network and console records an agent can read, and the limits on them. Records go to a file
+//! the agent greps rather than into every tool response, because a verbose per-action dump makes
+//! browser tooling unaffordable in a context window.
 //!
-//! Shape borrowed from Cursor's browser tool: records go to a **file the agent
-//! greps**, not into every tool response, because a verbose per-action dump is
-//! what makes browser tooling unaffordable in a context window.
-//!
-//! Three honesty rules, each of which the reader depends on:
-//!
-//! 1. **Declared coverage** (codex plan r2-I1). Patching `fetch`/`XHR` is not a
-//!    packet log: subresources, `sendBeacon`, WebSocket frames and
-//!    service-worker traffic are invisible to it. Every response carries
-//!    [`NETLOG_COVERAGE`] so an agent is never misled into concluding "no
-//!    request was made" from an empty list.
-//! 2. **Redaction is hygiene, not a boundary.** A page can `console.log`
-//!    anything, and no name-based filter catches that. The actual boundary is
-//!    [`super::TabMode::Protected`], which stops the capture script from being
-//!    installed at all (r2-C3) — a suppression at the source, because refusing
-//!    reads while the file keeps filling is no defence when the file is
-//!    deliberately agent-readable.
-//! 3. **Bodies are off by default.** Turning them on is a deliberate act.
+//! 1. Coverage is declared: patching `fetch`/XHR is not a packet log (subresources,
+//!    `sendBeacon`, WebSocket frames and service-worker traffic are invisible). Every response
+//!    carries [`NETLOG_COVERAGE`] so an empty list never reads as "no request was made".
+//! 2. Redaction is hygiene, not a boundary: a page can `console.log` anything. The boundary is
+//!    [`super::TabMode::Protected`], which stops the capture script being installed at all.
+//!    Refusing reads while the agent-readable file keeps filling would defend nothing.
+//! 3. Bodies are off by default; turning them on is deliberate.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// What the capture mechanism actually sees. Returned verbatim in every
-/// `webview.net` response.
+/// What the capture mechanism actually sees; returned verbatim in every `webview.net` response.
 pub const NETLOG_COVERAGE: &str = "js+navigation";
 
-/// Header names whose values are replaced before a record is written. Matched
-/// case-insensitively against the whole name.
+/// Header names whose values are replaced before a record is written, matched case-insensitively
+/// against the whole name.
 pub const REDACT_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -40,16 +30,14 @@ pub const REDACT_HEADERS: &[&str] = &[
     "x-csrf-token",
 ];
 
-/// Placeholder written in place of a redacted value. Distinct from an empty
-/// string so a reader can tell "absent" from "withheld".
+/// Placeholder for a redacted value; distinct from an empty string so "absent" differs from
+/// "withheld".
 pub const REDACTED: &str = "«redacted»";
 
-/// Longest HTTP method string kept verbatim. A page picks the method
-/// (`fetch(url, { method: … })`), so it is page-controlled and bounded.
+/// Longest HTTP method string kept verbatim; the page picks the method, so it is bounded.
 const MAX_METHOD: usize = 32;
 
-/// Field names whose values are redacted inside a captured body or console
-/// line. Matched case-insensitively.
+/// Field names redacted inside a captured body or console line, case-insensitively.
 pub const REDACT_FIELDS: &[&str] = &[
     "access_token",
     "api_key",
@@ -71,7 +59,6 @@ pub const REDACT_FIELDS: &[&str] = &[
     "token",
 ];
 
-/// `"password": "hunter2"` and `'password': 'hunter2'` in JSON-ish text.
 static JSON_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"(?i)(["']({})["']\s*:\s*)(["'])(?:\\.|[^"'\\])*(["'])"#,
@@ -80,28 +67,20 @@ static JSON_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     .expect("static field pattern compiles")
 });
 
-/// `password=hunter2` in form-encoded or query-shaped text.
 static FORM_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!("(?i)\\b({})=[^&\\s\"']*", REDACT_FIELDS.join("|")))
         .expect("static field pattern compiles")
 });
 
-/// `Bearer <token>` and bare JWTs, which carry no field name to key off.
 static BEARERISH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
         .expect("static bearer pattern compiles")
 });
 
-/// Redact credential-shaped content inside free text (a captured body, a console
-/// line). Returns the markers describing what was hit.
-///
-/// **Redact THEN clamp.** Truncating first could cut a secret so it no longer
-/// matches its pattern and a prefix survives — the same ordering rule
-/// `design_grab` follows.
-///
-/// This is hygiene, not a boundary: `console.log(pw)` has no field name to key
-/// off and no pattern to match. The boundary is [`super::TabMode::Protected`],
-/// which stops the capture script from being installed at all.
+/// Redact credential-shaped content inside free text (a captured body, a console line); returns
+/// the markers describing what was hit. Redact THEN clamp: truncating first could cut a secret
+/// below its pattern and leave a prefix (`design_grab` follows the same rule). Hygiene, not a
+/// boundary: `console.log(pw)` has no field name or pattern to match.
 pub fn redact_text(text: &mut String) -> Vec<String> {
     let mut hits = Vec::new();
     let after_json = JSON_FIELD.replace_all(text, |c: &regex::Captures| {
@@ -129,19 +108,14 @@ pub fn redact_text(text: &mut String) -> Vec<String> {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LogCaps {
-    /// Whether request/response bodies are captured at all.
     pub capture_bodies: bool,
-    /// Bytes of body kept per record when `capture_bodies` is on.
     pub body_truncate: usize,
-    /// Hard ceiling on one **serialized** record, enforced by
-    /// [`sanitize_net`] / [`sanitize_console`] against the JSON they will
-    /// actually write — not against any one field. A page controls URLs, header
-    /// values and console text, so budgeting a single field leaves the record as
-    /// a whole unbounded (codex review C3).
+    /// Hard ceiling on one SERIALIZED record, enforced by [`sanitize_net`] / [`sanitize_console`]
+    /// against the JSON actually written. A page controls URLs, header values and console text,
+    /// so budgeting a single field leaves the record unbounded.
     pub per_record: usize,
-    /// Ring size in records.
     pub ring_records: usize,
-    /// Ring size in bytes. Whichever ceiling is hit first evicts oldest-first.
+    /// Whichever ring ceiling (records or bytes) is hit first evicts oldest-first.
     pub ring_bytes: usize,
 }
 
@@ -161,10 +135,8 @@ impl Default for LogCaps {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NetSource {
-    /// `fetch()` or `XMLHttpRequest`, seen by the injected user script.
     Script,
-    /// A main-frame or subframe navigation, seen by the native navigation
-    /// delegate rather than by the script.
+    /// A main-frame or subframe navigation, seen by the native navigation delegate.
     Navigation,
 }
 
@@ -185,7 +157,6 @@ pub struct NetRecord {
     pub response_headers: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    /// Names of everything that was withheld from this record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redacted: Vec<String>,
 }
@@ -212,12 +183,10 @@ pub struct ConsoleRecord {
     pub redacted: Vec<String>,
 }
 
-/// JSONL sink for one pane. Kept per-pane rather than per-tab so a tab that
-/// closes does not orphan a file.
+/// JSONL sink for one pane; per-pane rather than per-tab so a closing tab does not orphan a file.
 pub fn log_path(panel_id: &str) -> Option<std::path::PathBuf> {
-    // Panel ids are UUIDs generated by copad, but they arrive here from the RPC
-    // wire, so they are held to the same charset rule as a tab id — no string
-    // from an untrusted caller is ever joined as a path unvalidated.
+    // Panel ids arrive from the RPC wire, so they get the tab-id charset rule: no untrusted
+    // string is joined as a path unvalidated.
     if !super::tabs::is_valid_tab_id(panel_id) {
         return None;
     }
@@ -229,7 +198,6 @@ pub fn log_path(panel_id: &str) -> Option<std::path::PathBuf> {
     )
 }
 
-/// Redact a header list in place, returning the names that were withheld.
 pub fn redact_headers(headers: &mut [(String, String)]) -> Vec<String> {
     let mut hit = Vec::new();
     for (name, value) in headers.iter_mut() {
@@ -241,8 +209,7 @@ pub fn redact_headers(headers: &mut [(String, String)]) -> Vec<String> {
     hit
 }
 
-/// Truncate a body to the cap on a **char boundary**, so a multi-byte sequence
-/// is never cut in half. Returns `true` when it truncated.
+/// Truncate a body to the cap on a char boundary; returns `true` when it truncated.
 pub fn truncate_body(body: &mut String, cap: usize) -> bool {
     if body.len() <= cap {
         return false;
@@ -255,10 +222,9 @@ pub fn truncate_body(body: &mut String, cap: usize) -> bool {
     true
 }
 
-/// Apply the caps and header redaction to a record before it is written.
-/// Returns `false` when the record cannot be brought under
-/// [`LogCaps::per_record`] even after shedding everything sheddable — the caller
-/// **drops it** rather than writing an over-budget line.
+/// Apply the caps and header redaction before a record is written. Returns `false` when the
+/// record cannot be brought under [`LogCaps::per_record`] even after shedding everything
+/// sheddable; the caller drops it.
 #[must_use]
 pub fn sanitize_net(record: &mut NetRecord, caps: &LogCaps) -> bool {
     let mut redacted = redact_headers(&mut record.request_headers);
@@ -269,8 +235,6 @@ pub fn sanitize_net(record: &mut NetRecord, caps: &LogCaps) -> bool {
             redacted.push("body".into());
         }
     } else if let Some(body) = record.body.as_mut() {
-        // Redact THEN clamp: truncating first could cut a secret below its
-        // pattern and leave a prefix behind.
         redacted.extend(redact_text(body));
         if truncate_body(body, caps.body_truncate) {
             redacted.push("body:truncated".into());
@@ -281,20 +245,17 @@ pub fn sanitize_net(record: &mut NetRecord, caps: &LogCaps) -> bool {
     enforce_net_cap(record, caps.per_record)
 }
 
-/// Serialized size of a record, or `usize::MAX` if it cannot be serialized (in
-/// which case every caller treats it as over budget and sheds).
+/// Serialized size of a record, or `usize::MAX` if it cannot be serialized (callers then treat it
+/// as over budget).
 fn serialized_len<T: Serialize>(value: &T) -> usize {
     serde_json::to_vec(value)
         .map(|b| b.len())
         .unwrap_or(usize::MAX)
 }
 
-/// Shed a net record's page-controlled fields until the JSON it will write fits
-/// `cap`, cheapest-to-lose first: body, then headers, then the URL.
-///
-/// The ts/tab/method/status skeleton is never shed — a record that says only
-/// "a POST happened at T and was too big to log" is still useful, whereas a
-/// record that silently exceeded the budget is a memory-growth bug.
+/// Shed a net record's page-controlled fields until the JSON fits `cap`, cheapest first: body,
+/// headers, then URL. The ts/tab/method/status skeleton is never shed: a record saying only "a
+/// POST happened at T and was too big to log" is still useful.
 fn enforce_net_cap(record: &mut NetRecord, cap: usize) -> bool {
     if serialized_len(record) <= cap {
         return true;
@@ -313,7 +274,6 @@ fn enforce_net_cap(record: &mut NetRecord, cap: usize) -> bool {
             return true;
         }
     }
-    // A page controls the request method string too (`fetch(url, {method: …})`).
     if record.method.len() > MAX_METHOD {
         truncate_body(&mut record.method, MAX_METHOD);
         if serialized_len(record) <= cap {
@@ -334,35 +294,28 @@ fn enforce_net_cap(record: &mut NetRecord, cap: usize) -> bool {
             return true;
         }
     }
-    // `redacted` is itself variable-length — every shed above pushes onto it and
-    // a page with many credential headers grows it further. Collapsed LAST, and
-    // to one honest marker rather than an arbitrary surviving entry: keeping
-    // e.g. "Authorization" while dropping "body:oversize" would misreport what
-    // happened to this record.
+    // `redacted` is itself variable-length (every shed above pushes onto it). Collapse it LAST,
+    // to one honest marker: keeping "Authorization" while dropping "body:oversize" would
+    // misreport what happened.
     if record.redacted.len() > 1 {
         record.redacted = vec!["shed:oversize".into()];
         if serialized_len(record) <= cap {
             return true;
         }
     }
-    // Everything sheddable is gone and the skeleton alone still exceeds the cap
-    // (an absurdly long `tab_id`, or a cap set below the skeleton size). Refuse
-    // rather than write an over-budget line — silently exceeding a documented
-    // ceiling is how a log becomes a memory-growth bug.
+    // The skeleton alone still exceeds the cap (an absurdly long `tab_id`, or a cap below the
+    // skeleton size): refuse rather than write an over-budget line.
     false
 }
 
-/// Cap a console record's text. Console text is NOT name-redacted — there is no
-/// name to key off — which is precisely why protected tabs never install the
-/// capture script in the first place.
+/// Cap a console record's text. Console text is not name-redacted (no name to key off), which is
+/// why protected tabs never install the capture script.
 #[must_use]
 pub fn sanitize_console(record: &mut ConsoleRecord, caps: &LogCaps) -> bool {
     let hits = redact_text(&mut record.text);
     record.redacted.extend(hits);
-    // Budget against the SERIALIZED record: JSON escaping (a page can emit a
-    // string of nothing but quotes and newlines) plus the ts/tab/level metadata
-    // both add bytes on top of the raw text, so capping `text` alone leaves the
-    // record unbounded (codex review C3/C1).
+    // Budget against the SERIALIZED record: JSON escaping (a page can emit only quotes and
+    // newlines) and the ts/tab/level metadata add bytes beyond the raw text.
     if serialized_len(record) <= caps.per_record {
         return true;
     }
@@ -378,8 +331,8 @@ pub fn sanitize_console(record: &mut ConsoleRecord, caps: &LogCaps) -> bool {
     if serialized_len(record) <= caps.per_record {
         return true;
     }
-    // `source` is page-controlled too — a stack frame's script URL. Emptying
-    // `text` alone would leave a 40 KiB `source` above the ceiling.
+    // `source` (a stack frame's script URL) is page-controlled too; emptying `text` alone could
+    // leave a 40 KiB `source` above the ceiling.
     if record.source.take().is_some() {
         record.redacted.push("source:oversize".into());
         if serialized_len(record) <= caps.per_record {
@@ -395,17 +348,9 @@ pub fn sanitize_console(record: &mut ConsoleRecord, caps: &LogCaps) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
-// The JSONL sink
-// ---------------------------------------------------------------------------
-//
-// One file per pane, holding both kinds, each line tagged with `kind`. A file
-// rather than an in-memory buffer because that is what makes browser
-// observability affordable at all: the agent greps and reads slices of it
-// instead of receiving a verbose dump after every action (the shape Cursor's
-// browser tool settled on).
+// The JSONL sink: one file per pane holding both kinds, each line tagged with `kind`. The agent
+// greps slices of it instead of receiving a verbose dump after every action.
 
-/// Which kind of record a line holds.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -413,16 +358,13 @@ pub enum Kind {
     Console,
 }
 
-/// Filters for a read. Everything is optional; the default is "the most recent
-/// `limit` records of both kinds".
+/// Filters for a read; the default is the most recent `limit` records of both kinds.
 #[derive(Debug, Clone, Default)]
 pub struct ReadQuery {
     pub kind: Option<Kind>,
-    /// Only records with `ts` strictly greater than this.
     pub since: Option<u64>,
     pub tab_id: Option<String>,
     pub level: Option<ConsoleLevel>,
-    /// Substring match against a net record's URL or a console record's text.
     pub contains: Option<String>,
     pub limit: usize,
 }
@@ -435,9 +377,8 @@ fn ensure_dir() -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
-/// Append one record. Returns false when the record was DROPPED for exceeding
-/// the per-record cap even after shedding — a caller that treats that as
-/// success would silently under-report.
+/// Append one record. Returns false when it was DROPPED for exceeding the per-record cap even
+/// after shedding; a caller treating that as success would under-report.
 pub fn append_net(panel_id: &str, mut record: NetRecord, caps: &LogCaps) -> Result<bool, String> {
     if !sanitize_net(&mut record, caps) {
         return Ok(false);
@@ -497,14 +438,10 @@ fn append_line(
     f.write_all(text.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))?;
 
-    // Trim lazily: rewriting on every append would turn a chatty page into a
-    // rewrite storm. The file is allowed to overshoot by a margin and is then
-    // cut back to the cap.
-    //
-    // Both ceilings, not just bytes. Triggering on size alone meant the
-    // record cap was not enforced until the log passed the BYTE margin — with
-    // small records that is tens of thousands of lines past the 2000-record
-    // limit, which is retention nobody asked for and a slower read every time.
+    // Trim lazily: rewriting on every append would be a rewrite storm, so the file may overshoot
+    // by a margin and is then cut back. Both ceilings trigger it, not just bytes: with small
+    // records a byte-only trigger lets the file run tens of thousands of lines past the record
+    // cap.
     let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
     let over_bytes = len > caps.ring_bytes + caps.ring_bytes / 4;
     let over_records = appends_since_trim(&path) > caps.ring_records / 4;
@@ -515,12 +452,9 @@ fn append_line(
     Ok(())
 }
 
-/// Appends since the last trim, per log path.
-///
-/// Counted in memory rather than by re-reading the file: the point is to avoid
-/// touching the whole log on every append, so a check that read it would defeat
-/// itself. ONE map — a second `static` inside the reset function would be a
-/// different map, and the counter would never actually reset.
+/// Appends since the last trim, per log path. Counted in memory so the check doesn't touch the
+/// whole log on every append. It must stay ONE map: a second `static` inside the reset function
+/// would be a different map and the counter would never reset.
 static APPEND_COUNTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -537,12 +471,10 @@ fn reset_append_counter(path: &std::path::Path) {
     counts.insert(path.to_path_buf(), 0);
 }
 
-/// Cut the file back to the ring caps, oldest-first.
 fn trim(path: &std::path::Path, caps: &LogCaps) -> Result<(), String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut kept: Vec<&str> = Vec::new();
     let mut bytes = 0usize;
-    // Walk backwards so the NEWEST records are the ones that survive.
     for line in raw.lines().rev() {
         if kept.len() >= caps.ring_records || bytes + line.len() + 1 > caps.ring_bytes {
             break;
@@ -555,8 +487,6 @@ fn trim(path: &std::path::Path, caps: &LogCaps) -> Result<(), String> {
     if !out.is_empty() {
         out.push('\n');
     }
-    // temp + rename, so a reader mid-trim sees either the old file or the new
-    // one — never a half-truncated log.
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("jsonl.tmp");
@@ -582,13 +512,11 @@ pub fn read(panel_id: &str, query: &ReadQuery) -> Result<Vec<serde_json::Value>,
     let path = log_path(panel_id).ok_or_else(|| format!("invalid panel id: {panel_id:?}"))?;
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
-        // No file yet is not an error: the pane simply has not logged anything.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
     let limit = if query.limit == 0 { 200 } else { query.limit };
     let mut out: Vec<serde_json::Value> = Vec::new();
-    // Backwards, so `limit` keeps the NEWEST matches rather than the oldest.
     for line in raw.lines().rev() {
         if out.len() >= limit {
             break;
@@ -650,7 +578,6 @@ fn matches_query(value: &serde_json::Value, query: &ReadQuery) -> bool {
     true
 }
 
-/// Drop a pane's log. Returns how many records were discarded.
 pub fn clear(panel_id: &str) -> Result<usize, String> {
     let path = log_path(panel_id).ok_or_else(|| format!("invalid panel id: {panel_id:?}"))?;
     let count = std::fs::read_to_string(&path)
@@ -694,7 +621,6 @@ mod tests {
         assert_eq!(r.response_headers[0].1, REDACTED);
         assert!(r.redacted.contains(&"Authorization".to_string()));
         assert!(r.redacted.contains(&"Set-Cookie".to_string()));
-        // Non-credential headers survive.
         assert_eq!(r.request_headers[0].1, "application/json");
     }
 
@@ -732,9 +658,9 @@ mod tests {
 
     #[test]
     fn truncation_never_splits_a_multibyte_character() {
-        let mut s = "한글한글".to_string(); // 3 bytes per char
+        let mut s = "한글한글".to_string();
         truncate_body(&mut s, 4);
-        assert_eq!(s, "한"); // cut back to the boundary at 3, not 4
+        assert_eq!(s, "한");
         assert!(s.is_char_boundary(s.len()));
     }
 
@@ -747,8 +673,6 @@ mod tests {
 
     #[test]
     fn an_oversize_net_record_sheds_page_controlled_fields_until_it_fits() {
-        // codex review C3: a page controls the URL and the header values, so the
-        // documented per-record ceiling has to hold against the serialized JSON.
         let caps = LogCaps {
             capture_bodies: true,
             per_record: 300,
@@ -763,7 +687,6 @@ mod tests {
             "record still {} bytes",
             serde_json::to_vec(&r).unwrap().len()
         );
-        // The skeleton survives, so the record still says a POST happened.
         assert_eq!(r.method, "POST");
         assert!(
             r.redacted
@@ -783,7 +706,6 @@ mod tests {
 
     #[test]
     fn console_escaping_cannot_push_a_record_over_the_cap() {
-        // A page emitting nothing but quotes doubles under JSON escaping.
         let caps = LogCaps {
             per_record: 120,
             ..Default::default()
@@ -803,8 +725,8 @@ mod tests {
 
     #[test]
     fn console_text_is_capped_and_flagged() {
-        // The cap is against the SERIALIZED record, so the budget left for text
-        // is whatever the ts/tab/level skeleton does not already consume.
+        // The cap is against the SERIALIZED record, so the text budget is what the ts/tab/level
+        // skeleton leaves.
         let caps = LogCaps {
             per_record: 100,
             ..Default::default()
@@ -849,8 +771,6 @@ mod tests {
 
     #[test]
     fn an_oversize_console_source_is_shed_after_the_text() {
-        // codex review C1: emptying `text` alone leaves a page-controlled
-        // `source` above the ceiling.
         let caps = LogCaps {
             per_record: 200,
             ..Default::default()
@@ -888,8 +808,7 @@ mod tests {
 
     #[test]
     fn a_record_that_cannot_be_shed_under_the_cap_is_rejected_not_written() {
-        // The skeleton alone exceeds an absurd cap: refuse rather than write an
-        // over-budget line.
+        // The skeleton alone exceeds an absurd cap: refuse rather than write.
         let caps = LogCaps {
             per_record: 1,
             ..Default::default()
@@ -910,8 +829,6 @@ mod tests {
 
     #[test]
     fn an_opted_in_body_has_credential_shaped_content_redacted() {
-        // codex review C2: truncation alone left a short
-        // `{"password":"hunter2"}` body intact in an agent-readable file.
         let caps = LogCaps {
             capture_bodies: true,
             ..Default::default()
@@ -932,7 +849,6 @@ mod tests {
         assert!(!s.contains("sk-live-abcdefghij"), "{s}");
         assert!(hits.contains(&"body:field".to_string()));
         assert!(hits.contains(&"body:bearer".to_string()));
-        // The field NAME survives so the record still says what was withheld.
         assert!(s.contains("password="), "{s}");
         assert!(s.contains("user=me"), "{s}");
     }
@@ -977,8 +893,6 @@ mod tests {
         assert!(!LogCaps::default().capture_bodies);
     }
 
-    // ---- the JSONL sink ----
-
     fn with_temp_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _guard = super::super::TEST_ENV_LOCK
             .lock()
@@ -988,13 +902,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let prev_home = std::env::var("HOME").ok();
         let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: SINK_ENV serializes every test that touches these vars.
         unsafe {
             std::env::set_var("HOME", &root);
             std::env::set_var("XDG_STATE_HOME", root.join("state"));
         }
         let out = f();
-        // SAFETY: still holding the lock.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
@@ -1040,7 +952,6 @@ mod tests {
             assert_eq!(all.len(), 2);
             assert_eq!(all[0]["kind"], "net");
             assert_eq!(all[1]["kind"], "console");
-            // Oldest first — the order they happened in.
             assert!(all[0]["ts"].as_u64() < all[1]["ts"].as_u64());
         });
     }
@@ -1071,8 +982,7 @@ mod tests {
             .unwrap();
             assert_eq!(only_console.len(), 2);
 
-            // `level` is a FLOOR, not an equality test: asking for warnings
-            // should not hide the errors above them.
+            // `level` is a floor, not equality: asking for warnings must not hide errors.
             let serious = read(
                 "panel1",
                 &ReadQuery {
@@ -1150,8 +1060,8 @@ mod tests {
 
     #[test]
     fn the_record_cap_is_enforced_without_waiting_for_the_byte_cap() {
-        // Triggering on size alone meant a log of small records ran tens of
-        // thousands of lines past the record cap before anything trimmed it.
+        // Triggering on size alone let a log of small records run tens of thousands of lines past
+        // the record cap.
         with_temp_state("ring-records", || {
             let caps = LogCaps {
                 ring_records: 20,
@@ -1204,7 +1114,6 @@ mod tests {
                 },
             )
             .unwrap();
-            // Whatever survived is the TAIL: the newest record is still there.
             assert_eq!(out.last().unwrap()["text"], "line200");
             assert!(out.len() < 200);
         });
@@ -1220,8 +1129,6 @@ mod tests {
             assert!(
                 !append_console("panel1", console_at(1, ConsoleLevel::Log, "x"), &caps).unwrap()
             );
-            // Nothing was written, so a caller treating `false` as success
-            // would be silently under-reporting.
             assert!(read("panel1", &ReadQuery::default()).unwrap().is_empty());
         });
     }

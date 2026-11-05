@@ -30,8 +30,7 @@ fn default_opacity() -> f64 {
     0.95
 }
 
-/// Image extensions scanned when `[background] image` is a directory —
-/// the same set the retired `kitty-random-bg.sh` `find` used.
+/// Image extensions scanned when `[background] image` is a directory.
 fn default_extensions() -> Vec<String> {
     ["jpg", "jpeg", "png", "webp"]
         .iter()
@@ -70,12 +69,8 @@ pub struct TerminalConfig {
     #[serde(default = "default_font_size")]
     pub font_size: u32,
 
-    /// When the PTY child (typically the user's shell) exits, close
-    /// the owning pane → cascade up to tab + window if it was the
-    /// last pane / tab. `false` keeps the dead-PTY viewport visible
-    /// so the user can read the exit message; they must close the
-    /// pane manually (Cmd+W / Ctrl+Shift+W). Default `true` matches
-    /// the long-standing Linux behavior pre-config.
+    /// Close the owning pane (cascading to tab and window) when the PTY child exits. `false`
+    /// keeps the dead viewport visible so the exit message can be read; close it manually.
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
 
@@ -85,33 +80,30 @@ pub struct TerminalConfig {
     #[serde(default = "default_true")]
     pub kitty_keyboard: bool,
 
-    /// Lines of history each pane keeps. Every kept line costs its full width in memory on
-    /// macOS (alacritty stores cells: a 200-column line is ~4.8 KB), so this is the main lever
-    /// on a busy pane's footprint; VTE on Linux compresses history and pays far less. Any
-    /// integer is accepted and clamped to 0..=100 000. Lowering it on a running copad drops
-    /// the oldest lines for good.
+    /// Lines of history per pane. On macOS every kept line costs its full width (alacritty
+    /// stores cells: a 200-column line is ~4.8 KB), so this is the main memory lever; VTE on
+    /// Linux compresses history. Any integer is accepted and clamped to 0..=100 000. Lowering
+    /// it on a running copad drops the oldest lines for good.
     #[serde(
         default = "default_scrollback",
         deserialize_with = "deserialize_scrollback"
     )]
     pub scrollback: usize,
 
-    /// Let programs draw images in the terminal (sixel on Linux, the kitty graphics protocol on
-    /// macOS) — what yazi and `kitten icat` use for previews. `false` makes the terminal ignore
-    /// image sequences and stop advertising support, so programs fall back to text.
+    /// Let programs draw images in the terminal (sixel on Linux, kitty graphics on macOS), as
+    /// yazi and `kitten icat` do. `false` ignores image sequences and stops advertising support.
     #[serde(default = "default_true")]
     pub images: bool,
 }
 
-/// The most scrollback a pane may keep.
 pub const MAX_SCROLLBACK: usize = 100_000;
 
 fn default_scrollback() -> usize {
     10_000
 }
 
-/// Any integer, clamped — a negative or huge value means "none" / "as much as allowed", not a
-/// config error that would throw away every other setting.
+/// Any integer, clamped: a negative or huge value means "none" / "as much as allowed", not a
+/// config error that would discard every other setting.
 fn deserialize_scrollback<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<usize, D::Error> {
@@ -135,28 +127,23 @@ impl Default for TerminalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundConfig {
-    /// A single image file *or* a directory to pick random wallpapers
-    /// from — resolved by `stat` at use time, so one key covers both
-    /// (`path` is accepted as an alias; macOS's Swift config has always
-    /// taken both spellings). A directory makes this the rotation
-    /// source and `list` is not consulted.
+    /// A single image file or a directory to pick random wallpapers from, resolved by `stat` at
+    /// use time (`path` is an accepted alias, as in macOS's Swift config). A directory becomes
+    /// the rotation source and `list` is not consulted.
     #[serde(default, alias = "path")]
     pub image: Option<String>,
 
-    /// Explicit wallpaper list file (one path per line). Used when
-    /// `image` is unset or points at a plain file. Defaults to the
-    /// platform cache location when unset. This is what
-    /// `coctl background cache` writes.
+    /// Explicit wallpaper list file, one path per line, used when `image` is unset or a plain
+    /// file; defaults to the platform cache location. Written by `coctl background cache`.
     #[serde(default)]
     pub list: Option<String>,
 
-    /// Extensions treated as images when `image` is a directory.
-    /// Matched case-insensitively, with or without a leading dot.
+    /// Extensions treated as images when `image` is a directory, case-insensitive, with or
+    /// without a leading dot.
     #[serde(default = "default_extensions")]
     pub extensions: Vec<String>,
 
-    /// Descend into subdirectories when `image` is a directory.
-    /// Off by default (the retired rotation script was `-maxdepth 1`).
+    /// Descend into subdirectories when `image` is a directory. Off by default.
     #[serde(default)]
     pub recursive: bool,
 
@@ -169,10 +156,9 @@ pub struct BackgroundConfig {
     #[serde(default = "default_opacity")]
     pub opacity: f64,
 
-    /// Auto-rotation cadence in seconds for random wallpapers from the
-    /// configured source. 0 (default) disables the timer — manual
-    /// `background.next` keeps working either way. A static `image` is
-    /// applied at startup; the first rotation tick then takes over.
+    /// Auto-rotation cadence in seconds; 0 (default) disables the timer, and manual
+    /// `background.next` works either way. A static `image` is applied at startup, then the first
+    /// rotation tick takes over.
     #[serde(default)]
     pub rotate_interval: u64,
 }
@@ -193,8 +179,8 @@ impl Default for BackgroundConfig {
 }
 
 impl BackgroundConfig {
-    /// `image`, tilde-expanded. Whether it names a file or a directory is
-    /// decided by the caller at use time (it may not exist yet).
+    /// `image`, tilde-expanded. File vs directory is decided by the caller at use time (it may not
+    /// exist yet).
     pub fn source_path(&self) -> Option<PathBuf> {
         self.image
             .as_deref()
@@ -202,7 +188,6 @@ impl BackgroundConfig {
             .map(expand_tilde)
     }
 
-    /// `list`, tilde-expanded. `None` means "use the platform default".
     pub fn list_path(&self) -> Option<PathBuf> {
         self.list
             .as_deref()
@@ -211,9 +196,6 @@ impl BackgroundConfig {
     }
 }
 
-/// Expand a leading `~` / `~/` against `$HOME`. Only the leading segment —
-/// `~user` is left verbatim (we have no passwd lookup and a literal path
-/// beating a wrong guess is the safer failure).
 pub fn expand_tilde(raw: &str) -> PathBuf {
     let Some(rest) = raw.strip_prefix('~') else {
         return PathBuf::from(raw);
@@ -227,32 +209,23 @@ pub fn expand_tilde(raw: &str) -> PathBuf {
     }
 }
 
-/// `[window]` — window-level transparency / blur. Distinct from
-/// `[background]` (which only affects the optional background-image
-/// layer); these knobs control the window itself so the desktop /
-/// blurred surface behind it shows through the terminal (Ghostty
-/// model). `blur` is macOS-only (NSVisualEffectView); Linux ignores it.
+/// `[window]`: window-level transparency and blur, distinct from `[background]` (the optional
+/// image layer). `blur` is macOS-only (NSVisualEffectView); Linux ignores it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowConfig {
-    /// 0.0 = fully transparent, 1.0 = fully opaque. Clamped at read
-    /// time (`load_from`-side callers should normalize; the field
-    /// here trusts the parse).
+    /// 0.0 fully transparent to 1.0 fully opaque. Not clamped here; callers normalize.
     #[serde(default = "default_window_opacity")]
     pub opacity: f64,
 
-    /// macOS-only. When true and `opacity < 1.0`, the window installs
-    /// an `NSVisualEffectView` behind the content view so the desktop
-    /// behind is blurred (Ghostty `background-blur-radius` equivalent).
-    /// No-op on Linux today; the key is accepted for cross-platform
-    /// config parity so the same config.toml works on both.
+    /// macOS-only: with `opacity < 1.0`, installs an `NSVisualEffectView` behind the content so
+    /// the desktop is blurred. A no-op on Linux; the key is accepted so one config.toml works on
+    /// both.
     #[serde(default = "default_window_blur")]
     pub blur: bool,
 
-    /// Solid base color for the window backdrop (`#rrggbb`). `opacity`
-    /// is this color's alpha, so it is the fraction of the color that
-    /// stays "maintained" over the desktop — a dark value keeps text
-    /// readable on a bright wallpaper. Defaults to the theme background
-    /// when unset. Linux-only today (macOS uses the theme background).
+    /// Solid base color for the window backdrop (`#rrggbb`); `opacity` is its alpha, so a dark
+    /// value keeps text readable on a bright wallpaper. Defaults to the theme background.
+    /// Linux-only (macOS uses the theme background).
     #[serde(default)]
     pub background: Option<String>,
 }
@@ -283,13 +256,10 @@ impl Default for ThemeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabsConfig {
-    /// Tab bar position: "top", "bottom", "left", "right"
     #[serde(default = "default_tab_position")]
     pub position: String,
-    /// Width of vertical tabs in pixels (left/right position)
     #[serde(default = "default_tab_width")]
     pub width: u32,
-    /// Whether the tab bar starts collapsed (icon-only). Default: true
     #[serde(default = "default_true")]
     pub collapsed: bool,
 }
@@ -318,13 +288,10 @@ fn default_statusbar_position() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusBarConfig {
-    /// Whether the status bar is enabled. Default: true
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Position: "top" or "bottom". Default: "bottom"
     #[serde(default = "default_statusbar_position")]
     pub position: String,
-    /// Height in pixels. Default: 28
     #[serde(default = "default_statusbar_height")]
     pub height: u32,
 }
@@ -341,12 +308,10 @@ impl Default for StatusBarConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KeybindingsConfig {
-    /// Key combo → command mapping, e.g. "ctrl+shift+g" = "spawn:~/script.sh --arg"
     #[serde(flatten)]
     pub map: HashMap<String, String>,
 }
 
-/// Parsed keybinding ready for matching
 #[derive(Debug, Clone)]
 pub struct ParsedKeybinding {
     pub ctrl: bool,
@@ -357,7 +322,6 @@ pub struct ParsedKeybinding {
 }
 
 impl KeybindingsConfig {
-    /// Parse all keybinding entries into structured form
     pub fn parse(&self) -> Vec<ParsedKeybinding> {
         self.map
             .iter()
@@ -403,29 +367,20 @@ fn default_secret_confirm() -> String {
     "once".to_string()
 }
 
-/// `[browser]` — the webview panes' behaviour. See
-/// `docs/browser-workbench-plan.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserConfig {
-    /// How much of a live URL may be persisted: `origin` (default) | `url` |
-    /// `full`. **`url` and `full` are sensitive persistence** — the token
-    /// denylist cannot save a `/reset/<token>` path, and mode 0600 is no
-    /// defence against an agent running as the same user. See
-    /// `browser::restore::RestorePolicy`.
+    /// How much of a live URL may be persisted: `origin` (default) | `url` | `full`. `url` and
+    /// `full` are sensitive persistence; see `browser::restore::RestorePolicy`.
     #[serde(default = "default_restore_policy")]
     pub restore: String,
-    /// Profile whose data store new browser panes use. `default` maps onto the
-    /// platform's PRE-EXISTING default store; any other name starts logged out
-    /// (see `browser::profile`).
+    /// Profile whose data store new browser panes use. `default` maps onto the platform's
+    /// pre-existing default store; any other name starts logged out (see `browser::profile`).
     #[serde(default = "default_profile")]
     pub profile: String,
-    /// `once` (default) = confirm a credential fill once per (origin,
-    /// credential) per app run; `always` = every time.
+    /// `once`: confirm a credential fill once per (origin, credential) per app run; `always`:
+    /// every time.
     #[serde(default = "default_secret_confirm")]
     pub secret_confirm: String,
-    /// Capture request/response bodies in the network log. Off by default —
-    /// bodies are the most likely place for a secret to end up in a file the
-    /// agent can read.
     #[serde(default)]
     pub capture_bodies: bool,
 }
@@ -446,9 +401,8 @@ impl Default for BrowserConfig {
 }
 
 impl BrowserConfig {
-    /// Parse `restore`, falling back to the safe default on an unknown value
-    /// rather than failing the whole config load — a typo must never silently
-    /// escalate what reaches disk, and must never brick startup either.
+    /// Falls back to the safe default on an unknown value: a typo must neither escalate what
+    /// reaches disk nor brick startup.
     pub fn restore_policy(&self) -> crate::browser::RestorePolicy {
         crate::browser::RestorePolicy::parse(&self.restore).unwrap_or_default()
     }
@@ -491,23 +445,17 @@ pub struct CopadConfig {
     #[serde(default)]
     pub keybindings: KeybindingsConfig,
 
-    /// Declarative event → action automation. See `docs/workflow-runtime.md`.
     #[serde(default)]
     pub triggers: Vec<Trigger>,
 
-    /// Project entries — see `docs/project-orchestration.md` § Project entity
-    /// + git_remote resolution. Phase 22.2+.
     #[serde(default)]
     pub projects: Vec<crate::project::Project>,
 }
 
 impl CopadConfig {
-    /// `$XDG_CONFIG_HOME/copad/config.toml`, else `~/.config/copad/
-    /// config.toml`. macOS deliberately overrides `dirs::config_dir()`
-    /// (which would point at `~/Library/Application Support/`) so the
-    /// Swift renderer (which hardcodes `~/.config/copad/`), the Rust
-    /// daemon, and `coctl` all load the same file — and users with
-    /// XDG-style dotfiles repos see their config on macOS too.
+    /// `$XDG_CONFIG_HOME/copad/config.toml`, else `~/.config/copad/config.toml`. macOS overrides
+    /// `dirs::config_dir()` so the Swift renderer (which hardcodes `~/.config/copad/`), the Rust
+    /// daemon and `coctl` load the same file.
     pub fn config_path() -> PathBuf {
         Self::config_dir().join("copad").join("config.toml")
     }
@@ -531,12 +479,10 @@ impl CopadConfig {
         Self::load_from(&Self::config_path())
     }
 
-    /// First-start loader for the GUI: on a parse/IO error, fall back to built-in defaults but
-    /// return a human-readable warning so the caller can surface it loudly (desktop-entry launches
-    /// hide stderr, so a typo in `config.toml` would otherwise silently discard the whole user
-    /// config). Distinct from [`load`](Self::load), which propagates the error, and from the
-    /// hot-reload path, which keeps the already-running config rather than resetting to defaults.
-    /// A missing file is the normal first-run state and yields `(default, None)`.
+    /// First-start loader for the GUI: on a parse/IO error, falls back to defaults and returns a
+    /// warning to surface loudly (desktop-entry launches hide stderr, so a typo would otherwise
+    /// silently discard the whole config). Unlike [`load`](Self::load) it does not propagate the
+    /// error. A missing file is the normal first run and yields `(default, None)`.
     pub fn load_or_default_warning() -> (Self, Option<String>) {
         Self::load_or_default_warning_from(&Self::config_path())
     }
@@ -555,11 +501,8 @@ impl CopadConfig {
         }
     }
 
-    /// Path-taking loader. Daemon config watcher uses this with a
-    /// monitored path; tests use it with an isolated tempfile.
-    /// Returns the default config when the path doesn't exist
-    /// (matches `load()`'s contract — first-run users have no file
-    /// yet and we don't want startup to fail).
+    /// Path-taking loader (daemon config watcher, isolated tests). A missing file yields the
+    /// default config, like `load()`, so first run doesn't fail startup.
     pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -668,7 +611,6 @@ mod tests {
             parse("[terminal]\nscrollback = 2000").unwrap().scrollback,
             2_000
         );
-        // Out of range clamps instead of failing the whole config (and losing the font).
         let t = parse("[terminal]\nscrollback = -5\nfont_size = 17").unwrap();
         assert_eq!((t.scrollback, t.font_size), (0, 17));
         assert_eq!(
@@ -677,7 +619,6 @@ mod tests {
                 .scrollback,
             MAX_SCROLLBACK
         );
-        // Not an integer is a type error, like any other field.
         assert!(parse("[terminal]\nscrollback = \"lots\"").is_err());
     }
 
@@ -717,9 +658,8 @@ close_on_exit = false
 
     #[test]
     fn background_accepts_path_as_an_alias_for_image() {
-        // macOS's Swift config has always taken both spellings; the Rust
-        // side must agree or the same config.toml behaves differently per
-        // platform.
+        // macOS's Swift config takes both spellings; Rust must agree or one config.toml behaves
+        // differently per platform.
         let dir = tmp_dir();
         let path = dir.join("config.toml");
         std::fs::write(
@@ -751,8 +691,7 @@ path = "/wallpapers"
         assert_eq!(cfg.source_path(), Some(home.join("wallpapers")));
         assert_eq!(cfg.list_path(), Some(home.join(".cache/list.txt")));
 
-        // An empty string is "unset", not "the home directory" — otherwise
-        // `image = ""` would silently make $HOME the wallpaper source.
+        // An empty string is "unset", not the home directory.
         let blank = BackgroundConfig {
             image: Some(String::new()),
             list: Some(String::new()),
@@ -765,7 +704,6 @@ path = "/wallpapers"
     #[test]
     fn expand_tilde_leaves_non_leading_and_named_tildes_alone() {
         assert_eq!(expand_tilde("/a/~/b"), PathBuf::from("/a/~/b"));
-        // No passwd lookup available — a literal path beats a wrong guess.
         assert_eq!(expand_tilde("~other/pics"), PathBuf::from("~other/pics"));
         assert_eq!(expand_tilde("relative/dir"), PathBuf::from("relative/dir"));
     }
@@ -773,8 +711,7 @@ path = "/wallpapers"
     #[test]
     fn background_defaults_keep_the_pre_directory_source_behavior() {
         let cfg = BackgroundConfig::default();
-        // Directory scanning must be opt-in: an existing install with only
-        // `image = "/some.jpg"` must not start recursing anything.
+        // Directory scanning is opt-in: an existing `image = "/some.jpg"` must not start recursing.
         assert!(!cfg.recursive);
         assert_eq!(cfg.list, None);
         assert_eq!(cfg.extensions, vec!["jpg", "jpeg", "png", "webp"]);
@@ -782,10 +719,8 @@ path = "/wallpapers"
 
     #[test]
     fn window_config_defaults_when_section_absent() {
-        // Default-constructed `CopadConfig` (no config file present) must
-        // give `opacity = 1.0` so the macOS / Linux window stays opaque
-        // for users who never opt in. Regression guard: a future
-        // refactor that changes the `Default` derive must keep this.
+        // No config file must give `opacity = 1.0` so windows stay opaque for users who never
+        // opt in.
         let cfg = CopadConfig::default();
         assert_eq!(cfg.window.opacity, 1.0);
         assert!(!cfg.window.blur);
@@ -946,12 +881,10 @@ subpath = "apps/web"
         let path = dir.join("config.toml");
         std::fs::write(&path, "this is not valid toml = = =").expect("write");
         let (cfg, warning) = CopadConfig::load_or_default_warning_from(&path);
-        // Falls back to defaults (so the GUI still starts) ...
         assert_eq!(
             cfg.terminal.font_size,
             CopadConfig::default().terminal.font_size
         );
-        // ... but loudly: the warning names the offending file so the user can find it.
         let warning = warning.expect("a parse error must produce a warning");
         assert!(
             warning.contains("config.toml"),
@@ -964,8 +897,6 @@ subpath = "apps/web"
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }
-
-    // ---- [browser] ----
 
     #[test]
     fn browser_defaults_to_the_safe_restore_policy_and_the_platform_default_profile() {
@@ -987,8 +918,6 @@ subpath = "apps/web"
 
     #[test]
     fn a_typo_in_restore_falls_back_to_origin_rather_than_escalating() {
-        // A misspelled policy must never silently widen what reaches disk, and
-        // must never brick startup either.
         let c: CopadConfig = toml::from_str("[browser]\nrestore = \"ful\"\n").unwrap();
         assert_eq!(
             c.browser.restore_policy(),

@@ -1,41 +1,25 @@
 //! The credential boundary: metadata crosses the agent wire, secrets never do.
 //!
-//! The type an agent can see is [`CredentialRef`], and it has **no field that
-//! can hold secret material** — that is the point of it being a separate type
-//! rather than a struct with an `Option<String> password`. The secret itself
-//! lives only in the platform keychain, keyed by [`CredentialRef::id`], and
-//! travels from there into the page inside the GUI process. It appears in no
-//! request, no response, no event, and no log file.
+//! The agent-visible type is [`CredentialRef`], which has no field that can hold secret material.
+//! The secret lives only in the platform keychain, keyed by [`CredentialRef::id`], and travels
+//! into the page inside the GUI process; it appears in no request, response, event or log.
 //!
-//! ## Why a "seal" was rejected
+//! A "seal" (fill, then refuse read-back RPCs while the secret sits in the DOM) was rejected: the
+//! agent can install a listener before the fill that copies the value to `localStorage` and read
+//! the copy once the lock lifts, and no transition proves the secret is gone (cancelled submit,
+//! SPA swallowing the event, back-navigation). So a credential only enters a document automation
+//! was never in, [`TabMode::Protected`], which the GUI enters by destroying and rebuilding the
+//! web view.
 //!
-//! The first design filled the password and then refused read-back RPCs while
-//! it sat in the DOM. Codex (plan r2-C1/C2) showed that guarantees nothing: the
-//! agent can install a listener *before* the fill that copies the value into
-//! `localStorage`, and read the copy the moment the lock lifts. Nor does any
-//! transition prove the secret is gone — a cancelled submit, an SPA that
-//! swallows the event, or a back-navigation all leave it recoverable.
-//!
-//! So a credential only ever enters a document that automation was never in:
-//! [`TabMode::Protected`], which the GUI enters by **destroying and rebuilding
-//! the web view**. No script from the previous document survives that.
-//!
-//! ## What this module does and does not promise
-//!
-//! Promises: the secret never crosses the agent boundary, and no agent-installed
-//! script is present in the document holding it.
-//!
-//! Does not promise: safety from a page that is *itself* hostile. A malicious
-//! login page exfiltrates whatever is typed into it, by hand or by copad. True
-//! of every browser, out of scope here.
+//! Promised: the secret never crosses the agent boundary, and no agent-installed script is in
+//! the document holding it. Not promised: safety from a page that is itself hostile.
 
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::ResponseError;
 
-/// Which field of a login form a credential fills. A password credential may
-/// only ever be written into an `<input type="password">`; the check lives in
-/// [`validate_fill`] so both GUIs inherit it.
+/// Which field of a login form a credential fills. A password credential may only be written
+/// into an `<input type="password">`; the check lives in [`validate_fill`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialSlot {
@@ -43,14 +27,11 @@ pub enum CredentialSlot {
     Password,
 }
 
-/// **Metadata only.** This is what crosses the RPC boundary, and therefore what
-/// an agent can see. Adding a secret-bearing field here would silently undo the
-/// entire design.
+/// Metadata only: this crosses the RPC boundary and is what an agent can see. A secret-bearing
+/// field here would undo the whole design.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CredentialRef {
-    /// Stable keychain key, e.g. `github.com/marshallku`.
     pub id: String,
-    /// Exact origin this credential may be filled into, `scheme://host[:port]`.
     pub origin: String,
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,37 +43,31 @@ pub struct CredentialRef {
     pub last_used: Option<u64>,
 }
 
-/// Whether a tab currently admits automation.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TabMode {
-    /// Agent RPCs are served. The default.
     #[default]
     Automation,
-    /// Freshly rebuilt web view, no agent script present, no capture installed.
-    /// Agent *reads* are refused; credential fills are allowed.
+    /// Freshly rebuilt web view, no agent script present, no capture installed. Agent reads are
+    /// refused; credential fills are allowed.
     Protected,
 }
 
-/// A tab's live state as the dispatcher sees it when authorizing a call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabState {
     pub tab_id: String,
     pub profile: String,
     pub mode: TabMode,
     pub origin: String,
-    /// Bumped by the GUI on every main-frame commit and on every mode change.
-    /// This is what binds an authorization to a document rather than an origin.
+    /// Bumped on every main-frame commit and mode change; binds an authorization to a document
+    /// rather than an origin.
     pub document_generation: u64,
 }
 
-/// An in-flight `browser.secret.fill`, captured at approval time and
-/// re-validated at injection time.
-///
-/// An origin check taken *before* an async keychain read is insufficient — the
-/// tab can navigate mid-flight (codex plan r2-C2). Every field here is compared
-/// again against the live [`TabState`] immediately before the value touches the
-/// page; any mismatch aborts and the secret is dropped without being written.
+/// An in-flight `browser.secret.fill`, captured at approval time and re-validated at injection
+/// time. The tab can navigate during the async keychain read, so every field is compared again
+/// against the live [`TabState`] right before the value touches the page; any mismatch aborts and
+/// the secret is dropped unwritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillRequest {
     pub credential_id: String,
@@ -103,24 +78,16 @@ pub struct FillRequest {
     pub slot: CredentialSlot,
 }
 
-/// The target element **as observed right now**, in the same synchronous step
-/// that will perform the injection.
+/// The target element as observed right now, in the same synchronous step that performs the
+/// injection. Deliberately not a field of [`FillRequest`]: a value captured at approval time is
+/// stale after the keychain read, and a page can swap the element or flip its `type` without a
+/// navigation, leaving `document_generation` unchanged.
 ///
-/// This is deliberately NOT a field of [`FillRequest`]: a value captured at
-/// approval time is stale by the time the keychain read returns, and a page can
-/// swap the element or flip its `type` without any navigation — so
-/// `document_generation` would not change and a stale "yes, it's a password
-/// input" would still validate (codex review C1).
-///
-/// **Platform contract:** observe the element, call [`validate_fill`], and write
-/// the value into *that same element*, with no `await` between the three. A GUI
-/// that probes the DOM, awaits anything, and then injects has reintroduced the
-/// bug this type exists to prevent.
+/// Platform contract: observe the element, call [`validate_fill`], and write into that same
+/// element with no `await` between the three.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveTarget {
-    /// Selector the value will actually be written to.
     pub selector: String,
-    /// Whether that element is an `<input type="password">` right now.
     pub is_password_input: bool,
 }
 
@@ -131,12 +98,10 @@ fn err(code: &str, message: impl Into<String>) -> ResponseError {
     }
 }
 
-/// Re-validate a fill immediately before injection.
-///
-/// Enforces, in order: the tab still exists in the same profile, it is still
-/// `Protected`, the document has not changed under us, the origin matches the
-/// credential *exactly* (no subdomain or scheme widening), and a password
-/// credential is going into a password input.
+/// Re-validate a fill immediately before injection. Enforces, in order: the tab still exists in
+/// the same profile, it is still `Protected`, the document has not changed, the origin matches
+/// the credential exactly (no subdomain or scheme widening), and a password credential goes into
+/// a password input.
 pub fn validate_fill(
     req: &FillRequest,
     cred: &CredentialRef,
@@ -149,12 +114,9 @@ pub fn validate_fill(
             "request does not name this credential",
         ));
     }
-    // The approval captured an origin and a slot. Re-check both against the
-    // credential as it stands NOW: the index is a file, and a credential's
-    // metadata could have been rewritten between approval and injection —
-    // turning a `Username` the user approved into a `Password` that would then
-    // be injected on the strength of an approval for something else (codex
-    // review C2).
+    // Re-check the approval's origin and slot against the credential as it stands NOW: the index
+    // is a file, and a rewrite between approval and injection could turn an approved `Username`
+    // into a `Password` injected on the strength of an approval for something else.
     if !origin_matches(&req.origin, &cred.origin) {
         return Err(err(
             "approval_mismatch",
@@ -203,33 +165,25 @@ pub fn validate_fill(
     Ok(())
 }
 
-/// Exact, case-insensitive origin equality. Deliberately NOT a suffix or
-/// subdomain match: `https://evil.github.com` must not receive a credential
-/// bound to `https://github.com`, and `http://` must not receive one bound to
-/// `https://`.
+/// Exact, case-insensitive origin equality, deliberately not a suffix or subdomain match:
+/// `https://evil.github.com` must not get a credential bound to `https://github.com`, nor
+/// `http://` one bound to `https://`.
 pub fn origin_matches(credential_origin: &str, tab_origin: &str) -> bool {
     !credential_origin.is_empty()
         && !tab_origin.is_empty()
         && credential_origin.eq_ignore_ascii_case(tab_origin)
 }
 
-/// Index of known credentials. Holds no secret material (that is in the
-/// keychain), but is still written 0600 because the set of sites you have
-/// accounts on is itself worth protecting.
 pub fn credential_index_path() -> std::path::PathBuf {
     crate::paths::state_dir()
         .join("browser")
         .join("credentials.json")
 }
 
-/// Error returned when the platform keychain is unavailable.
-///
-/// There is **no plaintext fallback** (codex plan r2-C4). Decision #54's
-/// plaintext store exists for revocable Slack bot tokens read by a background
-/// plugin; a user's website passwords are neither revocable in one click nor
-/// low-value, and a 0600 file is readable by the very same-user agent this
-/// module exists to keep them away from. An unavailable backend disables the
-/// feature rather than downgrading it.
+/// Error returned when the platform keychain is unavailable. There is no plaintext fallback:
+/// decision #54's plaintext store is for revocable Slack bot tokens, whereas website passwords
+/// are not revocable in one click and a 0600 file is readable by the same-user agent this module
+/// keeps them from. An unavailable backend disables the feature rather than downgrading it.
 pub fn backend_unavailable(detail: &str) -> ResponseError {
     err(
         "secret_backend_unavailable",
@@ -237,12 +191,8 @@ pub fn backend_unavailable(detail: &str) -> ResponseError {
     )
 }
 
-/// The credential index — metadata only, on disk.
-///
-/// Separate from the secret material by construction: this file is a list of
-/// [`CredentialRef`], and that type has no field that can hold a secret. It is
-/// still `0600`, because the set of sites you have accounts on is itself worth
-/// protecting.
+/// The credential index on disk: a list of [`CredentialRef`], so no secret material by
+/// construction. Still `0600`, because the set of sites you have accounts on is worth protecting.
 pub fn load_index() -> Vec<CredentialRef> {
     let path = credential_index_path();
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -254,9 +204,8 @@ pub fn load_index() -> Vec<CredentialRef> {
     })
 }
 
-/// Replace the index. temp → rename, so a crash mid-write cannot leave a
-/// truncated list that would silently "forget" credentials whose secrets are
-/// still sitting in the keychain.
+/// Replace the index via temp + rename, so a crash cannot leave a truncated list that silently
+/// "forgets" credentials whose secrets are still in the keychain.
 pub fn save_index(entries: &[CredentialRef]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -289,7 +238,6 @@ pub fn save_index(entries: &[CredentialRef]) -> Result<(), String> {
     })
 }
 
-/// Add or replace an entry, keyed by `id`.
 pub fn upsert(entry: CredentialRef) -> Result<Vec<CredentialRef>, String> {
     let mut all = load_index();
     all.retain(|c| c.id != entry.id);
@@ -299,9 +247,8 @@ pub fn upsert(entry: CredentialRef) -> Result<Vec<CredentialRef>, String> {
     Ok(all)
 }
 
-/// Forget an entry. Returns whether one was there. The caller deletes the
-/// secret from the keychain FIRST — an index entry removed while its secret
-/// survives is an orphan nothing can ever clean up.
+/// Forget an entry; returns whether one was there. The caller deletes the keychain secret FIRST,
+/// since an index entry removed while its secret survives is an orphan nothing can clean up.
 pub fn remove(id: &str) -> Result<bool, String> {
     let mut all = load_index();
     let before = all.len();
@@ -313,7 +260,6 @@ pub fn remove(id: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// Entries whose origin matches, or all of them when `origin` is None.
 pub fn list(origin: Option<&str>) -> Vec<CredentialRef> {
     let all = load_index();
     match origin {
@@ -325,10 +271,9 @@ pub fn list(origin: Option<&str>) -> Vec<CredentialRef> {
     }
 }
 
-/// A credential id must be usable as a keychain account string and must not be
-/// mistakable for a path. Deliberately permissive about the SHAPE (an id is
-/// conventionally `host/username`) but strict about control characters,
-/// whitespace and length.
+/// A credential id is a keychain account string and must not be mistakable for a path. Permissive
+/// about shape (conventionally `host/username`), strict about control characters, whitespace and
+/// length.
 pub fn is_valid_credential_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 256
@@ -404,7 +349,6 @@ mod tests {
 
     #[test]
     fn a_navigation_between_approval_and_injection_aborts_the_fill() {
-        // r2-C2: the tab navigated while the keychain read was in flight.
         let tab = live(TabMode::Protected, 5, "https://github.com");
         assert_eq!(
             validate_fill(&req(), &cred(), &tab, &target(true))
@@ -438,9 +382,8 @@ mod tests {
 
     #[test]
     fn a_password_will_not_go_into_a_non_password_input() {
-        // codex review C1: the check reads the element as it is NOW, so a page
-        // that swapped the input after approval — no navigation, so
-        // `document_generation` is unchanged — is still caught.
+        // The check reads the element as it is NOW, so a page that swapped the input after
+        // approval (no navigation, so `document_generation` is unchanged) is still caught.
         assert_eq!(
             validate_fill(&req(), &cred(), &ok_tab(), &target(false))
                 .unwrap_err()
@@ -460,9 +403,8 @@ mod tests {
 
     #[test]
     fn a_credential_rewritten_after_approval_is_refused() {
-        // codex review C2. The index was rewritten between approval and
-        // injection, so the captured approval no longer describes what would be
-        // injected.
+        // The index was rewritten between approval and injection, so the captured approval no
+        // longer describes what would be injected.
         let mut c = cred();
         c.slot = CredentialSlot::Username;
         assert_eq!(
@@ -510,8 +452,7 @@ mod tests {
 
     #[test]
     fn the_agent_facing_type_serializes_without_any_secret_field() {
-        // Guard against someone later adding a `password` field to the type that
-        // is, by definition, what the agent gets to see.
+        // Guards against someone adding a `password` field to the type the agent sees.
         let json = serde_json::to_string(&cred()).unwrap();
         for forbidden in ["password", "secret", "value", "token"] {
             assert!(
@@ -523,17 +464,14 @@ mod tests {
 
     #[test]
     fn the_approval_type_cannot_carry_a_stale_target_observation() {
-        // codex review C1 as a structural guard: `FillRequest` is the approval
-        // and must not hold anything about the element, or a GUI could pass a
-        // value captured before the keychain await.
+        // `FillRequest` is the approval and must not hold anything about the element, or a GUI
+        // could pass a value captured before the keychain await.
         let debug = format!("{:?}", req());
         assert!(
             !debug.contains("password_input"),
             "FillRequest must not carry a target observation: {debug}"
         );
     }
-
-    // ---- the credential index ----
 
     fn with_temp_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _guard = super::super::TEST_ENV_LOCK
@@ -544,13 +482,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let prev_home = std::env::var("HOME").ok();
         let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: TEST_ENV_LOCK serializes every test that touches these vars.
         unsafe {
             std::env::set_var("HOME", &root);
             std::env::set_var("XDG_STATE_HOME", root.join("state"));
         }
         let out = f();
-        // SAFETY: still holding the lock.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
@@ -572,10 +508,9 @@ mod tests {
             let all = load_index();
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].id, "github.com/marshallku");
-            // The guard that matters: whatever reaches disk cannot carry the
-            // password, because the TYPE cannot. Checked against the object's
-            // KEYS, not a substring — `slot: "password"` is the field NAME a
-            // credential fills and is exactly right to persist.
+            // Whatever reaches disk cannot carry the password because the TYPE cannot. Checked
+            // against the object's keys, not a substring: `slot: "password"` is a field name and
+            // is right to persist.
             let raw = std::fs::read_to_string(credential_index_path()).unwrap();
             let parsed: Vec<serde_json::Map<String, serde_json::Value>> =
                 serde_json::from_str(&raw).expect("index is a JSON array of objects");
@@ -633,9 +568,8 @@ mod tests {
 
             assert_eq!(list(None).len(), 2);
             assert_eq!(list(Some("https://github.com")).len(), 1);
-            // Exact, never a suffix match — the same rule the fill validator
-            // enforces, so listing cannot suggest a credential that could not
-            // then be filled.
+            // Exact, never a suffix match, same as the fill validator, so listing cannot suggest
+            // a credential that could not then be filled.
             assert!(list(Some("https://evil.github.com")).is_empty());
         });
     }
