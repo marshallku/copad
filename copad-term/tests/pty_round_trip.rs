@@ -123,7 +123,8 @@ fn null_destroy_no_op() {
 }
 
 /// A shell that ignores SIGHUP must not block `copad_term_destroy` in `waitpid`: the app calls it
-/// on the main thread.
+/// on the main thread. The SIGKILL escalation is macOS-only, like the app that links this crate.
+#[cfg(target_os = "macos")]
 #[test]
 fn destroy_does_not_wait_for_a_shell_that_ignores_sighup() {
     let shell = CString::new("/bin/sh").unwrap();
