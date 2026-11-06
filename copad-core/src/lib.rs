@@ -1,5 +1,4 @@
 pub mod action_registry;
-pub mod agent_cockpit;
 pub mod background;
 pub mod browser;
 pub mod condition;
@@ -9,8 +8,6 @@ pub mod design_grab;
 pub mod error;
 pub mod event_bus;
 pub mod fs_atomic;
-pub mod graph_bridge;
-pub mod muxhost;
 pub mod notifier;
 pub mod paths;
 pub mod plugin;
@@ -22,3 +19,6 @@ pub mod theme;
 pub mod thread_pool;
 pub mod trigger;
 pub mod workflow;
+
+// Moved to the comux-host crate (shared with AIDE); the paths stay.
+pub use comux_host::{agent_cockpit, graph_bridge, muxhost};

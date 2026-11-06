@@ -12,6 +12,7 @@ name = "copad_ffi"
 crate-type = ["staticlib"]
 
 [dependencies]
+comux-host = { path = "../comux-host" }
 serde_json = "1"
 copad-core = { path = "../copad-core" }
 copad-mux-proto = { path = "../copad-mux-proto" }

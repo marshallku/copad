@@ -1,0 +1,15 @@
+[package]
+name = "comux-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The host side of comux's L0 API (decisions #166): a GUI that draws comux's chrome natively (sidebar, notifications, overlays, the work graph) — copad and AIDE — keeps its state here, with a C ABI for Swift."
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde_json = "1"
+copad-mux-proto = { path = "../copad-mux-proto" }
+copad-graph-web = { path = "../copad-graph-web" }
