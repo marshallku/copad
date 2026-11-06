@@ -2545,9 +2545,6 @@ pub unsafe extern "C" fn copad_term_encode_key(
         let mode = *term.mode();
         (kitty_flags(mode), mode.contains(TermMode::APP_CURSOR))
     };
-    if flags == 0 {
-        return COPAD_KEY_TEXT;
-    }
     let unmodified = unsafe { ffi_str(input.unmodified, input.unmodified_len) };
     let shifted = unsafe { ffi_str(input.shifted, input.shifted_len) };
     let text = unsafe { ffi_str(input.text, input.text_len) };
@@ -2570,6 +2567,12 @@ pub unsafe extern "C" fn copad_term_encode_key(
         },
         text,
     };
+    // Protocol off: only keys without text get their legacy form here (arrows in DECCKM's, Home,
+    // F5 as `CSI 15 ~`, Shift+Tab as `CSI Z`). Everything else — text, Ctrl letters, Option
+    // chords the host maps to readline's `ESC b` — stays the host's.
+    if flags == 0 && !legacy_functional(&ev) {
+        return COPAD_KEY_TEXT;
+    }
     match copad_keys::encode(&ev, flags, app_cursor) {
         copad_keys::Encoded::Text => COPAD_KEY_TEXT,
         copad_keys::Encoded::Nothing => COPAD_KEY_NOTHING,
@@ -2584,6 +2587,22 @@ pub unsafe extern "C" fn copad_term_encode_key(
             }
             COPAD_KEY_BYTES
         }
+    }
+}
+
+/// A key `copad_term_encode_key` encodes even with the kitty protocol off: no text, and no Option
+/// (the host maps Option+arrows to readline's word moves).
+fn legacy_functional(ev: &copad_keys::KeyEvent) -> bool {
+    use copad_keys::Key;
+    if ev.mods & copad_keys::mods::ALT != 0 || ev.action == copad_keys::Action::Release {
+        return false;
+    }
+    match ev.key {
+        Key::Left | Key::Right | Key::Up | Key::Down => true,
+        Key::Home | Key::End | Key::PageUp | Key::PageDown | Key::Insert | Key::Delete => true,
+        Key::F(_) => true,
+        Key::Tab => ev.mods & copad_keys::mods::SHIFT != 0,
+        _ => false,
     }
 }
 

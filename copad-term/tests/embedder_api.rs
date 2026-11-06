@@ -174,3 +174,56 @@ fn null_handles_are_safe() {
         assert_eq!(copad_term_child_pid(std::ptr::null_mut()), -1);
     }
 }
+
+/// What `copad_term_encode_key` makes of a key: Some(bytes), or None for "the host's" (text).
+fn encode(
+    handle: *mut CopadHandle,
+    key_code: u16,
+    mods: u8,
+    unmodified: &str,
+    text: &str,
+) -> Option<Vec<u8>> {
+    let input = CopadKeyInput {
+        key_code,
+        mods,
+        action: 0,
+        unmodified: unmodified.as_ptr(),
+        unmodified_len: unmodified.len(),
+        shifted: unmodified.as_ptr(),
+        shifted_len: unmodified.len(),
+        text: text.as_ptr(),
+        text_len: text.len(),
+    };
+    let mut out = [0u8; 64];
+    let mut len = 0;
+    match unsafe { copad_term_encode_key(handle, &input, out.as_mut_ptr(), out.len(), &mut len) } {
+        COPAD_KEY_BYTES => Some(out[..len].to_vec()),
+        COPAD_KEY_TEXT => None,
+        other => panic!("unexpected encode result {other}"),
+    }
+}
+
+#[test]
+#[ignore]
+fn keys_without_text_get_their_legacy_form_with_the_protocol_off() {
+    let handle = spawn(&[], &[]);
+    // macOS virtual key codes.
+    assert_eq!(encode(handle, 126, 0, "", ""), Some(b"\x1b[A".to_vec()));
+    assert_eq!(encode(handle, 115, 0, "", ""), Some(b"\x1b[H".to_vec()));
+    assert_eq!(encode(handle, 116, 0, "", ""), Some(b"\x1b[5~".to_vec()));
+    assert_eq!(encode(handle, 117, 0, "", ""), Some(b"\x1b[3~".to_vec()));
+    assert_eq!(encode(handle, 96, 0, "", ""), Some(b"\x1b[15~".to_vec()));
+    assert_eq!(encode(handle, 48, 1, "\t", ""), Some(b"\x1b[Z".to_vec()));
+    assert_eq!(encode(handle, 123, 4, "", ""), Some(b"\x1b[1;5D".to_vec()));
+    // The host's: text, a plain Tab, Option+arrows (readline word moves).
+    assert_eq!(encode(handle, 0, 0, "a", "a"), None);
+    assert_eq!(encode(handle, 48, 0, "\t", "\t"), None);
+    assert_eq!(encode(handle, 123, 2, "", ""), None);
+    // DECCKM: application cursor keys.
+    send(handle, "printf '\\033[?1hck=1\\n'\n");
+    read_number(handle, "ck");
+    wait_until("DECCKM", 3_000, || {
+        encode(handle, 126, 0, "", "") == Some(b"\x1bOA".to_vec())
+    });
+    unsafe { copad_term_destroy(handle) };
+}
