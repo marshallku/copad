@@ -253,5 +253,49 @@ fn the_screen_reads_live_whatever_the_viewport_shows() {
     unsafe { copad_term_scroll(handle, 1, 0) };
     assert!(!screen(handle).contains("end=1"), "the viewport moved back");
     assert_eq!(screen_text(), live);
+    let (mut row, mut col) = (0u16, 0u16);
+    let s = unsafe { copad_term_screen_cells(handle, &mut row, &mut col) };
+    let mut len = 0;
+    let cells = String::from_utf8_lossy(unsafe {
+        std::slice::from_raw_parts(copad_string_bytes(s, &mut len), len)
+    })
+    .into_owned();
+    unsafe { copad_string_destroy(s) };
+    let rows: Vec<Vec<&str>> = cells
+        .split('\n')
+        .map(|r| r.split('\u{1f}').collect())
+        .collect();
+    assert_eq!(rows.len(), 24);
+    assert!(rows.iter().all(|r| r.len() == 80));
+    assert!(
+        rows.iter().any(|r| r.concat().starts_with("end=1")),
+        "live rows, not the scrolled view"
+    );
+    assert!((row as usize) < 24 && col < 80);
+    unsafe { copad_term_destroy(handle) };
+}
+
+#[test]
+#[ignore]
+fn a_wide_characters_second_cell_is_empty() {
+    let handle = spawn(&["LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8"], &[]);
+    send(handle, "printf 'w=\\352\\260\\200x\\n'\n");
+    wait_until("wide line", 3_000, || {
+        screen(handle).contains("w=\u{ac00}x")
+    });
+    let s = unsafe { copad_term_screen_cells(handle, std::ptr::null_mut(), std::ptr::null_mut()) };
+    let mut len = 0;
+    let cells = String::from_utf8_lossy(unsafe {
+        std::slice::from_raw_parts(copad_string_bytes(s, &mut len), len)
+    })
+    .into_owned();
+    unsafe { copad_string_destroy(s) };
+    let row: Vec<&str> = cells
+        .split('\n')
+        .find(|r| r.starts_with("w\u{1f}="))
+        .expect("the row")
+        .split('\u{1f}')
+        .collect();
+    assert_eq!(&row[..5], &["w", "=", "\u{ac00}", "", "x"]);
     unsafe { copad_term_destroy(handle) };
 }

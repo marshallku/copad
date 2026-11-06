@@ -2264,6 +2264,62 @@ pub unsafe extern "C" fn copad_term_screen_text(handle: *mut CopadHandle) -> *mu
     }))
 }
 
+/// The live screen cell by cell, whatever the viewport is scrolled to: each row's cells joined by
+/// U+001F, a wide character's spacer cell empty, rows joined by `\n`; `*cursor_row`/`*cursor_col`
+/// get the live cursor (screen coordinates). For hosts that read ranges of the screen without moving
+/// the user's scroll position. Free with `copad_string_destroy` exactly once.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle; the cursor pointers NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_screen_cells(
+    handle: *mut CopadHandle,
+    cursor_row: *mut u16,
+    cursor_col: *mut u16,
+) -> *mut CopadString {
+    use alacritty_terminal::term::cell::Flags;
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    let term = h.term.lock();
+    let grid = term.grid();
+    let (cols, rows) = (term.columns(), term.screen_lines());
+    let mut out = String::with_capacity(rows * cols * 2);
+    for row in 0..rows {
+        for col in 0..cols {
+            if col > 0 {
+                out.push('\u{1f}');
+            }
+            let cell = &grid[Point::new(Line(row as i32), Column(col))];
+            if !cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                out.push(if cell.c == '\0' { ' ' } else { cell.c });
+                if let Some(marks) = cell.zerowidth() {
+                    out.extend(marks.iter());
+                }
+            }
+        }
+        if row + 1 < rows {
+            out.push('\n');
+        }
+    }
+    let cursor = grid.cursor.point;
+    unsafe {
+        if !cursor_row.is_null() {
+            *cursor_row = cursor.line.0.max(0) as u16;
+        }
+        if !cursor_col.is_null() {
+            *cursor_col = cursor.column.0 as u16;
+        }
+    }
+    Box::into_raw(Box::new(CopadString {
+        data: out.into_bytes().into_boxed_slice(),
+    }))
+}
+
 fn read_screen_text(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     cols: usize,

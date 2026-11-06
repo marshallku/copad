@@ -203,6 +203,11 @@ CopadString* copad_term_history(CopadHandle* handle, size_t lines);
 /// characters' spacer cells left out. Free with copad_string_destroy.
 CopadString* copad_term_screen_text(CopadHandle* handle);
 
+/// The live screen cell by cell, whatever the viewport shows: a row's cells joined by U+001F (a
+/// wide character's spacer cell empty), rows by \n; *cursor_row/*cursor_col get the live cursor.
+/// Free with copad_string_destroy.
+CopadString* copad_term_screen_cells(CopadHandle* handle, uint16_t* cursor_row, uint16_t* cursor_col);
+
 const uint8_t* copad_string_bytes(const CopadString* s, size_t* out_len);
 void copad_string_destroy(CopadString* s);
 
