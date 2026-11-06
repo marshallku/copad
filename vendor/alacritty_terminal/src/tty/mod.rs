@@ -35,6 +35,11 @@ pub struct Options {
     /// Extra environment variables.
     pub env: HashMap<String, String>,
 
+    /// Variables the child must not inherit (copad patch: an embedder's own terminal identity,
+    /// e.g. `TMUX` when the app was started inside tmux). `env` is applied after, so a key in
+    /// both is set.
+    pub env_remove: Vec<String>,
+
     /// Specifies whether the Windows shell arguments should be escaped.
     ///
     /// - When `true`: Arguments will be escaped according to the standard C runtime rules.

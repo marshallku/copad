@@ -140,6 +140,13 @@ struct CopadListener {
     graphics: Arc<graphics::Shared>,
     /// Grid size in cells for `CSI 14 t` / `CSI 16 t` replies (alacritty gives only a formatter).
     grid_size: Arc<Mutex<(u16, u16)>>,
+    /// OSC 0/2 since the last `copad_term_take_title`: `Some(None)` is a reset. Last wins.
+    pending_title: Arc<std::sync::Mutex<Option<Option<String>>>>,
+    /// BEL since the last `copad_term_take_bell`.
+    bell: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once on `Event::ChildExit` and never cleared, unlike `child_exited`: after it the pid
+    /// may be reaped and reused, so `copad_term_child_pid` stops reporting it.
+    child_gone: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Catppuccin Mocha defaults, same as `copad_core::theme::Theme::default()`, duplicated as
@@ -182,6 +189,9 @@ impl CopadListener {
             child_exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             graphics: Arc::new(graphics::Shared::default()),
             grid_size: Arc::new(Mutex::new((1, 1))),
+            pending_title: Arc::new(std::sync::Mutex::new(None)),
+            bell: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            child_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -243,8 +253,12 @@ impl EventListener for CopadListener {
                 // Latch the flag; the renderer polls it and broadcasts `panel.exited`
                 // (`copad-core::context` clears per-panel cwd / active state on it). A latch is
                 // fine: ChildExit fires at most once per Term.
+                self.child_gone.store(true, Ordering::Relaxed);
                 self.child_exited.store(true, Ordering::Relaxed);
             }
+            Event::Title(title) => *self.pending_title.lock().unwrap() = Some(Some(title)),
+            Event::ResetTitle => *self.pending_title.lock().unwrap() = Some(None),
+            Event::Bell => self.bell.store(true, Ordering::Relaxed),
             // `CSI 14 t` / `CSI 16 t`: image tools size output with these. Only answered once
             // the host reported a cell size; a 1x1 answer would be worse than none.
             Event::TextAreaSizeRequest(format_reply)
@@ -253,8 +267,7 @@ impl EventListener for CopadListener {
                 self.send_to_pty(format_reply(self.window_size()).into_bytes());
             }
             _ => {
-                // Title / Bell / MouseCursorDirty / CursorBlinkingChange / Wakeup / Exit:
-                // intentionally dropped.
+                // MouseCursorDirty / CursorBlinkingChange / Wakeup / Exit: intentionally dropped.
             }
         }
     }
@@ -393,6 +406,82 @@ pub unsafe extern "C" fn copad_term_create(
     panel_id: *const c_char,
     socket_path: *const c_char,
 ) -> *mut CopadHandle {
+    unsafe { create_with(cols, rows, shell, cwd, panel_id, socket_path, &[], &[]) }
+}
+
+/// `copad_term_create` with a per-child environment for embedders: `set` holds `KEY=VALUE`
+/// pairs applied after copad's defaults (so a host's `TERM_PROGRAM` wins), `remove` keys the
+/// child must not inherit. No `COPAD_PANEL_ID` / `COPAD_SOCKET` are stamped. Entries that are
+/// not UTF-8, or `set` entries without `=`, are skipped.
+///
+/// # Safety
+///
+/// `shell`/`cwd` as for `copad_term_create`; `set` and `remove` point to `set_count` /
+/// `remove_count` valid C strings (or are NULL with a count of 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_create_env(
+    cols: u16,
+    rows: u16,
+    shell: *const c_char,
+    cwd: *const c_char,
+    set: *const *const c_char,
+    set_count: usize,
+    remove: *const *const c_char,
+    remove_count: usize,
+) -> *mut CopadHandle {
+    let set: Vec<(String, String)> = unsafe { c_strings(set, set_count) }
+        .into_iter()
+        .filter_map(|pair| {
+            pair.split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        })
+        .filter(|(k, _)| !k.is_empty())
+        .collect();
+    let remove = unsafe { c_strings(remove, remove_count) };
+    unsafe {
+        create_with(
+            cols,
+            rows,
+            shell,
+            cwd,
+            ptr::null(),
+            ptr::null(),
+            &set,
+            &remove,
+        )
+    }
+}
+
+/// # Safety
+///
+/// `list` points to `count` valid C strings, or `count` is 0.
+unsafe fn c_strings(list: *const *const c_char, count: usize) -> Vec<String> {
+    if list.is_null() || count == 0 {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(list, count) }
+        .iter()
+        .filter(|p| !p.is_null())
+        .filter_map(|&p| {
+            unsafe { CStr::from_ptr(p) }
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_with(
+    cols: u16,
+    rows: u16,
+    shell: *const c_char,
+    cwd: *const c_char,
+    panel_id: *const c_char,
+    socket_path: *const c_char,
+    set: &[(String, String)],
+    remove: &[String],
+) -> *mut CopadHandle {
     let safe_cols = cols.max(1);
     let safe_rows = rows.max(1);
 
@@ -445,6 +534,13 @@ pub unsafe extern "C" fn copad_term_create(
         && std::env::var_os("LC_CTYPE").is_none()
     {
         tty_opts.env.insert("LANG".into(), "C.UTF-8".into());
+    }
+    for key in remove {
+        tty_opts.env.remove(key);
+    }
+    tty_opts.env_remove = remove.to_vec();
+    for (key, value) in set {
+        tty_opts.env.insert(key.clone(), value.clone());
     }
     // May be NULL; alacritty then falls back to the system default shell.
     let shell_prog: Option<String> = if shell.is_null() {
@@ -606,8 +702,95 @@ pub unsafe extern "C" fn copad_term_destroy(handle: *mut CopadHandle) {
     // still sourcing rc files) would freeze the app. Same fix as comux's `PaneTerm::drop`.
     if let Some(jh) = handle.io_thread.take() {
         let pid = handle.child_pid;
-        std::thread::spawn(move || reap(jh, pid));
+        let (count, _) = &REAPERS;
+        *count.lock().unwrap() += 1;
+        std::thread::spawn(move || {
+            reap(jh, pid);
+            let (count, done) = &REAPERS;
+            *count.lock().unwrap() -= 1;
+            done.notify_all();
+        });
     }
+}
+
+/// Reaper threads `copad_term_destroy` started that haven't finished, for `copad_term_wait_reaps`.
+static REAPERS: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Blocks until every reaper `copad_term_destroy` started has finished, or `timeout_ms` passed;
+/// true when none is left. For app quit: exiting would cut a reaper short before it SIGKILLs a
+/// shell that ignores SIGHUP.
+#[unsafe(no_mangle)]
+pub extern "C" fn copad_term_wait_reaps(timeout_ms: u32) -> bool {
+    let (count, done) = &REAPERS;
+    let guard = count.lock().unwrap();
+    let (guard, _) = done
+        .wait_timeout_while(
+            guard,
+            std::time::Duration::from_millis(timeout_ms.into()),
+            |n| *n > 0,
+        )
+        .unwrap();
+    *guard == 0
+}
+
+/// The PTY child's pid, or -1 once it exited (it may be reaped and the pid reused then).
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_child_pid(handle: *mut CopadHandle) -> i32 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return -1;
+    };
+    if h.listener.child_gone.load(Ordering::Relaxed) {
+        -1
+    } else {
+        h.child_pid
+    }
+}
+
+/// OSC 0/2 since the last call: 0 nothing new, 1 a title (`*out` set; free it with
+/// `copad_string_destroy`), 2 the title was reset. Last wins.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle; `out` a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_take_title(
+    handle: *mut CopadHandle,
+    out: *mut *mut CopadString,
+) -> i32 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    match h.listener.pending_title.lock().unwrap().take() {
+        None => 0,
+        Some(None) => 2,
+        Some(Some(title)) => {
+            if !out.is_null() {
+                let boxed = Box::new(CopadString {
+                    data: title.into_bytes().into_boxed_slice(),
+                });
+                unsafe { *out = Box::into_raw(boxed) };
+            }
+            1
+        }
+    }
+}
+
+/// Whether a BEL arrived since the last call (clears on read).
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_take_bell(handle: *mut CopadHandle) -> bool {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return false;
+    };
+    h.listener.bell.swap(false, Ordering::Relaxed)
 }
 
 /// How long a closed terminal's shell gets to exit on SIGHUP before SIGKILL.
@@ -620,6 +803,15 @@ const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// recycled under us. Mirrors comux's `term::reap`.
 fn reap<T>(io_thread: JoinHandle<T>, pid: i32) {
     let joined = io_thread.join();
+    // The shell leads its own session (forkpty); its jobs have groups of their own in it. Hang
+    // them all up as a closing terminal does, while the shell — running or a zombie — is not yet
+    // reaped and so keeps the session id ours. No SIGKILL for them: a `nohup` job keeps running.
+    #[cfg(target_os = "macos")]
+    if pid > 1 && our_child(pid) {
+        for group in session_groups(pid) {
+            unsafe { libc::killpg(group, libc::SIGHUP) };
+        }
+    }
     #[cfg(target_os = "macos")]
     if pid > 1 && unreaped(pid) {
         unsafe { libc::kill(pid, libc::SIGHUP) };
@@ -634,6 +826,45 @@ fn reap<T>(io_thread: JoinHandle<T>, pid: i32) {
     #[cfg(not(target_os = "macos"))]
     let _ = (pid, REAP_GRACE);
     drop(joined);
+}
+
+/// Whether `pid` is still our child, running or exited, but not yet reaped (`waitid` without
+/// `ECHILD`); its pid can't be reused until it is.
+#[cfg(target_os = "macos")]
+fn our_child(pid: i32) -> bool {
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == 0
+    }
+}
+
+/// The process groups in session `session`, from every process macOS lists.
+#[cfg(target_os = "macos")]
+fn session_groups(session: i32) -> Vec<i32> {
+    let n = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0i32; n as usize + 64];
+    let bytes = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut groups: Vec<i32> = pids[..(n as usize).min(pids.len())]
+        .iter()
+        .filter(|&&p| p > 0 && unsafe { libc::getsid(p) } == session)
+        .map(|&p| unsafe { libc::getpgid(p) })
+        .filter(|&g| g > 0)
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
 }
 
 /// Whether our child `pid` is still running and un-reaped, checked without reaping (`WNOWAIT`):

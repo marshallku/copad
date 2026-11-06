@@ -34,3 +34,9 @@ filling up) reserved at least 1 000 full-width rows and kept that many spare aft
 
 The graphics logic itself lives in `copad-graphics`. These patches are copad's own, so this
 directory stays when upstream releases the keyboard fix.
+
+## Removing inherited variables
+
+`tty/mod.rs`: `Options::env_remove`; `tty/unix.rs` calls `Command::env_remove` for each before applying `env`.
+`env` can only add, so an app embedding copad-term (AIDE) couldn't keep its own `TMUX` or another terminal's
+identity out of the shell without changing its own process environment (`copad_term_create_env`).

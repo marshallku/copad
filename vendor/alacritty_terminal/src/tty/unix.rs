@@ -242,6 +242,10 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
     builder.env("HOME", user.home);
     // Set Window ID for clients relying on X11 hacks.
     builder.env("WINDOWID", window_id);
+    // copad patch: `Options::env_remove`.
+    for key in &config.env_remove {
+        builder.env_remove(key);
+    }
     for (key, value) in &config.env {
         builder.env(key, value);
     }

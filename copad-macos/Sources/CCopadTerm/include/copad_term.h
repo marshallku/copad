@@ -87,6 +87,29 @@ CopadHandle* copad_term_create(uint16_t cols, uint16_t rows,
                                   const char* socket_path);
 void copad_term_destroy(CopadHandle* handle);
 
+/// `copad_term_create` for embedding apps: `set` holds `KEY=VALUE` pairs applied after copad's
+/// defaults (a host's `TERM_PROGRAM` wins), `remove` keys the child must not inherit. No
+/// COPAD_PANEL_ID / COPAD_SOCKET. Either list may be NULL with a count of 0.
+CopadHandle* copad_term_create_env(uint16_t cols, uint16_t rows,
+                                   const char* shell, const char* cwd,
+                                   const char* const* set, size_t set_count,
+                                   const char* const* remove, size_t remove_count);
+
+/// The PTY child's pid, or -1 once it exited (it may be reaped and reused then).
+int32_t copad_term_child_pid(CopadHandle* handle);
+
+/// OSC 0/2 since the last call: 0 nothing new, 1 a title (*out set; free with
+/// copad_string_destroy), 2 the title was reset. Last wins.
+int32_t copad_term_take_title(CopadHandle* handle, CopadString** out);
+
+/// Whether a BEL arrived since the last call (clears on read).
+bool copad_term_take_bell(CopadHandle* handle);
+
+/// Blocks until every reaper copad_term_destroy started has finished (SIGHUP to the shell's
+/// session, SIGKILL to the shell after 2 s), or timeout_ms passed; true when none is left. For
+/// app quit, which would otherwise cut a reaper short.
+bool copad_term_wait_reaps(uint32_t timeout_ms);
+
 void copad_term_input(CopadHandle* handle, const uint8_t* bytes, size_t len);
 
 /// macOS only: the PTY child's cwd via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. Returns a
