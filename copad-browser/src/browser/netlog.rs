@@ -191,7 +191,7 @@ pub fn log_path(panel_id: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(
-        crate::paths::state_dir()
+        super::state_root()
             .join("browser")
             .join("logs")
             .join(format!("{panel_id}.jsonl")),
@@ -370,7 +370,7 @@ pub struct ReadQuery {
 }
 
 fn ensure_dir() -> Result<std::path::PathBuf, String> {
-    let dir = crate::paths::state_dir().join("browser").join("logs");
+    let dir = super::state_root().join("browser").join("logs");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
@@ -765,8 +765,10 @@ mod tests {
 
     #[test]
     fn log_path_refuses_a_panel_id_that_could_escape_the_log_dir() {
-        assert!(log_path("../../etc/passwd").is_none());
-        assert!(log_path("panel1").is_some());
+        super::super::with_state_root(std::env::temp_dir().join("copad-netlog-path"), || {
+            assert!(log_path("../../etc/passwd").is_none());
+            assert!(log_path("panel1").is_some());
+        });
     }
 
     #[test]
@@ -900,23 +902,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("copad-netlog-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let prev_home = std::env::var("HOME").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", &root);
-            std::env::set_var("XDG_STATE_HOME", root.join("state"));
-        }
+        let prev_root = super::super::replace_state_root(Some(root.join("state")));
         let out = f();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
+        super::super::replace_state_root(prev_root);
         let _ = std::fs::remove_dir_all(&root);
         out
     }

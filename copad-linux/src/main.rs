@@ -30,6 +30,7 @@ fn main() {
     // `warn` keeps a no-daemon launch silent on stderr; RUST_LOG=info / debug surfaces
     // gui_client register/reconnect diagnostics.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    copad_core::browser::set_state_root(copad_core::paths::state_dir());
 
     let args: Vec<String> = std::env::args().collect();
 

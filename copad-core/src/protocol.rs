@@ -22,11 +22,7 @@ pub struct Response {
     pub error: Option<ResponseError>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseError {
-    pub code: String,
-    pub message: String,
-}
+pub use copad_browser::protocol::ResponseError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {

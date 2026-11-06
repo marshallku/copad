@@ -54,7 +54,7 @@ unsafe fn rename_no_replace_raw(from: *const libc::c_char, to: *const libc::c_ch
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
-    "copad_core::fs_atomic only supports Linux (renameat2) and macOS (renamex_np). \
+    "copad_browser::fs_atomic only supports Linux (renameat2) and macOS (renamex_np). \
      Add a platform branch in fs_atomic.rs for other Unixes."
 );
 

@@ -56,7 +56,7 @@ pub fn profile_data_dir(id: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(
-        crate::paths::state_dir()
+        super::state_root()
             .join("browser")
             .join("profiles")
             .join(id),
@@ -86,8 +86,11 @@ mod tests {
 
     #[test]
     fn a_named_profile_gets_a_confined_directory() {
-        let dir = profile_data_dir("work").expect("valid id");
-        assert!(dir.ends_with("browser/profiles/work"));
-        assert!(profile_data_dir("../escape").is_none());
+        let root = std::env::temp_dir().join("copad-profile-test");
+        super::super::with_state_root(root.clone(), || {
+            let dir = profile_data_dir("work").expect("valid id");
+            assert_eq!(dir, root.join("browser/profiles/work"));
+            assert!(profile_data_dir("../escape").is_none());
+        });
     }
 }

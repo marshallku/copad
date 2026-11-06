@@ -175,9 +175,7 @@ pub fn origin_matches(credential_origin: &str, tab_origin: &str) -> bool {
 }
 
 pub fn credential_index_path() -> std::path::PathBuf {
-    crate::paths::state_dir()
-        .join("browser")
-        .join("credentials.json")
+    super::state_root().join("browser").join("credentials.json")
 }
 
 /// Error returned when the platform keychain is unavailable. There is no plaintext fallback:
@@ -480,23 +478,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("copad-cred-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let prev_home = std::env::var("HOME").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", &root);
-            std::env::set_var("XDG_STATE_HOME", root.join("state"));
-        }
+        let prev_root = super::super::replace_state_root(Some(root.join("state")));
         let out = f();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
+        super::super::replace_state_root(prev_root);
         let _ = std::fs::remove_dir_all(&root);
         out
     }

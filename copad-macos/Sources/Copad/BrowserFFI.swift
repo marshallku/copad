@@ -200,11 +200,16 @@ enum BrowserFFI {
     // MARK: - Private
 
     /// Copy-then-free, as `CopadFFI.callJSON` does: no caller holds a raw pointer.
+    /// The browser core has no state root until copad hands it one; a static `let` runs this once,
+    /// thread-safely, before the first call.
+    private static let stateRoot: Void = copad_ffi_browser_init()
+
     private static func call(
         _ fn: (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?,
         _ payload: [String: Any],
         label: String,
     ) -> String? {
+        _ = stateRoot
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let input = String(data: data, encoding: .utf8)
         else {

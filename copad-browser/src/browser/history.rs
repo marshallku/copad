@@ -207,8 +207,7 @@ fn hex_val(b: u8) -> Result<u8, String> {
     }
 }
 
-/// Test seam: `history_dir()` reads `state_dir()`, which tests redirect via `HOME` /
-/// `XDG_STATE_HOME`.
+/// Test seam: `history_dir()` reads the state root, which tests move with `replace_state_root`.
 pub fn dir() -> PathBuf {
     history_dir()
 }
@@ -226,8 +225,7 @@ mod tests {
     struct Sandbox {
         _guard: MutexGuard<'static, ()>,
         root: PathBuf,
-        prev_home: Option<String>,
-        prev_xdg: Option<String>,
+        prev_root: Option<PathBuf>,
     }
 
     impl Sandbox {
@@ -239,35 +237,18 @@ mod tests {
                 .join(format!("copad-history-test-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).unwrap();
-            let prev_home = std::env::var("HOME").ok();
-            let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-            // SAFETY: the ENV_LOCK above serializes every test that touches these.
-            unsafe {
-                std::env::set_var("HOME", &root);
-                std::env::set_var("XDG_STATE_HOME", root.join("state"));
-            }
+            let prev_root = super::super::replace_state_root(Some(root.join("state")));
             Self {
                 _guard: guard,
                 root,
-                prev_home,
-                prev_xdg,
+                prev_root,
             }
         }
     }
 
     impl Drop for Sandbox {
         fn drop(&mut self) {
-            // SAFETY: still holding ENV_LOCK.
-            unsafe {
-                match &self.prev_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-                match &self.prev_xdg {
-                    Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-            }
+            super::super::replace_state_root(self.prev_root.take());
             let _ = fs::remove_dir_all(&self.root);
         }
     }

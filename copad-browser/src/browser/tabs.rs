@@ -85,7 +85,7 @@ pub fn is_valid_tab_id(id: &str) -> bool {
 }
 
 pub fn history_dir() -> std::path::PathBuf {
-    crate::paths::state_dir().join("browser").join("history")
+    super::state_root().join("browser").join("history")
 }
 
 /// Rebuild a history blob's path from a validated id and generation; `None` for an invalid id.
@@ -208,18 +208,22 @@ mod tests {
 
     #[test]
     fn history_path_is_rebuilt_and_confined() {
-        let p = history_path("tab1", 7).expect("valid");
-        assert_eq!(p.file_name().unwrap(), "tab1-7.bin");
-        assert_eq!(p.parent().unwrap(), history_dir());
-        assert!(history_path("../../etc/passwd", 1).is_none());
-        assert!(history_path("a/b", 1).is_none());
+        super::super::with_state_root(std::env::temp_dir().join("copad-tabs-path"), || {
+            let p = history_path("tab1", 7).expect("valid");
+            assert_eq!(p.file_name().unwrap(), "tab1-7.bin");
+            assert_eq!(p.parent().unwrap(), history_dir());
+            assert!(history_path("../../etc/passwd", 1).is_none());
+            assert!(history_path("a/b", 1).is_none());
+        });
     }
 
     #[test]
     fn a_new_generation_is_a_new_file_so_the_previous_one_survives() {
-        let old = history_path("tab1", 1).unwrap();
-        let new = history_path("tab1", 2).unwrap();
-        assert_ne!(old, new);
+        super::super::with_state_root(std::env::temp_dir().join("copad-tabs-path"), || {
+            let old = history_path("tab1", 1).unwrap();
+            let new = history_path("tab1", 2).unwrap();
+            assert_ne!(old, new);
+        });
     }
 
     #[test]

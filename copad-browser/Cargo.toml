@@ -1,0 +1,17 @@
+[package]
+name = "copad-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "copad's browser core (decisions #210): the webview panes' models, policy, path rules and redaction, and Design Grab, with a C ABI for Swift — shared by copad and AIDE."
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+thiserror = "2"
+libc = "0.2"

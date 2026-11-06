@@ -11,6 +11,7 @@ members = [
     "copad-keys",
     "copad-graphics",
     "comux-host",
+    "copad-browser",
     "copad-mux",
     "copad-mux-proto",
     "copad-graph-web",

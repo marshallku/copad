@@ -213,6 +213,10 @@ char *copad_ffi_theme_list(void);
 // refused), never as "carry on with the raw input".
 // ---------------------------------------------------------------------------
 
+/// Points the browser core at copad's state directory. Call once before any
+/// call below; the core lives in copad-browser and has no default root.
+void copad_ffi_browser_init(void);
+
 /// `{ url, policy }` -> `{ url }`. Applies the `[browser] restore` policy.
 /// An unknown policy falls back to origin-only.
 char *copad_ffi_browser_canonicalize(const char *json);
