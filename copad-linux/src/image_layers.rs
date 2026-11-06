@@ -181,9 +181,13 @@ fn to_surface(image: &alacritty_terminal::term::cell::GraphicImage) -> Option<ca
         let mut data = surface.data().ok()?;
         for (y, row) in image.rgba.chunks_exact(w as usize * 4).enumerate() {
             let out = &mut data[y * stride..y * stride + w as usize * 4];
-            for (px, o) in row.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-                let argb = u32::from_be_bytes([px[3], px[0], px[1], px[2]]);
-                o.copy_from_slice(&argb.to_ne_bytes());
+            for (&[r, g, b, a], o) in row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<4>().0)
+            {
+                *o = u32::from_be_bytes([a, r, g, b]).to_ne_bytes();
             }
         }
     }

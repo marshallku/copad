@@ -591,8 +591,8 @@ fn decode(cmd: &Cmd, data: Vec<u8>) -> Result<(u32, u32, Vec<u8>), &'static str>
                 data
             } else {
                 let mut out = Vec::with_capacity(pixels * 4);
-                for px in data.chunks_exact(3) {
-                    out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                for &[r, g, b] in data.as_chunks::<3>().0 {
+                    out.extend_from_slice(&[r, g, b, 255]);
                 }
                 out
             };
@@ -623,12 +623,16 @@ fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let rgba = match frame.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => buf
-            .chunks_exact(3)
-            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => buf
-            .chunks_exact(2)
-            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|&[g, a]| [g, g, g, a])
             .collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::Indexed => return Err(bad),
@@ -640,7 +644,7 @@ fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
 }
 
 fn premultiply(rgba: &mut [u8]) {
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let a = px[3] as u16;
         if a != 255 {
             for c in &mut px[..3] {

@@ -162,7 +162,7 @@ impl ImageIds {
 
 fn encode(image: &GraphicImage) -> String {
     let mut straight = image.rgba.clone();
-    for px in straight.chunks_exact_mut(4) {
+    for px in straight.as_chunks_mut::<4>().0 {
         let a = px[3] as u32;
         if a != 0 && a != 255 {
             for c in &mut px[..3] {
