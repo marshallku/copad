@@ -474,6 +474,19 @@ pub struct UsageArgs {
     pub limits: bool,
 }
 
+impl UsageArgs {
+    /// The shared report's arguments (`copad_usage::report`, also behind `comux usage`).
+    pub fn to_report(&self) -> copad_usage::report::UsageArgs {
+        copad_usage::report::UsageArgs {
+            window: self.window.clone(),
+            since: self.since.clone(),
+            tool: self.tool.clone(),
+            oneline: self.oneline,
+            limits: self.limits,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum AgentCommand {
     /// Show running Claude/Codex agents (shells out to `tmx agents --json`,

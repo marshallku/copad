@@ -5,7 +5,7 @@ Common issues and their fixes, grouped by tool.
 ## comux
 
 **The status-bar usage gauge is blank.**
-The readout only shows when the terminal is at least 100 columns wide, so widen the window. It's resolved in-process (no `coctl` needed), but it still requires valid local credentials to read — a Claude OAuth token in `~/.claude/.credentials.json` and/or a Codex rollout file. Confirm the same data with `coctl usage --limits` if you have `coctl`. The poller can be disabled entirely with `usage = off` in `~/.config/copad/mux.toml` or `COPAD_MUX_USAGE=0`.
+The readout only shows when the terminal is at least 100 columns wide, so widen the window. It's resolved in-process (no `coctl` needed), but it still requires valid local credentials to read — a Claude OAuth token in `~/.claude/.credentials.json` and/or a Codex rollout file. Confirm the same data with `comux usage --limits`. The poller can be disabled entirely with `usage = off` in `~/.config/copad/mux.toml` or `COPAD_MUX_USAGE=0`.
 
 **My agents came back as fresh chats after a restart.**
 Agent resume needs `restore_agent_sessions = true` (the default) and a discoverable session id (`~/.claude/sessions/<pid>.json` for Claude, the held-open rollout file for Codex). One-shot invocations (`claude -p …`) are intentionally not resumed. See [Persistence & Agent Resume](./comux/persistence.md).

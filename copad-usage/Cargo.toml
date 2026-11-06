@@ -14,3 +14,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # same rationale as copad-cli: a corporate MITM CA that re-signs TLS is trusted like curl/claude,
 # and webpki is kept as a fallback for a minimal environment with no system cert store.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+
+[dev-dependencies]
+tempfile = "3"

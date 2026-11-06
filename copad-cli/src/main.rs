@@ -4,7 +4,6 @@ mod client;
 mod commands;
 mod plugin_cmds;
 mod update;
-mod usage;
 
 use clap::Parser;
 use commands::{AgentCommand, BackgroundCommand, Cli, Command, EventCommand, UpdateCommand};
@@ -23,7 +22,7 @@ fn main() {
     // `usage` and `agent status` are local readouts (transcripts, `tmx`), never the daemon socket,
     // so they work over SSH; dispatch before any socket resolution.
     if let Command::Usage(args) = &cli.command {
-        std::process::exit(usage::run(args, cli.json));
+        std::process::exit(copad_usage::report::run(&args.to_report(), cli.json));
     }
     if let Command::Agent(AgentCommand::Status { oneline }) = &cli.command {
         std::process::exit(agent_status::run(*oneline, cli.json));

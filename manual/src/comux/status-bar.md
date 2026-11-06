@@ -142,7 +142,9 @@ Claude asks the hook only when an auto-compact window is set: the override alone
 
 The most configurable part of the status bar. It shows your **subscription rate-limit utilization** — how much of each rolling window you've used — for Claude (5h + weekly) and Codex (weekly). It's resolved in-process by a poller that refreshes every 60s, and shows only when the terminal is at least 100 columns wide.
 
-> This readout uses the shared `copad-usage` crate, which reads the same data as `coctl usage --limits`. If you installed comux standalone, that's built in — no separate `coctl` needed for the readout itself. Set `COPAD_MUX_USAGE=0` (or `usage = off`) to disable the poller entirely.
+> This readout uses the shared `copad-usage` crate, which reads the same data as `comux usage --limits`. If you installed comux standalone, that's built in. Set `COPAD_MUX_USAGE=0` (or `usage = off`) to disable the poller entirely.
+
+`comux usage` prints the same report `coctl usage` does, from the local transcripts and without a server: tokens and cost (`--window today|all`, `--since 5h`, `--tool claude|codex`, `--oneline` for a tmux `status-right`, `--json`), or the subscription windows with `--limits`.
 
 There are three orthogonal knobs.
 

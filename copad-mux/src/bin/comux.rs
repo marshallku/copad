@@ -6,6 +6,7 @@
 //!   comux server <sub>       manage the persistent server: start|stop|restart|status
 //!   comux ctl <cmd> …        control the running server (explicit form)
 //!   comux doctor [--json]    diagnose config problems (runs locally, no server)
+//!   comux usage [...]        Claude/Codex tokens and cost, or --limits (runs locally)
 //!   comux <cmd> …            shorthand: any other verb is a control command, so
 //!                            `comux new-session work` == `comux ctl new-session work`
 
@@ -51,6 +52,7 @@ fn print_usage() {
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
          \x20 comux reload                re-read mux.toml on the live server (tmux source-file)\n\
          \x20 comux doctor [--json]       diagnose config problems (mux.toml + config.toml)\n\
+         \x20 comux usage [--limits] ...  Claude/Codex tokens and cost from local transcripts\n\
          \x20 comux health                live server counters (panes/labeled/sweep failures)\n\
          \x20 comux server restart        stop + restart the server (restores the workspace)\n\
          \x20 comux kill-server           stop the server\n\
@@ -80,6 +82,7 @@ fn main() {
         Some("proxy") => std::process::exit(copad_mux::client::run_proxy(&args[1..])),
         // Runs locally so it can diagnose a missing or broken server.
         Some("doctor") => std::process::exit(copad_mux::doctor::run(&args[1..])),
+        Some("usage") => std::process::exit(copad_usage::report::run_cli(&args[1..])),
         Some("help" | "-h" | "--help") => {
             print_usage();
             std::process::exit(0);

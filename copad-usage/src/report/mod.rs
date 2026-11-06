@@ -1,5 +1,5 @@
-//! `coctl usage` — local Claude/Codex token + cost aggregation from transcript files (no daemon,
-//! no socket), so it works over SSH and in a tmux `status-right`.
+//! `coctl usage` / `comux usage` — local Claude/Codex token + cost aggregation from transcript
+//! files (no daemon, no socket), so it works over SSH and in a tmux `status-right`.
 
 mod claude;
 mod codex;
@@ -7,11 +7,90 @@ mod model;
 mod pricing;
 mod render;
 
-use crate::commands::UsageArgs;
+use crate::limits;
 use chrono::{DateTime, Duration, Local, Timelike};
-use copad_usage::limits;
 use model::{Aggregate, Record, Tool, Warnings};
 use std::path::Path;
+
+/// What a usage report covers (coctl's `UsageArgs`, without clap).
+#[derive(Debug, Clone)]
+pub struct UsageArgs {
+    /// `today` (local midnight → now, default) or `all`; ignored with `since`.
+    pub window: String,
+    /// Rolling window ending now (`5h`, `30m`, `2d`); overrides `window`.
+    pub since: Option<String>,
+    /// `claude` or `codex`; both when None.
+    pub tool: Option<String>,
+    /// One line for a status bar.
+    pub oneline: bool,
+    /// Subscription rate-limit utilization instead of tokens and cost.
+    pub limits: bool,
+}
+
+impl Default for UsageArgs {
+    fn default() -> Self {
+        Self {
+            window: "today".into(),
+            since: None,
+            tool: None,
+            oneline: false,
+            limits: false,
+        }
+    }
+}
+
+/// `comux usage [--window today|all] [--since <dur>] [--tool claude|codex] [--oneline] [--limits]
+/// [--json]`: parses `args` (after `usage`) and runs the report; the exit code.
+pub fn run_cli(args: &[String]) -> i32 {
+    match parse_cli(args) {
+        Ok(None) => {
+            println!(
+                "usage: comux usage [--window today|all] [--since 5h] [--tool claude|codex] [--oneline] [--limits] [--json]"
+            );
+            0
+        }
+        Ok(Some((parsed, json))) => run(&parsed, json),
+        Err(e) => {
+            eprintln!("comux usage: {e}");
+            2
+        }
+    }
+}
+
+/// The arguments and `--json`, or None for `--help`. Takes clap's `--flag=value` as well as
+/// `--flag value`, as `coctl usage` did.
+fn parse_cli(args: &[String]) -> Result<Option<(UsageArgs, bool)>, String> {
+    let mut parsed = UsageArgs::default();
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(raw) = it.next() {
+        let (arg, inline) = match raw.split_once('=') {
+            Some((flag, v)) if flag.starts_with("--") => (flag, Some(v.to_string())),
+            _ => (raw.as_str(), None),
+        };
+        let mut value = |name: &str| {
+            inline
+                .clone()
+                .or_else(|| it.next().cloned())
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
+        let flag_only = matches!(arg, "--oneline" | "--limits" | "--json" | "--help");
+        if flag_only && inline.is_some() {
+            return Err(format!("{arg} takes no value"));
+        }
+        match arg {
+            "--window" => parsed.window = value("--window")?,
+            "--since" => parsed.since = Some(value("--since")?),
+            "--tool" => parsed.tool = Some(value("--tool")?),
+            "--oneline" => parsed.oneline = true,
+            "--limits" => parsed.limits = true,
+            "--json" => json = true,
+            "-h" | "--help" => return Ok(None),
+            other => return Err(format!("unknown option {other} (see comux usage --help)")),
+        }
+    }
+    Ok(Some((parsed, json)))
+}
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
@@ -315,5 +394,60 @@ mod tests {
         assert_eq!(m.usage.total(), 600);
         assert_eq!(agg.total_cost, 0.0);
         assert!(agg.has_unpriced); // the total must flag "+" so $0.00 is not read as free
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(list: &[&str]) -> Result<Option<(UsageArgs, bool)>, String> {
+        parse_cli(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn both_value_forms_parse_the_same() {
+        let (a, json) = parse(&[
+            "--window=all",
+            "--tool=codex",
+            "--since=5h",
+            "--oneline",
+            "--json",
+        ])
+        .unwrap()
+        .unwrap();
+        let (b, _) = parse(&[
+            "--window",
+            "all",
+            "--tool",
+            "codex",
+            "--since",
+            "5h",
+            "--oneline",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(json);
+        for x in [&a, &b] {
+            assert_eq!(
+                (
+                    x.window.as_str(),
+                    x.tool.as_deref(),
+                    x.since.as_deref(),
+                    x.oneline
+                ),
+                ("all", Some("codex"), Some("5h"), true)
+            );
+        }
+        assert!(parse(&["--limits"]).unwrap().unwrap().0.limits);
+    }
+
+    #[test]
+    fn bad_options_fail_and_help_is_none() {
+        assert!(parse(&["--bogus"]).is_err());
+        assert!(parse(&["--since"]).is_err());
+        assert!(parse(&["--help"]).unwrap().is_none());
+        assert!(parse(&["--oneline=false"]).is_err());
+        assert!(parse(&["--json=1"]).is_err());
     }
 }
