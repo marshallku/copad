@@ -2244,6 +2244,52 @@ pub unsafe extern "C" fn copad_term_history(
     }))
 }
 
+/// The live screen as text, one line per row, whatever the viewport is scrolled to: rows
+/// `Line(0)..screen_lines` of the grid, not the scrolled-back view. Wide characters' spacer
+/// cells are left out, NUL cells are `' '`. For hosts reading the screen without moving the
+/// user's scroll position. Free with `copad_string_destroy` exactly once.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by `copad_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_screen_text(handle: *mut CopadHandle) -> *mut CopadString {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    let term = h.term.lock();
+    let text = read_screen_text(term.grid(), term.columns(), term.screen_lines());
+    Box::into_raw(Box::new(CopadString {
+        data: text.into_bytes().into_boxed_slice(),
+    }))
+}
+
+fn read_screen_text(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    cols: usize,
+    rows: usize,
+) -> String {
+    use alacritty_terminal::term::cell::Flags;
+    let mut out = String::with_capacity(rows * (cols + 1));
+    for row in 0..rows {
+        let line = Line(row as i32);
+        for col in 0..cols {
+            let cell = &grid[Point::new(line, Column(col))];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            out.push(if cell.c == '\0' { ' ' } else { cell.c });
+        }
+        if row + 1 < rows {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Joins `lines` rows of scrollback above the viewport top into plain text, oldest first. Split
 /// from the FFI so tests can use a synthetic Term. Clamps `lines` to `history_size()`; NUL
 /// cells render as `' '`.

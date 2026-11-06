@@ -199,6 +199,10 @@ CopadString* copad_term_selection_string(CopadHandle* handle);
 // non-NULL empty CopadString; NULL only for a NULL handle. Free with copad_string_destroy once.
 CopadString* copad_term_history(CopadHandle* handle, size_t lines);
 
+/// The live screen as text (one line per row), whatever the viewport is scrolled to; wide
+/// characters' spacer cells left out. Free with copad_string_destroy.
+CopadString* copad_term_screen_text(CopadHandle* handle);
+
 const uint8_t* copad_string_bytes(const CopadString* s, size_t* out_len);
 void copad_string_destroy(CopadString* s);
 

@@ -227,3 +227,31 @@ fn keys_without_text_get_their_legacy_form_with_the_protocol_off() {
     });
     unsafe { copad_term_destroy(handle) };
 }
+
+#[test]
+#[ignore]
+fn the_screen_reads_live_whatever_the_viewport_shows() {
+    let handle = spawn(&[], &[]);
+    send(
+        handle,
+        "i=0; while [ $i -lt 200 ]; do echo line-$i; i=$((i+1)); done; printf 'end=1\\n'\n",
+    );
+    read_number(handle, "end");
+    let screen_text = || {
+        let s = unsafe { copad_term_screen_text(handle) };
+        let mut len = 0;
+        let text = String::from_utf8_lossy(unsafe {
+            std::slice::from_raw_parts(copad_string_bytes(s, &mut len), len)
+        })
+        .into_owned();
+        unsafe { copad_string_destroy(s) };
+        text
+    };
+    let live = screen_text();
+    assert!(live.contains("end=1"), "{live:?}");
+    // Scroll the viewport back: the snapshot changes, the screen text doesn't.
+    unsafe { copad_term_scroll(handle, 1, 0) };
+    assert!(!screen(handle).contains("end=1"), "the viewport moved back");
+    assert_eq!(screen_text(), live);
+    unsafe { copad_term_destroy(handle) };
+}
