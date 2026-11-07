@@ -11,11 +11,12 @@
 //! - Static strings (`copad_term_version`) live for the program; no free.
 //!
 //! Threading: `Arc<FairMutex<Term>>` is shared between alacritty's PTY reader thread and
-//! snapshot callers. Snapshots lock briefly, copy out the visible rows, then release.
+//! snapshot callers. Snapshots lock briefly, copy out the visible rows, then release. A mirror
+//! (`copad_term_create_mirror`) has no thread of its own: the host's `copad_term_feed` parses.
 
 use copad_graphics as graphics;
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::ptr;
@@ -37,7 +38,9 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
+};
 
 /// `#[repr(C)]` for a stable FFI layout. Cells reference the row's contiguous utf8 buffer via
 /// `utf8_offset` + `utf8_len` to avoid per-cell allocation.
@@ -240,9 +243,9 @@ impl EventListener for CopadListener {
             }
             Event::ColorRequest(index, format_reply) => {
                 // OSC 4/10/11/12: apps ask what color an index renders as (e.g. nvim's
-                // `&background=dark`). Resolve against the host palette. No reply on a miss:
-                // a stale alacritty default would be wrong, and apps treat silence as "use my
-                // default".
+                // `&background=dark`). The vendored alacritty answers a colour the program set
+                // itself, so this one is unset: the host palette. No reply on a miss: a stale
+                // alacritty default would be wrong, and apps treat silence as "use my default".
                 let rgb = self.palette.lock().unwrap().get(&index).copied();
                 if let Some(rgb) = rgb {
                     let reply = format_reply(rgb);
@@ -283,13 +286,7 @@ pub struct CopadHandle {
     /// the reader isn't starved.
     term: Arc<FairMutex<Term<CopadListener>>>,
     listener: CopadListener,
-    sender: EventLoopSender,
-    /// Owns the PTY + parser loop; joined in `copad_term_destroy` after `Msg::Shutdown`.
-    io_thread: Option<JoinHandle<(EventLoop<Pty, CopadListener>, State)>>,
-    /// Child PID (typically the login shell), captured at construction so `copad_term_child_cwd`
-    /// can query the kernel without the Pty handle. Stale after exit: `proc_pidinfo` errors and
-    /// the FFI returns NULL.
-    child_pid: i32,
+    io: Io,
     /// Hash of the cursor row's renderable content plus cursor style/blink/show, for
     /// `copad_term_take_damage`. Catches changes the line-bounds filter drops: cursor-cell
     /// mutation collapsing to `(line, col, col)` damage, zero-width combining marks (Term::input
@@ -310,6 +307,67 @@ pub struct CopadHandle {
     options: Mutex<TermOptions>,
     /// kitty virtual placements, which Unicode placeholder cells show (decisions #194).
     virtuals: graphics::Virtuals,
+}
+
+/// What drives a handle's parser and takes its input.
+enum Io {
+    Pty {
+        sender: EventLoopSender,
+        /// Owns the PTY + parser loop; joined in `copad_term_destroy` after `Msg::Shutdown`.
+        io_thread: Option<JoinHandle<(EventLoop<Pty, CopadListener>, State)>>,
+        /// Child PID (typically the login shell), captured at construction so
+        /// `copad_term_child_cwd` can query the kernel without the Pty handle. Stale after exit:
+        /// `proc_pidinfo` errors and the FFI returns NULL.
+        child_pid: i32,
+    },
+    Mirror(Box<Mirror>),
+}
+
+/// Input from a mirror's key, mouse and paste paths goes here; the host frames it for whatever
+/// owns the real PTY. Called on the thread that called `copad_term_input`.
+pub type CopadWriteCallback = unsafe extern "C" fn(ctx: *mut c_void, bytes: *const u8, len: usize);
+
+struct Mirror {
+    /// The parser state `copad_term_feed` keeps between calls; locked before the term.
+    parser: Mutex<Processor<StdSyncHandler>>,
+    write: Option<CopadWriteCallback>,
+    ctx: *mut c_void,
+}
+
+// SAFETY: `ctx` is only handed back to `write`, which `copad_term_create_mirror`'s caller allows on
+// any thread that calls into the handle.
+unsafe impl Send for Mirror {}
+unsafe impl Sync for Mirror {}
+
+impl CopadHandle {
+    fn send(&self, msg: Msg) {
+        if let Io::Pty { sender, .. } = &self.io {
+            let _ = sender.send(msg);
+        }
+    }
+
+    fn child_pid(&self) -> i32 {
+        match &self.io {
+            Io::Pty { child_pid, .. } => *child_pid,
+            Io::Mirror(_) => -1,
+        }
+    }
+
+    /// A mirror has no event loop to end a synchronized update (`?2026`) that never ends: the
+    /// next feed or frame after its timeout does, as alacritty's loop does on its poll timeout.
+    fn settle_sync(&self) {
+        let Io::Mirror(m) = &self.io else {
+            return;
+        };
+        let mut parser = m.parser.lock().unwrap();
+        let expired = parser
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|at| at <= std::time::Instant::now());
+        if expired {
+            parser.stop_sync(&mut *self.term.lock());
+        }
+    }
 }
 
 /// The per-pane settings the GUI can change after creation.
@@ -577,20 +635,7 @@ unsafe fn create_with(
     // stays valid for `proc_pidinfo` until the shell exits, then `copad_term_child_cwd` returns NULL.
     let child_pid = pty.child().id() as i32;
 
-    let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
-    // `kitty_keyboard` keeps per-screen flag stacks and answers `CSI ? u`; the GUI encodes keys
-    // against them via `copad_term_encode_key`.
-    let config = TermOptions::default().config();
-    let mut term = Term::new(config, &term_size, listener.clone());
-    let mut images = graphics::Graphics::new(listener.graphics.clone(), {
-        let listener = listener.clone();
-        Box::new(move |reply: String| listener.send_to_pty(reply.into_bytes()))
-    });
-    let virtuals = images.virtuals();
-    term.set_apc_handler(Some(Box::new(move |term, data| {
-        images.handle(term, data);
-    })));
-    let term = Arc::new(FairMutex::new(term));
+    let (term, virtuals) = new_term(&listener, safe_cols, safe_rows);
 
     let event_loop = match EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false) {
         Ok(el) => el,
@@ -606,9 +651,11 @@ unsafe fn create_with(
     Box::into_raw(Box::new(CopadHandle {
         term,
         listener,
-        sender,
-        io_thread: Some(io_thread),
-        child_pid,
+        io: Io::Pty {
+            sender,
+            io_thread: Some(io_thread),
+            child_pid,
+        },
         last_redraw_state_hash: AtomicU64::new(0),
         last_display_offset: AtomicI32::new(0),
         last_selection_range: Mutex::new(CopadSelectionRange::default()),
@@ -616,6 +663,95 @@ unsafe fn create_with(
         options: Mutex::new(TermOptions::default()),
         virtuals,
     }))
+}
+
+/// The Term with copad's options and its kitty graphics handler, whose replies go the way the
+/// listener's do.
+fn new_term(
+    listener: &CopadListener,
+    cols: u16,
+    rows: u16,
+) -> (Arc<FairMutex<Term<CopadListener>>>, graphics::Virtuals) {
+    let term_size = TermSize::new(cols as usize, rows as usize);
+    // `kitty_keyboard` keeps per-screen flag stacks and answers `CSI ? u`; the GUI encodes keys
+    // against them via `copad_term_encode_key`.
+    let config = TermOptions::default().config();
+    let mut term = Term::new(config, &term_size, listener.clone());
+    let mut images = graphics::Graphics::new(listener.graphics.clone(), {
+        let listener = listener.clone();
+        Box::new(move |reply: String| listener.send_to_pty(reply.into_bytes()))
+    });
+    let virtuals = images.virtuals();
+    term.set_apc_handler(Some(Box::new(move |term, data| {
+        images.handle(term, data);
+    })));
+    (Arc::new(FairMutex::new(term)), virtuals)
+}
+
+/// A terminal with no PTY and no child, for a host that gets a program's output from elsewhere
+/// (AIDE's mux server owns the PTY and the screen of record). `copad_term_feed` drives its
+/// parser; every read call works as on a PTY terminal. It never answers the program: DSR, DA,
+/// colour and size queries, graphics replies and focus reports are dropped, since whatever owns
+/// the PTY answers them. `copad_term_input` (what the host's key, mouse and paste paths send)
+/// goes to `write_cb` instead of a PTY; NULL drops it. `copad_term_resize` changes the grid only.
+///
+/// # Safety
+///
+/// `write_cb`, when not NULL, must be callable with `ctx` from every thread that calls
+/// `copad_term_input` on this handle, until `copad_term_destroy` returns, and must not call back
+/// into this handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_create_mirror(
+    cols: u16,
+    rows: u16,
+    write_cb: Option<CopadWriteCallback>,
+    ctx: *mut c_void,
+) -> *mut CopadHandle {
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    // No sender is ever injected, so `send_to_pty` drops every reply.
+    let listener = CopadListener::new();
+    *listener.grid_size.lock().unwrap() = (cols, rows);
+    listener.graphics.enabled.store(true, Ordering::Relaxed);
+    let (term, virtuals) = new_term(&listener, cols, rows);
+    Box::into_raw(Box::new(CopadHandle {
+        term,
+        listener,
+        io: Io::Mirror(Box::new(Mirror {
+            parser: Mutex::new(Processor::new()),
+            write: write_cb,
+            ctx,
+        })),
+        last_redraw_state_hash: AtomicU64::new(0),
+        last_display_offset: AtomicI32::new(0),
+        last_selection_range: Mutex::new(CopadSelectionRange::default()),
+        search_state: Mutex::new(SearchState::default()),
+        options: Mutex::new(TermOptions::default()),
+        virtuals,
+    }))
+}
+
+/// Parses a program's output into a mirror, in order; a call may end anywhere, inside a sequence
+/// or a UTF-8 character included. A no-op on a PTY terminal, whose own thread parses.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle; `bytes` must point to `len` readable bytes (or be
+/// NULL when len=0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_feed(handle: *mut CopadHandle, bytes: *const u8, len: usize) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    let Io::Mirror(m) = &h.io else {
+        return;
+    };
+    if len == 0 || bytes.is_null() {
+        return;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    h.settle_sync();
+    let mut parser = m.parser.lock().unwrap();
+    parser.advance(&mut *h.term.lock(), slice);
 }
 
 /// macOS only: the PTY child's cwd via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. Returns a
@@ -636,7 +772,11 @@ pub unsafe extern "C" fn copad_term_child_cwd(handle: *mut CopadHandle) -> *mut 
         // EPERM on un-entitled dev builds: `proc_pidinfo(PROC_PIDVNODEPATHINFO)` needs the same
         // audit token, root, or the Apple-signed-only `com.apple.private.security.proc-info`.
         // The caller falls back to its initialCwd until install-macos.sh embeds an entitlement.
-        let Some(cwd) = macos_child_cwd(h.child_pid) else {
+        let pid = h.child_pid();
+        if pid <= 0 {
+            return ptr::null_mut();
+        }
+        let Some(cwd) = macos_child_cwd(pid) else {
             return ptr::null_mut();
         };
         Box::into_raw(Box::new(CopadString {
@@ -694,14 +834,22 @@ pub unsafe extern "C" fn copad_term_destroy(handle: *mut CopadHandle) {
         return;
     }
     let mut handle = unsafe { Box::from_raw(handle) };
+    let Io::Pty {
+        sender,
+        io_thread,
+        child_pid,
+    } = &mut handle.io
+    else {
+        return;
+    };
     // Best-effort: if the reader already exited the send fails but join still cleans up.
-    let _ = handle.sender.send(Msg::Shutdown);
+    let _ = sender.send(Msg::Shutdown);
     // The join runs on a detached thread, never the caller (the main thread, via the view
     // controller's deinit). Joining returns alacritty's `EventLoop`, whose `Pty::drop` SIGHUPs
     // the shell then `waitpid`s with NO timeout, so a shell that survives SIGHUP (e.g. `zsh -l`
     // still sourcing rc files) would freeze the app. Same fix as comux's `PaneTerm::drop`.
-    if let Some(jh) = handle.io_thread.take() {
-        let pid = handle.child_pid;
+    if let Some(jh) = io_thread.take() {
+        let pid = *child_pid;
         let (count, _) = &REAPERS;
         *count.lock().unwrap() += 1;
         std::thread::spawn(move || {
@@ -734,7 +882,8 @@ pub extern "C" fn copad_term_wait_reaps(timeout_ms: u32) -> bool {
     *guard == 0
 }
 
-/// The PTY child's pid, or -1 once it exited (it may be reaped and the pid reused then).
+/// The PTY child's pid, or -1 once it exited (it may be reaped and the pid reused then) or on a
+/// mirror.
 ///
 /// # Safety
 ///
@@ -747,7 +896,7 @@ pub unsafe extern "C" fn copad_term_child_pid(handle: *mut CopadHandle) -> i32 {
     if h.listener.child_gone.load(Ordering::Relaxed) {
         -1
     } else {
-        h.child_pid
+        h.child_pid()
     }
 }
 
@@ -885,7 +1034,7 @@ fn unreaped(pid: i32) -> bool {
     }
 }
 
-/// Feeds input bytes to the PTY via the event-loop channel.
+/// Feeds input bytes to the PTY via the event-loop channel, or to a mirror's `write_cb`.
 ///
 /// # Safety
 ///
@@ -899,13 +1048,23 @@ pub unsafe extern "C" fn copad_term_input(handle: *mut CopadHandle, bytes: *cons
         return;
     }
     let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
-    let _ = h.sender.send(Msg::Input(slice.to_vec().into()));
+    match &h.io {
+        Io::Pty { sender, .. } => {
+            let _ = sender.send(Msg::Input(slice.to_vec().into()));
+        }
+        Io::Mirror(m) => {
+            if let Some(write) = m.write {
+                unsafe { write(m.ctx, slice.as_ptr(), slice.len()) };
+            }
+        }
+    }
 }
 
 /// Populates one entry of the OSC colour-query palette used by `Event::ColorRequest`. Index
 /// follows `vte::ansi::NamedColor`: 0-15 ANSI, 16-255 cube, 256 fg, 257 bg, 258 cursor.
-/// Re-calling overwrites (theme hot-reload). Unpopulated indices produce no reply, so apps use
-/// their own defaults rather than a colour we don't draw.
+/// Re-calling overwrites (theme hot-reload). A colour the program set itself is answered first;
+/// an unset one at an unpopulated index produces no reply, so apps use their own defaults rather
+/// than a colour we don't draw.
 ///
 /// # Safety
 ///
@@ -933,7 +1092,8 @@ pub unsafe extern "C" fn copad_term_set_palette_entry(
 }
 
 /// Resizes the terminal grid, clamping zero dimensions to 1 so the PTY always sees a positive
-/// `winsize`. Its pixel size comes from the host-reported cell size (1x1 until reported).
+/// `winsize`. Its pixel size comes from the host-reported cell size (1x1 until reported). A
+/// mirror's grid only: whatever owns its PTY sizes that.
 ///
 /// # Safety
 ///
@@ -951,7 +1111,7 @@ pub unsafe extern "C" fn copad_term_resize(handle: *mut CopadHandle, cols: u16, 
     let ws = h.listener.window_size();
     // `Msg::Resize` only SIGWINCHes the child via `pty.on_resize`; the Term grid is a separate
     // resize and must be done explicitly under the term lock (as alacritty's `on_resize` does).
-    let _ = h.sender.send(Msg::Resize(ws));
+    h.send(Msg::Resize(ws));
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
     h.term.lock().resize(term_size);
 }
@@ -1142,6 +1302,7 @@ pub unsafe extern "C" fn copad_term_take_damage_rows(
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return 0;
     };
+    h.settle_sync();
     if cap == 0 {
         // No room for rows: drain the damage state anyway so the next call starts clean.
         let mut term = h.term.lock();
@@ -1299,6 +1460,7 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return ptr::null_mut();
     };
+    h.settle_sync();
 
     let term = h.term.lock();
     let cols = term.columns() as u16;
@@ -2951,7 +3113,7 @@ pub unsafe extern "C" fn copad_term_set_cell_pixels(
     if (old_width, old_height) == (width, height) {
         return;
     }
-    let _ = h.sender.send(Msg::Resize(h.listener.window_size()));
+    h.send(Msg::Resize(h.listener.window_size()));
 }
 
 #[unsafe(no_mangle)]
@@ -3697,5 +3859,57 @@ mod kitty_keyboard_tests {
         feed(&mut t, b"\x1b[?u\x1b[>1u");
         assert!(replies.0.lock().unwrap().is_empty());
         assert_eq!(kitty_flags(*t.mode()), 0);
+    }
+}
+
+#[cfg(test)]
+mod color_query_tests {
+    use super::*;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    /// Replies as copad-term's listener sends them: PtyWrite as is, a ColorRequest from a
+    /// one-entry host palette (index 257, the background).
+    #[derive(Clone, Default)]
+    struct Replies(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl EventListener for Replies {
+        fn send_event(&self, event: Event) {
+            match event {
+                Event::PtyWrite(s) => self.0.lock().unwrap().push(s),
+                Event::ColorRequest(257, format) => self.0.lock().unwrap().push(format(Rgb {
+                    r: 0x1e,
+                    g: 0x1e,
+                    b: 0x2e,
+                })),
+                _ => {}
+            }
+        }
+    }
+
+    fn answers(bytes: &[u8]) -> Vec<String> {
+        let replies = Replies::default();
+        let mut term = Term::new(Config::default(), &TermSize::new(20, 5), replies.clone());
+        Processor::<StdSyncHandler>::default().advance(&mut term, bytes);
+        replies.0.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn the_programs_own_colour_comes_before_the_host_palette() {
+        assert_eq!(
+            answers(b"\x1b]11;?\x1b\\\x1b]11;rgb:12/34/56\x1b\\\x1b]11;?\x1b\\\x1b]111\x1b\\\x1b]11;?\x07"),
+            vec![
+                "\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\".to_string(),
+                "\x1b]11;rgb:1212/3434/5656\x1b\\".to_string(),
+                "\x1b]11;rgb:1e1e/1e1e/2e2e\x07".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_indexed_colour_set_by_the_program_is_answered_without_the_host() {
+        assert_eq!(
+            answers(b"\x1b]4;1;?\x07\x1b]4;1;rgb:ab/cd/ef\x07\x1b]4;1;?\x07"),
+            vec!["\x1b]4;1;rgb:abab/cdcd/efef\x07".to_string()]
+        );
     }
 }

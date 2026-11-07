@@ -777,7 +777,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     performer.print(c);
 
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    // copad patch: upstream returns `valid_bytes - old_bytes`, which also consumes
+                    // every whole character copied in after this one, so they are never printed.
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -1005,6 +1007,20 @@ mod tests {
             parser.advance(&mut dispatcher, chunk);
         }
         dispatcher.dispatched
+    }
+
+    #[test]
+    fn a_read_ending_inside_a_character_loses_nothing() {
+        let text = "e\u{301} a\u{308} \u{1100}\u{1161}! é 漢字";
+        let mut whole = Dispatcher::default();
+        Parser::new().advance(&mut whole, text.as_bytes());
+        for cut in 1..text.len() {
+            let mut split = Dispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut split, &text.as_bytes()[..cut]);
+            parser.advance(&mut split, &text.as_bytes()[cut..]);
+            assert_eq!(split.dispatched, whole.dispatched, "cut at byte {cut}");
+        }
     }
 
     #[cfg(feature = "std")]

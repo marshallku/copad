@@ -1,7 +1,8 @@
 // Rust side: copad-term/src/lib.rs.
 //
 // Pointer ownership:
-//   copad_term_create -> CopadHandle*       free with copad_term_destroy
+//   copad_term_create -> CopadHandle*       free with copad_term_destroy (also _create_env,
+//   _create_mirror)
 //   copad_term_snapshot -> CopadSnapshot*   free with copad_snapshot_destroy
 //   *const CopadRun from row_runs, *const uint8_t from row_utf8: borrowed from the snapshot,
 //   valid until snapshot_destroy
@@ -95,7 +96,22 @@ CopadHandle* copad_term_create_env(uint16_t cols, uint16_t rows,
                                    const char* const* set, size_t set_count,
                                    const char* const* remove, size_t remove_count);
 
-/// The PTY child's pid, or -1 once it exited (it may be reaped and reused then).
+/// Where a mirror's input goes, on the thread that called copad_term_input.
+typedef void (*CopadWriteCallback)(void* ctx, const uint8_t* bytes, size_t len);
+
+/// A terminal with no PTY and no child: the host feeds it a program's output with
+/// copad_term_feed, and every read call works as on a PTY terminal. It never answers the
+/// program (DSR, DA, colour and size queries, graphics replies and focus reports are dropped).
+/// copad_term_input goes to `write_cb` (NULL drops it), which must not call back into the
+/// handle; copad_term_resize changes the grid only.
+CopadHandle* copad_term_create_mirror(uint16_t cols, uint16_t rows,
+                                      CopadWriteCallback write_cb, void* ctx);
+
+/// Parses output into a mirror, in order; a call may end anywhere, inside a sequence or a UTF-8
+/// character included. A no-op on a PTY terminal.
+void copad_term_feed(CopadHandle* handle, const uint8_t* bytes, size_t len);
+
+/// The PTY child's pid, or -1 once it exited (it may be reaped and reused then) or on a mirror.
 int32_t copad_term_child_pid(CopadHandle* handle);
 
 /// OSC 0/2 since the last call: 0 nothing new, 1 a title (*out set; free with
@@ -119,7 +135,8 @@ CopadString* copad_term_child_cwd(CopadHandle* handle);
 
 /// Populate one entry of the OSC color-query palette, indexed as `vte::ansi::NamedColor`: 0-15
 /// ANSI, 16-255 256-color, 256 foreground, 257 background, 258 cursor. Re-call to overwrite on
-/// theme hot-reload. Indices never set make OSC 4/10/11/12 queries a silent no-op.
+/// theme hot-reload. An OSC 4/10/11/12 query is answered with the colour the program set, else
+/// this entry; indices never set here make a query for an unset colour a silent no-op.
 int copad_term_set_palette_entry(CopadHandle* handle,
                                    uint16_t index,
                                    uint8_t r, uint8_t g, uint8_t b);

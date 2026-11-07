@@ -40,3 +40,10 @@ directory stays when upstream releases the keyboard fix.
 `tty/mod.rs`: `Options::env_remove`; `tty/unix.rs` calls `Command::env_remove` for each before applying `env`.
 `env` can only add, so an app embedding copad-term (AIDE) couldn't keep its own `TMUX` or another terminal's
 identity out of the shell without changing its own process environment (`copad_term_create_env`).
+
+## Colour queries answer the program's own colour (decisions #211)
+
+`term/mod.rs`, `Handler::dynamic_color_sequence`: an OSC 4/10/11/12 query for a colour the program set
+itself is answered at once with `Event::PtyWrite`; only an unset one still sends `Event::ColorRequest`.
+The host answering `ColorRequest` runs under the term lock and can't read `Term::colors`, so it could only
+answer from its theme, and a query after an OSC 11 change got the theme's colour back.

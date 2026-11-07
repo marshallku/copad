@@ -1830,15 +1830,20 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Requested write of escape sequence for color code {prefix}: color[{index}]");
 
         let terminator = terminator.to_owned();
-        self.event_proxy.send_event(Event::ColorRequest(
-            index,
-            Arc::new(move |color| {
-                format!(
-                    "\x1b]{};rgb:{1:02x}{1:02x}/{2:02x}{2:02x}/{3:02x}{3:02x}{4}",
-                    prefix, color.r, color.g, color.b, terminator
-                )
-            }),
-        ));
+        let format = move |color: Rgb| {
+            format!(
+                "\x1b]{};rgb:{1:02x}{1:02x}/{2:02x}{2:02x}/{3:02x}{3:02x}{4}",
+                prefix, color.r, color.g, color.b, terminator
+            )
+        };
+        // copad patch: a colour the program set itself (OSC 4/10/11/12) is the answer; only an
+        // unset one asks the host, whose listener can't read `colors` (it runs under the term lock).
+        if let Some(color) = self.colors[index] {
+            self.event_proxy.send_event(Event::PtyWrite(format(color)));
+            return;
+        }
+        self.event_proxy
+            .send_event(Event::ColorRequest(index, Arc::new(format)));
     }
 
     /// Reset the indexed color to original value.
