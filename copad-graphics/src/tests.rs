@@ -577,3 +577,360 @@ fn evicting_an_image_takes_its_virtual_placements_with_it() {
         "its bytes were freed for image 2"
     );
 }
+
+// MARK: - Carrying the state to another process (carry.rs)
+
+/// One step of a stream: text both terminals get, or a graphics command only the original does.
+enum Step<'a> {
+    Text(&'a [u8]),
+    Apc(&'a str, Vec<u8>),
+}
+
+/// Everything a cell's fragments say, with the image by its content.
+fn fragments(rig: &mut Rig) -> Vec<(usize, i32, usize, Vec<String>)> {
+    let mut out = Vec::new();
+    for (screen, grid) in rig.term.grids_mut().into_iter().enumerate() {
+        for line in all_lines(grid) {
+            for col in 0..grid.columns() {
+                let graphics = grid[Line(line)][Column(col)].graphics();
+                if graphics.is_empty() {
+                    continue;
+                }
+                let described = graphics
+                    .iter()
+                    .map(|g| {
+                        format!(
+                            "{} {} {} {} {:?} {:?} {}x{} {}",
+                            g.image_id,
+                            g.placement,
+                            g.client_placement,
+                            g.z,
+                            g.uv,
+                            g.dst,
+                            g.image.width,
+                            g.image.height,
+                            g.image.rgba.iter().map(|&b| b as u64).sum::<u64>()
+                        )
+                    })
+                    .collect();
+                out.push((screen, line, col, described));
+            }
+        }
+    }
+    out
+}
+
+/// The store as (id, number, used, size), sorted.
+fn store(rig: &Rig) -> Vec<(u32, u32, u64, (u32, u32))> {
+    let g = rig.graphics.lock().unwrap();
+    let mut out: Vec<_> = g
+        .images
+        .iter()
+        .map(|(&id, s)| (id, s.number, s.used, (s.image.width, s.image.height)))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The original after `steps`, and a terminal that got only their text with the original's
+/// graphics state imported.
+fn carried(columns: usize, lines: usize, steps: &[Step]) -> (Rig, Rig) {
+    let (mut original, mut copy) = (Rig::new(columns, lines), Rig::new(columns, lines));
+    for step in steps {
+        match step {
+            Step::Text(bytes) => {
+                original.feed(bytes);
+                copy.feed(bytes);
+            }
+            Step::Apc(control, payload) => original.apc(control, payload),
+        }
+    }
+    original.replies();
+    let bytes = original.graphics.lock().unwrap().export(&mut original.term);
+    copy.graphics
+        .lock()
+        .unwrap()
+        .import(&mut copy.term, &bytes)
+        .expect("import");
+    (original, copy)
+}
+
+/// Both get `bytes`; their replies, fragments and stores must agree.
+fn same_after(original: &mut Rig, copy: &mut Rig, bytes: &[u8]) {
+    original.feed(bytes);
+    copy.feed(bytes);
+    assert_eq!(
+        original.replies(),
+        copy.replies(),
+        "after {:?}",
+        String::from_utf8_lossy(bytes)
+    );
+    assert_eq!(fragments(original), fragments(copy));
+    assert_eq!(store(original), store(copy));
+}
+
+fn the_works() -> Vec<Step<'static>> {
+    vec![
+        Step::Text(b"hello\r\n"),
+        // On screen, then carried into scrollback by the lines after it.
+        Step::Apc("a=T,i=1,f=24,s=20,v=40,C=1,q=2", rgb(20, 40)),
+        Step::Text(b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n"),
+        // Stored, never shown.
+        Step::Apc("a=t,i=2,f=24,s=10,v=20,q=2", rgb(10, 20)),
+        // Numbered: an id assigned.
+        Step::Apc("a=t,I=7,f=24,s=10,v=20,q=2", rgb(10, 20)),
+        // A virtual placement (placeholders draw it).
+        Step::Apc("a=T,U=1,i=3,f=24,s=10,v=20,q=2", rgb(10, 20)),
+        // A named placement on screen, and a second placement of the same image.
+        Step::Apc("a=p,i=1,p=5,C=1,q=2", vec![]),
+        Step::Text(b"ab"),
+        Step::Apc("a=p,i=2,z=-1,C=1,q=2", vec![]),
+        // On the alternate screen.
+        Step::Text(b"\x1b[?1049h"),
+        Step::Apc("a=T,i=9,f=24,s=10,v=20,C=1,q=2", rgb(10, 20)),
+        Step::Text(b"\x1b[?1049l"),
+    ]
+}
+
+#[test]
+fn a_carried_state_draws_the_same_and_answers_every_command_the_same() {
+    let (mut original, mut copy) = carried(20, 5, &the_works());
+    assert!(
+        fragments(&mut original)
+            .iter()
+            .any(|(_, line, _, _)| *line < 0),
+        "an image in scrollback"
+    );
+    assert!(
+        fragments(&mut original)
+            .iter()
+            .any(|(screen, _, _, _)| *screen == 1),
+        "one on the other screen"
+    );
+    assert_eq!(fragments(&mut original), fragments(&mut copy));
+    assert_eq!(store(&original), store(&copy));
+    assert_eq!(
+        copy.graphics.lock().unwrap().live_bytes(),
+        original.graphics.lock().unwrap().live_bytes()
+    );
+    {
+        let (a, b) = (
+            original.graphics.lock().unwrap(),
+            copy.graphics.lock().unwrap(),
+        );
+        assert_eq!(a.live, b.live);
+        assert_eq!(a.named, b.named);
+        let virtuals = |g: &Graphics| {
+            let mut v: Vec<_> = g
+                .virtuals
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (*k, v.cols, v.rows, v.z, v.image.width))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(virtuals(&a), virtuals(&b));
+        assert!(b.revision > a.revision, "a renderer redraws");
+    }
+    // The store answers alike: by id, by number, a query, the next id and placement made.
+    same_after(&mut original, &mut copy, b"\x1b_Ga=p,i=2,C=1\x1b\\");
+    same_after(&mut original, &mut copy, b"\x1b_Ga=p,I=7,C=1\x1b\\");
+    same_after(&mut original, &mut copy, b"\x1b_Ga=p,i=4,C=1\x1b\\");
+    same_after(&mut original, &mut copy, b"\x1b_Ga=p,i=1,p=5,C=1\x1b\\");
+    same_after(
+        &mut original,
+        &mut copy,
+        format!(
+            "\x1b_Ga=t,I=8,f=24,s=1,v=1;{}\x1b\\",
+            BASE64.encode(rgb(1, 1))
+        )
+        .as_bytes(),
+    );
+    same_after(
+        &mut original,
+        &mut copy,
+        format!(
+            "\x1b_Ga=q,i=30,f=24,s=1,v=1;{}\x1b\\",
+            BASE64.encode(rgb(1, 1))
+        )
+        .as_bytes(),
+    );
+    // Deletes free the same, and scrolling carries both the same way.
+    same_after(&mut original, &mut copy, b"\x1b_Ga=d,d=i,i=1\x1b\\");
+    same_after(&mut original, &mut copy, b"\r\n\r\n\r\n");
+    same_after(&mut original, &mut copy, b"\x1b_Ga=d,d=I,i=2\x1b\\");
+    assert_eq!(
+        copy.graphics.lock().unwrap().live_bytes(),
+        original.graphics.lock().unwrap().live_bytes()
+    );
+}
+
+#[test]
+fn a_transmission_in_progress_goes_on_where_it_stopped() {
+    let pixels = BASE64.encode(rgb(20, 40));
+    let (a, b) = pixels.split_at(1200);
+    let (mut original, mut copy) = (Rig::new(20, 5), Rig::new(20, 5));
+    original.feed(b"x");
+    copy.feed(b"x");
+    // The first chunk (its payload already base64): the rest is still to come at the export.
+    original.feed(format!("\x1b_Ga=T,i=4,f=24,s=20,v=40,C=1,m=1;{a}\x1b\\").as_bytes());
+    let bytes = original.graphics.lock().unwrap().export(&mut original.term);
+    copy.graphics
+        .lock()
+        .unwrap()
+        .import(&mut copy.term, &bytes)
+        .unwrap();
+    same_after(
+        &mut original,
+        &mut copy,
+        format!("\x1b_Gm=0;{b}\x1b\\").as_bytes(),
+    );
+    assert_eq!(
+        original.at(0, 1).len(),
+        1,
+        "placed once the last chunk came"
+    );
+}
+
+#[test]
+fn the_eviction_order_is_carried() {
+    let size = 10 * 20 * 4;
+    let mut steps = vec![];
+    for id in 1..=3 {
+        steps.push(Step::Apc(
+            [
+                "a=t,i=1,f=24,s=10,v=20,q=2",
+                "a=t,i=2,f=24,s=10,v=20,q=2",
+                "a=t,i=3,f=24,s=10,v=20,q=2",
+            ][id - 1],
+            rgb(10, 20),
+        ));
+    }
+    steps.push(Step::Apc("a=p,i=1,C=1,q=2", vec![]));
+    steps.push(Step::Text(b"\x1b[2J"));
+    let (mut original, mut copy) = carried(10, 3, &steps);
+    for rig in [&original, &copy] {
+        rig.graphics.lock().unwrap().quota = 3 * size;
+    }
+    // Room for one more: the least recently used goes, in both.
+    same_after(
+        &mut original,
+        &mut copy,
+        format!(
+            "\x1b_Ga=t,i=5,f=24,s=10,v=20,q=2;{}\x1b\\",
+            BASE64.encode(rgb(10, 20))
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        store(&copy).iter().map(|s| s.0).collect::<Vec<_>>(),
+        [1, 3, 5]
+    );
+}
+
+/// `set_quota` below what is kept evicts nothing: that state still goes across.
+#[test]
+fn a_quota_lowered_below_what_is_kept_still_carries() {
+    let steps = [Step::Apc("a=t,i=1,f=24,s=10,v=20,q=2", rgb(10, 20))];
+    let (mut original, _) = carried(10, 3, &steps);
+    original.graphics.lock().unwrap().set_quota(1);
+    let bytes = original.graphics.lock().unwrap().export(&mut original.term);
+    let mut copy = Rig::new(10, 3);
+    copy.graphics
+        .lock()
+        .unwrap()
+        .import(&mut copy.term, &bytes)
+        .unwrap();
+    assert_eq!(store(&copy), store(&original));
+}
+
+#[test]
+fn an_import_refuses_what_it_cant_take_and_keeps_nothing() {
+    let (mut original, _) = carried(20, 5, &the_works());
+    let bytes = original.graphics.lock().unwrap().export(&mut original.term);
+    // Every truncation, and a byte changed anywhere, fails cleanly or imports: never a panic.
+    for cut in (0..bytes.len()).step_by(97) {
+        let mut rig = Rig::new(20, 5);
+        rig.feed(b"hello\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
+        assert!(
+            rig.graphics
+                .lock()
+                .unwrap()
+                .import(&mut rig.term, &bytes[..cut])
+                .is_err()
+        );
+        assert_eq!(rig.graphics.lock().unwrap().live_bytes(), 0, "nothing kept");
+        assert!(fragments(&mut rig).is_empty());
+    }
+    for at in (0..bytes.len()).step_by(89) {
+        let mut flipped = bytes.clone();
+        flipped[at] ^= 0x5a;
+        let mut rig = Rig::new(20, 5);
+        rig.feed(b"hello\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
+        let _ = rig.graphics.lock().unwrap().import(&mut rig.term, &flipped);
+    }
+    // Values no real state holds: a counter about to overflow (the revision, after the magic,
+    // version, quota, clock, next id and next placement), and a virtual placement wider than any
+    // screen, which a renderer would multiply by the cell size.
+    let mut huge = bytes.clone();
+    let at = 4 + 2 + 8 + 8 + 4 + 8;
+    huge[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    let mut rig = Rig::new(20, 5);
+    rig.feed(b"hello\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
+    let err = rig
+        .graphics
+        .lock()
+        .unwrap()
+        .import(&mut rig.term, &huge)
+        .unwrap_err();
+    assert!(err.contains("counter"), "{err}");
+    assert!(fragments(&mut rig).is_empty(), "nothing kept");
+    let mut wide = Rig::new(20, 5);
+    wide.apc("a=T,U=1,i=3,c=10000,f=24,s=10,v=20,q=2", &rgb(10, 20));
+    let mut state = wide.graphics.lock().unwrap().export(&mut wide.term);
+    let cols = 10_000u32.to_le_bytes();
+    let at = state
+        .windows(4)
+        .rposition(|w| w == cols)
+        .expect("the virtual placement's columns");
+    state[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let mut rig = Rig::new(20, 5);
+    let err = rig
+        .graphics
+        .lock()
+        .unwrap()
+        .import(&mut rig.term, &state)
+        .unwrap_err();
+    assert!(err.contains("virtual placement"), "{err}");
+    // Another version, a terminal without the history, and one that isn't fresh.
+    let mut other = bytes.clone();
+    other[4] = 2;
+    let mut rig = Rig::new(20, 5);
+    assert!(
+        rig.graphics
+            .lock()
+            .unwrap()
+            .import(&mut rig.term, &other)
+            .unwrap_err()
+            .contains("version 2")
+    );
+    let err = rig
+        .graphics
+        .lock()
+        .unwrap()
+        .import(&mut rig.term, &bytes)
+        .unwrap_err();
+    assert!(err.contains("outside the terminal"), "{err}");
+    assert_eq!(rig.graphics.lock().unwrap().live_bytes(), 0);
+    rig.apc("a=t,i=1,f=24,s=1,v=1,q=2", &rgb(1, 1));
+    assert!(
+        rig.graphics
+            .lock()
+            .unwrap()
+            .import(&mut rig.term, &bytes)
+            .unwrap_err()
+            .contains("fresh")
+    );
+}

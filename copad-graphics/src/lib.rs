@@ -548,6 +548,11 @@ fn check_dimensions(width: u32, height: u32) -> Result<usize, &'static str> {
     Ok(bytes)
 }
 
+/// What a chunk of a transmission in progress can make it end in (the others are its start's,
+/// [`transmission_cap`]).
+const TOO_LARGE: &str = "EFBIG:transmission too large";
+const BAD_BASE64: &str = "EINVAL:bad base64";
+
 fn transmission_cap(cmd: &Cmd) -> Result<usize, &'static str> {
     match raw_bpp(cmd.format)? {
         Some(bpp) if !cmd.compressed => {
@@ -842,8 +847,8 @@ impl Graphics {
                 Ok(bytes) if pending.data.len() + bytes.len() <= pending.cap => {
                     pending.data.extend_from_slice(&bytes)
                 }
-                Ok(_) => pending.error = Some("EFBIG:transmission too large"),
-                Err(_) => pending.error = Some("EINVAL:bad base64"),
+                Ok(_) => pending.error = Some(TOO_LARGE),
+                Err(_) => pending.error = Some(BAD_BASE64),
             }
             if pending.error.is_some() {
                 // Keep consuming the remaining chunks, but stop holding the bytes.
@@ -1599,6 +1604,9 @@ pub fn collect(
         out.images,
     )
 }
+
+mod carry;
+pub use carry::CARRY_VERSION;
 
 #[cfg(test)]
 mod tests;
