@@ -132,6 +132,7 @@ jobs:
           name: testflight-log
           path: copad-ios/build/fastlane/testflight.log
           if-no-files-found: ignore
+          retention-days: 7
 
       - name: Remove the keychain and key
         if: always()

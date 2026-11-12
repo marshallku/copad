@@ -84,6 +84,7 @@ jobs:
             ${{ env.COMUX_ASSET }}
             ${{ env.COMUX_MUSL_ASSET }}
           if-no-files-found: error
+          retention-days: 3
 
   build-macos:
     name: Build macOS arm64
@@ -322,6 +323,7 @@ jobs:
             ${{ env.ARCHIVE }}
             ${{ env.COMUX_ASSET }}
           if-no-files-found: error
+          retention-days: 3
 
   release:
     name: Publish GitHub Release
